@@ -147,6 +147,24 @@ def pick_arrival_params(task_cfg: Dict[str, Any], args) -> tuple:
     return task_cfg.get("mu", 0.0), task_cfg.get("sigma", 0.0)
 
 
+class BurstGate:
+    """victim burst 计数屏障。
+
+    搅拌等到全部 victim 越过 pause_after_turn 才放行，使淘汰压力只落在 pause 窗口内。
+    用进度计数而不是墙钟：单轮时延随 prompt 增长，20 轮累计漂移可达数秒。
+    """
+
+    def __init__(self, expect: int):
+        self.expect = expect
+        self.count = 0
+        self.event = asyncio.Event()
+
+    def done_one(self) -> None:
+        self.count += 1
+        if self.count >= self.expect:
+            self.event.set()
+
+
 # --------------------------------------------------------------------------
 # 混合负载：Poisson 会话到达调度（模仿 UniCache simulator.py init_heap）
 # --------------------------------------------------------------------------
@@ -218,9 +236,16 @@ def build_hybrid_arrival_schedule(tasks_config: Dict[str, Any],
         if shuffle:
             rng.shuffle(sessions)
 
-        # Poisson 到达时刻（seed+task_id 保证各 task 到达流相互独立且可复现）
-        arrival_times = generate_poisson_requests(
-            lambda_rate, len(sessions), seed + task_id)
+        # arrival.mode=fixed：确定性到达（victim 需同相位，Poisson 会把 pause 打散）
+        arrival = task.get("arrival") or {}
+        if arrival.get("mode") == "fixed":
+            base = float(arrival.get("offset_s", 0.0))
+            step = float(arrival.get("step_s", 0.05))
+            arrival_times = [base + step * i for i in range(len(sessions))]
+        else:
+            # Poisson 到达时刻（seed+task_id 保证各 task 到达流相互独立且可复现）
+            arrival_times = generate_poisson_requests(
+                lambda_rate, len(sessions), seed + task_id)
 
         for sess, at in zip(sessions, arrival_times):
             events.append(SessionArrival(at, counter, name, task, sess))
@@ -379,12 +404,18 @@ async def one_request(
                 last_meta = meta
 
     e2e = time.perf_counter() - t0
+    # TTFT 分解：forward_entry_time → prefill_finished_time 是纯 prefill，
+    # 其余为 tokenizer 入队与调度排队。用于把尾部归因到重算而非排队。
+    fe = last_meta.get("forward_entry_time")
+    pf = last_meta.get("prefill_finished_time")
     return {
         "ttft": ttft,
         "e2e": e2e,
         "prompt_tokens": last_meta.get("prompt_tokens", 0),
         "cached_tokens": last_meta.get("cached_tokens", 0),
         "completion_tokens": last_meta.get("completion_tokens", 0),
+        "queue_time_ms": round((last_meta.get("queue_time") or 0.0) * 1000, 3),
+        "prefill_ms": round((pf - fe) * 1000, 3) if fe and pf else None,
     }
 
 
@@ -400,6 +431,7 @@ async def run_session(
     url: str,
     task_cfg: Optional[Dict[str, Any]] = None,
     arrival_offset: float = 0.0,
+    gate: Optional[BurstGate] = None,
 ) -> None:
     """跑一个 session 的全部轮次（会话内逐轮串行）。
 
@@ -420,11 +452,16 @@ async def run_session(
     rng = random.Random(stable_seed_from_str(sid, base_seed=base_seed))
     num_turns = sess["num_turns"]
 
+    # 带 gate_after 的流（搅拌）等 victim burst 屏障释放后才开始计到达
+    if gate is not None and task_cfg.get("gate_after"):
+        await gate.event.wait()
+
     # 混合负载：Poisson 到达调度（真实墙钟）。arrival_scale 可整体缩放到达节奏。
     if arrival_offset > 0:
         await asyncio.sleep(arrival_offset)
 
     prev_end: Optional[float] = None  # 上一轮请求完成时刻（算真实轮间隔）
+    pause_done = False
     async with sem:  ##控制并发粒度
         for t in range(1, num_turns + 1):
             turn = sess[f"turn_{t}"]
@@ -463,23 +500,43 @@ async def run_session(
                     "gap_since_prev_end_s": (
                         round(now - prev_end, 3) if prev_end is not None else None
                     ),
+                    # 跨会话对齐时间轴（SimultaneityIndex 用）；e2e 分解用后两列
+                    "queue_time_ms": r["queue_time_ms"],
+                    "prefill_ms": r["prefill_ms"],
+                    "ts": round(time.time(), 3),
                 })
                 prev_end = now
             except Exception as exc:  # noqa: BLE001
                 stats.errors += 1
                 print(f"[ERR] {sid} turn {t}: {type(exc).__name__}: {exc}")
 
+            # burst 段结束：计一次屏障，然后进入 pause（tool 往返/人工等待）。
+            # pause 不乘 wait_scale：它是自变量，必须精确。
+            pause_after = task_cfg.get("pause_after_turn")
+            if pause_after and t == pause_after:
+                pause_done = True
+                if gate is not None:
+                    gate.done_one()
+                await asyncio.sleep(task_cfg.get("pause_s", 0.0))
+
             # 轮间等待（inter-turn 到达间隔，模仿 UniCache simulator.py
             #   _maybe_schedule_next_turn）：
-            # wait_scale=0 不等（快速跑）；否则按负载类型取 lognormal(mu, sigma) 采样。
-            # 仅当还有下一轮时采样（对齐 UniCache：最后一轮后不等待）。
+            # gap_mode=fixed 用固定间隔；否则按负载类型取 lognormal(mu, sigma) 采样。
+            # wait_scale=0 不等（快速跑）；仅当还有下一轮时等待（对齐 UniCache）。
             if args.wait_scale > 0 and t < num_turns:
-                mu, sigma = pick_arrival_params(task_cfg, args)
-                if mu == 0.0 and sigma == 0.0:
-                    wait = 0.0
+                if task_cfg.get("gap_mode") == "fixed":
+                    wait = task_cfg.get("gap_s", 0.0)
                 else:
-                    wait = rng.lognormvariate(mu, sigma) * args.wait_scale
-                await asyncio.sleep(wait)
+                    mu, sigma = pick_arrival_params(task_cfg, args)
+                    if mu == 0.0 and sigma == 0.0:
+                        wait = 0.0
+                    else:
+                        wait = rng.lognormvariate(mu, sigma)
+                await asyncio.sleep(wait * args.wait_scale)
+
+    # 轮数不足 pause_after_turn 的 session 也要放行屏障，否则搅拌永久等待
+    if gate is not None and task_cfg.get("pause_after_turn") and not pause_done:
+        gate.done_one()
 
     stats.record_session(task_name)
 
@@ -512,8 +569,12 @@ async def main_async(args: argparse.Namespace) -> Dict[str, Any]:
                       f"max_record={t.get('max_record', -1):>5} "
                       f"mu={t.get('mu', 0)} sigma={t.get('sigma', 0)} "
                       f"data={t['data_path']}")
+            # 屏障参与方 = 带 pause_after_turn 的 victim 会话数
+            gate = BurstGate(
+                sum(1 for ev in schedule if ev.task_cfg.get("pause_after_turn")))
             print(f"[Uni-Bench] base_url={args.base_url} concurrency={args.concurrency} "
-                  f"arrival_scale={args.arrival_scale} wait_scale={args.wait_scale}")
+                  f"arrival_scale={args.arrival_scale} wait_scale={args.wait_scale} "
+                  f"burst_gate={gate.expect}")
 
             # 每个 SessionArrival 一个协程：先按到达时刻 sleep，再竞争并发槽。
             # 会话间并发（sem）、会话内串行（run_session 内逐轮）。
@@ -522,6 +583,7 @@ async def main_async(args: argparse.Namespace) -> Dict[str, Any]:
                     http, sem, ev.session, args, stats, url,
                     task_cfg=ev.task_cfg,
                     arrival_offset=ev.arrival_offset * args.arrival_scale,
+                    gate=gate,
                 ))
                 for ev in schedule
             ]

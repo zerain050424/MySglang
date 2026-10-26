@@ -30,8 +30,10 @@ class SimpleHybridRadixCache(RadixCache):
         num_tokens = params.num_tokens
         # 每隔 update_interval 秒按命中效率刷新各类型 α 权重
         if self._alpha_updater is not None:
-            # 传两份口径：alpha 用可调度容量，profile 用 workload 占用
-            self._alpha_updater(*self._profile_token_counts())
+            # 传三份口径：alpha 用可调度容量，profile 用 workload 占用与会话缺口
+            self._alpha_updater(
+                *self._profile_token_counts(), self.session_registry.summary()
+            )
 
         strategy = self.eviction_strategy
         num_evicted = 0
@@ -54,7 +56,8 @@ class SimpleHybridRadixCache(RadixCache):
         return EvictResult(num_tokens_evicted=num_evicted)
 
     def _evict_one(self, node) -> int:
-        """淘汰一个叶子并释放其 KV，返回释放的 token 数。
+        """
+        淘汰一个叶子并释放其 KV，返回释放的 token 数。
         one-shot 节点向上追溯：把因本次删除而变得「无其他子树、未上锁」的
         祖先链一次删净 —— 单轮会话的 response 走后，其上方的 prompt 链
         不会再产生任何复用，逐叶淘汰只会让死链反复以新叶子的身份暴露，

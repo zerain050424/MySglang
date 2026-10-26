@@ -49,6 +49,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.uni_utils import (   
+    SessionRegistry,
     SimpleHybridTaskType,
     classify_simple_hybrid_task_type,
     workload_label_of,
@@ -286,6 +287,8 @@ class TreeNode: ## TreeNode 是基数树（RadixTree）的节点，每个节点�
         self.priority = priority
         self.task_type = None
         self.is_decode = False
+        # SimpleHYBRID：节点归属的会话（用于会话级缺口记账，见 uni_utils.SessionRegistry）
+        self.session_id: Optional[str] = None
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
 
@@ -349,6 +352,8 @@ class RadixCache(BasePrefixCache):
         )
 
         self.evictable_leaves = set()
+        # SimpleHYBRID：会话级 KV 账本（每会话 d/L/gaps），供公平淘汰使用
+        self.session_registry = SessionRegistry()
         self.reset()
 
         # ---- 策略无关的「按工作负载占用」采样器（env 门控，默认关）----
@@ -487,6 +492,7 @@ class RadixCache(BasePrefixCache):
         chunked = params.chunked
         task_type = params.task_type
         decode_start = params.decode_start
+        session_id = params.session_id
         key, value = key.maybe_to_bigram_view(self.is_eagle, value)
         key = key.page_aligned(self.page_size)
         if value is not None:
@@ -496,7 +502,8 @@ class RadixCache(BasePrefixCache):
             value = torch.tensor(key.token_ids[: len(key)], dtype=torch.int64)
 
         prefix_len, last_node = self._insert_helper(
-            self.root_node, key, value, priority, chunked,task_type,decode_start
+            self.root_node, key, value, priority, chunked, task_type,
+            decode_start, session_id,
         )
         return InsertResult(prefix_len=prefix_len, last_device_node=last_node)
 
@@ -531,6 +538,10 @@ class RadixCache(BasePrefixCache):
         # boundary so decode-portion nodes can be flagged (evicted first).
         task_type = classify_simple_hybrid_task_type(req.session_id, req.extra_key)
         decode_start = (len(req.origin_input_ids) // self.page_size) * self.page_size
+        # SimpleHYBRID：会话账本入口。请求写入后链完整驻留，缺口归零。
+        self.session_registry.touch(
+            req.session_id, getattr(req, "rid", ""), len(radix_key)
+        )
         result = self.insert(
             InsertParams(
                 key=radix_key,
@@ -539,6 +550,7 @@ class RadixCache(BasePrefixCache):
                 priority=priority,
                 task_type=task_type,
                 decode_start=decode_start,
+                session_id=req.session_id,
                )
            )
         if split_prompt:
@@ -560,6 +572,7 @@ class RadixCache(BasePrefixCache):
                         # hit_count bump would promote every prompt node.
                         chunked=True,
                         task_type=task_type,
+                        session_id=req.session_id,
                         decode_start=decode_start
                     )
                 )
@@ -639,7 +652,9 @@ class RadixCache(BasePrefixCache):
         # Phase 3: refresh per-type alphas from recent hit efficiency.
         # 同时传两份口径：alpha 用可调度容量，profile 用 workload 占用。
         if self._alpha_updater is not None:
-            self._alpha_updater(*self._profile_token_counts())
+            self._alpha_updater(
+                *self._profile_token_counts(), self.session_registry.summary()
+            )
         leaves = list(self.evictable_leaves)
         eviction_heap = [
             (self.eviction_strategy.get_priority(node), node) for node in leaves
@@ -851,6 +866,8 @@ class RadixCache(BasePrefixCache):
            # reclassified as decode when the split lands at/after decode_start.
            new_node.task_type = child.task_type
            new_node.is_decode = child.is_decode
+           new_node.session_id = child.session_id
+           self.session_registry.attach(new_node.session_id, len(new_node.value))
            child.parent = new_node
            child.key = child.key[split_len:]
            child.value = child.value[split_len:].clone()
@@ -885,6 +902,7 @@ class RadixCache(BasePrefixCache):
         chunked: bool = False,
         task_type: Optional[SimpleHybridTaskType] = None,
         decode_start: Optional[int] = None,
+        session_id: Optional[str] = None,
     ):
         # Convert None priority to 0
         if priority is None:
@@ -928,6 +946,8 @@ class RadixCache(BasePrefixCache):
             new_node.is_decode = (
                 decode_start is not None and total_prefix_length >= decode_start
             )
+            new_node.session_id = session_id
+            self.session_registry.attach(session_id, len(new_node.value))
             self._inc_hit_count(new_node, chunked)
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)
@@ -957,6 +977,8 @@ class RadixCache(BasePrefixCache):
                 )
 
     def _delete_leaf(self, node):
+        # SimpleHYBRID：节点消亡的唯一原语，会话缺口在此累加（覆盖淘汰与释放两条路径）
+        self.session_registry.charge(node)
         key = node.key.child_key(self.page_size)
         v = node.parent.children.pop(key, None) ## 从父节点的children字典中删除当前节点，并返回删除的节点
         assert v == node, f"parent does not have child key, {key}"

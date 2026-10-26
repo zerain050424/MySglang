@@ -133,7 +133,7 @@ class SimpleHybridStrategy(EvictionStrategy):
     """
       多级别队列进行淘汰
     """
-    # Per-event decay of other queues' hit stats (mirrors UniCache 0.95).
+    # 衰减
     HIT_DECAY = 0.95
     # Cap on the once-per-request dedup set (bounds memory in long runs).
     MAX_SEEN_RIDS = 100_000
@@ -150,7 +150,7 @@ class SimpleHybridStrategy(EvictionStrategy):
     ):
         self.max_offset = max_offset or 2048
         # ---- alpha 控制器的稳定性参数----
-        # 锯齿极限环,加下限使 eff 有界。
+        # 加下限使 eff 有界。
         self.min_cap_share = min_cap_share
         # 单次更新允许的最大倍数变化（上/下）。防止一个噪声窗口把权重从下界直接顶到上界。
         self.max_alpha_step = max_alpha_step
@@ -214,8 +214,7 @@ class SimpleHybridStrategy(EvictionStrategy):
         """
         全序优先级：带 0 = 一次性内容（random / 单轮 response 段）先淘汰，
         带内按树上结束偏移降序（与 one_shot_key 同口径）；带 1 = 可调度内容
-        按 reuse_score 竞争。多轮 response 段在带 1，与其所属 workload 的
-        prompt 段同队列。
+        按 reuse_score 竞争。
         """
         if self.is_one_shot(node):
             return (0, float(-_node_end_offset(node)), 0.0)
@@ -230,7 +229,8 @@ class SimpleHybridStrategy(EvictionStrategy):
         return (self._reuse_score(node), -_node_num_tokens(node))
 
     def is_one_shot(self, node) -> bool:
-        """一次性内容（one-shot）：淘汰顺序永远先于可调度内容。
+        """
+        一次性内容（one-shot）：淘汰顺序永远先于可调度内容。
           - SINGLE_TURN_RANDOM：随机单轮，跨会话几乎不复用；
           - 单轮负载（SINGLE_TURN）的生成段：会话发完即弃，response 不会再被任何请求当作前缀。
         多轮负载的 response 段不在此列：下一轮会复用，与其 prompt 段同队列参与调度。
@@ -292,7 +292,7 @@ class SimpleHybridStrategy(EvictionStrategy):
         if self.is_one_shot(node):
             self._total_evicted_one_shot += tokens
 
-    def profile_summary(self, workload_occ) -> str:
+    def profile_summary(self, workload_occ, session_summary=None) -> str:
         """返回各 workload 的 profile 摘要，供日志打印。
 
         字段含义：
@@ -328,9 +328,18 @@ class SimpleHybridStrategy(EvictionStrategy):
             f"  pool={pool:.0f} schedulable={schedulable:.0f} "
             f"one_shot_evicted={self._total_evicted_one_shot:.0f}"
         )
+        if session_summary:
+            # 会话级缺口：d_sum 与淘汰总量同量纲，可互相校验
+            lines.append(
+                f"  sessions={int(session_summary['sessions'])} "
+                f"d_sum={session_summary['d_sum']:.0f} "
+                f"d_p50={session_summary['d_p50']:.0f} "
+                f"d_max={session_summary['d_max']:.0f} "
+                f"d_nonzero={int(session_summary['d_nonzero'])}"
+            )
         return "\n".join(lines)
 
-    def maybe_update_alpha(self, sched, workload_occ) -> None:
+    def maybe_update_alpha(self, sched, workload_occ, session_summary=None) -> None:
         # Time-guarded trigger for alpha rebalancing (called from evict()).
         now = time.monotonic()
         if now - self._last_update < self.update_interval:
@@ -340,7 +349,7 @@ class SimpleHybridStrategy(EvictionStrategy):
         # 每个 update_interval 秒打印一次各 workload profile 摘要
         logger.info(
             "[SimpleHybrid profile]\n%s",
-            self.profile_summary(workload_occ),
+            self.profile_summary(workload_occ, session_summary),
         )
 
     def update_alpha_balance(

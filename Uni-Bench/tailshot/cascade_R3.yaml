@@ -1,0 +1,53 @@
+# Cascade R3：异构 idle（H=10s / W=30s / C=90s）—— 主格
+# 时间轴：12 victim 同时到达 → turn1..20 (gap=1s) → 屏障 → pause(10/30/90s) → turn21..26
+# 压力：ShareGPT 单轮（MULTI_TURN_TEXT）→ 落在**可调度带**。
+#   首版用 apps/Codeparrot（one-shot 带）时，profile 显示 evicted single 33,798 /
+#   agentic 2,407：压力全被 one-shot 带吃掉，受害者无损，故改为可调度搅拌。
+#   20 条 × 601 tok ≈ 12k tok 注入，F_eff ≈ 126 tok/s。
+tasks:
+- name: AgentBank_alfred_hot
+  task_id: 3
+  data_path: ../TaskData/victim_pool12_H.jsonl
+  lambda_rate: 9
+  seed: 42
+  max_record: 4
+  shuffle: false
+  arrival: {mode: fixed, offset_s: 0.0, step_s: 0.05}
+  gap_mode: fixed
+  gap_s: 1.0
+  pause_after_turn: 20
+  pause_s: 10
+- name: AgentBank_alfred_warm
+  task_id: 4
+  data_path: ../TaskData/victim_pool12_W.jsonl
+  lambda_rate: 9
+  seed: 42
+  max_record: 4
+  shuffle: false
+  arrival: {mode: fixed, offset_s: 0.0, step_s: 0.05}
+  gap_mode: fixed
+  gap_s: 1.0
+  pause_after_turn: 20
+  pause_s: 30
+- name: AgentBank_alfred_cold
+  task_id: 5
+  data_path: ../TaskData/victim_pool12_C.jsonl
+  lambda_rate: 9
+  seed: 42
+  max_record: 4
+  shuffle: false
+  arrival: {mode: fixed, offset_s: 0.0, step_s: 0.05}
+  gap_mode: fixed
+  gap_s: 1.0
+  pause_after_turn: 20
+  pause_s: 90
+- name: ShareGPT_stirrer
+  task_id: 2
+  data_path: ../TaskData/stirrer_text.jsonl
+  lambda_rate: 0.20
+  mu: 0
+  sigma: 0
+  seed: 42
+  max_record: 24
+  shuffle: true
+  gate_after: victim_burst_done
