@@ -1,0 +1,65 @@
+# Uni-Bench 到达间隔配置
+#
+# 每个 task 的 mu/sigma 是 inter-turn（轮间）到达间隔的 lognormal 参数（秒），
+# lambda_rate 是 session 到达率（Poisson，session/s）。
+#
+# 当前 UniBench 用 Semaphore 控制会话并发、会话内串行
+# session 级 Poisson 到达调度
+#
+# session_id 前缀 -> task name 的映射见 bench_unicache.py 的 classify_session()，
+# 与 sglang mem_cache/uni_utils.py 的 classify_simple_hybrid_task_type 一致。
+#
+# mu/sigma 取值来源：
+#   text / agentic / single / random —— 对齐 UniCache 对应 tasks_config.yaml 的
+#     到达间隔实测拟合值；
+#   file / image / search —— UniCache 未开源其到达间隔实测值，此处沿用其复用概率
+#     的 lognormal 拟合参数（vllm/core/evictor.py calculate_priority）作近似。
+tasks:
+  - name: text            # ShareGPT-multi-turn-* / text_ShareGPT-multi-turn-*
+    task_id: 0
+    lambda_rate: 1
+    mu: 4.15              # UniCache TaskData/SharedGPT-multi-turn/tasks_config.yaml
+    sigma: 0.971
+    seed: 42
+
+  - name: agentic         # alfred_*
+    task_id: 1
+    lambda_rate: 1
+    mu: 1.81              # UniCache TaskData/AgentBankData/tasks_config_alfred.yaml
+    sigma: 1.092
+    seed: 42
+
+  - name: single          # 其余（Codeparrot 等单轮）
+    task_id: 2
+    lambda_rate: 1
+    mu: 1.81              # UniCache TaskData/Codeparrot/tasks_config.yaml
+    sigma: 1.092
+    seed: 42
+
+  - name: random          # apps_* / mind2web_*
+    task_id: 3
+    lambda_rate: 1
+    mu: 1.81              # UniCache TaskData/AgentBankData/tasks_config.yaml
+    sigma: 1.092
+    seed: 42
+
+  - name: file            # file_ShareGPT-multi-turn-*（无 UniCache 到达间隔实测值）
+    task_id: 4
+    lambda_rate: 1
+    mu: 5.07658           # 复用概率 lognormal 拟合值（evictor.py）
+    sigma: 1.06383
+    seed: 42
+
+  - name: image           # image_ShareGPT-multi-turn-*
+    task_id: 5
+    lambda_rate: 1
+    mu: 4.4449            # 复用概率 lognormal 拟合值（evictor.py）
+    sigma: 1.09066
+    seed: 42
+
+  - name: search          # search_ShareGPT-multi-turn-*
+    task_id: 6
+    lambda_rate: 1
+    mu: 4.961663          # 复用概率 lognormal 拟合值（evictor.py）
+    sigma: 1.13877
+    seed: 42

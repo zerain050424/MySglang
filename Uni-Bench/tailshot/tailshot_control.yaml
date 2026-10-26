@@ -1,0 +1,11 @@
+tasks:
+- name: AgentBank_alfred
+  task_id: 3
+  data_path: ../TaskData/victim_pool.jsonl
+  lambda_rate: 0.5
+  mu: 3.4012
+  sigma: 0.01
+  max_trace_duration: -1
+  seed: 42
+  max_record: 4
+  shuffle: false

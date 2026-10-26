@@ -1,0 +1,71 @@
+# =============================================================================
+# 混合负载配置（模仿 UniCache TaskData/Hybrid/*/tasks_config.yaml）
+#
+# 语义（逐字段对齐 UniCache vllm/simulator/simulator.py）：
+#   - lambda_rate : 该负载的 session 到达率（Poisson，session/s）。
+#                   「混合比例」即各 task 的 lambda_rate 之比（如 2:1 表示
+#                   A 的 session 到达速度是 B 的 2 倍）。
+#   - mu / sigma  : 会话内「轮间」到达间隔的 lognormal 参数（秒）；单轮负载为 0。
+#   - max_record  : 该负载最多加载的 session 数（UniCache 的 max_record）。
+#   - seed/task_id: 确定性打乱与 RNG（stable_seed = seed + task_id*1000）。
+#   - shuffle     : 是否打乱该负载自身 session 顺序（mashqa 同文档问题相邻可设 false）。
+#
+# data_path 相对本文件所在目录（Uni-Bench/）解析。
+#
+# 本配置按 UniCache 混合实验的默认比例：各负载 lambda_rate=1（1:1:1:1），
+# 覆盖四类异构负载：
+#   - 多轮文本 text    （session_id 前缀 ShareGPT-multi-turn-* → MULTI_TURN_TEXT）
+#   - 多轮 agentic     （session_id 前缀 alfred_*            → MULTI_TURN_AGENTIC）
+#   - 单轮 code/single （session_id 前缀 Code-*             → SINGLE_TURN）
+#   - 单轮 API random  （session_id 前缀 apps_*             → SINGLE_TURN_RANDOM）
+#
+# 调整「比例」：改各 task 的 lambda_rate 即可（如 ShareGPT 设 2、其余设 1 → 2:1:1:1）。
+# =============================================================================
+tasks:
+  # --- 单轮：AgentBank apps（apps_* → SINGLE_TURN_RANDOM）---
+  - name: AgentBank_apps
+    task_id: 0
+    data_path: TaskData/AgentBankData/Qwen2.5-7B-Instruct/AgentBank_apps_session_data.jsonl
+    lambda_rate: 1
+    mu: 0            # 单轮：无轮间等待
+    sigma: 0
+    max_trace_duration: -1
+    seed: 42
+    max_record: 1800
+    shuffle: true
+
+  # --- 单轮：Codeparrot（Code-* → SINGLE_TURN）---
+  - name: Codeparrot
+    task_id: 1
+    data_path: TaskData/Codeparrot/Qwen2.5-7B-Instruct/Code_session_data.jsonl
+    lambda_rate: 1
+    mu: 0
+    sigma: 0
+    max_trace_duration: -1
+    seed: 42
+    max_record: 1800
+    shuffle: true
+
+  # --- 多轮文本：ShareGPT（ShareGPT-multi-turn-* → MULTI_TURN_TEXT）---
+  - name: ShareGPT
+    task_id: 2
+    data_path: TaskData/SharedGPT-multi-turn/Qwen2.5-7B-Instruct/ShareGPT_cleaned_valid_deduplicated_session_data.jsonl
+    lambda_rate: 1
+    mu: 4.15         # UniCache SharedGPT-multi-turn/tasks_config.yaml
+    sigma: 0.971
+    max_trace_duration: -1
+    seed: 42
+    max_record: 500
+    shuffle: true
+
+  # --- 多轮 agentic：AgentBank alfred（alfred_* → MULTI_TURN_AGENTIC）---
+  - name: AgentBank_alfred
+    task_id: 3
+    data_path: TaskData/AgentBankData/Qwen2.5-7B-Instruct/AgentBank_alfred_scale_5000_session_data.jsonl
+    lambda_rate: 1
+    mu: 1.81         # UniCache AgentBankData/tasks_config_alfred.yaml
+    sigma: 1.092
+    max_trace_duration: -1
+    seed: 42
+    max_record: 500
+    shuffle: true
