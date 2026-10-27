@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 import logging
 import time
 from collections import deque
-from typing import TYPE_CHECKING, Dict, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, Iterable, Optional, Tuple, Union
 
 from sglang.srt.mem_cache.uni_utils import (
     TASK_CONFIG,
@@ -14,6 +14,8 @@ from sglang.srt.mem_cache.uni_utils import (
     _cached_lognorm_cdf,
     alpha_key_of,
     classify_simple_hybrid_task_type,
+    SessionRegistry,
+    SessionState
 )
 
 if TYPE_CHECKING:
@@ -147,6 +149,14 @@ class SimpleHybridStrategy(EvictionStrategy):
         max_alpha_step: float = 3.0,
         alpha_smooth: float = 0.7,
         alpha_temperature: float = 0.5,
+        fair_drr: bool = False,
+        drr_use_p: bool = False,
+        drr_workloads: Tuple[str, ...] = ("multi_turn_agentic",),
+        kappa: float = 0.5,
+        min_retain_tokens: int = 512,
+        min_retain_frac: float = 0.3,
+        horizon_s: float = 300.0,
+        p_levels: Tuple[float, ...] = (1.0, 0.5, 0.2, 0.05),
     ):
         self.max_offset = max_offset or 2048
         # ---- alpha 控制器的稳定性参数----
@@ -171,6 +181,29 @@ class SimpleHybridStrategy(EvictionStrategy):
             }
         )
         # 在线更新α状态
+        # fair_drr=True  开启 DRR；False 时完全走原来的全局 min(victim_key)。
+        #                开启后只在 drr_workloads 内部改变选择顺序，
+        #                与其它 workload 的仲裁仍按 victim_key 比大小。
+        self.fair_drr = fair_drr
+        # drr_use_p=True 排序键为 P_i·d_i（期望缺口，容量流向前景好的会话）；
+        #               False 为 d_i（纯轮询，只按已损失量摊薄，不看是否会回来）。
+        self.drr_use_p = drr_use_p
+        # DRR 生效的 workload 列表。默认只接管 agentic：多轮 agentic 的链上每个 token
+        # 省下的重算量相同，摊薄纯赚；而单轮 text/single 内容被剪掉属于净损失。
+        self.drr_workloads = tuple(drr_workloads)
+        # κ：单会话缺口上限占链长的比例。d_i ≥ κ·L_i 的会话不再被选中（除非全部到顶）。
+        # 0.5 = 一条会话最多被砍掉一半；越小越保守、p99 越低，但留下的半截链越多。
+        self.kappa = kappa
+        # 最小保留前缀：链头承载 system prompt / 任务指令，必须留够。
+        # 实际保留量 = max(min_retain_tokens, min_retain_frac · L_i)。
+        self.min_retain_tokens = min_retain_tokens
+        self.min_retain_frac = min_retain_frac
+        # 视界 H（秒）：P_i 问的是「这份 KV 在被再次挤掉之前会不会回来」，
+        # 所以 idle 要与池周转时间比较，而不是与绝对时间比较。H 把 P_i 归一化到集群规模。
+        self.horizon_s = horizon_s
+        # P_i 的量化档位（降序）。排序只关心相对大小，四档足够；
+        # 同时避免 idle 每变一秒就让"谁最便宜"翻转（排序抖动）。
+        self.p_levels = p_levels
         self.update_interval = update_interval
         self._last_update = time.monotonic()
         self._hit_tokens: Dict[str, float] = {}
@@ -185,10 +218,10 @@ class SimpleHybridStrategy(EvictionStrategy):
         self._total_evicted_tokens: Dict[str, float] = {}
         self._total_evicted_one_shot = 0.0
     @staticmethod
-    def _task_type_of(node) -> SimpleHybridTaskType:
+    def _task_type_of(node: "TreeNode") -> SimpleHybridTaskType:
          return getattr(node, "task_type", None) or SimpleHybridTaskType.SINGLE_TURN
 
-    def _reuse_score(self, node) -> float:
+    def _reuse_score(self, node: "TreeNode") -> float:
         """calculate_priority() from UniCache, with time.monotonic() as now."""
         task_type = self._task_type_of(node)
         num_tokens = len(node.value) if node.value is not None else 0
@@ -200,9 +233,8 @@ class SimpleHybridStrategy(EvictionStrategy):
             alpha = self.alpha_balance.get(alpha_key, 1.0) # 在线更新α
             reuse_prob = 1.0 - _cached_lognorm_cdf(e, mu, sigma)
             return alpha * reuse_prob
-        if task_type == SimpleHybridTaskType.SINGLE_TURN:
+        if task_type == SimpleHybridTaskType.SINGLE_TURN: ## 单轮
             alpha = self.alpha_balance.get("single", 1.0)
-            # UniCache 的 offset 是块在序列中的绝对结束位置，不是 radix 片段长度。
             offset_factor = 1.0 - _node_end_offset(node) / (self.max_offset or 1)
             offset_factor = max(0.0, min(1.0, offset_factor))
             #  单轮分数 = alpha * 位置项。
@@ -222,11 +254,115 @@ class SimpleHybridStrategy(EvictionStrategy):
 
     # 暴露给淘汰器的键语义
 
-    def victim_key(self, node) -> tuple:
-        """
-            统一淘汰键：复用分数低者先走，同分时 token 多者先走。
+    def victim_key(self, node: "TreeNode") -> Tuple[float, int]:
+        """统一淘汰键（越小越先淘汰）。
+
+        node: 可淘汰叶子节点。分数取自 node.last_access_time 与 node.task_type，
+              因此同一会话链上的节点同分，链内按 abs_start 的深浅区分。
+
+        返回 (reuse_score, -num_tokens)：复用分数低者先走；同分时片段大者先走。
         """
         return (self._reuse_score(node), -_node_num_tokens(node))
+
+    # ---- 会话级公平轮询 ----
+    def _loss_cap(self, chain_len: int) -> float:
+        """
+        chain_len: 该会话当前链长 L_i（最近一次请求的 prompt 长度）。
+        返回 min(κ·L_i, L_i - max(min_retain_tokens, min_retain_frac·L_i))。
+        """
+        keep = max(self.min_retain_tokens, self.min_retain_frac * chain_len) ## 最小保留前缀
+        return max(0.0, min(self.kappa * chain_len, chain_len - keep))
+
+    def _in_drr_queue(self, node: "TreeNode") -> bool:
+        """
+        判断该节点是否属于 DRR 接管的队列。
+        node: 候选叶子。按其 task_type 的字符串名与 drr_workloads 比对。
+        返回 True 表示这个节点的会话参与Agent均摊；False 则走原 victim_key 口径。
+        """
+        task_type = self._task_type_of(node)
+        name = getattr(task_type, "value", task_type)
+        return name in self.drr_workloads
+
+    def _pick_in_queue(
+        self,
+        leaves: Iterable["TreeNode"],
+        registry: "SessionRegistry",
+        now: float,
+    ) -> Optional["TreeNode"]:
+        """
+        在单个队列内部按会话缺口选一个待删叶子。
+        leaves:   本队列的可淘汰叶子集合
+        registry: 提供每个会话的 L / d / 轮间隔样本。
+        now:      time.monotonic() 快照，用于计算 P_i 的 idle。
+        """
+        tails = {}       # 记录每个会话的最深叶子以及对应的sessionState
+        untracked = None
+        for node in leaves:
+            sid = getattr(node, "session_id", None)
+            st = registry.get(sid)
+            if st is None or st.L <= 0:
+                # 无会话归属：仍可淘汰，但按原键参与本队列代表选举
+                if untracked is None or self.victim_key(node) < self.victim_key(untracked):
+                    untracked = node
+                continue
+            cur = tails.get(sid)
+            if cur is None or _node_end_offset(node) > _node_end_offset(cur[0]): # 记录进tail
+                tails[sid] = (node, st)
+
+        for relax in (0, 1):
+            ## 两级别淘汰尺度
+            best = None
+            for sid, (node, st) in tails.items():
+                if relax == 0 and st.d >= self._loss_cap(st.L): ## 严格:保留kappa比例，并保留最小前缀
+                    continue
+                if relax == 1 and st.d >= self.kappa * st.L:  ## 宽松:只跳过到kappa*L的
+                    continue
+                p = (
+                    registry.p_reuse(sid, now, self.horizon_s, self.p_levels)
+                    if self.drr_use_p
+                    else 1.0
+                )
+                key = (p * st.d, -st.L) ##期望缺口最小者先被剪枝,若相同比较节点长度
+                if best is None or key < best[0]:
+                    best = (key, node)
+            if best is not None:
+                return best[1]
+
+        if untracked is not None:
+            return untracked
+        if not tails:
+            return None
+        # 兜底：护栏全满时按缺口最大者继续删，避免淘汰无法推进
+        return max(tails.values(), key=lambda x: x[1].d)[0]
+
+    def pick_fair_victim(
+        self,
+        leaves: Iterable["TreeNode"],
+        registry: SessionRegistry,
+        now: Optional[float] = None,
+    ) -> Optional["TreeNode"]:
+        """选出下一个被淘汰的叶子
+        leaves:   当前全部可淘汰叶子。
+        registry: SessionRegistry，损失Token账本。
+        now:      time.monotonic() 快照；None 时内部取一次。
+        """
+        if not self.fair_drr:
+            return min(leaves, key=self.victim_key)
+        now = time.monotonic() if now is None else now
+
+        in_q, out_q = [], []
+        for node in leaves:
+            (in_q if self._in_drr_queue(node) else out_q).append(node)
+
+        cand_q = self._pick_in_queue(in_q, registry, now) if in_q else None
+        cand_o = min(out_q, key=self.victim_key) if out_q else None
+
+        if cand_q is None:
+            return cand_o if cand_o is not None else min(leaves, key=self.victim_key)
+        if cand_o is None:
+            return cand_q
+
+        return cand_q if self.victim_key(cand_q) <= self.victim_key(cand_o) else cand_o
 
     def is_one_shot(self, node) -> bool:
         """
@@ -242,15 +378,12 @@ class SimpleHybridStrategy(EvictionStrategy):
             task_type == SimpleHybridTaskType.SINGLE_TURN
         )
 
-    def workload_of(self, node) -> str:
+    def workload_of(self, node: "TreeNode") -> str:
         """节点所属的工作负载。"""
         return workload_label_of(self._task_type_of(node))
 
-    def one_shot_key(self, node) -> tuple:
-        """one-shot 带内排序：树上结束偏移最深的块先淘汰。
-
-        口径对齐 UniCache 的 evict_first 堆键（-num_hashed_tokens，
-        即块的绝对结束位置）：序列里越靠后的生成段越先走。"""
+    def one_shot_key(self, node: "TreeNode") -> Tuple[int, float]:
+        """one-shot 带内排序：树上结束偏移最深的块先淘汰。序列里越靠后的生成段越先走。"""
         return (-_node_end_offset(node), node.last_access_time)
 
     # ---- online alpha balancing ----

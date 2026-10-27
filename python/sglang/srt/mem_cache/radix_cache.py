@@ -540,7 +540,8 @@ class RadixCache(BasePrefixCache):
         decode_start = (len(req.origin_input_ids) // self.page_size) * self.page_size
         # SimpleHYBRID：会话账本入口。请求写入后链完整驻留，缺口归零。
         self.session_registry.touch(
-            req.session_id, getattr(req, "rid", ""), len(radix_key)
+            req.session_id, getattr(req, "rid", ""), len(radix_key),
+            task_type=task_type,
         )
         result = self.insert(
             InsertParams(
@@ -937,7 +938,7 @@ class RadixCache(BasePrefixCache):
                 child_key = key.child_key(self.page_size)
 
         if len(key): ## 如果还有剩余的key,说明没有匹配到子节点,需要创建新的子节点
-            # SimpleHYBRID：新片段从「已匹配长度」处开始（绝对偏移）。
+            # SimpleHYBRID：新片段从已匹配长度处开始（绝对偏移）。
             new_node = TreeNode(priority=priority, abs_start=total_prefix_length)
             new_node.parent = node
             new_node.key = key
@@ -947,7 +948,7 @@ class RadixCache(BasePrefixCache):
                 decode_start is not None and total_prefix_length >= decode_start
             )
             new_node.session_id = session_id
-            self.session_registry.attach(session_id, len(new_node.value))
+            self.session_registry.attach(session_id, len(new_node.value)) ##刷新记账
             self._inc_hit_count(new_node, chunked)
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)
@@ -977,7 +978,7 @@ class RadixCache(BasePrefixCache):
                 )
 
     def _delete_leaf(self, node):
-        # SimpleHYBRID：节点消亡的唯一原语，会话缺口在此累加（覆盖淘汰与释放两条路径）
+        # 会话缺口在此累加
         self.session_registry.charge(node)
         key = node.key.child_key(self.page_size)
         v = node.parent.children.pop(key, None) ## 从父节点的children字典中删除当前节点，并返回删除的节点

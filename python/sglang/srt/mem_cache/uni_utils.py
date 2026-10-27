@@ -3,10 +3,11 @@ import dataclasses
 import enum
 import logging
 import os
+import statistics
 import math
 import time
 from functools import lru_cache
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 # SPDX-License-Identifier: Apache-2.0
 from enum import Enum
@@ -132,6 +133,9 @@ class SessionState:
     last_active: float = 0.0    # monotonic
     last_rid: str = ""          # 用于 chunked prefill 去重
     gaps: List[float] = dataclasses.field(default_factory=list)
+    task_type: Optional["SimpleHybridTaskType"] = None
+    p: float = 1.0              # 量化后的视界内回归概率
+    p_ts: float = 0.0           # p 的上次刷新时刻（节流用）
     attached: int = 0           # 累计挂到该会话名下的 token 数（调试用）
     charged: int = 0            # 累计被删的 token 数（调试用）
 
@@ -145,8 +149,8 @@ _TRACE_SID = os.environ.get("SGLANG_SESSION_TRACE_SID", "")
 
 
 class SessionRegistry:
-    """会话表。由 RadixCache 实例持有，不做模块级单例。
-
+    """
+    会话表。
     只做记账：`touch` 由插入路径调用，`charge`/`attach` 由节点新增与删除调用。
     不依赖 radix tree，节点按鸭子类型读取 `session_id` 与 `value`。
     """
@@ -162,6 +166,10 @@ class SessionRegistry:
 
     # ---- 查询 ----
     def get(self, session_id: Optional[str]) -> Optional[SessionState]:
+        """取会话账本。
+
+        session_id: Req.session_id；None 或未登记时返回 None
+        """
         return self._sessions.get(session_id) if session_id else None
 
     def __len__(self) -> int:
@@ -174,8 +182,18 @@ class SessionRegistry:
         rid: str = "",
         prompt_len: int = 0,
         now: Optional[float] = None,
+        task_type: Optional["SimpleHybridTaskType"] = None,
     ) -> Optional[SessionState]:
-        """会话自己的请求被写入时调用：记轮间隔、更新 L、缺口归零。"""
+        """会话自己的请求被写入时调用：记轮间隔、更新 L、缺口归零。
+
+        session_id: Req.session_id；为空则不入表，直接返回 None。
+        rid:        请求 rid，用于 chunked prefill 去重（同一请求多次进入插入路径）。
+        prompt_len: 本次请求写入的链长（page 对齐后的 key 长度），记为 L_i。
+        now:        time.monotonic() 快照；None 时内部取一次。
+        task_type:  该请求的 workload 分类，留给 p_reuse 选先验。
+
+        返回更新后的 SessionState；session_id 为空时返回 None。
+        """
         if not session_id:
             return None
         now = time.monotonic() if now is None else now
@@ -184,13 +202,15 @@ class SessionRegistry:
             st = self._sessions[session_id] = SessionState(session_id=session_id)
         elif rid != st.last_rid and st.last_active > 0.0:
             # chunked prefill 会让同一请求多次进入插入路径，只有换 rid 才算新的一轮
-            st.gaps.append(now - st.last_active)
+            st.gaps.append(now - st.last_active) #轮间间隔
             if len(st.gaps) > self.GAP_WINDOW:
                 del st.gaps[0]
         st.last_rid = rid
         st.L = prompt_len
         st.d = 0
         st.last_active = now
+        if task_type is not None:
+            st.task_type = task_type
 
         self._touches += 1
         if self._touches % self.SWEEP_EVERY == 0:
@@ -198,7 +218,11 @@ class SessionRegistry:
         return st
 
     def attach(self, session_id: Optional[str], num_tokens: int = 0) -> None:
-        """新增一个归属该会话的节点。"""
+        """登记一个新节点归属某会话。
+
+        session_id: 该节点的 owner；为空则不记。
+        num_tokens: 该节点的片段长度 len(value)，用于调试时核对归属总量。
+        """
         if not session_id:
             return
         st = self._sessions.get(session_id)
@@ -207,8 +231,13 @@ class SessionRegistry:
         st.node_count += 1
         st.attached += num_tokens
 
-    def charge(self, node) -> None:
-        """节点被删时调用：所属会话缺口累加，存活节点数减一。"""
+    def charge(self, node: Any) -> None:
+        """节点被删时调用：所属会话缺口累加，存活节点数减一。
+
+        node: 刚被 _delete_leaf 摘除的 TreeNode。无session_id的节点不计入。
+
+        副作用：d += len(node.value)，并按 L_i 截断到链长（孤儿分支的重复计账）。
+        """
         session_id = getattr(node, "session_id", None)
         if not session_id:
             return
@@ -217,8 +246,8 @@ class SessionRegistry:
         st = self._sessions.get(session_id)
         if st is None:
             st = self._sessions[session_id] = SessionState(session_id=session_id)
-        st.d += num_tokens
-        st.charged += num_tokens
+        st.d += num_tokens ## 当前缺口
+        st.charged += num_tokens ##累计被删除的token数目
         if st.node_count > 0:
             st.node_count -= 1
         if _TRACE_SID and session_id == _TRACE_SID:
@@ -237,12 +266,67 @@ class SessionRegistry:
                 st.attached, st.charged, st.attached - st.charged, st.node_count,
             )
         # 同一会话在树里可能同时存在活路径与孤儿分支（部分清空后从断点重插），
-        # 孤儿分支被淘汰时也会计入 d。d 的语义是当前缺口，上限即链长。
+        # 孤儿分支被淘汰时也会计入 d  d 的语义是当前缺口，上限即链长。
         if st.L and st.d > st.L:
             st.d = st.L
 
+    # ---- 权重 ----
+    P_REFRESH_S = 0.2       # 权重重算节流
+    SHRINK_K = 3            # 向 workload 先验收缩的强度
+
+    def p_reuse(
+        self,
+        session_id: Optional[str],
+        now: Optional[float] = None,
+        horizon_s: float = 300.0,
+        levels: Tuple[float, ...] = (1.0, 0.5, 0.2, 0.05),
+    ) -> float:
+        """视界内回归概率，量化为档位。
+
+        session_id: 目标会话；未登记时返回 0.0（视为最不值得保留）。
+        now:        time.monotonic() 快照；None 时内部取一次。
+        horizon_s:  视界 H，池子周转时间的量级（秒）。
+        levels:     量化档位，降序；返回值取「不超过 p 的最高档」，p 低于末档时取末档。
+
+        P = F(idle + H) − F(idle)：F 为 lognormal(ln m_i, 1.0) 的 CDF，
+        m_i 取该会话轮间隔中位数并向 workload 先验按 SHRINK_K 收缩。
+        结果缓存在 state 上，P_REFRESH_S 内重复调用直接返回缓存值。
+        """
+        st = self._sessions.get(session_id) if session_id else None
+        if st is None:
+            return 0.0
+        now = time.monotonic() if now is None else now
+        if st.p_ts and now - st.p_ts < self.P_REFRESH_S:
+            return st.p
+
+        cfg = TASK_CONFIG.get(st.task_type) if st.task_type is not None else None
+        m_prior = math.exp(cfg[0]) if cfg else 30.0
+        n = len(st.gaps)
+        if n:
+            m = (n * statistics.median(st.gaps) + self.SHRINK_K * m_prior) / (n + self.SHRINK_K)
+        else:
+            m = m_prior
+        mu = math.log(max(m, 1e-3))
+        idle = max(now - st.last_active, 0.0)
+        p = _cached_lognorm_cdf(idle + horizon_s, mu, 1.0) - _cached_lognorm_cdf(idle, mu, 1.0)
+        p = min(max(p, 0.0), 1.0)
+        q = levels[-1] if levels else 1.0
+        for lv in levels:
+            if p >= lv:
+                q = lv
+                break
+        st.p, st.p_ts = q, now
+        return q
+
     # ---- 回收 ----
     def sweep(self, now: Optional[float] = None) -> int:
+        """
+        回收过期会话账本。
+        now: time.monotonic() 快照；None 时内部取一次。
+
+        回收条件：距最后一次请求超过 idle_ttl，或已无存活节点且超过 empty_grace。
+        返回被删除的会话数。touch 每 SWEEP_EVERY 次会顺带调一次。
+        """
         now = time.monotonic() if now is None else now
         dead = [
             sid
@@ -256,7 +340,14 @@ class SessionRegistry:
 
     # ---- 观测 ----
     def summary(self) -> Dict[str, float]:
-        """给 [SimpleHybrid profile] 用的缺口分布。"""
+        """给 [SimpleHybrid profile] 用的缺口分布。
+
+        返回 {sessions, d_sum, d_p50, d_max, d_nonzero}：
+          sessions  登记在册的会话数
+          d_sum     各会话当前缺口之和（与淘汰总量同量纲，可互相校验）
+          d_p50/max 缺口的中位数 / 最大值
+          d_nonzero 缺口大于 0 的会话数（被淘汰过的会话数）
+        """
         ds = sorted(st.d for st in self._sessions.values())
         if not ds:
             return {"sessions": 0, "d_sum": 0, "d_p50": 0, "d_max": 0, "d_nonzero": 0}

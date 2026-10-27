@@ -47,7 +47,10 @@ class SimpleHybridRadixCache(RadixCache):
             if one_shot:
                 victim = min(one_shot, key=strategy.one_shot_key)
             elif leaves:
-                victim = min(leaves, key=strategy.victim_key)
+                # 会话级公平轮询
+                victim = strategy.pick_fair_victim(leaves, self.session_registry)
+                if victim is None:
+                    break
             else:
                 break
             num_evicted += self._evict_one(victim)

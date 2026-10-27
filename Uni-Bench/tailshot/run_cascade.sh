@@ -18,7 +18,7 @@ run_one () {
   local CFG=$1 TAG=$2
   echo "=== [$TAG] server up $(date +%T) ==="
   POLICY=simple_hybrid MAX_TOTAL_TOKENS=100000 PORT=$PORT \
-    LOG=$OUT/server_${TAG}.log EXTRA_ARGS="--attention-backend triton" \
+    LOG=$OUT/server_${TAG}.log EXTRA_ARGS="--attention-backend triton ${EXTRA_ARGS:-}" \
     nohup bash "$BENCH/serve.sh" > /dev/null 2>&1 &
   for _ in $(seq 1 120); do
     sleep 5
