@@ -1,0 +1,39 @@
+{
+  "num_sessions": 11,
+  "num_requests": 132,
+  "num_errors": 0,
+  "prompt_tokens": 420047,
+  "cached_tokens": 278470,
+  "completion_tokens": 12309,
+  "cache_hit_rate": 0.6629,
+  "cache_hit_rate_pct": 66.29,
+  "ttft_p50_ms": 90.78,
+  "ttft_p90_ms": 650.76,
+  "ttft_p99_ms": 1557.85,
+  "e2e_mean_ms": 2180.62,
+  "e2e_p99_ms": 4764.94,
+  "per_task": {
+    "agentic_idle": {
+      "num_sessions": 8,
+      "num_requests": 96,
+      "prompt_tokens": 348034,
+      "cached_tokens": 219143,
+      "cache_hit_rate_pct": 62.97
+    },
+    "agentic_active": {
+      "num_sessions": 3,
+      "num_requests": 36,
+      "prompt_tokens": 72013,
+      "cached_tokens": 59327,
+      "cache_hit_rate_pct": 82.38
+    }
+  },
+  "wall_time_s": 155.3,
+  "request_throughput": 0.85,
+  "base_url": "http://127.0.0.1:30000",
+  "concurrency": 32,
+  "wait_scale": 1.0,
+  "mode": "hybrid",
+  "tasks_config": "/root/sg-unicache/Uni-Bench/tailshot/large/s1n3.yaml",
+  "arrival_scale": 1.0
+}

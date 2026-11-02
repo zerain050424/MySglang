@@ -1,0 +1,25 @@
+# S 格：临界并发 n_a<m<n（active 8 + idle 8，pool 73k，m≈10）
+# active 持续写入；idle 第 10 轮后统一 pause 60s → 回归浪潮
+tasks:
+- name: agentic_active
+  task_id: 3
+  data_path: ../../TaskData/burst/active_8.jsonl
+  lambda_rate: 0
+  seed: 42
+  max_record: -1
+  shuffle: false
+  arrival: {mode: fixed, offset_s: 0.0, step_s: 0.05}
+  gap_mode: fixed
+  gap_s: 6.0
+- name: agentic_idle
+  task_id: 4
+  data_path: ../../TaskData/burst/idle_8.jsonl
+  lambda_rate: 0
+  seed: 42
+  max_record: -1
+  shuffle: false
+  arrival: {mode: fixed, offset_s: 0.0, step_s: 0.05}
+  gap_mode: fixed
+  gap_s: 6.0
+  pause_after_turn: 10
+  pause_s: 60

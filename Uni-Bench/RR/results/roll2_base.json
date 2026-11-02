@@ -1,0 +1,67 @@
+{
+  "num_sessions": 12,
+  "num_requests": 144,
+  "num_errors": 0,
+  "prompt_tokens": 365101,
+  "cached_tokens": 317411,
+  "completion_tokens": 12908,
+  "cache_hit_rate": 0.8694,
+  "cache_hit_rate_pct": 86.94,
+  "ttft_p50_ms": 65.11,
+  "ttft_p90_ms": 134.01,
+  "ttft_p99_ms": 276.23,
+  "e2e_mean_ms": 1743.93,
+  "e2e_p99_ms": 2816.82,
+  "per_task": {
+    "pair0": {
+      "num_sessions": 2,
+      "num_requests": 24,
+      "prompt_tokens": 58184,
+      "cached_tokens": 50417,
+      "cache_hit_rate_pct": 86.65
+    },
+    "pair1": {
+      "num_sessions": 2,
+      "num_requests": 24,
+      "prompt_tokens": 66332,
+      "cached_tokens": 57223,
+      "cache_hit_rate_pct": 86.27
+    },
+    "pair2": {
+      "num_sessions": 2,
+      "num_requests": 24,
+      "prompt_tokens": 60129,
+      "cached_tokens": 54770,
+      "cache_hit_rate_pct": 91.09
+    },
+    "pair3": {
+      "num_sessions": 2,
+      "num_requests": 24,
+      "prompt_tokens": 60549,
+      "cached_tokens": 51606,
+      "cache_hit_rate_pct": 85.23
+    },
+    "pair4": {
+      "num_sessions": 2,
+      "num_requests": 24,
+      "prompt_tokens": 60913,
+      "cached_tokens": 51822,
+      "cache_hit_rate_pct": 85.08
+    },
+    "pair5": {
+      "num_sessions": 2,
+      "num_requests": 24,
+      "prompt_tokens": 58994,
+      "cached_tokens": 51573,
+      "cache_hit_rate_pct": 87.42
+    }
+  },
+  "wall_time_s": 62.27,
+  "request_throughput": 2.31,
+  "base_url": "http://127.0.0.1:30000",
+  "concurrency": 32,
+  "wait_scale": 1.0,
+  "mode": "hybrid",
+  "tasks_config": "/root/sg-unicache/Uni-Bench/tailshot/large/burst_roll2.yaml",
+  "arrival_scale": 1.0
+}

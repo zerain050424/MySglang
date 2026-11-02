@@ -1,0 +1,270 @@
+diff --git a/Uni-Bench/bench_unicache.py b/Uni-Bench/bench_unicache.py
+index 80d901f..acf0522 100644
+--- a/Uni-Bench/bench_unicache.py
++++ b/Uni-Bench/bench_unicache.py
+@@ -2,8 +2,8 @@
+ """Uni-Bench：对 sglang SimpleHybridRadixCache 做前缀缓存 benchmark。
+ 
+ 支持两种负载模式：
+-  1) 单负载模式（--data-path）：单个 session_data.jsonl 压测（向后兼容）。
+-  2) 混合负载模式（--tasks-config）：多个异构负载按 UniCache 的「比例」混成一条
++  1) 单负载模式（--data-path）：单个 session_data.jsonl 压测。
++  2) 混合负载模式（--tasks-config）：多个异构负载按 UniCache 的比例混成一条
+      到达流交错压测，见 hybrid_tasks_config.yaml。
+ 
+ 核心设计（方案 A）：
+@@ -44,6 +44,7 @@ from __future__ import annotations
+ 
+ import argparse
+ import asyncio
++import bisect
+ import hashlib
+ import json
+ import os
+@@ -52,7 +53,7 @@ import statistics
+ import time
+ from dataclasses import dataclass
+ from pathlib import Path
+-from typing import Any, Dict, List, Optional
++from typing import Any, Dict, List, Optional, Tuple
+ 
+ import aiohttp
+ import yaml
+@@ -147,9 +148,80 @@ def pick_arrival_params(task_cfg: Dict[str, Any], args) -> tuple:
+     return task_cfg.get("mu", 0.0), task_cfg.get("sigma", 0.0)
+ 
+ 
+-class BurstGate:
+-    """victim burst 计数屏障。
++class ToolGapSampler:
++    """工具感知的轮间隔采样：gap = Σ 工具耗时 + ε。
++
++    工具耗时取自 exp/tool_durations.json 的分位表（tracelab + cachewise 实测，
++    q[0..100] 用逆 CDF 线性插值采样）；ε 是有工具轮扣掉工具耗时后的残余。
++    本轮无任何工具调用时改用人工等待桶（模型答完、等用户）。
++    """
++
++    def __init__(
++        self,
++        path: Optional[str],
++        eps: Tuple[float, float] = (2.02, 0.87),
++        nothink: Tuple[float, float] = (4.09, 1.58),
++        fallback: Optional[Dict[str, float]] = None,
++    ):
++        self.tools: Dict[str, dict] = {}
++        self.buckets: Dict[str, dict] = {}
++        if path and os.path.exists(path):
++            with open(path, encoding="utf-8") as f:
++                doc = json.load(f)
++            self.tools = doc.get("tools", {})
++            self.buckets = doc.get("buckets", {})
++        self.eps = eps
++        self.nothink = nothink
++        # 未在表里的工具：按名字查 fallback，再退到 _default
++        self.fallback = {"env_action": 0.1, "api_call": 1.0, "_default": 1.0}
++        if fallback:
++            self.fallback.update(fallback)
++
++    @staticmethod
++    def _sample_q(rng: random.Random, tab) -> float:
++        """在分位表上做逆 CDF 线性插值采样。
++
++        tab: 分位表。新格式是 dict {"p": [0..100 非均匀水平], "q": [对应秒数]}，
++             尾部加密到 99.99；为兼容旧格式也接受等距 q 列表（视为 0..100）。
++        """
++        if isinstance(tab, dict):
++            p, q = tab["p"], tab["q"]
++            u = rng.random() * 100.0
++            i = bisect.bisect_right(p, u) - 1
++            if i < 0:
++                return q[0]
++            if i >= len(p) - 1:
++                return q[-1]
++            w = (u - p[i]) / (p[i + 1] - p[i])
++            return q[i] + (q[i + 1] - q[i]) * w
++        q = tab
++        x = rng.random() * (len(q) - 1)
++        i = int(x)
++        return q[i] if i >= len(q) - 1 else q[i] + (q[i + 1] - q[i]) * (x - i)
++
++    def _dur(self, rng: random.Random, name: str) -> float:
++        d = self.tools.get(name)
++        if d is None:
++            return float(self.fallback.get(name, self.fallback["_default"]))
++        return self._sample_q(rng, d)
++
++    def _bucket(self, rng: random.Random, key: str, params: Tuple[float, float]) -> float:
++        b = self.buckets.get(key)
++        if b and b.get("q"):
++            return self._sample_q(rng, b)
++        return rng.lognormvariate(*params)
++
++    def gap(self, rng: random.Random, tools) -> float:
++        """有工具：Σ工具耗时 + 残余；无工具：走人工等待桶。"""
++        names = [n for n in (tools or []) if n]
++        if not names:
++            return self._bucket(rng, "nothink", self.nothink)
++        return sum(self._dur(rng, n) for n in names) + self._bucket(rng, "eps", self.eps)
+ 
++
++class BurstGate:
++    """
++    victim burst 计数屏障。
+     搅拌等到全部 victim 越过 pause_after_turn 才放行，使淘汰压力只落在 pause 窗口内。
+     用进度计数而不是墙钟：单轮时延随 prompt 增长，20 轮累计漂移可达数秒。
+     """
+@@ -170,8 +242,8 @@ class BurstGate:
+ # --------------------------------------------------------------------------
+ @dataclass
+ class SessionArrival:
+-    """混合负载的一个「会话首轮到达事件」。
+-
++    """
++    混合负载的一个「会话首轮到达事件」。
+     对齐 UniCache future_request_heap 的元素：
+       (timestamp, counter, request) —— timestamp 即 arrival_offset，counter 作 tiebreaker。
+     """
+@@ -184,7 +256,8 @@ class SessionArrival:
+ 
+ def generate_poisson_requests(lambda_rate: float, num_sessions: int,
+                               seed: int) -> List[float]:
+-    """模仿 UniCache simulator/utils.py::generate_poisson_requests。
++    """
++    模仿 UniCache simulator/utils.py::generate_poisson_requests。
+     Poisson 过程：session 到达间隔服从 Exp(lambda_rate)（均值 1/lambda_rate），
+     累加得到每个 session 的到达时刻。
+     numpy 的 default_rng.exponential(scale=1/λ) 与 stdlib random.expovariate(λ)
+@@ -202,8 +275,8 @@ def generate_poisson_requests(lambda_rate: float, num_sessions: int,
+ def build_hybrid_arrival_schedule(tasks_config: Dict[str, Any],
+                                   base_dir: Optional[str] = None
+                                   ) -> List[SessionArrival]:
+-    """把多个异构负载按 lambda_rate「比例」混成一条全局到达流。
+-
++    """
++    把多个异构负载按 lambda_rate比例混成一条全局到达流。
+     逐行对齐 UniCache simulator.py::init_heap：
+       1. 对每个 task：读其 session 数据（max_record 限制数量）
+       2. 用 rng(seed + task_id) 打乱该 task 自身 session 顺序
+@@ -460,6 +533,7 @@ async def run_session(
+     if arrival_offset > 0:
+         await asyncio.sleep(arrival_offset)
+ 
++    sampler: ToolGapSampler = args.gap_sampler
+     prev_end: Optional[float] = None  # 上一轮请求完成时刻（算真实轮间隔）
+     pause_done = False
+     async with sem:  ##控制并发粒度
+@@ -526,6 +600,17 @@ async def run_session(
+             if args.wait_scale > 0 and t < num_turns:
+                 if task_cfg.get("gap_mode") == "fixed":
+                     wait = task_cfg.get("gap_s", 0.0)
++                elif task_cfg.get("gap_mode") == "preassigned":
++                    # 逐轮间隔在池构造阶段写入 turn.gap_s：每条会话独立采样、
++                    # 无 BurstGate 屏障、无统一 pause（LargeScale 方案）。
++                    g_pre = turn.get("gap_s")
++                    wait = float(g_pre if g_pre is not None
++                                 else task_cfg.get("gap_s", 0.0))
++                elif task_cfg.get("gap_mode") == "tool_aware":
++                    # 本轮调了哪些工具由数据侧标注；缺省取 task_cfg.default_tools
++                    wait = sampler.gap(
++                        rng, turn.get("tools") or task_cfg.get("default_tools") or []
++                    )
+                 else:
+                     mu, sigma = pick_arrival_params(task_cfg, args)
+                     if mu == 0.0 and sigma == 0.0:
+@@ -547,6 +632,8 @@ async def run_session(
+ async def main_async(args: argparse.Namespace) -> Dict[str, Any]:
+     stats = Stats()
+     sem = asyncio.Semaphore(args.concurrency)  ## 建立并发信号量
++    # 工具感知的间隔采样器（--tool-durations 缺失时退化为 lognormal 路径）
++    args.gap_sampler = ToolGapSampler(getattr(args, "tool_durations", None))
+     url = args.base_url.rstrip("/") + "/generate"
+ 
+     t0 = time.perf_counter()
+@@ -664,6 +751,11 @@ def parse_args() -> argparse.Namespace:
+     p.add_argument("--sigma", type=float, default=None,
+                    help="轮间等待 lognormal sigma 全局覆盖；默认 None=按负载类型取")
+     p.add_argument("--wait-scale", type=float, default=0.0, help="轮间等待缩放；0=不等（快速跑）")
++    p.add_argument(
++        "--tool-durations",
++        default=str(Path(__file__).resolve().parent / "exp" / "tool_durations.json"),
++        help="逐工具耗时分位表（gap_mode=tool_aware 时使用）",
++    )
+     p.add_argument("--timeout-s", type=float, default=1800.0, help="单请求超时（秒）")
+     p.add_argument("--output", default=None, help="结果 JSON 输出路径")
+     return p.parse_args()
+diff --git a/Uni-Bench/exp/make_stirrer_text.py b/Uni-Bench/exp/make_stirrer_text.py
+index 90cd35c..55d5d29 100644
+--- a/Uni-Bench/exp/make_stirrer_text.py
++++ b/Uni-Bench/exp/make_stirrer_text.py
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python3
+-"""切出「可调度」搅拌流：ShareGPT 多轮会话的第 1 轮，各成一个单轮会话。
++"""切出可调度搅拌流：ShareGPT 多轮会话的第 1 轮，各成一个单轮会话。
+ 
+ 用途：Cascade 实验的压力必须落在**可调度带**。单轮 apps/Codeparrot 属 one-shot 带，
+ 会被优先清空，压力到不了 agentic 受害者（R3 首跑实测 evicted single 33,798 /
+diff --git a/python/sglang/srt/mem_cache/uni_utils.py b/python/sglang/srt/mem_cache/uni_utils.py
+index fec6a75..ebefc7e 100644
+--- a/python/sglang/srt/mem_cache/uni_utils.py
++++ b/python/sglang/srt/mem_cache/uni_utils.py
+@@ -103,7 +103,7 @@ def classify_simple_hybrid_task_type(
+            return SimpleHybridTaskType.MULTI_TURN_SEARCH
+        if key.startswith("file_ShareGPT-multi-turn"):
+            return SimpleHybridTaskType.MULTI_TURN_FILE
+-       if key.startswith("alfred_"):
++       if key.startswith(("alfred_", "APIGenMT-")):
+            return SimpleHybridTaskType.MULTI_TURN_AGENTIC
+        if key.startswith(("apps_", "mind2web_")):
+            return SimpleHybridTaskType.SINGLE_TURN_RANDOM
+@@ -166,8 +166,8 @@ class SessionRegistry:
+ 
+     # ---- 查询 ----
+     def get(self, session_id: Optional[str]) -> Optional[SessionState]:
+-        """取会话账本。
+-
++        """
++        取会话账本。
+         session_id: Req.session_id；None 或未登记时返回 None
+         """
+         return self._sessions.get(session_id) if session_id else None
+@@ -281,14 +281,13 @@ class SessionRegistry:
+         horizon_s: float = 300.0,
+         levels: Tuple[float, ...] = (1.0, 0.5, 0.2, 0.05),
+     ) -> float:
+-        """视界内回归概率，量化为档位。
+-
++        """
++        视界内回归概率，量化为档位。
+         session_id: 目标会话；未登记时返回 0.0（视为最不值得保留）。
+         now:        time.monotonic() 快照；None 时内部取一次。
+         horizon_s:  视界 H，池子周转时间的量级（秒）。
+-        levels:     量化档位，降序；返回值取「不超过 p 的最高档」，p 低于末档时取末档。
+-
+-        P = F(idle + H) − F(idle)：F 为 lognormal(ln m_i, 1.0) 的 CDF，
++        levels:     量化档位，降序；返回值取不超过 p 的最高档，p 低于末档时取末档。
++        P = F(idle + H) - F(idle)：F 为 lognormal(ln m_i, 1.0) 的 CDF，
+         m_i 取该会话轮间隔中位数并向 workload 先验按 SHRINK_K 收缩。
+         结果缓存在 state 上，P_REFRESH_S 内重复调用直接返回缓存值。
+         """
+@@ -301,16 +300,19 @@ class SessionRegistry:
+ 
+         cfg = TASK_CONFIG.get(st.task_type) if st.task_type is not None else None
+         m_prior = math.exp(cfg[0]) if cfg else 30.0
+-        n = len(st.gaps)
++        n = len(st.gaps) # st.gaps历次轮间间隔
+         if n:
+             m = (n * statistics.median(st.gaps) + self.SHRINK_K * m_prior) / (n + self.SHRINK_K)
++            # 样本数 n 越大，越信任实测；n=0 时完全用先验。SHRINK_K 控制收缩强度
+         else:
+             m = m_prior
+         mu = math.log(max(m, 1e-3))
+         idle = max(now - st.last_active, 0.0)
+         p = _cached_lognorm_cdf(idle + horizon_s, mu, 1.0) - _cached_lognorm_cdf(idle, mu, 1.0)
+-        p = min(max(p, 0.0), 1.0)
++        p = min(max(p, 0.0), 1.0) #在未来的H区间内再次被复用的概率
+         q = levels[-1] if levels else 1.0
++        ## levels 默认 (1.0, 0.5, 0.2, 0.05)，降序。返回不超过 p 的最高档；如果 p 低于最小档 0.05，也取 0.05。
++        ## 这个量化设计的意义在于：淘汰策略只需要处理 4 个离散档位，而不是连续浮点数，便于做分级决策
+         for lv in levels:
+             if p >= lv:
+                 q = lv

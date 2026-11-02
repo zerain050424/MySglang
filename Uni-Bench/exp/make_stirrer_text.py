@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""切出「可调度」搅拌流：ShareGPT 多轮会话的第 1 轮，各成一个单轮会话。
+"""切出可调度搅拌流：ShareGPT 多轮会话的第 1 轮，各成一个单轮会话。
 
-用途：Cascade 实验的压力必须落在**可调度带**。单轮 apps/Codeparrot 属 one-shot 带，
+用途：Cascade 实验的压力必须落在可调度带。单轮 apps/Codeparrot 属 one-shot 带，
 会被优先清空，压力到不了 agentic 受害者（R3 首跑实测 evicted single 33,798 /
 agentic 2,407，即证）。此处用 ShareGPT-multi-turn-* 前缀 → MULTI_TURN_TEXT（可调度）。
 

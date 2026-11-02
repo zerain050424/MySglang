@@ -1,0 +1,75 @@
+# 两两轮转空闲：6 对 × 2 条，任何时刻恰好 2 条空闲（偏移 = 一轮活跃时长 15 s）
+# gap=1.5s、pause=15.0s，窗口首尾相接
+tasks:
+- name: pair0
+  task_id: 10
+  data_path: /root/sg-unicache/Uni-Bench/TaskData/burst/roll2_pair0.jsonl
+  lambda_rate: 0
+  seed: 42
+  max_record: -1
+  shuffle: false
+  arrival: {mode: fixed, offset_s: 0.0, step_s: 0.05}
+  gap_mode: fixed
+  gap_s: 1.5
+  pause_after_turn: 10
+  pause_s: 15.0
+- name: pair1
+  task_id: 11
+  data_path: /root/sg-unicache/Uni-Bench/TaskData/burst/roll2_pair1.jsonl
+  lambda_rate: 0
+  seed: 42
+  max_record: -1
+  shuffle: false
+  arrival: {mode: fixed, offset_s: 15.0, step_s: 0.05}
+  gap_mode: fixed
+  gap_s: 1.5
+  pause_after_turn: 10
+  pause_s: 15.0
+- name: pair2
+  task_id: 12
+  data_path: /root/sg-unicache/Uni-Bench/TaskData/burst/roll2_pair2.jsonl
+  lambda_rate: 0
+  seed: 42
+  max_record: -1
+  shuffle: false
+  arrival: {mode: fixed, offset_s: 30.0, step_s: 0.05}
+  gap_mode: fixed
+  gap_s: 1.5
+  pause_after_turn: 10
+  pause_s: 15.0
+- name: pair3
+  task_id: 13
+  data_path: /root/sg-unicache/Uni-Bench/TaskData/burst/roll2_pair3.jsonl
+  lambda_rate: 0
+  seed: 42
+  max_record: -1
+  shuffle: false
+  arrival: {mode: fixed, offset_s: 45.0, step_s: 0.05}
+  gap_mode: fixed
+  gap_s: 1.5
+  pause_after_turn: 10
+  pause_s: 15.0
+- name: pair4
+  task_id: 14
+  data_path: /root/sg-unicache/Uni-Bench/TaskData/burst/roll2_pair4.jsonl
+  lambda_rate: 0
+  seed: 42
+  max_record: -1
+  shuffle: false
+  arrival: {mode: fixed, offset_s: 60.0, step_s: 0.05}
+  gap_mode: fixed
+  gap_s: 1.5
+  pause_after_turn: 10
+  pause_s: 15.0
+- name: pair5
+  task_id: 15
+  data_path: /root/sg-unicache/Uni-Bench/TaskData/burst/roll2_pair5.jsonl
+  lambda_rate: 0
+  seed: 42
+  max_record: -1
+  shuffle: false
+  arrival: {mode: fixed, offset_s: 75.0, step_s: 0.05}
+  gap_mode: fixed
+  gap_s: 1.5
+  pause_after_turn: 10
+  pause_s: 15.0

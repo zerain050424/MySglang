@@ -1,0 +1,25 @@
+# S36 格：pool 36k，idle 组 8×6k=48k 单独就超过池子（1.33×）
+# active 4×2.45k=9.8k（n_a=4 < m=6 < n=12），pause 60s 制造回归浪潮
+tasks:
+- name: agentic_active
+  task_id: 3
+  data_path: ../../TaskData/burst/active_4.jsonl
+  lambda_rate: 0
+  seed: 42
+  max_record: -1
+  shuffle: false
+  arrival: {mode: fixed, offset_s: 0.0, step_s: 0.05}
+  gap_mode: fixed
+  gap_s: 6.0
+- name: agentic_idle
+  task_id: 4
+  data_path: ../../TaskData/burst/idle_8.jsonl
+  lambda_rate: 0
+  seed: 42
+  max_record: -1
+  shuffle: false
+  arrival: {mode: fixed, offset_s: 0.0, step_s: 0.05}
+  gap_mode: fixed
+  gap_s: 6.0
+  pause_after_turn: 10
+  pause_s: 60

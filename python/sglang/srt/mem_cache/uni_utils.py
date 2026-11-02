@@ -103,7 +103,7 @@ def classify_simple_hybrid_task_type(
            return SimpleHybridTaskType.MULTI_TURN_SEARCH
        if key.startswith("file_ShareGPT-multi-turn"):
            return SimpleHybridTaskType.MULTI_TURN_FILE
-       if key.startswith("alfred_"):
+       if key.startswith(("alfred_", "APIGenMT-")):
            return SimpleHybridTaskType.MULTI_TURN_AGENTIC
        if key.startswith(("apps_", "mind2web_")):
            return SimpleHybridTaskType.SINGLE_TURN_RANDOM
@@ -166,8 +166,8 @@ class SessionRegistry:
 
     # ---- 查询 ----
     def get(self, session_id: Optional[str]) -> Optional[SessionState]:
-        """取会话账本。
-
+        """
+        取会话账本。
         session_id: Req.session_id；None 或未登记时返回 None
         """
         return self._sessions.get(session_id) if session_id else None
@@ -281,14 +281,13 @@ class SessionRegistry:
         horizon_s: float = 300.0,
         levels: Tuple[float, ...] = (1.0, 0.5, 0.2, 0.05),
     ) -> float:
-        """视界内回归概率，量化为档位。
-
+        """
+        视界内回归概率，量化为档位。
         session_id: 目标会话；未登记时返回 0.0（视为最不值得保留）。
         now:        time.monotonic() 快照；None 时内部取一次。
         horizon_s:  视界 H，池子周转时间的量级（秒）。
-        levels:     量化档位，降序；返回值取「不超过 p 的最高档」，p 低于末档时取末档。
-
-        P = F(idle + H) − F(idle)：F 为 lognormal(ln m_i, 1.0) 的 CDF，
+        levels:     量化档位，降序；返回值取不超过 p 的最高档，p 低于末档时取末档。
+        P = F(idle + H) - F(idle)：F 为 lognormal(ln m_i, 1.0) 的 CDF，
         m_i 取该会话轮间隔中位数并向 workload 先验按 SHRINK_K 收缩。
         结果缓存在 state 上，P_REFRESH_S 内重复调用直接返回缓存值。
         """
@@ -301,16 +300,19 @@ class SessionRegistry:
 
         cfg = TASK_CONFIG.get(st.task_type) if st.task_type is not None else None
         m_prior = math.exp(cfg[0]) if cfg else 30.0
-        n = len(st.gaps)
+        n = len(st.gaps) # st.gaps历次轮间间隔
         if n:
             m = (n * statistics.median(st.gaps) + self.SHRINK_K * m_prior) / (n + self.SHRINK_K)
+            # 样本数 n 越大，越信任实测；n=0 时完全用先验。SHRINK_K 控制收缩强度
         else:
             m = m_prior
         mu = math.log(max(m, 1e-3))
         idle = max(now - st.last_active, 0.0)
         p = _cached_lognorm_cdf(idle + horizon_s, mu, 1.0) - _cached_lognorm_cdf(idle, mu, 1.0)
-        p = min(max(p, 0.0), 1.0)
+        p = min(max(p, 0.0), 1.0) #在未来的H区间内再次被复用的概率
         q = levels[-1] if levels else 1.0
+        ## levels 默认 (1.0, 0.5, 0.2, 0.05)，降序。返回不超过 p 的最高档；如果 p 低于最小档 0.05，也取 0.05。
+        ## 这个量化设计的意义在于：淘汰策略只需要处理 4 个离散档位，而不是连续浮点数，便于做分级决策
         for lv in levels:
             if p >= lv:
                 q = lv

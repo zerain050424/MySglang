@@ -2,8 +2,8 @@
 """Uni-Bench：对 sglang SimpleHybridRadixCache 做前缀缓存 benchmark。
 
 支持两种负载模式：
-  1) 单负载模式（--data-path）：单个 session_data.jsonl 压测（向后兼容）。
-  2) 混合负载模式（--tasks-config）：多个异构负载按 UniCache 的「比例」混成一条
+  1) 单负载模式（--data-path）：单个 session_data.jsonl 压测。
+  2) 混合负载模式（--tasks-config）：多个异构负载按 UniCache 的比例混成一条
      到达流交错压测，见 hybrid_tasks_config.yaml。
 
 核心设计（方案 A）：
@@ -148,8 +148,8 @@ def pick_arrival_params(task_cfg: Dict[str, Any], args) -> tuple:
 
 
 class BurstGate:
-    """victim burst 计数屏障。
-
+    """
+    victim burst 计数屏障。
     搅拌等到全部 victim 越过 pause_after_turn 才放行，使淘汰压力只落在 pause 窗口内。
     用进度计数而不是墙钟：单轮时延随 prompt 增长，20 轮累计漂移可达数秒。
     """
@@ -170,8 +170,8 @@ class BurstGate:
 # --------------------------------------------------------------------------
 @dataclass
 class SessionArrival:
-    """混合负载的一个「会话首轮到达事件」。
-
+    """
+    混合负载的一个「会话首轮到达事件」。
     对齐 UniCache future_request_heap 的元素：
       (timestamp, counter, request) —— timestamp 即 arrival_offset，counter 作 tiebreaker。
     """
@@ -184,7 +184,8 @@ class SessionArrival:
 
 def generate_poisson_requests(lambda_rate: float, num_sessions: int,
                               seed: int) -> List[float]:
-    """模仿 UniCache simulator/utils.py::generate_poisson_requests。
+    """
+    模仿 UniCache simulator/utils.py::generate_poisson_requests。
     Poisson 过程：session 到达间隔服从 Exp(lambda_rate)（均值 1/lambda_rate），
     累加得到每个 session 的到达时刻。
     numpy 的 default_rng.exponential(scale=1/λ) 与 stdlib random.expovariate(λ)
@@ -202,8 +203,8 @@ def generate_poisson_requests(lambda_rate: float, num_sessions: int,
 def build_hybrid_arrival_schedule(tasks_config: Dict[str, Any],
                                   base_dir: Optional[str] = None
                                   ) -> List[SessionArrival]:
-    """把多个异构负载按 lambda_rate「比例」混成一条全局到达流。
-
+    """
+    把多个异构负载按 lambda_rate比例混成一条全局到达流。
     逐行对齐 UniCache simulator.py::init_heap：
       1. 对每个 task：读其 session 数据（max_record 限制数量）
       2. 用 rng(seed + task_id) 打乱该 task 自身 session 顺序

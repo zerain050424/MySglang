@@ -1,0 +1,51 @@
+# 台阶式空闲：8 条同时起跑，第 10 轮全部 pause，但时长 15/30/45/60 s
+# gap=1.5s；pair i 的 pause_s = 15+15i
+tasks:
+- name: pair0
+  task_id: 20
+  data_path: /root/sg-unicache/Uni-Bench/TaskData/burst/stair_pair0.jsonl
+  lambda_rate: 0
+  seed: 42
+  max_record: -1
+  shuffle: false
+  arrival: {mode: fixed, offset_s: 0.0, step_s: 0.05}
+  gap_mode: fixed
+  gap_s: 1.5
+  pause_after_turn: 10
+  pause_s: 15.0
+- name: pair1
+  task_id: 21
+  data_path: /root/sg-unicache/Uni-Bench/TaskData/burst/stair_pair1.jsonl
+  lambda_rate: 0
+  seed: 42
+  max_record: -1
+  shuffle: false
+  arrival: {mode: fixed, offset_s: 0.0, step_s: 0.05}
+  gap_mode: fixed
+  gap_s: 1.5
+  pause_after_turn: 10
+  pause_s: 30.0
+- name: pair2
+  task_id: 22
+  data_path: /root/sg-unicache/Uni-Bench/TaskData/burst/stair_pair2.jsonl
+  lambda_rate: 0
+  seed: 42
+  max_record: -1
+  shuffle: false
+  arrival: {mode: fixed, offset_s: 0.0, step_s: 0.05}
+  gap_mode: fixed
+  gap_s: 1.5
+  pause_after_turn: 10
+  pause_s: 45.0
+- name: pair3
+  task_id: 23
+  data_path: /root/sg-unicache/Uni-Bench/TaskData/burst/stair_pair3.jsonl
+  lambda_rate: 0
+  seed: 42
+  max_record: -1
+  shuffle: false
+  arrival: {mode: fixed, offset_s: 0.0, step_s: 0.05}
+  gap_mode: fixed
+  gap_s: 1.5
+  pause_after_turn: 10
+  pause_s: 60.0

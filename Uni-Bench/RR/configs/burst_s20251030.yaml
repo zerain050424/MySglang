@@ -1,0 +1,25 @@
+# 格 s20251030：active 3 + idle 8，pause 60s
+# active 持续写入；idle 第 10 轮后统一 pause 60s → 回归浪潮
+tasks:
+- name: agentic_active
+  task_id: 3
+  data_path: /root/sg-unicache/Uni-Bench/TaskData/burst/active_3_s20251030.jsonl
+  lambda_rate: 0
+  seed: 42
+  max_record: -1
+  shuffle: false
+  arrival: {mode: fixed, offset_s: 0.0, step_s: 0.05}
+  gap_mode: fixed
+  gap_s: 6.0
+- name: agentic_idle
+  task_id: 4
+  data_path: /root/sg-unicache/Uni-Bench/TaskData/burst/idle_8_s20251030.jsonl
+  lambda_rate: 0
+  seed: 42
+  max_record: -1
+  shuffle: false
+  arrival: {mode: fixed, offset_s: 0.0, step_s: 0.05}
+  gap_mode: fixed
+  gap_s: 6.0
+  pause_after_turn: 10
+  pause_s: 60

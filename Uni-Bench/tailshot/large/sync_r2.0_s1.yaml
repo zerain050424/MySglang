@@ -1,0 +1,15 @@
+# 同步 arm：同一池子，但用 Cascade 的时间轴（burst 1s + 第 10 轮统一 pause 90s）
+# 与 preassigned（逐轮独立采样）对照，检验「级联是否依赖同步空闲」
+tasks:
+- name: agentic_large
+  task_id: 3
+  data_path: ../../TaskData/large/alfred_r2.0_s1.jsonl
+  lambda_rate: 0
+  seed: 42
+  max_record: -1
+  shuffle: false
+  arrival: {mode: fixed, offset_s: 0.0, step_s: 0.05}
+  gap_mode: fixed
+  gap_s: 1.0
+  pause_after_turn: 10
+  pause_s: 90

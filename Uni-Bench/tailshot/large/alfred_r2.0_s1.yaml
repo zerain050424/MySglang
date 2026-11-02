@@ -1,0 +1,13 @@
+# 自动生成（exp/build_large_pools.py）：alfred_r2.0_s1
+# model=claude rho=2.0 pi_human=0.137 seed=1
+# 逐轮 gap_s 已写入数据文件；此格不使用 BurstGate 与统一 pause。
+tasks:
+- name: agentic_large
+  task_id: 3
+  data_path: ../../TaskData/large/alfred_r2.0_s1.jsonl
+  lambda_rate: 0
+  seed: 42
+  max_record: -1
+  shuffle: false
+  arrival: {mode: fixed, offset_s: 0.0, step_s: 0.05}
+  gap_mode: preassigned

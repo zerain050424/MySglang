@@ -150,6 +150,7 @@ class SimpleHybridStrategy(EvictionStrategy):
         alpha_smooth: float = 0.7,
         alpha_temperature: float = 0.5,
         fair_drr: bool = False,
+        fair_rr: bool = False,
         drr_use_p: bool = False,
         drr_workloads: Tuple[str, ...] = ("multi_turn_agentic",),
         kappa: float = 0.5,
@@ -180,35 +181,40 @@ class SimpleHybridStrategy(EvictionStrategy):
                 "agentic": 1.0,
             }
         )
-        # 在线更新α状态
-        # fair_drr=True  开启 DRR；False 时完全走原来的全局 min(victim_key)。
-        #                开启后只在 drr_workloads 内部改变选择顺序，
-        #                与其它 workload 的仲裁仍按 victim_key 比大小。
-        self.fair_drr = fair_drr
-        # drr_use_p=True 排序键为 P_i·d_i（期望缺口，容量流向前景好的会话）；
-        #               False 为 d_i（纯轮询，只按已损失量摊薄，不看是否会回来）。
+        # fair_drr=True bool开关
+        self.fair_drr = fair_drr 
+        self.fair_rr = fair_rr
+        #   _rr_last[sid]  该会话上次被淘汰的序号（越小 = 越久没被服务）
+        #   _rr_seq        单调递增的服务序号
+        #   _quota_breach  配额全部耗尽、被迫按 LRU 兜底淘汰的次数（用于报告配额是否可行）
+        self._rr_last: Dict[str, int] = {}
+        self._rr_seq = 0
+        self._quota_breach = 0
+
         self.drr_use_p = drr_use_p
-        # DRR 生效的 workload 列表。默认只接管 agentic：多轮 agentic 的链上每个 token
-        # 省下的重算量相同，摊薄纯赚；而单轮 text/single 内容被剪掉属于净损失。
         self.drr_workloads = tuple(drr_workloads)
-        # κ：单会话缺口上限占链长的比例。d_i ≥ κ·L_i 的会话不再被选中（除非全部到顶）。
-        # 0.5 = 一条会话最多被砍掉一半；越小越保守、p99 越低，但留下的半截链越多。
+        # κ：单会话缺口上限占链长的比例。d_i ≥ κ·L_i 的会话不再被选中
+        # 允许删去的长度
         self.kappa = kappa
+
         # 最小保留前缀：链头承载 system prompt / 任务指令，必须留够。
         # 实际保留量 = max(min_retain_tokens, min_retain_frac · L_i)。
         self.min_retain_tokens = min_retain_tokens
         self.min_retain_frac = min_retain_frac
-        # 视界 H（秒）：P_i 问的是「这份 KV 在被再次挤掉之前会不会回来」，
+
+        # 视界 H（秒）：P_i 问的是这份 KV 在被再次挤掉之前会不会回来，
         # 所以 idle 要与池周转时间比较，而不是与绝对时间比较。H 把 P_i 归一化到集群规模。
         self.horizon_s = horizon_s
-        # P_i 的量化档位（降序）。排序只关心相对大小，四档足够；
-        # 同时避免 idle 每变一秒就让"谁最便宜"翻转（排序抖动）。
+
+        # P_i 的量化档位
         self.p_levels = p_levels
+
         self.update_interval = update_interval
         self._last_update = time.monotonic()
         self._hit_tokens: Dict[str, float] = {}
         self._seen_rids: set = set()
         self._rid_order: deque = deque()
+        
         # 累计计数器（不清空，供 profile 使用）
         #   - self._hit_tokens : 策略用的窗口命中量，键是alpha_key
         #   - self._total_hit_tokens / _total_evicted_tokens : profile用的累计量，键是 workload 标签（"random" 单列），与alpha无关。
@@ -283,6 +289,52 @@ class SimpleHybridStrategy(EvictionStrategy):
         name = getattr(task_type, "value", task_type)
         return name in self.drr_workloads
 
+    def _pick_round_robin(
+        self,
+        leaves: Iterable["TreeNode"],
+        registry: "SessionRegistry",
+    ) -> Optional["TreeNode"]:
+        """
+        硬配额 + 朴素轮询：挑一个会话，削它最深的一片叶子，然后排到队尾。
+        leaves:   当前可淘汰叶子（调用方已滤掉 one-shot）。
+        registry: 会话账本，提供 L 与已亏损量 d。
+        返回:     选中的叶子；所有候选会话的配额都已耗尽时返回 None。
+
+        规则：
+          1. 配额 quota_i = _loss_cap(L_i)，即最多削 κ·L_i 且保留最小前缀；
+          2. d_i >= quota_i ⇒ 该会话退出轮询，不再被选（硬约束）；
+          3. 候选里选最久没被服务的会话（_rr_last 最小，新会话视为-1）；
+          4. 服务后把 _rr_last 更新为当前序号并 +1 → 等价于排到队尾。
+        配额由 touch 重置（会话自己写入时 d 归零），所以每轮都有新配额。
+        """
+        tails: Dict[str, tuple] = {}
+        for node in leaves:
+            sid = getattr(node, "session_id", None)
+            if sid is None:
+                continue
+            st = registry.get(sid)
+            if st is None or st.L <= 0:
+                continue
+            cur = tails.get(sid)
+            if cur is None or _node_end_offset(node) > _node_end_offset(cur[0]):
+                tails[sid] = (node, st) ## 找到每一个会话的最深的叶子
+        if not tails:
+            return None
+
+        best = None
+        for sid, (node, st) in tails.items():
+            if st.d >= self._loss_cap(st.L):   # 硬配额已用尽
+                continue
+            last = self._rr_last.get(sid, -1)
+            if best is None or last < best[0]: # 找到最久没被削的session
+                best = (last, sid, node)
+        if best is None:
+            return None
+
+        self._rr_last[best[1]] = self._rr_seq
+        self._rr_seq += 1
+        return best[2]
+
     def _pick_in_queue(
         self,
         leaves: Iterable["TreeNode"],
@@ -346,6 +398,13 @@ class SimpleHybridStrategy(EvictionStrategy):
         registry: SessionRegistry，损失Token账本。
         now:      time.monotonic() 快照；None 时内部取一次。
         """
+        if self.fair_rr:
+            victim = self._pick_round_robin(leaves, registry)
+            if victim is not None:
+                return victim
+            # 所有人的配额都用尽：配额不可行（Σquota < 需求），记一次违约并退回 LRU
+            self._quota_breach += 1
+            return min(leaves, key=self.victim_key)
         if not self.fair_drr:
             return min(leaves, key=self.victim_key)
         now = time.monotonic() if now is None else now
@@ -459,7 +518,8 @@ class SimpleHybridStrategy(EvictionStrategy):
             )
         lines.append(
             f"  pool={pool:.0f} schedulable={schedulable:.0f} "
-            f"one_shot_evicted={self._total_evicted_one_shot:.0f}"
+            f"one_shot_evicted={self._total_evicted_one_shot:.0f} "
+            f"rr_breach={self._quota_breach}"
         )
         if session_summary:
             # 会话级缺口：d_sum 与淘汰总量同量纲，可互相校验

@@ -1,0 +1,39 @@
+{
+  "num_sessions": 16,
+  "num_requests": 192,
+  "num_errors": 0,
+  "prompt_tokens": 528518,
+  "cached_tokens": 464607,
+  "completion_tokens": 17938,
+  "cache_hit_rate": 0.8791,
+  "cache_hit_rate_pct": 87.91,
+  "ttft_p50_ms": 66.09,
+  "ttft_p90_ms": 334.05,
+  "ttft_p99_ms": 615.79,
+  "e2e_mean_ms": 1839.35,
+  "e2e_p99_ms": 2831.99,
+  "per_task": {
+    "agentic_active": {
+      "num_sessions": 8,
+      "num_requests": 96,
+      "prompt_tokens": 189787,
+      "cached_tokens": 169310,
+      "cache_hit_rate_pct": 89.21
+    },
+    "agentic_idle": {
+      "num_sessions": 8,
+      "num_requests": 96,
+      "prompt_tokens": 338731,
+      "cached_tokens": 295297,
+      "cache_hit_rate_pct": 87.18
+    }
+  },
+  "wall_time_s": 153.54,
+  "request_throughput": 1.25,
+  "base_url": "http://127.0.0.1:30000",
+  "concurrency": 32,
+  "wait_scale": 1.0,
+  "mode": "hybrid",
+  "tasks_config": "/root/sg-unicache/Uni-Bench/tailshot/large/burst_n8.yaml",
+  "arrival_scale": 1.0
+}
