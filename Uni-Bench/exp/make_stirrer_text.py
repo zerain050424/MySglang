@@ -3,7 +3,7 @@
 
 用途：Cascade 实验的压力必须落在**可调度带**。单轮 apps/Codeparrot 属 one-shot 带，
 会被优先清空，压力到不了 agentic 受害者（R3 首跑实测 evicted single 33,798 /
-agentic 2,407，即证）。此处用 ShareGPT-multi-turn-* 前缀 → MULTI_TURN_TEXT（可调度）。
+agentic 2,407，即证）。此处用 ShareGPT-multi-turn-* 前缀 → MULTI_TURN_CHAT（可调度）。
 
 选片：turn_1 长度落在 [400, 900]，压窄 F 的可预测性；只保留 turn_1。
 """

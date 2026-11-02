@@ -34,7 +34,6 @@ if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import HiCacheController
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
-    from sglang.srt.mem_cache.uni_utils import SimpleHybridTaskType
     from sglang.srt.mem_cache.radix_cache import RadixKey
     from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
     from sglang.srt.mem_cache.unified_cache.cache_action import (
@@ -97,8 +96,6 @@ class InsertParams:
     chunked: bool = False
     priority: int = 0
     session_id: Optional[str] = None
-    # SimpleHYBRID (HeterCache) workload metadata stamped onto new tree nodes.
-    task_type: Optional[SimpleHybridTaskType] = None
     decode_start: Optional[int] = None
     track_adopted_ranges: bool = False
 

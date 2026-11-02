@@ -151,7 +151,7 @@ def main() -> None:
                    help="apps test.jsonl 路径")
     p.add_argument("--output", default="Code.json", help="输出对话 JSON")
     p.add_argument("--id-prefix", default="Code-",
-                   help="id 前缀（默认 Code-→SINGLE_TURN；apps_→SINGLE_TURN_RANDOM）")
+                   help="session id 前缀（仅用于数据集命名空间，不参与缓存队列分类）")
     p.add_argument("--max-samples", type=int, default=-1, help="最多处理题目数（-1=全部）")
     args = p.parse_args()
 

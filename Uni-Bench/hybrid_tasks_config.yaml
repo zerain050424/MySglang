@@ -14,15 +14,13 @@
 #
 # 本配置按 HeterCache 混合实验的默认比例：各负载 lambda_rate=1（1:1:1:1），
 # 覆盖四类异构负载：
-#   - 多轮文本 text    （session_id 前缀 ShareGPT-multi-turn-* → MULTI_TURN_TEXT）
-#   - 多轮 agentic     （session_id 前缀 alfred_*            → MULTI_TURN_AGENTIC）
-#   - 单轮 code/single （session_id 前缀 Code-*             → SINGLE_TURN）
-#   - 单轮 API random  （session_id 前缀 apps_*             → SINGLE_TURN_RANDOM）
+#   - 多轮 chat、agentic，以及 struct/random 单轮数据均由缓存状态机根据
+#     命中间隔与树分支动态归类；session_id 前缀仅用于数据集命名空间。
 #
 # 调整「比例」：改各 task 的 lambda_rate 即可（如 ShareGPT 设 2、其余设 1 → 2:1:1:1）。
 # =============================================================================
 tasks:
-  # --- 单轮：AgentBank apps（apps_* → SINGLE_TURN_RANDOM）---
+  # --- 单轮：AgentBank apps（数据集命名空间；队列由状态机动态判断）---
   - name: AgentBank_apps
     task_id: 0
     data_path: TaskData/AgentBankData/Qwen2.5-7B-Instruct/AgentBank_apps_session_data.jsonl
@@ -34,7 +32,7 @@ tasks:
     max_record: 1800
     shuffle: true
 
-  # --- 单轮：Codeparrot（Code-* → SINGLE_TURN）---
+  # --- 单轮：Codeparrot（数据集命名空间；队列由状态机动态判断）---
   - name: Codeparrot
     task_id: 1
     data_path: TaskData/Codeparrot/Qwen2.5-7B-Instruct/Code_session_data.jsonl
@@ -46,7 +44,7 @@ tasks:
     max_record: 1800
     shuffle: true
 
-  # --- 多轮文本：ShareGPT（ShareGPT-multi-turn-* → MULTI_TURN_TEXT）---
+  # --- 多轮 chat：ShareGPT（ShareGPT-multi-turn-* → MULTI_TURN_CHAT）---
   - name: ShareGPT
     task_id: 2
     data_path: TaskData/SharedGPT-multi-turn/Qwen2.5-7B-Instruct/ShareGPT_cleaned_valid_deduplicated_session_data.jsonl

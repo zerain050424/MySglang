@@ -11,20 +11,14 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 # SPDX-License-Identifier: Apache-2.0
 from enum import Enum
 
-# #3：原先这里预计算 exp(-t/600)，供 SINGLE_TURN 的复用分数使用。
-# 该时间常数不对应任何生成过程（单轮 workload 没有「下一轮」），已随 #3
-# 移除；单轮的队列级权重改由 alpha（实测命中效率）承担，见 evict_policy.py。
+# 单轮 workload 没有「下一轮」，其队列级权重由 alpha（实测命中效率）承担。
 
 
 class SimpleHybridTaskType(str, enum.Enum):
-    MULTI_TURN_TEXT = "multi_turn_text"
-    MULTI_TURN_FILE = "multi_turn_file"
-    MULTI_TURN_IMAGE = "multi_turn_image"
-    MULTI_TURN_SEARCH = "multi_turn_search"
+    MULTI_TURN_CHAT = "multi_turn_chat"
     MULTI_TURN_AGENTIC = "multi_turn_agentic"
-    SINGLE_TURN = "single_turn"
-    SINGLE_TURN_RANDOM = "single_turn_random"
-    DEFAULT = "default"
+    STRUCT_SINGLE_TURN = "struct_single_turn"
+    RANDOM_SINGLE_TURN = "random_single_turn"
 
 
 class SimpleHybridQueueTag(str, enum.Enum):
@@ -74,33 +68,28 @@ def _cached_lognorm_cdf(x: float, mu: float, sigma: float) -> float:
 
    # (mu, sigma, alpha_key) per multi-turn workload type
 TASK_CONFIG = {
-    SimpleHybridTaskType.MULTI_TURN_TEXT: (4.77, 1.279, "text"),
-    SimpleHybridTaskType.MULTI_TURN_IMAGE: (4.4449, 1.09066, "image"),
-    SimpleHybridTaskType.MULTI_TURN_SEARCH: (4.961663, 1.13877, "search"),
-    SimpleHybridTaskType.MULTI_TURN_FILE: (5.07658, 1.06383, "file"),
+    SimpleHybridTaskType.MULTI_TURN_CHAT: (4.77, 1.279, "chat"),
     SimpleHybridTaskType.MULTI_TURN_AGENTIC: (1.81, 1.092, "agentic"),
 }
 
-# profile/记账用的工作负载标签（顺序即打印顺序）。
-# 与 alpha_key 的区别：SINGLE_TURN_RANDOM（apps / mind2web）单列成 "random"，
-# 不再折进 "single"；alpha 维度仍用 alpha_key_of（策略只调度可调度内容，
-# random 单轮整个请求都是 one-shot，不参与 alpha）。
-WORKLOAD_LABELS = ("single", "random", "text", "file", "image", "search", "agentic")
+# profile/记账用的四类工作负载标签（顺序即打印顺序）。
+WORKLOAD_LABELS = ("chat", "agentic", "struct", "random")
 
 
 def workload_label_of(task_type) -> str:
-    """把任务类型映射到**工作负载**标签（记账维度，与淘汰带无关）。"""
-    if task_type == SimpleHybridTaskType.SINGLE_TURN_RANDOM:
-        return "random"
+    """把任务类型映射到四类工作负载标签。"""
     return alpha_key_of(task_type)
 
 
 def alpha_key_of(task_type) -> str:
-    """Map a task type to its alpha-balance key ("single"/"text"/"file"/...)."""
+    """Map a task type to one of the four workload keys."""
     cfg = TASK_CONFIG.get(task_type)
     if cfg is not None:
         return cfg[2]
-    return "single"
+    return {
+        SimpleHybridTaskType.STRUCT_SINGLE_TURN: "struct",
+        SimpleHybridTaskType.RANDOM_SINGLE_TURN: "random",
+    }.get(task_type, "chat")
 
 
 @dataclasses.dataclass
@@ -131,8 +120,8 @@ _TRACE_SID = os.environ.get("SGLANG_SESSION_TRACE_SID", "")
 
 
 class SessionRegistry:
-    """会话表。由 RadixCache 实例持有，不做模块级单例。
-
+    """
+    会话表,记录每个会话的状态
     只做记账：`touch` 由插入路径调用，`charge`/`attach` 由节点新增与删除调用。
     不依赖 radix tree，节点按鸭子类型读取 `session_id` 与 `value`。
     """
@@ -214,7 +203,7 @@ class SessionRegistry:
                 len(getattr(node, "key", []) or []), num_tokens, st.d, st.L,
             )
         if _D_BREAK_LOG and st.L and st.d > st.L + 32:
-            # d 不应超过该会话最近一次写入的链长；超了说明归属或长度口径有问题
+            # d 不应超过该会话最近一次写入的链长；超过说明归属或长度口径有问题
             logger.warning(
                 "[session d break] sid=%s d=%d L=%d +%d abs_start=%s "
                 "attached=%d charged=%d live=%d node_count=%d",

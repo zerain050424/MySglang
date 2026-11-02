@@ -14,14 +14,14 @@
 
 ## 一、数据准备（每个负载一次）
 
-### 1. ShareGPT（多轮文本 → MULTI_TURN_TEXT）
+### 1. ShareGPT（多轮 chat 数据；实际队列由缓存状态机动态判断）
 ```bash
 # 前提：/root/autodl-tmp/TaskData/SharedGPT-multi-turn/ShareGPT_V3_unfiltered_cleaned_split.json 已下载
 bash TaskData/SharedGPT-multi-turn/data.sh
 # 产物: TaskData/SharedGPT-multi-turn/Qwen2.5-7B-Instruct/ShareGPT_cleaned_valid_deduplicated_session_data.jsonl
 ```
 
-### 2. Codeparrot（单轮随机 → SINGLE_TURN，可切 apps_ 前缀归 SINGLE_TURN_RANDOM）
+### 2. Codeparrot（结构化单轮数据；实际队列由缓存状态机动态判断）
 ```bash
 # 前提：/root/autodl-tmp/TaskData/Codeparrot/test.jsonl 已下载（已就绪）
 bash TaskData/Codeparrot/data.sh
@@ -34,7 +34,7 @@ bash TaskData/Codeparrot/data.sh
 bash TaskData/AgentBankData/data.sh
 # 产物: TaskData/AgentBankData/Qwen2.5-7B-Instruct/
 #   AgentBank_alfred_scale_5000_session_data.jsonl   (alfred_* → MULTI_TURN_AGENTIC)
-#   AgentBank_apps_session_data.jsonl                (apps_* → SINGLE_TURN_RANDOM)
+#   AgentBank_apps_session_data.jsonl                (apps_* 仅为数据集命名空间)
 ```
 
 ## 二、起 server（simple_hybrid 实验组）

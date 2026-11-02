@@ -8,7 +8,7 @@
   3. 每个问题生成一条单轮对话：
        prompt = "Please answer the question based on the texts below.\\n{doc}\\nQuestion: {q}\\nAnswer: "
      —— 同一文档的多个问题共享整段长 context，构成"结构化复用"的长共享前缀。
-  4. id 前缀 "QA-" → sglang SimpleHybrid 分类为 SINGLE_TURN（结构化单轮队列）。
+  4. id 前缀 "QA-" 仅作为数据集命名空间；缓存队列由内部状态机动态判断。
 
 【用法】
   /root/sl_old/bin/python prepare_data.py \

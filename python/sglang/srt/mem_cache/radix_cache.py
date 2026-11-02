@@ -51,8 +51,6 @@ from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.uni_utils import (   
     SessionRegistry,
     SimpleHybridQueueTag,
-    SimpleHybridTaskType,
-    workload_label_of,
 )
 from sglang.srt.mem_cache.utils import (
     get_eviction_strategy,
@@ -282,10 +280,9 @@ class TreeNode: ## TreeNode 是基数树（RadixTree）的节点，每个节点�
         self.event_hash_value: Optional[List[str]] = None
         # priority for priority-aware eviction
         # SimpleHYBRID (HeterCache) workload metadata.
-        # task_type: multi-turn text/file/image/search/agentic vs single-turn.
+
         # is_decode: generated-output (decode) portion, never reused, evict first.
         self.priority = priority
-        self.task_type = None
         self.queue_tag = SimpleHybridQueueTag.QTRANS
         self.is_decode = False
         # SimpleHYBRID：节点归属的会话（用于会话级缺口记账，见 uni_utils.SessionRegistry）
@@ -360,7 +357,7 @@ class RadixCache(BasePrefixCache):
         # ---- 策略无关的「按工作负载占用」采样器（env 门控，默认关）----
         # 用途：LRU 等不触发 [SimpleHybrid profile] 的策略，也能拿到每队列
         # 占用占比。__init__ 在 scheduler 进程内执行，这里起一个 daemon 线程，
-        # 周期性调 _per_workload_token_count()（基类方法，树上节点带 task_type，
+        # 周期性调 _per_workload_token_count()（基类方法，树上节点带 queue_tag，
         # 任何策略都可用）。默认关闭：无 env 时这里只做一次 os.environ.get 判空。
         _occ_env = os.environ.get("SGLANG_WORKLOAD_OCC_LOG", "0")
         logger.info(
@@ -475,7 +472,7 @@ class RadixCache(BasePrefixCache):
             value = self._empty_match_result.device_indices
         # Phase 3: record the request's prefix-cache hit (once per request).
         if self._hit_recorder is not None and params.req is not None:
-            self._hit_recorder(params.req, value.numel())
+            self._hit_recorder(params.req, last_node, value.numel())
         return MatchResult(
             device_indices=value,
             last_device_node=last_node,
@@ -491,7 +488,6 @@ class RadixCache(BasePrefixCache):
         value = params.value
         priority = params.priority
         chunked = params.chunked
-        task_type = params.task_type
         decode_start = params.decode_start
         session_id = params.session_id
         key, value = key.maybe_to_bigram_view(self.is_eagle, value)
@@ -503,7 +499,7 @@ class RadixCache(BasePrefixCache):
             value = torch.tensor(key.token_ids[: len(key)], dtype=torch.int64)
 
         prefix_len, last_node = self._insert_helper(
-            self.root_node, key, value, priority, chunked, task_type,
+            self.root_node, key, value, priority, chunked,
             decode_start, session_id,
         )
         return InsertResult(prefix_len=prefix_len, last_device_node=last_node)
@@ -537,7 +533,6 @@ class RadixCache(BasePrefixCache):
         priority = req.priority or 0
         # 定位 prompt/output 边界，使 decode 部分节点可以单独标记；
         # 不再要求客户端提供工作负载类型标签。
-        task_type = None
         decode_start = (len(req.origin_input_ids) // self.page_size) * self.page_size
         # SimpleHYBRID：会话账本入口。请求写入后链完整驻留，缺口归零。
         self.session_registry.touch(
@@ -549,7 +544,6 @@ class RadixCache(BasePrefixCache):
                 value=values,
                 chunked=chunked,
                 priority=priority,
-                task_type=task_type,
                 decode_start=decode_start,
                 session_id=req.session_id,
                )
@@ -572,7 +566,6 @@ class RadixCache(BasePrefixCache):
                         # The request created these nodes moments ago; another
                         # hit_count bump would promote every prompt node.
                         chunked=True,
-                        task_type=task_type,
                         session_id=req.session_id,
                         decode_start=decode_start
                     )
@@ -689,14 +682,11 @@ class RadixCache(BasePrefixCache):
         fn = getattr(self.eviction_strategy, "is_one_shot", None)
         if fn is not None:
             return bool(fn(node))
-        task_type = getattr(node, "task_type", None)
-        return bool(getattr(node, "is_decode", False)) or (
-            task_type == SimpleHybridTaskType.SINGLE_TURN_RANDOM
-        )
+        return bool(getattr(node, "is_decode", False))
 
     def _workload_occ_log_loop(self, interval: float) -> None:
         """后台循环：每 interval 秒打一行按工作负载的占用占比。
-        输出格式：`[workload occ] single=.. random=.. text=.. agentic=.. ...`
+        输出格式：`[workload occ] chat=.. agentic=.. struct=.. random=..`
         其中数值是 `_per_workload_token_count` 的 total（含 response 段）。
         并发说明：树在 scheduler 主线程上被增删，这里在 daemon 线程里只读遍历；
         GIL 保证不会崩，最坏读到一次瞬时不一致的计数（采样统计可接受）。
@@ -726,7 +716,7 @@ class RadixCache(BasePrefixCache):
         的 response 段被记进一次性带，真实占用被低估数倍）。
         返回 {label: {"total": t, "one_shot": o}}；
         one_shot = 该 workload 中一次性内容的 token（random 整行、
-        single 的 response 段；多轮恒为 0）。
+        struct 的 response 段；多轮恒为 0）。
         Σ(total − one_shot) 即 alpha 的可调度分母，见 _schedulable_per_alpha_key。
         """
         out: dict = {}
@@ -736,8 +726,8 @@ class RadixCache(BasePrefixCache):
             for child in node.children.values():
                 if child.evicted:
                     continue
-                task_type = getattr(child, "task_type", None)
-                label = workload_label_of(task_type)
+                workload_of = getattr(self.eviction_strategy, "workload_of", None)
+                label = workload_of(child) if workload_of is not None else "chat"
                 rec = out.setdefault(label, {"total": 0.0, "one_shot": 0.0})
                 n = len(child.key)
                 rec["total"] += n
@@ -878,7 +868,6 @@ class RadixCache(BasePrefixCache):
            new_node.value = child.value[:split_len].clone()
            # SimpleHYBRID metadata: prefix half inherits; suffix half is
            # reclassified as decode when the split lands at/after decode_start.
-           new_node.task_type = child.task_type
            new_node.queue_tag = child.queue_tag
            new_node.is_decode = child.is_decode
            new_node.session_id = child.session_id
@@ -915,7 +904,6 @@ class RadixCache(BasePrefixCache):
         value,
         priority: int = 0,
         chunked: bool = False,
-        task_type: Optional[SimpleHybridTaskType] = None,
         decode_start: Optional[int] = None,
         session_id: Optional[str] = None,
     ):
@@ -957,14 +945,12 @@ class RadixCache(BasePrefixCache):
             new_node.parent = node
             new_node.key = key
             new_node.value = value.clone()
-            new_node.task_type = task_type
             new_node.queue_tag = SimpleHybridQueueTag.QTRANS
             new_node.is_decode = (
                 decode_start is not None and total_prefix_length >= decode_start
             )
             new_node.session_id = session_id
             self.session_registry.attach(session_id, len(new_node.value))
-            self._inc_hit_count(new_node, chunked)
             node.children[child_key] = new_node
             if node is not self.root_node and len(node.children) >= 2:
                 node.queue_tag = SimpleHybridQueueTag.QSTRUCT

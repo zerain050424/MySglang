@@ -286,7 +286,7 @@ pool=35880  one_shot_evicted=10078
 
 one-shot 带吃掉了 42k 淘汰量，agentic 只掉 2,407（≈ 每轮增量），victim wipe = 0。这不是策略出错，而是两带设计的正常行为：只要 one-shot 供给不断，压力就到不了可调度带。
 
-v2 把搅拌换成 `ShareGPT-multi-turn-*` 单轮（`MULTI_TURN_TEXT`，**可调度带**），20 条 × 601 tok，`F_eff ≈ 126 tok/s`（λ=0.20，mean prompt 601）。
+v2 把搅拌换成 `ShareGPT-multi-turn-*` 单轮（`MULTI_TURN_CHAT`，**可调度带**），20 条 × 601 tok，`F_eff ≈ 126 tok/s`（λ=0.20，mean prompt 601）。
 
 ### B. 结果
 

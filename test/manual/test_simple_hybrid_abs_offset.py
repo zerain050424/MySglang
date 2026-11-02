@@ -35,7 +35,10 @@ from sglang.srt.mem_cache.simple_hybrid_radix_cache import (  # noqa: E402
 )
 from sglang.srt.mem_cache.evict_policy import SimpleHybridStrategy  # noqa: E402
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey  # noqa: E402
-from sglang.srt.mem_cache.uni_utils import SimpleHybridTaskType  # noqa: E402
+from sglang.srt.mem_cache.uni_utils import (  # noqa: E402
+    SimpleHybridQueueTag,
+    SimpleHybridTaskType,
+)
 
 FAILS = []
 
@@ -145,12 +148,25 @@ def test_deep_tree_offsets():
     )
 
 
-def _mk_node(n_tokens, abs_start, task_type=SimpleHybridTaskType.SINGLE_TURN):
+def _queue_tag_for(task_type):
+    return {
+        SimpleHybridTaskType.MULTI_TURN_CHAT: SimpleHybridQueueTag.QCHAT,
+        SimpleHybridTaskType.MULTI_TURN_AGENTIC: SimpleHybridQueueTag.QAGENT,
+        SimpleHybridTaskType.STRUCT_SINGLE_TURN: SimpleHybridQueueTag.QSTRUCT,
+        SimpleHybridTaskType.RANDOM_SINGLE_TURN: SimpleHybridQueueTag.QTRANS,
+    }[task_type]
+
+
+def _mk_node(
+    n_tokens,
+    abs_start,
+    task_type=SimpleHybridTaskType.STRUCT_SINGLE_TURN,
+):
     return SimpleNamespace(
         value=[0] * n_tokens,
         key=[0] * n_tokens,
         abs_start=abs_start,
-        task_type=task_type,
+        queue_tag=_queue_tag_for(task_type),
         is_decode=False,
         last_access_time=time.monotonic(),
         hit_count=0,
@@ -242,17 +258,17 @@ def test_eviction_prefers_deep_single_turn_node():
     )
 
     def insert(tokens, task_type):
-        cache.insert(
+        result = cache.insert(
             InsertParams(
                 key=RadixKey(array("q", tokens)),
                 value=torch.tensor(tokens, dtype=torch.int64),
-                task_type=task_type,
             )
         )
+        result.last_device_node.queue_tag = _queue_tag_for(task_type)
 
     # deep: [0..1999] then extend to [0..2031] -> 32-token child at abs_start=2000
-    insert(list(range(0, 2000)), SimpleHybridTaskType.SINGLE_TURN)
-    insert(list(range(0, 2032)), SimpleHybridTaskType.SINGLE_TURN)
+    insert(list(range(0, 2000)), SimpleHybridTaskType.STRUCT_SINGLE_TURN)
+    insert(list(range(0, 2032)), SimpleHybridTaskType.STRUCT_SINGLE_TURN)
     # rival: separate 32-token agentic node hanging off the root
     insert(list(range(5000, 5032)), SimpleHybridTaskType.MULTI_TURN_AGENTIC)
 
@@ -260,9 +276,9 @@ def test_eviction_prefers_deep_single_turn_node():
     for node in cache.evictable_leaves:
         if len(node.value) != 32:
             continue
-        if node.task_type == SimpleHybridTaskType.SINGLE_TURN:
+        if node.queue_tag == SimpleHybridQueueTag.QSTRUCT:
             deep = node
-        elif node.task_type == SimpleHybridTaskType.MULTI_TURN_AGENTIC:
+        elif node.queue_tag == SimpleHybridQueueTag.QAGENT:
             rival = node
     check(deep is not None, "expected a 32-token single-turn node")
     check(rival is not None, "expected a 32-token agentic node")
@@ -320,14 +336,14 @@ def test_same_queue_picks_lowest_score():
         )
     )
 
-    def insert(tokens, task_type=SimpleHybridTaskType.SINGLE_TURN):
-        cache.insert(
+    def insert(tokens, task_type=SimpleHybridTaskType.STRUCT_SINGLE_TURN):
+        result = cache.insert(
             InsertParams(
                 key=RadixKey(array("q", tokens)),
                 value=torch.tensor(tokens, dtype=torch.int64),
-                task_type=task_type,
             )
         )
+        result.last_device_node.queue_tag = _queue_tag_for(task_type)
 
     insert(list(range(0, 2000)))          # shallow 2000-token single node
     insert(list(range(0, 2032)))          # splits it: 32-token child at abs_start=2000
@@ -374,18 +390,18 @@ def test_one_shot_still_drained_first():
     )
 
     def insert(tokens, task_type):
-        cache.insert(
+        result = cache.insert(
             InsertParams(
                 key=RadixKey(array("q", tokens)),
                 value=torch.tensor(tokens, dtype=torch.int64),
-                task_type=task_type,
             )
         )
+        result.last_device_node.queue_tag = _queue_tag_for(task_type)
 
     # random single-turn -> one-shot, low reuse value
-    insert(list(range(0, 100)), SimpleHybridTaskType.SINGLE_TURN_RANDOM)
+    insert(list(range(0, 100)), SimpleHybridTaskType.RANDOM_SINGLE_TURN)
     # normal single-turn, shallow -> high reuse score
-    insert(list(range(9000, 9032)), SimpleHybridTaskType.SINGLE_TURN)
+    insert(list(range(9000, 9032)), SimpleHybridTaskType.STRUCT_SINGLE_TURN)
 
     result = cache.evict(EvictParams(num_tokens=32))
     print(f"      evicted {result.num_tokens_evicted} tokens")
@@ -394,7 +410,11 @@ def test_one_shot_still_drained_first():
         f"expected the 100-token one-shot node, got "
         f"{result.num_tokens_evicted} tokens",
     )
-    survivors = [n for n in cache.evictable_leaves if n.task_type == SimpleHybridTaskType.SINGLE_TURN]
+    survivors = [
+        n
+        for n in cache.evictable_leaves
+        if n.queue_tag == SimpleHybridQueueTag.QSTRUCT
+    ]
     check(len(survivors) == 1, "the shallow single-turn node must survive")
 
 
@@ -428,7 +448,6 @@ def test_one_shot_order_by_tree_offset():
             InsertParams(
                 key=RadixKey(array("q", tokens)),
                 value=torch.tensor(tokens, dtype=torch.int64),
-                task_type=SimpleHybridTaskType.SINGLE_TURN,
                 decode_start=decode_start,
             )
         )
@@ -504,7 +523,6 @@ def test_one_shot_chain_stops_at_branch_and_lock():
         cache.insert(InsertParams(
             key=RadixKey(array("q", tokens)),
             value=torch.tensor(tokens, dtype=torch.int64),
-            task_type=SimpleHybridTaskType.SINGLE_TURN,
             decode_start=ds,
         ))
     prompt = _find_node(cache, lambda n: len(n.value) == 100)
@@ -527,12 +545,11 @@ def test_one_shot_chain_stops_at_branch_and_lock():
     cache.insert(InsertParams(
         key=RadixKey(array("q", list(range(0, 100)))),
         value=torch.tensor(list(range(0, 100)), dtype=torch.int64),
-        task_type=SimpleHybridTaskType.SINGLE_TURN,
+
     ))
     cache.insert(InsertParams(
         key=RadixKey(array("q", list(range(0, 130)))),
         value=torch.tensor(list(range(0, 130)), dtype=torch.int64),
-        task_type=SimpleHybridTaskType.SINGLE_TURN,
         decode_start=100,
     ))
     prompt = _find_node(cache, lambda n: len(n.value) == 100)
@@ -558,8 +575,8 @@ def test_alpha_symmetry_stays_neutral():
     """
     print("[11] alpha symmetry: identical efficiency must keep alpha == 1.0")
     strategy = SimpleHybridStrategy()
-    hits = {"single": 1000.0, "text": 1000.0, "agentic": 1000.0}
-    cap = {"single": 30000.0, "text": 30000.0, "agentic": 30000.0}
+    hits = {"struct": 1000.0, "chat": 1000.0, "agentic": 1000.0}
+    cap = {"struct": 30000.0, "chat": 30000.0, "agentic": 30000.0}
     for _ in range(6):
         strategy._hit_tokens.clear()
         strategy._hit_tokens.update(hits)
@@ -575,8 +592,8 @@ def test_alpha_rewards_productive_queue():
     """#4: 单位容量命中产出更高的队列 alpha 更高，且差异由数据驱动。"""
     print("[12] alpha rewards the productive queue")
     strategy = SimpleHybridStrategy()
-    hits = {"single": 500.0, "text": 2000.0, "agentic": 120000.0}
-    cap = {"single": 38104.0, "text": 18759.0, "agentic": 26982.0}
+    hits = {"struct": 500.0, "chat": 2000.0, "agentic": 120000.0}
+    cap = {"struct": 38104.0, "chat": 18759.0, "agentic": 26982.0}
     for _ in range(6):
         strategy._hit_tokens.clear()
         strategy._hit_tokens.update(hits)
@@ -584,9 +601,9 @@ def test_alpha_rewards_productive_queue():
     a = strategy.alpha_balance
     print(f"      alpha={ {q: round(a[q], 6) for q in hits} }")
     check(a["agentic"] > 1.0, f"agentic alpha={a['agentic']:.6f}, expected > 1")
-    check(a["single"] < 1.0, f"single alpha={a['single']:.6f}, expected < 1")
-    check(a["agentic"] > a["single"] * 10.0,
-          f"agentic({a['agentic']:.4f}) must exceed single({a['single']:.4f}) by 10x")
+    check(a["struct"] < 1.0, f"struct alpha={a['struct']:.6f}, expected < 1")
+    check(a["agentic"] > a["struct"] * 10.0,
+          f"agentic({a['agentic']:.4f}) must exceed struct({a['struct']:.4f}) by 10x")
     for q in hits:
         check(0.001 <= a[q] <= 10.0, f"{q} alpha={a[q]} out of bounds")
 
@@ -600,8 +617,8 @@ def test_alpha_punishes_zero_hit_capacity():
     """
     print("[13] alpha punishes a queue that holds capacity with zero hits")
     strategy = SimpleHybridStrategy()
-    hits = {"text": 10000.0}          # single 有容量，本窗口零命中
-    cap = {"single": 30000.0, "text": 30000.0}
+    hits = {"chat": 10000.0}          # struct 有容量，本窗口零命中
+    cap = {"struct": 30000.0, "chat": 30000.0}
     # smooth=0.7 + 单步限速后收敛更慢，给足迭代次数
     for _ in range(20):
         strategy._hit_tokens.clear()
@@ -609,10 +626,10 @@ def test_alpha_punishes_zero_hit_capacity():
         strategy.update_alpha_balance(cap)
     a = strategy.alpha_balance
     print(f"      alpha={ {q: round(a[q], 6) for q in cap} }")
-    check(a["single"] < 0.1,
-          f"zero-hit single alpha={a['single']:.6f}, expected pushed below 0.1")
-    check(a["text"] > a["single"] * 10.0,
-          f"text({a['text']:.4f}) must exceed single({a['single']:.4f}) by 10x")
+    check(a["struct"] < 0.1,
+          f"zero-hit struct alpha={a['struct']:.6f}, expected pushed below 0.1")
+    check(a["chat"] > a["struct"] * 10.0,
+          f"chat({a['chat']:.4f}) must exceed struct({a['struct']:.4f}) by 10x")
 
 
 def test_single_score_is_time_invariant():
@@ -652,25 +669,25 @@ def test_starved_queue_does_not_explode():
     """
     print("[15] starved queue must not explode to the upper bound")
     strat = SimpleHybridStrategy()
-    hits = {"single": 300.0, "agentic": 100000.0}   # single 极少命中
-    cap = {"single": 50.0, "agentic": 100000.0}     # single 容量 0.05%
+    hits = {"struct": 300.0, "agentic": 100000.0}   # struct 极少命中
+    cap = {"struct": 50.0, "agentic": 100000.0}     # struct 容量 0.05%
     for _ in range(20):
         strat._hit_tokens.clear()
         strat._hit_tokens.update(hits)
         strat.update_alpha_balance(cap)
-    a = strat.alpha_balance["single"]
-    print(f"      alpha(single) after 20 windows = {a:.4f}")
-    check(a < 0.1, f"starved single alpha={a:.4f}, expected < 0.1 (no explosion)")
+    a = strat.alpha_balance["struct"]
+    print(f"      alpha(struct) after 20 windows = {a:.4f}")
+    check(a < 0.1, f"starved struct alpha={a:.4f}, expected < 0.1 (no explosion)")
 
 
 def test_alpha_step_is_rate_limited():
     """单次更新不得把 alpha 变化超过 max_alpha_step 倍，避免 Bang-Bang 跳变。"""
     print("[16] per-update alpha change is rate limited")
     strat = SimpleHybridStrategy()
-    strat.alpha_balance["single"] = 0.001
-    strat._hit_tokens.update({"single": 100000.0, "agentic": 1.0})
-    strat.update_alpha_balance({"single": 50000.0, "agentic": 50000.0})
-    a = strat.alpha_balance["single"]
+    strat.alpha_balance["struct"] = 0.001
+    strat._hit_tokens.update({"struct": 100000.0, "agentic": 1.0})
+    strat.update_alpha_balance({"struct": 50000.0, "agentic": 50000.0})
+    a = strat.alpha_balance["struct"]
     limit = 0.001 * strat.max_alpha_step * 1.0001
     print(f"      0.001 -> {a:.6f}  (limit {limit:.6f})")
     check(a <= limit, f"alpha jumped 0.001 -> {a:.6f}, expected <= {limit:.6f}")
@@ -680,8 +697,8 @@ def test_alpha_converges_under_steady_load():
     """稳态负载下 alpha 必须收敛（尾部窗口不再变化），而不是持续极限环。"""
     print("[17] alpha converges under a steady workload")
     strat = SimpleHybridStrategy()
-    hits = {"single": 500.0, "text": 2000.0, "agentic": 120000.0}
-    cap = {"single": 38104.0, "text": 18759.0, "agentic": 26982.0}
+    hits = {"struct": 500.0, "chat": 2000.0, "agentic": 120000.0}
+    cap = {"struct": 38104.0, "chat": 18759.0, "agentic": 26982.0}
     hist = []
     for _ in range(80):
         strat._hit_tokens.clear()
@@ -732,8 +749,8 @@ def test_workload_and_band_are_orthogonal():
     prompt = _mk_node(32, 0, task_type=SimpleHybridTaskType.MULTI_TURN_AGENTIC)
     resp = _mk_node(32, 32, task_type=SimpleHybridTaskType.MULTI_TURN_AGENTIC)
     resp.is_decode = True
-    rnd = _mk_node(32, 0, task_type=SimpleHybridTaskType.SINGLE_TURN_RANDOM)
-    code = _mk_node(32, 0, task_type=SimpleHybridTaskType.SINGLE_TURN)
+    rnd = _mk_node(32, 0, task_type=SimpleHybridTaskType.RANDOM_SINGLE_TURN)
+    code = _mk_node(32, 0, task_type=SimpleHybridTaskType.STRUCT_SINGLE_TURN)
 
     check(st.workload_of(prompt) == "agentic", "agentic prompt workload")
     check(
@@ -742,7 +759,7 @@ def test_workload_and_band_are_orthogonal():
     )
     check(st.is_one_shot(rnd), "random request is one-shot")
     check(st.workload_of(rnd) == "random", "apps/mind2web must not fold into 'single'")
-    check(st.workload_of(code) == "single", "codeparrot workload = single")
+    check(st.workload_of(code) == "struct", "codeparrot workload = struct")
 
 
 def test_workload_occ_accounting_adds_up():
@@ -751,19 +768,19 @@ def test_workload_occ_accounting_adds_up():
     cache = _sh_cache()
 
     def ins(tokens, task, decode_start=None):
-        cache.insert(
+        result = cache.insert(
             InsertParams(
                 key=RadixKey(array("q", tokens)),
                 value=torch.tensor(tokens, dtype=torch.int64),
-                task_type=task,
                 decode_start=decode_start,
             )
         )
+        result.last_device_node.queue_tag = _queue_tag_for(task)
 
     ins(list(range(0, 1000)), SimpleHybridTaskType.MULTI_TURN_AGENTIC, decode_start=1000)
     ins(list(range(0, 2000)), SimpleHybridTaskType.MULTI_TURN_AGENTIC, decode_start=1000)
-    ins(list(range(5000, 5100)), SimpleHybridTaskType.SINGLE_TURN_RANDOM)
-    ins(list(range(9000, 9100)), SimpleHybridTaskType.SINGLE_TURN)
+    ins(list(range(5000, 5100)), SimpleHybridTaskType.RANDOM_SINGLE_TURN)
+    ins(list(range(9000, 9100)), SimpleHybridTaskType.STRUCT_SINGLE_TURN)
 
     wl = cache._per_workload_token_count()
     cap = cache._schedulable_per_alpha_key(wl)
@@ -778,8 +795,8 @@ def test_workload_occ_accounting_adds_up():
     rn = wl.get("random", {})
     check(rn.get("total") == 100, f"random total={rn.get('total')}, expected 100")
     check(rn.get("one_shot") == 100, "random 全部是一次性内容")
-    cd = wl.get("single", {})
-    check(cd.get("one_shot") == 0, f"single one_shot={cd.get('one_shot')}, expected 0")
+    cd = wl.get("struct", {})
+    check(cd.get("one_shot") == 0, f"struct one_shot={cd.get('one_shot')}, expected 0")
 
     tot_total = sum(v["total"] for v in wl.values())
     tot_os = sum(v["one_shot"] for v in wl.values())
@@ -794,11 +811,12 @@ def test_record_hit_uses_workload_label():
     print("[20] record_hit: profile 按 workload 记账，策略仍按 alpha_key")
     st = SimpleHybridStrategy()
     req = SimpleNamespace(rid="r1", session_id="apps_123", extra_key=None)
-    st.record_hit(req, 500)
+    node = _mk_node(32, 0, task_type=SimpleHybridTaskType.RANDOM_SINGLE_TURN)
+    st.record_hit(req, node, 500)
     check(st._total_hit_tokens.get("random") == 500,
           f"profile 记到 {list(st._total_hit_tokens)}, expected random=500")
-    check(st._hit_tokens.get("single") == 500,
-          f"策略维度应保持 alpha_key=single, got {st._hit_tokens}")
+    check(st._hit_tokens.get("random") == 500,
+          f"策略维度应使用 random alpha_key, got {st._hit_tokens}")
 
 
 def test_record_evict_one_shot_scalar():
@@ -813,7 +831,7 @@ def test_record_evict_one_shot_scalar():
     check(st._total_evicted_one_shot == 0,
           f"多轮 response 不算 one-shot，实际={st._total_evicted_one_shot}")
 
-    rnd = _mk_node(32, 0, task_type=SimpleHybridTaskType.SINGLE_TURN_RANDOM)
+    rnd = _mk_node(32, 0, task_type=SimpleHybridTaskType.RANDOM_SINGLE_TURN)
     st.record_evict(rnd)
     check(st._total_evicted_tokens.get("random") == 32,
           f"random 未被单列: {st._total_evicted_tokens}")
@@ -834,15 +852,15 @@ def test_multiturn_decode_is_not_one_shot():
 
     def node(tt, dec):
         return SimpleNamespace(
-            value=[0] * 64, key=[0] * 64, task_type=tt, is_decode=dec,
+            value=[0] * 64, key=[0] * 64, queue_tag=_queue_tag_for(tt), is_decode=dec,
             last_access_time=time.monotonic(), hit_count=0,
         )
 
     cases = [
         (SimpleHybridTaskType.MULTI_TURN_AGENTIC, True, "agentic", False),
-        (SimpleHybridTaskType.MULTI_TURN_TEXT, True, "text", False),
-        (SimpleHybridTaskType.SINGLE_TURN, True, "single", True),
-        (SimpleHybridTaskType.SINGLE_TURN_RANDOM, False, "random", True),
+        (SimpleHybridTaskType.MULTI_TURN_CHAT, True, "chat", False),
+        (SimpleHybridTaskType.STRUCT_SINGLE_TURN, True, "struct", True),
+        (SimpleHybridTaskType.RANDOM_SINGLE_TURN, False, "random", True),
     ]
     for tt, dec, want_q, want_os in cases:
         n = node(tt, dec)
@@ -865,22 +883,22 @@ def test_decode_band_end_to_end():
             )
         )
         # 先有 [0,50) 前缀，再以 decode_start=50 扩展到 100 -> 后段 is_decode=True
-        cache.insert(InsertParams(
+        result = cache.insert(InsertParams(
             key=RadixKey(array("q", list(range(0, 50)))),
             value=torch.tensor(list(range(0, 50)), dtype=torch.int64),
-            task_type=task_type,
         ))
-        cache.insert(InsertParams(
+        result.last_device_node.queue_tag = _queue_tag_for(task_type)
+        result = cache.insert(InsertParams(
             key=RadixKey(array("q", list(range(0, 100)))),
             value=torch.tensor(list(range(0, 100)), dtype=torch.int64),
-            task_type=task_type,
             decode_start=50,
         ))
+        result.last_device_node.queue_tag = _queue_tag_for(task_type)
         return cache
 
     for tt, label, want_os in (
         (SimpleHybridTaskType.MULTI_TURN_AGENTIC, "agentic", False),
-        (SimpleHybridTaskType.SINGLE_TURN, "single", True),
+        (SimpleHybridTaskType.STRUCT_SINGLE_TURN, "struct", True),
     ):
         cache = build(tt)
         dec_nodes = [n for n in cache.evictable_leaves if getattr(n, "is_decode", False)]

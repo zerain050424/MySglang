@@ -10,6 +10,7 @@ from sglang.srt.mem_cache.uni_utils import (
     TASK_CONFIG,
     WORKLOAD_LABELS,
     workload_label_of,
+    alpha_key_of,
     SimpleHybridQueueTag,
     SimpleHybridTaskType,
     _cached_lognorm_cdf,
@@ -167,12 +168,10 @@ class SimpleHybridStrategy(EvictionStrategy):
             dict(alpha_balance)
             if alpha_balance
             else {
-                "single": 1.0,
-                "text": 1.0,
-                "file": 1.0,
-                "image": 1.0,
-                "search": 1.0,
+                "chat": 1.0,
                 "agentic": 1.0,
+                "struct": 1.0,
+                "random": 1.0,
             }
         )
         self.fair_rr = fair_rr
@@ -198,18 +197,14 @@ class SimpleHybridStrategy(EvictionStrategy):
         self._total_evicted_one_shot = 0.0
     @staticmethod
     def _task_type_of(node) -> SimpleHybridTaskType:
-        explicit_type = getattr(node, "task_type", None)
-        if explicit_type is not None:
-            return explicit_type
-
         # 队列标签由缓存状态机维护。固定映射为各队列提供策略语义，
-        # 不检查会话 ID 或提示词。
+        # 不检查请求字段、会话 ID 或提示词。
         return {
-            SimpleHybridQueueTag.QTRANS: SimpleHybridTaskType.SINGLE_TURN_RANDOM,
-            SimpleHybridQueueTag.QSTRUCT: SimpleHybridTaskType.MULTI_TURN_TEXT,
+            SimpleHybridQueueTag.QTRANS: SimpleHybridTaskType.RANDOM_SINGLE_TURN,
+            SimpleHybridQueueTag.QSTRUCT: SimpleHybridTaskType.STRUCT_SINGLE_TURN,
             SimpleHybridQueueTag.QAGENT: SimpleHybridTaskType.MULTI_TURN_AGENTIC,
-            SimpleHybridQueueTag.QCHAT: SimpleHybridTaskType.SINGLE_TURN,
-        }.get(getattr(node, "queue_tag", None), SimpleHybridTaskType.SINGLE_TURN)
+            SimpleHybridQueueTag.QCHAT: SimpleHybridTaskType.MULTI_TURN_CHAT,
+        }.get(node.queue_tag, SimpleHybridTaskType.MULTI_TURN_CHAT)
 
     def _reuse_score(self, node) -> float:
         """calculate_priority() from HeterCache, with time.monotonic() as now."""
@@ -223,8 +218,8 @@ class SimpleHybridStrategy(EvictionStrategy):
             alpha = self.alpha_balance.get(alpha_key, 1.0) # 在线更新α
             reuse_prob = 1.0 - _cached_lognorm_cdf(e, mu, sigma)
             return alpha * reuse_prob
-        if task_type == SimpleHybridTaskType.SINGLE_TURN:
-            alpha = self.alpha_balance.get("single", 1.0)
+        if task_type == SimpleHybridTaskType.STRUCT_SINGLE_TURN:
+            alpha = self.alpha_balance.get("struct", 1.0)
             # HeterCache 的 offset 是块在序列中的绝对结束位置，不是 radix 片段长度。
             offset_factor = 1.0 - _node_end_offset(node) / (self.max_offset or 1)
             offset_factor = max(0.0, min(1.0, offset_factor))
@@ -266,24 +261,25 @@ class SimpleHybridStrategy(EvictionStrategy):
             sid = getattr(node, "session_id", None)
             if sid is None:
                 continue
-            state = registry.get(sid)
+            state = registry.get(sid) ##获取会话KV记账状态
             if state is None or state.L <= 0:
                 continue
             current = tails.get(sid)
             if current is None or _node_end_offset(node) > _node_end_offset(current[0]):
+                ## 会话内部,保留最深节点
                 tails[sid] = (node, state)
 
         best = None
-        for sid, (node, state) in tails.items():
-            if state.d >= self._loss_cap(state.L):
+        for sid, (node, state) in tails.items(): ## 跨对话轮询删除
+            if state.d >= self._loss_cap(state.L): ## 删除的缺口超过阈值,不再考虑
                 continue
-            last = self._rr_last.get(sid, -1)
+            last = self._rr_last.get(sid, -1) # 获取该对话上次被选中的序号,若上次未被选中,则为-1
             if best is None or last < best[0]:
                 best = (last, sid, node)
         if best is None:
             return None
 
-        self._rr_last[best[1]] = self._rr_seq
+        self._rr_last[best[1]] = self._rr_seq #选中淘汰之后更新序号
         self._rr_seq += 1
         return best[2]
 
@@ -309,15 +305,15 @@ class SimpleHybridStrategy(EvictionStrategy):
     def is_one_shot(self, node) -> bool:
         """
         一次性内容（one-shot）：淘汰顺序永远先于可调度内容。
-          - SINGLE_TURN_RANDOM：随机单轮，跨会话几乎不复用；
-          - 单轮负载（SINGLE_TURN）的生成段：会话发完即弃，response 不会再被任何请求当作前缀。
+          - RANDOM_SINGLE_TURN：随机单轮，跨会话几乎不复用；
+          - STRUCT_SINGLE_TURN 的生成段：会话发完即弃，response 不会再被任何请求当作前缀。
         多轮负载的 response 段不在此列：下一轮会复用，与其 prompt 段同队列参与调度。
         """
         task_type = self._task_type_of(node)
-        if task_type == SimpleHybridTaskType.SINGLE_TURN_RANDOM:
+        if task_type == SimpleHybridTaskType.RANDOM_SINGLE_TURN:
             return True
-        return bool(getattr(node, "is_decode", False)) and (
-            task_type == SimpleHybridTaskType.SINGLE_TURN
+        return node.is_decode and (
+            task_type == SimpleHybridTaskType.STRUCT_SINGLE_TURN
         )
 
     def workload_of(self, node) -> str:
@@ -333,7 +329,7 @@ class SimpleHybridStrategy(EvictionStrategy):
 
     # ---- online alpha balancing ----
 
-    def record_hit(self, req, hit_tokens: int) -> None:
+    def record_hit(self, req, node, hit_tokens: int) -> None:
         # Attribute a request's prefix-cache hit to its workload type, once
         # per request; decay other types to keep the window recent.
         rid = getattr(req, "rid", None)
@@ -344,13 +340,14 @@ class SimpleHybridStrategy(EvictionStrategy):
         if len(self._rid_order) > self.MAX_SEEN_RIDS:
             self._seen_rids.discard(self._rid_order.popleft())
 
-        key = "single"
+        task_type = self._task_type_of(node)
+        key = alpha_key_of(task_type)
         for q in self._hit_tokens:
             if q != key:
                 self._hit_tokens[q] *= self.HIT_DECAY ## 命中期间其他队列的窗口衰减
         self._hit_tokens[key] = self._hit_tokens.get(key, 0.0) + hit_tokens
         # 累计命中。
-        wkey = "single"
+        wkey = workload_label_of(task_type)
         self._total_hit_tokens[wkey] = self._total_hit_tokens.get(wkey, 0.0) + hit_tokens
 
     def record_evict(self, node) -> None:
@@ -372,7 +369,7 @@ class SimpleHybridStrategy(EvictionStrategy):
           hit / evicted : 累计命中 / 淘汰 token，按 workload（与 occ 同口径，可比较）
           occ           : 该 workload 的全部驻留 token（含 response 段）；
                           `occ(-N)` 后缀 = 其中 one-shot 部分（random 整行、
-                          single 的 response 段），alpha 调度不了
+                          struct 的 response 段），alpha 调度不了
           alpha         : 在线权重（random 不参与 alpha，恒为 "-"）
 
         Σocc == schedulable + Σone_shot（schedulable 即 alpha 分母）。
@@ -441,7 +438,7 @@ class SimpleHybridStrategy(EvictionStrategy):
 
         为什么需要三个稳定性约束（实测 62 分钟的教训）
         -------------------------------------------------
-        1. 容量份额下限：分母趋零时 eff 爆炸。single 被压到 786/100000
+        1. 容量份额下限：分母趋零时 eff 爆炸。struct 被压到 786/100000
            (0.8%) 时，一个窗口里少量命中就让 eff 冲高 -> r**5 顶到上界 10；
            下一窗口它没有容量自然没命中 -> EMA 逐窗 ×0.1 衰减回 0.001。
            实测形成 ~2.5 分钟周期的锯齿，alpha 跨度 10000×。
