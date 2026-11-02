@@ -66,9 +66,8 @@ bash run_all.sh   # POLICIES="lru simple_hybrid" × TOKENS_LIST="50000 100000 20
 
 1. **tokenizer 必须 Qwen2.5-7B-Instruct**：本地 UniCache 数据是 Llama-3 tokenizer 产物
    （demo head20 也是），服务器模型是 Qwen2.5，必须重生成，否则 token ids 错位全 miss。
-2. **直发 input_ids + session_id 打分类**：session_id 前缀决定 task_type
-   （ShareGPT-multi-turn-* / alfred_* / apps_* / mind2web_*），同一 session 恒定，
-   不影响 radix tree 命名空间。
+2. **直发 input_ids + session_id 标识会话**：session_id 前缀不再决定 task_type，
+   同一 session 恒定且不影响 radix tree 命名空间。
 3. **会话间并发、会话内串行**：下一轮依赖上一轮 KV，串行才能让前缀缓存命中。
 4. **max-total-tokens 是关键**：调小到装不下工作集才触发淘汰，policy 差异才显现。
 

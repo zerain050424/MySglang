@@ -1895,20 +1895,24 @@ class Scheduler(
         else:
             self.schedule_stream.wait_stream(self.forward_stream)
 
-    @DynamicGradMode()
+    @DynamicGradMode() ##动态控制PyTorch的梯度计算模式
     def event_loop_normal(self):
         """A normal scheduler loop."""
         while True:
-            if self.gracefully_exit:
+            if self.gracefully_exit: ## 接受到推出信号,退出推理
                 break
 
             # Receive requests
-            self.ingest_requests()
+            self.ingest_requests() 
+            # 从请求队列中读取新请求，
+            # 并将它们加入调度器管理的等待队列或相关状态中。
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
 
             # Get the next batch to run
+            # 根据当前正在运行的 batch 和上一次运行的 batch，决定下一步的调度计划。
+            # 计划中包括 running_batch（当前正在运行的 batch）和 batch_to_run（下一步要运行的 batch）。
             plan = self.get_next_batch_to_run(
                 running_batch=self.running_batch, last_batch=self.last_batch
             )
@@ -1918,15 +1922,15 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
-                result = self.run_batch(batch)
-                self.process_batch_result(batch, result)
+                result = self.run_batch(batch) #执行batch
+                self.process_batch_result(batch, result) #处理batch运行结果
             else:
                 # When the server is idle, do self-check and re-init some states.
                 self._sched_idled = True
                 self.on_idle()
 
             # Update last_batch
-            self.last_batch = batch
+            self.last_batch = batch # 保持本轮batch
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
 
@@ -2059,6 +2063,7 @@ class Scheduler(
         The one place a new per-iteration input source belongs; the return
         value exists for the pipeline stages that relay requests onward.
         """
+        # 在每一轮循环中接收/同步/分发外部请求
         local_reqs = []
         if (
             get_parallel().pp_rank == 0
@@ -2066,14 +2071,14 @@ class Scheduler(
             and get_parallel().attn_cp_rank == 0
         ):
             local_reqs = self._poll_timeout_aborts()
-        recv_reqs = self.request_receiver.recv_requests(local_reqs=local_reqs)
+        recv_reqs = self.request_receiver.recv_requests(local_reqs=local_reqs) # 接受请求
         if recv_reqs:
-            self.metrics_reporter.record_scheduler_active()
+            self.metrics_reporter.record_scheduler_active() # 本轮接收到请求,标记调度器处于活跃状态
         self.process_input_requests(recv_reqs)
         return recv_reqs
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_REQUESTS)
-    def process_input_requests(self, recv_reqs: List):
+    def process_input_requests(self, recv_reqs: List): ##处理接受到的请求
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
 

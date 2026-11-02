@@ -8,8 +8,7 @@
 #     AgentBank_alfred_scale_5000_session_data.jsonl   (agentic 多轮, id=alfred_*)
 #     AgentBank_apps_session_data.jsonl                (单轮 API, id=apps_*)
 #     AgentBank_single_api_session_data.jsonl          (apps+mind2web 合并, 可选)
-# 说明: 分类规则见 uni_utils.classify_simple_hybrid_task_type:
-#       alfred_*→MULTI_TURN_AGENTIC, apps_*/mind2web_*→SINGLE_TURN_RANDOM
+# 说明: session_id 仅用于标识会话，不承载请求类型。
 # =============================================================================
 set -eu
 UB="$(cd "$(dirname "$0")/../.." && pwd)"

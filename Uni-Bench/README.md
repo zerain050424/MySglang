@@ -19,9 +19,8 @@ Uni-Bench/
 
 1. **直发 `input_ids`**：直接复用 UniCache 已 tokenize 的 `session_data.jsonl`，
    与 UniCache 仿真逐 token 一致，避免 chat template 差异。
-2. **`session_id` 打分类标签**：同一 session 的多轮用同一个 `session_id`，
-   形如 `ShareGPT-multi-turn-*` → 触发 `classify_simple_hybrid_task_type`
-   命中 `MULTI_TURN_TEXT`（进 text 队列）。
+2. **`session_id` 仅标识会话**：同一 session 的多轮用同一个 `session_id`，
+   不再依赖客户端为请求类型打标签。
    **不使用 `extra_key` 做标签**——`extra_key` 会隔离 radix tree 命名空间，
    导致跨 session 的 31-token system prompt 无法共享。
 3. **并发模型**：会话间并发（`Semaphore`），**会话内逐轮串行**（下一轮依赖上一轮的 KV）。

@@ -139,7 +139,7 @@ victim_pool.jsonl
 
 | 字段 | 定义 |
 |---|---|
-| `task` | `classify_session()` 按 `session_id` 前缀归档 |
+| `task` | 按 benchmark 配置归档，不再从 `session_id` 前缀解析 |
 | `session_id` | 数据集原 id，仅作标签|
 | `turn` | 会话内第几轮 |
 | `prompt_tokens` | `meta_info.prompt_tokens`：本轮真正喂进 prefill 的整条序列长度|

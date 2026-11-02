@@ -35,7 +35,7 @@ L1 可独立合并、独立验收；L2 在 L1 的账目对得上之后再动。
 
 ### 1.2 数据结构
 
-放在 `uni_utils.py` 末尾，与 `WORKLOAD_LABELS` / `classify_simple_hybrid_task_type` 同一模块：
+放在 `uni_utils.py` 末尾，与 `WORKLOAD_LABELS` 同一模块：
 
 ```
 SessionState        # 一条会话的账

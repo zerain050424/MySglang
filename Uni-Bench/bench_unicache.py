@@ -9,10 +9,8 @@
 核心设计（方案 A）：
   - 复用 UniCache 的 session_data.jsonl（已 tokenize 的多轮会话）。
   - 直发 input_ids（与 UniCache 逐 token 一致，无 chat template 差异）。
-  - session_id 打分类标签：同一 session 的多轮用同一个 session_id，
-    且形如 "ShareGPT-multi-turn-*" → 触发 classify_simple_hybrid_task_type
-    的 MULTI_TURN_TEXT 分类（进 text 队列）。
-    注意：不能用 extra_key 做 session 标签——extra_key 会隔离 radix tree
+  - session_id 仅用于标识同一会话的多轮请求，不承载工作负载类型。
+    不能用 extra_key 做 session 标签——extra_key 会隔离 radix tree
     命名空间，导致跨 session 的前缀（31-token system prompt）无法共享。
   - 并发模型：会话间并发（Semaphore），会话内逐轮串行（下一轮依赖上一轮 KV）。
   - 指标：命中率 = Σcached_tokens / Σprompt_tokens，来自每次响应的 meta_info。
@@ -106,27 +104,6 @@ def load_arrival_config(path: Optional[str]) -> Dict[str, Dict[str, Any]]:
     with open(path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
     return {t["name"]: t for t in cfg.get("tasks", [])}
-
-
-def classify_session(session_id: str) -> str:
-    """session_id -> workload task name。
-
-    与 sglang mem_cache/uni_utils.py 的 classify_simple_hybrid_task_type 一致；
-    对应 UniCache simulator.py 的 create_session_id_2_task_name_mapping 语义。
-    """
-    if session_id.startswith(("ShareGPT-multi-turn", "text_ShareGPT-multi-turn")):
-        return "text"
-    if session_id.startswith("image_ShareGPT-multi-turn"):
-        return "image"
-    if session_id.startswith("search_ShareGPT-multi-turn"):
-        return "search"
-    if session_id.startswith("file_ShareGPT-multi-turn"):
-        return "file"
-    if session_id.startswith("alfred_"):
-        return "agentic"
-    if session_id.startswith(("apps_", "mind2web_")):
-        return "random"
-    return "single"
 
 
 def stable_seed_from_str(s: str, base_seed: int = 0) -> int:
@@ -441,10 +418,10 @@ async def run_session(
     task_cfg 传入时（混合负载）直接用其 mu/sigma/seed/task_id；
     否则（单负载）按 session_id 前缀从 arrival_config 查。
     """
-    sid = sess["id"]  # 形如 "ShareGPT-multi-turn-<x>"，作为分类标签
+    sid = sess["id"]
     if task_cfg is None:
-        task_cfg = args.arrival_config.get(classify_session(sid), {})
-    task_name = task_cfg.get("name") or classify_session(sid)
+        task_cfg = next(iter(args.arrival_config.values()), {})
+    task_name = task_cfg.get("name", "default")
 
     # 每 session 独立 RNG，seed 由 (sid, task.seed, task.task_id) 确定性生成
     # （模仿 UniCache simulator.py 的 stable_seed_from_str + _init_session_rngs）
@@ -470,7 +447,7 @@ async def run_session(
                 "input_ids": turn["input_ids"],
                 # 固定输出长度，复现 UniCache 的 response_ids 长度
                 "max_new_tokens": len(turn["response_ids"]),
-                # 分类标签：同一 session 恒定；不影响 radix tree 命名空间
+                # Session identity only; it does not select an eviction policy.
                 "session_id": sid,
                 "rid": f"{sid}_turn_{t}",
             }

@@ -15,11 +15,9 @@
   3. 随机选 1..N 个 solution（N ~ gauss(6.5, 1.5)，clamp 到 [1, len(sols)]），
      每个 solution 生成一条单轮对话 {id: "<prefix>-<uuid>-<idx>", conversations: [user, assistant]}。
 
-【分类标签（重要）】
-  id 前缀决定 SimpleHybrid 的 task_type 分类（见 uni_utils.classify_simple_hybrid_task_type）：
-    - 默认 "Code-"  → SINGLE_TURN（与原版 UniCache 一致）
-    - 改 "--id-prefix apps_" → SINGLE_TURN_RANDOM（apps 数据集专属队列，论文里 Codeparrot 归此类）
-  发送时 bench_unicache.py 会把 id 原样作为 session_id，故前缀直接影响分类。
+【会话标识】
+  id 仅用于关联同一会话的请求，不承载 SimpleHybrid 的 task_type。
+  发送时 bench_unicache.py 会把 id 原样作为 session_id，但前缀不再影响策略。
 
 【用法】
   /root/sl_old/bin/python prepare_data.py \

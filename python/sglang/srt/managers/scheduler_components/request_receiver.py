@@ -100,15 +100,15 @@ class SchedulerRequestReceiver:
             if not self.recv_skipper.handle(self.get_last_batch()):
                 return []
 
-        recv_reqs = self._pull_raw_reqs()
+        recv_reqs = self._pull_raw_reqs() ## 拉取原始请求
 
-        if self.input_blocker is not None:
+        if self.input_blocker is not None: ## 输入拦截器
             recv_reqs = self.input_blocker.handle(recv_reqs)
 
         recv_reqs = self._broadcast_reqs_across_ranks(recv_reqs, local_reqs)
 
         if get_parallel().pp_rank == 0:
-            self.unwrap_pickle_wrapper(recv_reqs)
+            self.unwrap_pickle_wrapper(recv_reqs) ##pickle解包
 
         recv_reqs = self._apply_mm_receiver(recv_reqs)
 
@@ -135,6 +135,7 @@ class SchedulerRequestReceiver:
                         if self.recv_limit_reached(len(recv_reqs)):
                             break
                         recv_req = sock_recv(self.recv_from_tokenizer, zmq.NOBLOCK)
+                        # 先从tokenizer接收请求，如果没有请求就从rpc接收请求
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_req)
@@ -142,7 +143,7 @@ class SchedulerRequestReceiver:
                 while True:
                     try:
                         if self.recv_limit_reached(len(recv_reqs)):
-                            break
+                            break ## 限制读取的请求数目
                         recv_rpc = sock_recv(self.recv_from_rpc, zmq.NOBLOCK)
                     except zmq.ZMQError:
                         break

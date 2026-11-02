@@ -6,8 +6,7 @@
 # 当前 UniBench 用 Semaphore 控制会话并发、会话内串行
 # session 级 Poisson 到达调度
 #
-# session_id 前缀 -> task name 的映射见 bench_unicache.py 的 classify_session()，
-# 与 sglang mem_cache/uni_utils.py 的 classify_simple_hybrid_task_type 一致。
+# 单负载模式使用第一个 task 的到达参数；混合模式按 tasks 配置选择参数。
 #
 # mu/sigma 取值来源：
 #   text / agentic / single / random —— 对齐 UniCache 对应 tasks_config.yaml 的

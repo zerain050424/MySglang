@@ -12,11 +12,9 @@
   alfworld/apps/gsm8k/hotpotqa/humaneval/intercode_bash/intercode_sql/iqa/math/
   mathqa/mbpp/mbpp_before/mind2web/rearrange/strategyqa/triviaqa/webarena/webshop/alfred
 
-【分类标签（重要）】
-  session_id 前缀决定 SimpleHybrid 的 task_type（见 uni_utils.classify_simple_hybrid_task_type）：
-    - "alfred_"  → MULTI_TURN_AGENTIC
-    - "apps_"/"mind2web_" → SINGLE_TURN_RANDOM
-  因此 data.sh 只挑选 alfred（agentic 多轮）+ apps/mind2web（单轮 API 调用）两类构建混合负载。
+【会话标识】
+  session_id 仅用于关联同一会话的多轮请求，不承载 SimpleHybrid 的 task_type。
+  data.sh 仍可挑选不同数据集构建混合负载，但负载类型由 benchmark 配置决定。
 
 【用法】
   /root/sl_old/bin/python prepare_agentbank_data.py \

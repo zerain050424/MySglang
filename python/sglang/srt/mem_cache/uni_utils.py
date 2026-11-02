@@ -83,32 +83,6 @@ def workload_label_of(task_type) -> str:
     return alpha_key_of(task_type)
 
 
-def classify_simple_hybrid_task_type(
-       session_id: Optional[str] = None,
-       extra_key: Optional[str] = None,
-   ) -> SimpleHybridTaskType:
-       """Map a request's session/namespace key to a UniCache workload type.
-
-       Mirrors UniCache's mark_blocks_simple_hybrid_atrribute: the conversation
-       key prefix decides the type. sglang carries the analogous string in
-       Req.session_id / Req.extra_key.
-       """
-       key = session_id or extra_key or ""
-       if key.startswith(("ShareGPT-multi-turn", "text_ShareGPT-multi-turn")):
-           return SimpleHybridTaskType.MULTI_TURN_TEXT
-       if key.startswith("image_ShareGPT-multi-turn"):
-           return SimpleHybridTaskType.MULTI_TURN_IMAGE
-       if key.startswith("search_ShareGPT-multi-turn"):
-           return SimpleHybridTaskType.MULTI_TURN_SEARCH
-       if key.startswith("file_ShareGPT-multi-turn"):
-           return SimpleHybridTaskType.MULTI_TURN_FILE
-       if key.startswith("alfred_"):
-           return SimpleHybridTaskType.MULTI_TURN_AGENTIC
-       if key.startswith(("apps_", "mind2web_")):
-           return SimpleHybridTaskType.SINGLE_TURN_RANDOM
-       return SimpleHybridTaskType.SINGLE_TURN
-
-
 def alpha_key_of(task_type) -> str:
     """Map a task type to its alpha-balance key ("single"/"text"/"file"/...)."""
     cfg = TASK_CONFIG.get(task_type)

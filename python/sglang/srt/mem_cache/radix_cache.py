@@ -51,7 +51,6 @@ from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.uni_utils import (   
     SessionRegistry,
     SimpleHybridTaskType,
-    classify_simple_hybrid_task_type,
     workload_label_of,
 )
 from sglang.srt.mem_cache.utils import (
@@ -534,9 +533,9 @@ class RadixCache(BasePrefixCache):
 
         # Radix Cache takes one ref in memory pool
         priority = req.priority or 0
-        # SimpleHYBRID: classify workload type and locate the prompt/output
-        # boundary so decode-portion nodes can be flagged (evicted first).
-        task_type = classify_simple_hybrid_task_type(req.session_id, req.extra_key)
+        # Locate the prompt/output boundary so decode-portion nodes can be
+        # flagged without requiring a client-provided workload tag.
+        task_type = None
         decode_start = (len(req.origin_input_ids) // self.page_size) * self.page_size
         # SimpleHYBRID：会话账本入口。请求写入后链完整驻留，缺口归零。
         self.session_registry.touch(

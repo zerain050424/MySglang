@@ -12,8 +12,6 @@ from sglang.srt.mem_cache.uni_utils import (
     workload_label_of,
     SimpleHybridTaskType,
     _cached_lognorm_cdf,
-    alpha_key_of,
-    classify_simple_hybrid_task_type,
 )
 
 if TYPE_CHECKING:
@@ -266,18 +264,13 @@ class SimpleHybridStrategy(EvictionStrategy):
         if len(self._rid_order) > self.MAX_SEEN_RIDS:
             self._seen_rids.discard(self._rid_order.popleft())
 
-        task_type = classify_simple_hybrid_task_type(
-            getattr(req, "session_id", None), getattr(req, "extra_key", None)
-        )
-        key = alpha_key_of(task_type)
+        key = "single"
         for q in self._hit_tokens:
             if q != key:
                 self._hit_tokens[q] *= self.HIT_DECAY ## 命中期间其他队列的窗口衰减
         self._hit_tokens[key] = self._hit_tokens.get(key, 0.0) + hit_tokens
         # 累计命中。
-        # 用 workload 标签记账（SINGLE_TURN_RANDOM 单列 "random"），
-        # 与上面喂给 alpha 的 alpha_key 是两个口径。
-        wkey = workload_label_of(task_type)
+        wkey = "single"
         self._total_hit_tokens[wkey] = self._total_hit_tokens.get(wkey, 0.0) + hit_tokens
 
     def record_evict(self, node) -> None:
