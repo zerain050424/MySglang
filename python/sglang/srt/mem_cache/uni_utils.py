@@ -27,6 +27,18 @@ class SimpleHybridTaskType(str, enum.Enum):
     DEFAULT = "default"
 
 
+class SimpleHybridQueueTag(str, enum.Enum):
+    """HeterCache 节点状态标签。
+
+    标签由缓存状态机根据插入、命中间隔和分支拓扑自动维护。
+    """
+
+    QTRANS = "qtrans"
+    QSTRUCT = "qstruct"
+    QAGENT = "qagent"
+    QCHAT = "qchat"
+
+
 @lru_cache(maxsize=8)
 def _cached_lognorm_params(mu: float, sigma: float):
     """Cache lognormal parameters to avoid recomputation."""

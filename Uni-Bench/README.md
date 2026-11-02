@@ -17,10 +17,12 @@ Uni-Bench/
 
 ## 设计要点（为什么这样做）
 
-1. **直发 `input_ids`**：直接复用 UniCache 已 tokenize 的 `session_data.jsonl`，
-   与 UniCache 仿真逐 token 一致，避免 chat template 差异。
+1. **直发 `input_ids`**：直接复用 HeterCache 已 tokenize 的 `session_data.jsonl`，
+   与 HeterCache 仿真逐 token 一致，避免 chat template 差异。
 2. **`session_id` 仅标识会话**：同一 session 的多轮用同一个 `session_id`，
-   不再依赖客户端为请求类型打标签。
+   不再依赖客户端为请求类型打标签，由缓存状态机自动判断队列。
+   HeterCache 根据节点是否复用、复用间隔和树分支自动判断
+   `qtrans`、`qstruct`、`qagent`、`qchat` 四类队列。
    **不使用 `extra_key` 做标签**——`extra_key` 会隔离 radix tree 命名空间，
    导致跨 session 的 31-token system prompt 无法共享。
 3. **并发模型**：会话间并发（`Semaphore`），**会话内逐轮串行**（下一轮依赖上一轮的 KV）。
@@ -30,9 +32,9 @@ Uni-Bench/
 
 1. **sglang 已按前面 Phase 1–6 打好补丁**（`SimpleHybridStrategy` + `SimpleHybridRadixCache`
    + `--enable-simple-hybrid` + profile 日志）。
-2. **数据**：UniCache 的 `session_data.jsonl`。生成方式：
+2. **数据**：HeterCache 的 `session_data.jsonl`。生成方式：
    ```bash
-   cd /home/rain/UniCache/TaskData/SharedGPT-multi-turn
+   cd /home/rain/HeterCache/TaskData/SharedGPT-multi-turn
    bash data.sh    # → models/<model>/ShareGPT_cleaned_valid_deduplicated_session_data.jsonl
    ```
    冒烟可直接用 `demo/ShareGPT_cleaned_valid_session_data_head20.jsonl`（20 session）。
@@ -49,7 +51,7 @@ POLICY=simple_hybrid MAX_TOTAL_TOKENS=200000 bash Uni-Bench/serve.sh
 
 # 2) 跑 driver（20-session demo）
 python Uni-Bench/bench_unicache.py \
-  --data-path /home/rain/UniCache/demo/ShareGPT_cleaned_valid_session_data_head20.jsonl \
+  --data-path /home/rain/HeterCache/demo/ShareGPT_cleaned_valid_session_data_head20.jsonl \
   --base-url http://127.0.0.1:30000 \
   --concurrency 8 \
   --output Uni-Bench/result/smoke.json
@@ -60,9 +62,9 @@ python Uni-Bench/bench_unicache.py \
 冒烟预期：cache 调大（无淘汰）时命中率接近上限——跨 session 共享 31-token system prompt
 + 会话内轮间共享历史。
 
-## 混合负载（模仿 UniCache 异构负载混合）
+## 混合负载（模仿 HeterCache 异构负载混合）
 
-把多个异构负载按 UniCache 的「比例」（`lambda_rate` Poisson 会话到达率之比）混成
+把多个异构负载按 HeterCache 的「比例」（`lambda_rate` Poisson 会话到达率之比）混成
 一条到达流交错压测，触发 SimpleHybrid 的多队列（text/single/random/agentic…）竞争。
 
 ```bash
@@ -84,7 +86,7 @@ source env.sh
 | 参数 | 含义 |
 |---|---|
 | `--tasks-config` | 混合负载 YAML（含每个 task 的 data_path/lambda_rate/mu/sigma/max_record） |
-| `--arrival-scale` | 会话到达节奏缩放：1=UniCache 真实 Poisson；0=全部立即到达；<1 加速 |
+| `--arrival-scale` | 会话到达节奏缩放：1=HeterCache 真实 Poisson；0=全部立即到达；<1 加速 |
 | 配置里 `lambda_rate` | 「混合比例」= 各 task 的 lambda_rate 之比（如 2:1） |
 
 结果 JSON 含 `per_task` 字段：每个负载各自的命中率细分。

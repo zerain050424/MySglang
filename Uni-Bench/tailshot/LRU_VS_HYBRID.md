@@ -83,7 +83,7 @@ LRU 的结构性弱点不在**总容量**，而在**重访间隔**：只要两�
 
 ## 3. 三条流如何拼到一根时间轴上
 
-`bench_unicache.py --tasks-config` 的混合负载模式，逐函数对齐 UniCache
+`bench_unicache.py --tasks-config` 的混合负载模式，逐函数对齐 HeterCache
 `vllm/simulator/simulator.py`：
 
 1. 每个 task 读自己的 `session_data.jsonl`（`max_record` 截断），用
@@ -96,7 +96,7 @@ LRU 的结构性弱点不在**总容量**，而在**重访间隔**：只要两�
    再抢 `Semaphore(concurrency=32)`；
 5. **会话内逐轮串行**（下一轮依赖上一轮 KV，并发会人为压低命中率）；
    轮间等待 `rng.lognormvariate(mu, sigma) * wait_scale`；
-6. `arrival_scale=1`、`wait_scale=1` 表示严格按 UniCache 真实节奏，不做加速。
+6. `arrival_scale=1`、`wait_scale=1` 表示严格按 HeterCache 真实节奏，不做加速。
 
 `tailshot_*.yaml` 就是三条流：
 

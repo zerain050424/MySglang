@@ -1,18 +1,18 @@
 # =============================================================================
-# 混合负载配置（模仿 UniCache TaskData/Hybrid/*/tasks_config.yaml）
+# 混合负载配置（模仿 HeterCache TaskData/Hybrid/*/tasks_config.yaml）
 #
-# 语义（逐字段对齐 UniCache vllm/simulator/simulator.py）：
+# 语义（逐字段对齐 HeterCache vllm/simulator/simulator.py）：
 #   - lambda_rate : 该负载的 session 到达率（Poisson，session/s）。
 #                   「混合比例」即各 task 的 lambda_rate 之比（如 2:1 表示
 #                   A 的 session 到达速度是 B 的 2 倍）。
 #   - mu / sigma  : 会话内「轮间」到达间隔的 lognormal 参数（秒）；单轮负载为 0。
-#   - max_record  : 该负载最多加载的 session 数（UniCache 的 max_record）。
+#   - max_record  : 该负载最多加载的 session 数（HeterCache 的 max_record）。
 #   - seed/task_id: 确定性打乱与 RNG（stable_seed = seed + task_id*1000）。
 #   - shuffle     : 是否打乱该负载自身 session 顺序（mashqa 同文档问题相邻可设 false）。
 #
 # data_path 相对本文件所在目录（Uni-Bench/）解析。
 #
-# 本配置按 UniCache 混合实验的默认比例：各负载 lambda_rate=1（1:1:1:1），
+# 本配置按 HeterCache 混合实验的默认比例：各负载 lambda_rate=1（1:1:1:1），
 # 覆盖四类异构负载：
 #   - 多轮文本 text    （session_id 前缀 ShareGPT-multi-turn-* → MULTI_TURN_TEXT）
 #   - 多轮 agentic     （session_id 前缀 alfred_*            → MULTI_TURN_AGENTIC）
@@ -51,7 +51,7 @@ tasks:
     task_id: 2
     data_path: TaskData/SharedGPT-multi-turn/Qwen2.5-7B-Instruct/ShareGPT_cleaned_valid_deduplicated_session_data.jsonl
     lambda_rate: 1
-    mu: 4.15         # UniCache SharedGPT-multi-turn/tasks_config.yaml
+    mu: 4.15         # HeterCache SharedGPT-multi-turn/tasks_config.yaml
     sigma: 0.971
     max_trace_duration: -1
     seed: 42
@@ -63,7 +63,7 @@ tasks:
     task_id: 3
     data_path: TaskData/AgentBankData/Qwen2.5-7B-Instruct/AgentBank_alfred_scale_5000_session_data.jsonl
     lambda_rate: 1
-    mu: 1.81         # UniCache AgentBankData/tasks_config_alfred.yaml
+    mu: 1.81         # HeterCache AgentBankData/tasks_config_alfred.yaml
     sigma: 1.092
     max_trace_duration: -1
     seed: 42

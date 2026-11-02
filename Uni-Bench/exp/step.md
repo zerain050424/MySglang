@@ -62,7 +62,7 @@ SessionRegistry     # 表 + 四个方法
 
 ### 1.3.1 为什么放 `uni_utils.py`
 
-- 与 `WORKLOAD_LABELS` / `alpha_key_of` 同属 UniCache 迁移层的常量与状态，命名口径一致；
+- 与 `WORKLOAD_LABELS` / `alpha_key_of` 同属 HeterCache 迁移层的常量与状态，命名口径一致；
 - 该模块现在只有 `math` / `enum` / `time` / `typing` 依赖，加状态表不引入新依赖，也不反向依赖树；
 - 对上游的 diff 变成"一个已有文件尾部追加一块"，不新增文件名，rebase 冲突面最小。
 

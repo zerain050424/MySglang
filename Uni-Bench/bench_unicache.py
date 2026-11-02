@@ -3,19 +3,19 @@
 
 支持两种负载模式：
   1) 单负载模式（--data-path）：单个 session_data.jsonl 压测（向后兼容）。
-  2) 混合负载模式（--tasks-config）：多个异构负载按 UniCache 的「比例」混成一条
+  2) 混合负载模式（--tasks-config）：多个异构负载按 HeterCache 的「比例」混成一条
      到达流交错压测，见 hybrid_tasks_config.yaml。
 
 核心设计（方案 A）：
-  - 复用 UniCache 的 session_data.jsonl（已 tokenize 的多轮会话）。
-  - 直发 input_ids（与 UniCache 逐 token 一致，无 chat template 差异）。
+  - 复用 HeterCache 的 session_data.jsonl（已 tokenize 的多轮会话）。
+  - 直发 input_ids（与 HeterCache 逐 token 一致，无 chat template 差异）。
   - session_id 仅用于标识同一会话的多轮请求，不承载工作负载类型。
     不能用 extra_key 做 session 标签——extra_key 会隔离 radix tree
     命名空间，导致跨 session 的前缀（31-token system prompt）无法共享。
   - 并发模型：会话间并发（Semaphore），会话内逐轮串行（下一轮依赖上一轮 KV）。
   - 指标：命中率 = Σcached_tokens / Σprompt_tokens，来自每次响应的 meta_info。
 
-混合负载设计（逐函数对齐 UniCache vllm/simulator/simulator.py）：
+混合负载设计（逐函数对齐 HeterCache vllm/simulator/simulator.py）：
   - init_heap                    → build_hybrid_arrival_schedule()
       每 task 用 rng(seed+task_id) 打乱自身 session，Poisson(lambda_rate) 生成到达
       时刻，全部 task 的 (arrival_time, counter) 合并进同一个全局到达流。
@@ -31,7 +31,7 @@
       --base-url http://127.0.0.1:30000 \
       --concurrency 32 --output result/bench.json
 
-用法（混合负载，模仿 UniCache Hybrid/tasks_config.yaml）：
+用法（混合负载，模仿 HeterCache Hybrid/tasks_config.yaml）：
   python bench_unicache.py \
       --tasks-config hybrid_tasks_config.yaml \
       --base-url http://127.0.0.1:30000 \
@@ -66,7 +66,7 @@ def load_sessions(path: str, num_sessions: int, seed: Optional[int] = None,
     shuffle=False 时保持文件原始顺序：用于 mashqa 这类"同一文档的多个问题
     在文件中相邻"的数据，避免打乱后同文档兄弟问题被拆散、共享长前缀失效。
     混合负载模式下 shuffle 由 build_hybrid_arrival_schedule 用 (seed+task_id)
-    的 RNG 完成（对齐 UniCache init_heap），故此处传 shuffle=False。
+    的 RNG 完成（对齐 HeterCache init_heap），故此处传 shuffle=False。
     """
     sessions: List[Dict[str, Any]] = []
     with open(path, encoding="utf-8") as f:
@@ -78,7 +78,7 @@ def load_sessions(path: str, num_sessions: int, seed: Optional[int] = None,
             sessions.append(list(json.loads(line).values())[0])
             # 提前终止：仅当不需要「先打乱全集再截取」（shuffle=False）时，
             # 读满 num_sessions 即停，避免读入 GB 级大文件。
-            # 对齐 UniCache data_parser.read_simulator_data 的 max_records 提前 break。
+            # 对齐 HeterCache data_parser.read_simulator_data 的 max_records 提前 break。
             if (not shuffle and num_sessions and num_sessions > 0
                     and len(sessions) >= num_sessions):
                 break
@@ -91,12 +91,12 @@ def load_sessions(path: str, num_sessions: int, seed: Optional[int] = None,
 
 
 # --------------------------------------------------------------------------
-# 到达间隔配置（模仿 UniCache TaskData/*/tasks_config.yaml + vllm/simulator/simulator.py）
+# 到达间隔配置（模仿 HeterCache TaskData/*/tasks_config.yaml + vllm/simulator/simulator.py）
 # --------------------------------------------------------------------------
 def load_arrival_config(path: Optional[str]) -> Dict[str, Dict[str, Any]]:
     """读取到达间隔 YAML，返回 {task_name: {task_id, lambda_rate, mu, sigma, seed}}。
 
-    结构对齐 UniCache 的 tasks_config.yaml（见 Uni-Bench/arrival_config.yaml）。
+    结构对齐 HeterCache 的 tasks_config.yaml（见 Uni-Bench/arrival_config.yaml）。
     仅单负载模式使用：根据 session_id 前缀查该负载类型的轮间 mu/sigma。
     """
     if not path:
@@ -107,7 +107,7 @@ def load_arrival_config(path: Optional[str]) -> Dict[str, Dict[str, Any]]:
 
 
 def stable_seed_from_str(s: str, base_seed: int = 0) -> int:
-    """字符串 -> 稳定 32-bit seed（模仿 UniCache simulator.py stable_seed_from_str）。"""
+    """字符串 -> 稳定 32-bit seed（模仿 HeterCache simulator.py stable_seed_from_str）。"""
     h = hashlib.sha256(s.encode()).hexdigest()
     return (int(h, 16) + base_seed) % (2**32 - 1)
 
@@ -115,7 +115,7 @@ def stable_seed_from_str(s: str, base_seed: int = 0) -> int:
 def pick_arrival_params(task_cfg: Dict[str, Any], args) -> tuple:
     """按负载取 (mu, sigma)；显式指定 --mu/--sigma 时全局 override。
 
-    对应 UniCache simulator.py 的：
+    对应 HeterCache simulator.py 的：
         task_para = task_paras[task_name]
         wait_time = rng.lognormal(mean=task_para["mu"], sigma=task_para["sigma"])
     """
@@ -143,13 +143,13 @@ class BurstGate:
 
 
 # --------------------------------------------------------------------------
-# 混合负载：Poisson 会话到达调度（模仿 UniCache simulator.py init_heap）
+# 混合负载：Poisson 会话到达调度（模仿 HeterCache simulator.py init_heap）
 # --------------------------------------------------------------------------
 @dataclass
 class SessionArrival:
     """混合负载的一个「会话首轮到达事件」。
 
-    对齐 UniCache future_request_heap 的元素：
+    对齐 HeterCache future_request_heap 的元素：
       (timestamp, counter, request) —— timestamp 即 arrival_offset，counter 作 tiebreaker。
     """
     arrival_offset: float         # 相对起始时刻的到达时间（秒，Poisson 采样）
@@ -161,7 +161,7 @@ class SessionArrival:
 
 def generate_poisson_requests(lambda_rate: float, num_sessions: int,
                               seed: int) -> List[float]:
-    """模仿 UniCache simulator/utils.py::generate_poisson_requests。
+    """模仿 HeterCache simulator/utils.py::generate_poisson_requests。
     Poisson 过程：session 到达间隔服从 Exp(lambda_rate)（均值 1/lambda_rate），
     累加得到每个 session 的到达时刻。
     numpy 的 default_rng.exponential(scale=1/λ) 与 stdlib random.expovariate(λ)
@@ -181,7 +181,7 @@ def build_hybrid_arrival_schedule(tasks_config: Dict[str, Any],
                                   ) -> List[SessionArrival]:
     """把多个异构负载按 lambda_rate「比例」混成一条全局到达流。
 
-    逐行对齐 UniCache simulator.py::init_heap：
+    逐行对齐 HeterCache simulator.py::init_heap：
       1. 对每个 task：读其 session 数据（max_record 限制数量）
       2. 用 rng(seed + task_id) 打乱该 task 自身 session 顺序
       3. 用 Poisson(lambda_rate) 生成该 task 的 session 到达时刻
@@ -207,7 +207,7 @@ def build_hybrid_arrival_schedule(tasks_config: Dict[str, Any],
         task_id = task.get("task_id", 0)
         shuffle = task.get("shuffle", True)  # mashqa 等同文档问题相邻的数据可设 false
 
-        # 读 session（保持文件原序），再由该 task 独立 RNG 打乱（对齐 UniCache rng.shuffle）
+        # 读 session（保持文件原序），再由该 task 独立 RNG 打乱（对齐 HeterCache rng.shuffle）
         sessions = load_sessions(data_path, max_record, seed=None, shuffle=False)
         rng = random.Random(seed + task_id)
         if shuffle:
@@ -424,7 +424,7 @@ async def run_session(
     task_name = task_cfg.get("name", "default")
 
     # 每 session 独立 RNG，seed 由 (sid, task.seed, task.task_id) 确定性生成
-    # （模仿 UniCache simulator.py 的 stable_seed_from_str + _init_session_rngs）
+    # （模仿 HeterCache simulator.py 的 stable_seed_from_str + _init_session_rngs）
     base_seed = task_cfg.get("seed", args.seed) + task_cfg.get("task_id", 0) * 1000
     rng = random.Random(stable_seed_from_str(sid, base_seed=base_seed))
     num_turns = sess["num_turns"]
@@ -443,11 +443,11 @@ async def run_session(
         for t in range(1, num_turns + 1):
             turn = sess[f"turn_{t}"]
             payload = {
-                # 直发 token ids：与 UniCache 数据逐 token 一致
+                # 直发 token ids：与 HeterCache 数据逐 token 一致
                 "input_ids": turn["input_ids"],
-                # 固定输出长度，复现 UniCache 的 response_ids 长度
+                # 固定输出长度，复现 HeterCache 的 response_ids 长度
                 "max_new_tokens": len(turn["response_ids"]),
-                # Session identity only; it does not select an eviction policy.
+                # session_id 仅用于标识会话，不选择淘汰策略。
                 "session_id": sid,
                 "rid": f"{sid}_turn_{t}",
             }
@@ -496,10 +496,10 @@ async def run_session(
                     gate.done_one()
                 await asyncio.sleep(task_cfg.get("pause_s", 0.0))
 
-            # 轮间等待（inter-turn 到达间隔，模仿 UniCache simulator.py
+            # 轮间等待（inter-turn 到达间隔，模仿 HeterCache simulator.py
             #   _maybe_schedule_next_turn）：
             # gap_mode=fixed 用固定间隔；否则按负载类型取 lognormal(mu, sigma) 采样。
-            # wait_scale=0 不等（快速跑）；仅当还有下一轮时等待（对齐 UniCache）。
+            # wait_scale=0 不等（快速跑）；仅当还有下一轮时等待（对齐 HeterCache）。
             if args.wait_scale > 0 and t < num_turns:
                 if task_cfg.get("gap_mode") == "fixed":
                     wait = task_cfg.get("gap_s", 0.0)
@@ -615,14 +615,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--tasks-config",
         default=None,
-        help="混合负载 tasks_config.yaml 路径（模仿 UniCache tasks_config.yaml，"
+        help="混合负载 tasks_config.yaml 路径（模仿 HeterCache tasks_config.yaml，"
              "含多个 task 的 data_path/lambda_rate/mu/sigma/seed/max_record）",
     )
     p.add_argument(
         "--arrival-scale",
         type=float,
         default=1.0,
-        help="混合负载的 session 到达时刻整体缩放：1=UniCache 真实 Poisson 节奏；"
+        help="混合负载的 session 到达时刻整体缩放：1=HeterCache 真实 Poisson 节奏；"
              "0=所有 session 立即到达（等同单负载并发）；<1 加速压测",
     )
 

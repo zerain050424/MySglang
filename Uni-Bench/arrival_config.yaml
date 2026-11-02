@@ -9,40 +9,40 @@
 # 单负载模式使用第一个 task 的到达参数；混合模式按 tasks 配置选择参数。
 #
 # mu/sigma 取值来源：
-#   text / agentic / single / random —— 对齐 UniCache 对应 tasks_config.yaml 的
+#   text / agentic / single / random —— 对齐 HeterCache 对应 tasks_config.yaml 的
 #     到达间隔实测拟合值；
-#   file / image / search —— UniCache 未开源其到达间隔实测值，此处沿用其复用概率
+#   file / image / search —— HeterCache 未开源其到达间隔实测值，此处沿用其复用概率
 #     的 lognormal 拟合参数（vllm/core/evictor.py calculate_priority）作近似。
 tasks:
   - name: text            # ShareGPT-multi-turn-* / text_ShareGPT-multi-turn-*
     task_id: 0
     lambda_rate: 1
-    mu: 4.15              # UniCache TaskData/SharedGPT-multi-turn/tasks_config.yaml
+    mu: 4.15              # HeterCache TaskData/SharedGPT-multi-turn/tasks_config.yaml
     sigma: 0.971
     seed: 42
 
   - name: agentic         # alfred_*
     task_id: 1
     lambda_rate: 1
-    mu: 1.81              # UniCache TaskData/AgentBankData/tasks_config_alfred.yaml
+    mu: 1.81              # HeterCache TaskData/AgentBankData/tasks_config_alfred.yaml
     sigma: 1.092
     seed: 42
 
   - name: single          # 其余（Codeparrot 等单轮）
     task_id: 2
     lambda_rate: 1
-    mu: 1.81              # UniCache TaskData/Codeparrot/tasks_config.yaml
+    mu: 1.81              # HeterCache TaskData/Codeparrot/tasks_config.yaml
     sigma: 1.092
     seed: 42
 
   - name: random          # apps_* / mind2web_*
     task_id: 3
     lambda_rate: 1
-    mu: 1.81              # UniCache TaskData/AgentBankData/tasks_config.yaml
+    mu: 1.81              # HeterCache TaskData/AgentBankData/tasks_config.yaml
     sigma: 1.092
     seed: 42
 
-  - name: file            # file_ShareGPT-multi-turn-*（无 UniCache 到达间隔实测值）
+  - name: file            # file_ShareGPT-multi-turn-*（无 HeterCache 到达间隔实测值）
     task_id: 4
     lambda_rate: 1
     mu: 5.07658           # 复用概率 lognormal 拟合值（evictor.py）

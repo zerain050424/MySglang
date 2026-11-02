@@ -65,7 +65,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--arrival-config",
         default=str(HERE / "arrival_config.yaml"),
-        help="到达间隔 YAML 路径（模仿 UniCache tasks_config.yaml）",
+        help="到达间隔 YAML 路径（模仿 HeterCache tasks_config.yaml）",
     )
     p.add_argument("--mu", type=float, default=None,
                    help="轮间等待 lognormal mean 全局覆盖；默认 None=按负载类型取")

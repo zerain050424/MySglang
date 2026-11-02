@@ -1,7 +1,7 @@
 # Uni-Bench 实验设计总纲
 
 > 位置：`Uni-Bench/exp/README.md`
-> 范围：本目录收录 UniCache(SimpleHybrid) 在 sglang 上的两个受控实验设计。
+> 范围：本目录收录 HeterCache(SimpleHybrid) 在 sglang 上的两个受控实验设计。
 > 状态：Tailshot 已实现并产数（`result/tailshot*`）；Cascade 已设计并完成首次实测（`result/cascade/R3.*`），完整矩阵待跑。
 
 ---
@@ -25,7 +25,7 @@
 
 ## 1.1 目标
 
-定量暴露 **node-level recency 的尾部驱逐缺陷**：多轮长对话在轮间空窗被外来流挤出缓存、尾部（最新 turn）叶子先被驱逐，下一轮到达时整段历史重算 KV，TTFT 恶化。对照组：`simple_hybrid`（UniCache 迁移版：lognormal 复用概率 + alpha 在线平衡 + 两带驱逐）。
+定量暴露 **node-level recency 的尾部驱逐缺陷**：多轮长对话在轮间空窗被外来流挤出缓存、尾部（最新 turn）叶子先被驱逐，下一轮到达时整段历史重算 KV，TTFT 恶化。对照组：`simple_hybrid`（HeterCache 迁移版：lognormal 复用概率 + alpha 在线平衡 + 两带驱逐）。
 
 ## 1.2 设计要点
 

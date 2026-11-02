@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """MASHQA（webmd_squad_v2）原始 JSON → 单轮对话 JSON（服务器版）。
 
-【逻辑复刻（对齐 UniCache TaskData/mashqa_data/prepare_data.py）】
+【逻辑复刻（对齐 HeterCache TaskData/mashqa_data/prepare_data.py）】
   1. 读 train/test/val 三个 _full.json，每个 "data" 元素是一个文档（paragraph）。
   2. 每个文档取 context 作为长上下文，随机取 ~gauss(5.74, 1.0)（clamp 到 [1, len(qas)]）个问题。
   3. 每个问题生成一条单轮对话：

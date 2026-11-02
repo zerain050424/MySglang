@@ -8,7 +8,7 @@
   这里改为直接读本地 jsonl，避免重新下载。字段与 apps 数据集一致：
   {id, question, solutions(str-JSON), input_output(str-JSON), difficulty, url, starter_code}
 
-【逻辑复刻（对齐 UniCache TaskData/Codeparrot/prepare_data.py）】
+【逻辑复刻（对齐 HeterCache TaskData/Codeparrot/prepare_data.py）】
   1. 只保留 difficulty == "introductory" 的题目（与 load_dataset 过滤一致）。
   2. 每道题取第一个 input/output 样例拼进 prompt：
        "Question: <question> <Use Standard/Call-Based format> <io> \n\nAnswer:\n"

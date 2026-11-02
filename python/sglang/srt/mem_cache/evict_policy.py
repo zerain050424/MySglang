@@ -10,6 +10,7 @@ from sglang.srt.mem_cache.uni_utils import (
     TASK_CONFIG,
     WORKLOAD_LABELS,
     workload_label_of,
+    SimpleHybridQueueTag,
     SimpleHybridTaskType,
     _cached_lognorm_cdf,
 )
@@ -184,10 +185,21 @@ class SimpleHybridStrategy(EvictionStrategy):
         self._total_evicted_one_shot = 0.0
     @staticmethod
     def _task_type_of(node) -> SimpleHybridTaskType:
-         return getattr(node, "task_type", None) or SimpleHybridTaskType.SINGLE_TURN
+        explicit_type = getattr(node, "task_type", None)
+        if explicit_type is not None:
+            return explicit_type
+
+        # 队列标签由缓存状态机维护。固定映射为各队列提供策略语义，
+        # 不检查会话 ID 或提示词。
+        return {
+            SimpleHybridQueueTag.QTRANS: SimpleHybridTaskType.SINGLE_TURN_RANDOM,
+            SimpleHybridQueueTag.QSTRUCT: SimpleHybridTaskType.MULTI_TURN_TEXT,
+            SimpleHybridQueueTag.QAGENT: SimpleHybridTaskType.MULTI_TURN_AGENTIC,
+            SimpleHybridQueueTag.QCHAT: SimpleHybridTaskType.SINGLE_TURN,
+        }.get(getattr(node, "queue_tag", None), SimpleHybridTaskType.SINGLE_TURN)
 
     def _reuse_score(self, node) -> float:
-        """calculate_priority() from UniCache, with time.monotonic() as now."""
+        """calculate_priority() from HeterCache, with time.monotonic() as now."""
         task_type = self._task_type_of(node)
         num_tokens = len(node.value) if node.value is not None else 0
         elapsed = time.monotonic() - node.last_access_time
@@ -200,7 +212,7 @@ class SimpleHybridStrategy(EvictionStrategy):
             return alpha * reuse_prob
         if task_type == SimpleHybridTaskType.SINGLE_TURN:
             alpha = self.alpha_balance.get("single", 1.0)
-            # UniCache 的 offset 是块在序列中的绝对结束位置，不是 radix 片段长度。
+            # HeterCache 的 offset 是块在序列中的绝对结束位置，不是 radix 片段长度。
             offset_factor = 1.0 - _node_end_offset(node) / (self.max_offset or 1)
             offset_factor = max(0.0, min(1.0, offset_factor))
             #  单轮分数 = alpha * 位置项。
@@ -247,7 +259,7 @@ class SimpleHybridStrategy(EvictionStrategy):
     def one_shot_key(self, node) -> tuple:
         """one-shot 带内排序：树上结束偏移最深的块先淘汰。
 
-        口径对齐 UniCache 的 evict_first 堆键（-num_hashed_tokens，
+        口径对齐 HeterCache 的 evict_first 堆键（-num_hashed_tokens，
         即块的绝对结束位置）：序列里越靠后的生成段越先走。"""
         return (-_node_end_offset(node), node.last_access_time)
 

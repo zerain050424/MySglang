@@ -97,7 +97,7 @@ class InsertParams:
     chunked: bool = False
     priority: int = 0
     session_id: Optional[str] = None
-    # SimpleHYBRID (UniCache) workload metadata stamped onto new tree nodes.
+    # SimpleHYBRID (HeterCache) workload metadata stamped onto new tree nodes.
     task_type: Optional[SimpleHybridTaskType] = None
     decode_start: Optional[int] = None
     track_adopted_ranges: bool = False

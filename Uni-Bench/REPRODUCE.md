@@ -1,13 +1,13 @@
 # Uni-Bench 服务器复现流程（AutoDL + Qwen2.5-7B-Instruct）
 
-本目录在服务器 `/root/sg-unicache/Uni-Bench`，是对本地 UniCache 数据准备与发送逻辑的
+本目录在服务器 `/root/sg-unicache/Uni-Bench`，是对本地 HeterCache 数据准备与发送逻辑的
 **复用 + 服务器适配**。所有脚本含中文注释，可直接按序执行。
 
 ## 环境
 
 | 组件 | 位置 |
 |---|---|
-| UniCache 部署 venv | `/root/sl_old`（python 3.12.3，torch 2.13.0，与 9-26 基线 pin 一致） |
+| HeterCache 部署 venv | `/root/sl_old`（python 3.12.3，torch 2.13.0，与 9-26 基线 pin 一致） |
 | 模型（tokenizer 必须一致） | `/root/autodl-tmp/model/Qwen2.5-7B-Instruct` |
 | 原始数据集 | `/root/autodl-tmp/TaskData/`（下载脚本见 `download_datasets.sh`） |
 | server 启动环境 | `env.sh`（venv python + ninja PATH + LD_LIBRARY_PATH） |
@@ -64,7 +64,7 @@ bash run_all.sh   # POLICIES="lru simple_hybrid" × TOKENS_LIST="50000 100000 20
 
 ## 关键设计（为什么这么改）
 
-1. **tokenizer 必须 Qwen2.5-7B-Instruct**：本地 UniCache 数据是 Llama-3 tokenizer 产物
+1. **tokenizer 必须 Qwen2.5-7B-Instruct**：本地 HeterCache 数据是 Llama-3 tokenizer 产物
    （demo head20 也是），服务器模型是 Qwen2.5，必须重生成，否则 token ids 错位全 miss。
 2. **直发 input_ids + session_id 标识会话**：session_id 前缀不再决定 task_type，
    同一 session 恒定且不影响 radix tree 命名空间。

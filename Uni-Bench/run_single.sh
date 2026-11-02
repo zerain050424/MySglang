@@ -5,7 +5,7 @@
 #
 # 用法（server 需已用同一 policy 启动，见 serve.sh）：
 #   bash run_single.sh lru             # → result/LRU/
-#   bash run_single.sh simple_hybrid   # → result/UniCache/
+#   bash run_single.sh simple_hybrid   # → result/HeterCache/
 #   POLICY=lfu bash run_single.sh      # → result/LFU/
 #
 # 可调环境变量：
@@ -32,10 +32,10 @@ CONC=${CONC:-32}
 MASHQA_CONC=${MASHQA_CONC:-8}
 WAIT_SCALE=${WAIT_SCALE:-1}
 
-# policy → 输出目录名（LRU / UniCache / ...）
+# policy → 输出目录名（LRU / HeterCache / ...）
 case "$POLICY" in
   lru)           DIR="LRU" ;;
-  simple_hybrid) DIR="UniCache" ;;
+  simple_hybrid) DIR="HeterCache" ;;
   lfu)           DIR="LFU" ;;
   slru)          DIR="SLRU" ;;
   *)             DIR="$(echo "$POLICY" | tr 'a-z' 'A-Z')" ;;

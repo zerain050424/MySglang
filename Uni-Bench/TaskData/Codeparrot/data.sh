@@ -3,7 +3,7 @@
 # Codeparrot(APPS) 数据准备（服务器版）
 # 流程: test.jsonl（已下载 1.29GB）→ prepare_data.py → prepare_session_data.py
 # 产物: TaskData/Codeparrot/Qwen2.5-7B-Instruct/Code_session_data.jsonl
-# 说明: 默认 id 前缀 "Code-"（→SINGLE_TURN，与原版 UniCache 一致）；
+# 说明: 默认 id 前缀 "Code-"（→SINGLE_TURN，与原版 HeterCache 一致）；
 #       想归入 SINGLE_TURN_RANDOM 队列可把 ID_PREFIX 改成 apps_
 # =============================================================================
 set -eu

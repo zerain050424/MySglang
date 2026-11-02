@@ -1,6 +1,6 @@
 """Proof tests: SimpleHybrid "offset" must be the ABSOLUTE token offset.
 
-UniCache's heap key is (-num_hashed_tokens, ...), where num_hashed_tokens is a
+HeterCache's heap key is (-num_hashed_tokens, ...), where num_hashed_tokens is a
 block's end offset in the sequence. The sglang port used len(node.value)
 (radix node segment length) instead, which is an artifact of sharing topology,
 not of position in the sequence. These tests pin down the intended semantics:
@@ -399,7 +399,7 @@ def test_one_shot_still_drained_first():
 
 
 def test_one_shot_order_by_tree_offset():
-    """one-shot 带内按树上结束偏移降序（对齐 UniCache -num_hashed_tokens）。
+    """one-shot 带内按树上结束偏移降序（对齐 HeterCache -num_hashed_tokens）。
 
     两个单轮请求（独立分支）：response 段 A=end 160/len 60，B=end 540/len 40。
     按片段长度排序会先淘汰 A；按树上结束偏移应先淘汰 B（位置更深），
@@ -723,7 +723,7 @@ def test_workload_and_band_are_orthogonal():
     两个维度：
       - workload：response 段属于 agentic（记账不能丢）；
       - one-shot：**多轮**的 response 不是一次性内容 —— 它会成为下一轮
-                  prompt 的前缀（对齐 UniCache：按会话类型归队，没有
+                  prompt 的前缀（对齐 HeterCache：按会话类型归队，没有
                   「decode 就先进 one-shot」这条规则）。
     只有单轮负载的生成段才是一次性的。
     """
@@ -824,7 +824,7 @@ def test_record_evict_one_shot_scalar():
 def test_multiturn_decode_is_not_one_shot():
     """多轮负载的 response(decode) 段不得进入 one-shot。
 
-    UniCache 按会话类型归队：agentic/text 的 response 会成为下一轮 prompt 的
+    HeterCache 按会话类型归队：agentic/text 的 response 会成为下一轮 prompt 的
     前缀，是真实复用的一部分。原实现把 is_decode 无条件映射到 evict_first，
     导致「上一轮结束 → 下一轮开始」的窗口里被优先驱逐。
     只有单轮负载的生成段（以及随机单轮）才是一次性内容。

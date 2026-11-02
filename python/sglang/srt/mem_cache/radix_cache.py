@@ -50,6 +50,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.uni_utils import (   
     SessionRegistry,
+    SimpleHybridQueueTag,
     SimpleHybridTaskType,
     workload_label_of,
 )
@@ -267,7 +268,7 @@ class TreeNode: ## TreeNode 是基数树（RadixTree）的节点，每个节点�
         self.key: RadixKey = None
         self.value: Optional[torch.Tensor] = None ##挂在在节点上的缓存值，通常是KV缓存的索引或数据片段
         ## SimpleHYBRID：本节点片段第一个 token 在整条序列中的绝对偏移（从根算起）。
-        ## abs_start + len(value) 即 UniCache/vLLM 的 num_hashed_tokens（片段结束偏移）。
+        ## abs_start + len(value) 即 HeterCache/vLLM 的 num_hashed_tokens（片段结束偏移）。
         ## 注意：radix 片段长度由「共享拓扑」决定，与序列位置无关，二者不可混用。
         self.abs_start = abs_start
         self.lock_ref = 0 ## 节点的锁引用计数，表示有多少请求正在使用该节点及其子树，防止被驱逐。
@@ -280,11 +281,12 @@ class TreeNode: ## TreeNode 是基数树（RadixTree）的节点，每个节点�
         # Namespace-aware hashes used only for external KV events.
         self.event_hash_value: Optional[List[str]] = None
         # priority for priority-aware eviction
-        # SimpleHYBRID (UniCache) workload metadata.
+        # SimpleHYBRID (HeterCache) workload metadata.
         # task_type: multi-turn text/file/image/search/agentic vs single-turn.
         # is_decode: generated-output (decode) portion, never reused, evict first.
         self.priority = priority
         self.task_type = None
+        self.queue_tag = SimpleHybridQueueTag.QTRANS
         self.is_decode = False
         # SimpleHYBRID：节点归属的会话（用于会话级缺口记账，见 uni_utils.SessionRegistry）
         self.session_id: Optional[str] = None
@@ -533,8 +535,8 @@ class RadixCache(BasePrefixCache):
 
         # Radix Cache takes one ref in memory pool
         priority = req.priority or 0
-        # Locate the prompt/output boundary so decode-portion nodes can be
-        # flagged without requiring a client-provided workload tag.
+        # 定位 prompt/output 边界，使 decode 部分节点可以单独标记；
+        # 不再要求客户端提供工作负载类型标签。
         task_type = None
         decode_start = (len(req.origin_input_ids) // self.page_size) * self.page_size
         # SimpleHYBRID：会话账本入口。请求写入后链完整驻留，缺口归零。
@@ -825,15 +827,16 @@ class RadixCache(BasePrefixCache):
         value = []
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key] ## 获取匹配的子节点
-            child.last_access_time = access_time
             prefix_len = child.key.match(key, page_size=self.page_size) ##计算当前节点的key与子节点的key的匹配长度，返回匹配的逻辑单位数量，向下取整为page_size的整数倍
             if prefix_len < len(child.key): ## 如果匹配长度小于子节点的key长度，说明匹配结束在子节点的中间，需要将子节点拆分为两个节点，一个表示匹配的前缀，一个表示剩余的后缀
                 new_node = self._split_node(child.key, child, prefix_len)
+                self._record_node_hit(new_node, access_time)
                 value.append(new_node.value) ## 追加KV张量
                 node = new_node ## 将当前节点更新为新创建的节点
                 break
             else:
                 value.append(child.value) ## 完全匹配追加全量张量
+                self._record_node_hit(child, access_time)
                 node = child ## 将当前节点更新为子节点
                 key = key[prefix_len:] ## 将key截断为剩余未匹配的部分
 
@@ -841,6 +844,18 @@ class RadixCache(BasePrefixCache):
                     child_key = key.child_key(self.page_size)
 
         return value, node
+
+    def _record_node_hit(self, node: TreeNode, access_time: float) -> None:
+        """根据命中间隔更新节点状态。"""
+        delta = access_time - node.last_access_time
+        node.hit_count += 1
+        if node.queue_tag != SimpleHybridQueueTag.QSTRUCT:
+            node.queue_tag = (
+                SimpleHybridQueueTag.QAGENT
+                if delta < 8.0
+                else SimpleHybridQueueTag.QCHAT
+            )
+        node.last_access_time = access_time
 
     def _split_node(
            self,
@@ -864,6 +879,7 @@ class RadixCache(BasePrefixCache):
            # SimpleHYBRID metadata: prefix half inherits; suffix half is
            # reclassified as decode when the split lands at/after decode_start.
            new_node.task_type = child.task_type
+           new_node.queue_tag = child.queue_tag
            new_node.is_decode = child.is_decode
            new_node.session_id = child.session_id
            self.session_registry.attach(new_node.session_id, len(new_node.value))
@@ -942,6 +958,7 @@ class RadixCache(BasePrefixCache):
             new_node.key = key
             new_node.value = value.clone()
             new_node.task_type = task_type
+            new_node.queue_tag = SimpleHybridQueueTag.QTRANS
             new_node.is_decode = (
                 decode_start is not None and total_prefix_length >= decode_start
             )
@@ -949,6 +966,8 @@ class RadixCache(BasePrefixCache):
             self.session_registry.attach(session_id, len(new_node.value))
             self._inc_hit_count(new_node, chunked)
             node.children[child_key] = new_node
+            if node is not self.root_node and len(node.children) >= 2:
+                node.queue_tag = SimpleHybridQueueTag.QSTRUCT
             self.evictable_size_ += len(key)
             self._update_leaf_status(node)
             self._update_leaf_status(new_node)

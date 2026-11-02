@@ -8,7 +8,7 @@
 set -eu
 UB="$(cd "$(dirname "$0")/../.." && pwd)"          # Uni-Bench 根目录
 TOKENIZER="/root/autodl-tmp/model/Qwen2.5-7B-Instruct"  # 服务器模型（可改）
-PY="/root/sl_old/bin/python"                        # UniCache 部署环境 python
+PY="/root/sl_old/bin/python"                        # HeterCache 部署环境 python
 RAW="/root/autodl-tmp/TaskData/SharedGPT-multi-turn/ShareGPT_V3_unfiltered_cleaned_split.json"
 OUT_DIR="$UB/TaskData/SharedGPT-multi-turn/Qwen2.5-7B-Instruct"
 mkdir -p "$OUT_DIR"

@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""UniCache 数据准备：raw 对话 JSON → session_data.jsonl（独立版，无 vllm 依赖）。
+"""HeterCache 数据准备：raw 对话 JSON → session_data.jsonl（独立版，无 vllm 依赖）。
 
 【背景】
-  本地 UniCache 用 vllm 的 vllm.simulator.data_parser.prepare_simulator_data_streaming_jsonl
+  本地 HeterCache 用 vllm 的 vllm.simulator.data_parser.prepare_simulator_data_streaming_jsonl
   把"多轮对话原始数据"转成逐 session、逐 turn 的 token 序列。服务器上没有 vllm，
   这里用纯 transformers 复刻同样的逻辑（输出格式逐字节一致），方便后续
   bench_unicache.py 直接复用。
 
-【输出格式】（与 UniCache 完全一致，一行一个 session）
+【输出格式】（与 HeterCache 完全一致，一行一个 session）
   {"<session_id>": {
       "id": "<session_id>",
       "num_turns": N,
@@ -19,9 +19,9 @@
 【关键点】
   1. tokenizer 必须与 sglang server 加载的模型一致（本项目用 Qwen2.5-7B-Instruct）。
      server 直发 input_ids，tokenizer 不一致会全部前缀 miss。
-  2. input_ids 带 BOS（add_special_tokens=True）；response_ids 不带 BOS（对齐 UniCache）。
+  2. input_ids 带 BOS（add_special_tokens=True）；response_ids 不带 BOS（对齐 HeterCache）。
   3. apply_chat_template 的 date_string="13 Sep 2025" 是 Llama 3 模板的固定日期；
-     Qwen2.5 模板不引用它（自动忽略），保留参数仅为对齐 UniCache 的 prompt 构造。
+     Qwen2.5 模板不引用它（自动忽略），保留参数仅为对齐 HeterCache 的 prompt 构造。
 
 【用法】
   /root/sl_old/bin/python prepare_session_data.py \
@@ -40,7 +40,7 @@ from transformers import AutoTokenizer
 
 
 # --------------------------------------------------------------------------
-# 单个 prompt 的文本构造（复刻 UniCache get_prompt_text）
+# 单个 prompt 的文本构造（复刻 HeterCache get_prompt_text）
 # --------------------------------------------------------------------------
 def get_prompt_text(tokenizer, conversations, add_generation_prompt: bool = True) -> str:
     """把 conversations 按 chat template 拼成 prompt 文本。
@@ -48,7 +48,7 @@ def get_prompt_text(tokenizer, conversations, add_generation_prompt: bool = True
     - conversations: [{"role": "user"/"assistant", "content": ...}, ...]
     - add_generation_prompt=True: 末尾追加"等待 assistant 回复"的占位
       （Qwen 是 <|im_start|>assistant\n；Llama 3 是 <|start_header_id|>assistant<|end_header_id|>）
-    - date_string="13 Sep 2025": 对齐 UniCache 的固定日期（Qwen 模板忽略该 kwarg）
+    - date_string="13 Sep 2025": 对齐 HeterCache 的固定日期（Qwen 模板忽略该 kwarg）
     """
     chat = [{"role": t["from"], "content": t["value"].strip()} for t in conversations]
     # 校验：生成前最后一轮必须是 user
@@ -58,7 +58,7 @@ def get_prompt_text(tokenizer, conversations, add_generation_prompt: bool = True
     if ends_with_user and not add_generation_prompt:
         raise ValueError("The last turn must be from 'assistant' when add_generation_prompt=False.")
     try:
-        # 对齐 UniCache 的固定日期（Llama 模板需要；Qwen 模板未引用则自动忽略）
+        # 对齐 HeterCache 的固定日期（Llama 模板需要；Qwen 模板未引用则自动忽略）
         return tokenizer.apply_chat_template(
             chat, tokenize=False, add_generation_prompt=add_generation_prompt,
             date_string="13 Sep 2025")
@@ -69,7 +69,7 @@ def get_prompt_text(tokenizer, conversations, add_generation_prompt: bool = True
 
 
 # --------------------------------------------------------------------------
-# 单 session 的 turn 切分（复刻 UniCache prepare_session_data_*）
+# 单 session 的 turn 切分（复刻 HeterCache prepare_session_data_*）
 # --------------------------------------------------------------------------
 def prepare_session_data_with_system_prompt(entry: Dict[str, Any], tokenizer):
     """conversations 以 system 开头（system, user, assistant, ...）：
@@ -130,7 +130,7 @@ def prepare_session_data(entry: Dict[str, Any], tokenizer):
 # 主流程：流式写 JSONL
 # --------------------------------------------------------------------------
 def main() -> None:
-    p = argparse.ArgumentParser(description="UniCache 数据准备（独立版，无 vllm 依赖）")
+    p = argparse.ArgumentParser(description="HeterCache 数据准备（独立版，无 vllm 依赖）")
     p.add_argument("--raw_data_path", required=True, help="raw 对话 JSON（[{id, conversations:[{from,value}]}]）")
     p.add_argument("--save_data_path", required=True, help="输出 session_data.jsonl（一行一个 session）")
     p.add_argument("--tokenizer_path", default="/root/autodl-tmp/model/Qwen2.5-7B-Instruct",
