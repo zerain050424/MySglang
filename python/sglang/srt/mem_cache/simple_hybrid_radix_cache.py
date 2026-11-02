@@ -12,6 +12,7 @@ from sglang.srt.mem_cache.base_prefix_cache import EvictParams, EvictResult
 from sglang.srt.mem_cache.evict_policy import SimpleHybridStrategy
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.registry import register_radix_cache_backend
+from sglang.srt.mem_cache.uni_utils import SimpleHybridTaskType
 
 
 class SimpleHybridRadixCache(RadixCache):
@@ -48,6 +49,12 @@ class SimpleHybridRadixCache(RadixCache):
                 victim = min(one_shot, key=strategy.one_shot_key)
             elif leaves:
                 victim = min(leaves, key=strategy.victim_key)
+                if strategy._task_type_of(victim) == SimpleHybridTaskType.MULTI_TURN_AGENTIC:
+                    rr_victim = strategy.pick_agentic_rr_victim(
+                        leaves, self.session_registry
+                    )
+                    if rr_victim is not None:
+                        victim = rr_victim
             else:
                 break
             num_evicted += self._evict_one(victim)

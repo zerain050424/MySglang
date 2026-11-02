@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 import logging
 import time
 from collections import deque
-from typing import TYPE_CHECKING, Dict, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, Iterable, Optional, Tuple, Union
 
 from sglang.srt.mem_cache.uni_utils import (
     TASK_CONFIG,
@@ -13,6 +13,8 @@ from sglang.srt.mem_cache.uni_utils import (
     SimpleHybridQueueTag,
     SimpleHybridTaskType,
     _cached_lognorm_cdf,
+    SessionRegistry,
+    SessionState,
 )
 
 if TYPE_CHECKING:
@@ -146,6 +148,10 @@ class SimpleHybridStrategy(EvictionStrategy):
         max_alpha_step: float = 3.0,
         alpha_smooth: float = 0.7,
         alpha_temperature: float = 0.5,
+        fair_rr: bool = False,
+        kappa: float = 0.5,
+        min_retain_tokens: int = 512,
+        min_retain_frac: float = 0.3,
     ):
         self.max_offset = max_offset or 2048
         # ---- alpha 控制器的稳定性参数----
@@ -169,6 +175,13 @@ class SimpleHybridStrategy(EvictionStrategy):
                 "agentic": 1.0,
             }
         )
+        self.fair_rr = fair_rr
+        self.kappa = kappa
+        self.min_retain_tokens = min_retain_tokens
+        self.min_retain_frac = min_retain_frac
+        self._rr_last: Dict[str, int] = {}
+        self._rr_seq = 0
+        self._quota_breach = 0
         # 在线更新α状态
         self.update_interval = update_interval
         self._last_update = time.monotonic()
@@ -237,6 +250,61 @@ class SimpleHybridStrategy(EvictionStrategy):
             统一淘汰键：复用分数低者先走，同分时 token 多者先走。
         """
         return (self._reuse_score(node), -_node_num_tokens(node))
+
+    def _loss_cap(self, chain_len: int) -> float:
+        keep = max(self.min_retain_tokens, self.min_retain_frac * chain_len)
+        return max(0.0, min(self.kappa * chain_len, chain_len - keep))
+
+    def _pick_round_robin(
+        self,
+        leaves: Iterable["TreeNode"],
+        registry: "SessionRegistry",
+    ) -> Optional["TreeNode"]:
+        """Pick the deepest leaf of the least recently served Agentic session."""
+        tails: Dict[str, Tuple["TreeNode", "SessionState"]] = {}
+        for node in leaves:
+            sid = getattr(node, "session_id", None)
+            if sid is None:
+                continue
+            state = registry.get(sid)
+            if state is None or state.L <= 0:
+                continue
+            current = tails.get(sid)
+            if current is None or _node_end_offset(node) > _node_end_offset(current[0]):
+                tails[sid] = (node, state)
+
+        best = None
+        for sid, (node, state) in tails.items():
+            if state.d >= self._loss_cap(state.L):
+                continue
+            last = self._rr_last.get(sid, -1)
+            if best is None or last < best[0]:
+                best = (last, sid, node)
+        if best is None:
+            return None
+
+        self._rr_last[best[1]] = self._rr_seq
+        self._rr_seq += 1
+        return best[2]
+
+    def pick_agentic_rr_victim(
+        self,
+        leaves: Iterable["TreeNode"],
+        registry: "SessionRegistry",
+    ) -> Optional["TreeNode"]:
+        if not self.fair_rr:
+            return None
+        agentic_leaves = [
+            node
+            for node in leaves
+            if self._task_type_of(node) == SimpleHybridTaskType.MULTI_TURN_AGENTIC
+        ]
+        if not agentic_leaves:
+            return None
+        victim = self._pick_round_robin(agentic_leaves, registry)
+        if victim is None:
+            self._quota_breach += 1
+        return victim
 
     def is_one_shot(self, node) -> bool:
         """
