@@ -178,6 +178,7 @@ def paired_ratio_delta(
     rows_b: Sequence[dict],
     *,
     task: Optional[str] = None,
+    kind: Optional[str] = None,
     n_boot: int = 5000,
     seed: int = 0,
     alpha: float = 0.05,
@@ -191,8 +192,15 @@ def paired_ratio_delta(
     def key(r):
         return (r["task"], r["sid"], r["turn"])
 
-    ka = {key(r): r for r in rows_a if task is None or r["task"] == task}
-    kb = {key(r): r for r in rows_b if task is None or r["task"] == task}
+    def keep(r):
+        if task is not None and r["task"] != task:
+            return False
+        if kind is not None and _kind(r.get("sid", "")) != kind:
+            return False
+        return True
+
+    ka = {key(r): r for r in rows_a if keep(r)}
+    kb = {key(r): r for r in rows_b if keep(r)}
     keys = sorted(set(ka) & set(kb))
     if not keys:
         return {"n": 0, "mean": 0.0, "lo": 0.0, "hi": 0.0}
@@ -290,6 +298,69 @@ def cover(L: int):
 # ---------------------------------------------------------------------------
 # 表
 # ---------------------------------------------------------------------------
+def _kind(sid: str) -> str:
+    """按 session_id 前缀把请求分成两个成分（与 wtl.synth 的命名约定一致）。"""
+    return "burst" if "noise" in (sid or "") else "struct"
+
+
+def _split_hit(rows, kind=None) -> dict:
+    """成分内命中率：Σcached/Σprompt。"""
+    sel = [r for r in rows if kind is None or _kind(r.get("sid", "")) == kind]
+    prompt = sum(float(r["prompt_tokens"]) for r in sel)
+    cached = sum(float(r["cached_tokens"]) for r in sel)
+    return {
+        "n": len(sel),
+        "prompt": prompt,
+        "cached": cached,
+        "hit_pct": round(100.0 * cached / prompt, 3) if prompt else 0.0,
+    }
+
+
+def _ret_from_rows(rows, layers, kind=None) -> Dict[int, dict]:
+    """按成分计算前缀保留度：I = 1[cached>=L]，cover = min(cached,L)/L。
+
+    直接用逐请求 rows 算，不需要 replay 参与——这样 burst 请求不会稀释
+    结构复用的保留度（它们是「本就没有前缀」的干扰项）。
+    """
+    out: Dict[int, dict] = {}
+    for L in layers or []:
+        sel = [
+            r for r in rows
+            if (kind is None or _kind(r.get("sid", "")) == kind)
+        ]
+        if not sel:
+            continue
+        full = sum(1 for r in sel if float(r["cached_tokens"]) >= L)
+        cover = sum(min(float(r["cached_tokens"]), L) / L for r in sel)
+        out[int(L)] = {
+            "n": len(sel),
+            "full_rate": round(full / len(sel), 4),
+            "cover": round(cover / len(sel), 4),
+        }
+    return out
+
+
+def _rho(d: dict) -> Optional[float]:
+    """干扰强度 ρ = **两次模板复用之间的 burst token** / 池容量。
+
+    burst 在时间上均匀铺开时，一个模板的两次使用之间会插入
+    ``noise_sessions / U`` 个一次性请求（U = 模板总使用次数 = 变体数×每模板会话×轮数），
+    它们合计 ``(noise/U)×doc_len`` 个 token —— 这才是「干扰能否冲掉前缀」的判据。
+    ρ ≳ 1 表示 burst 有能力在模板复用之间把池子刷一遍。
+    """
+    meta = d.get("meta") or {}
+    variants = meta.get("variants") or []
+    breadth = int(meta.get("breadth") or 0)
+    turns = int(meta.get("turns") or 0)
+    noise = int(meta.get("noise_sessions") or 0)
+    doc_len = int(meta.get("doc_len") or 0)
+    pool = int(d.get("pool_tokens") or 0)
+    uses = max(len(variants), 1) * max(breadth, 1) * max(turns, 1)
+    if noise <= 0 or doc_len <= 0 or pool <= 0 or uses <= 0:
+        return None
+    return round((noise / uses) * doc_len / pool, 3)
+
+
 def offline_table(runs: Sequence[dict]) -> List[dict]:
     rows = []
     for d in runs:
@@ -304,6 +375,10 @@ def offline_table(runs: Sequence[dict]) -> List[dict]:
             "label": d.get("label"),
             "workload": d.get("workload"),
             "ratio": d.get("ratio"),
+            "ladder": (
+                f"pool={d.get('pool_tokens')}" if d.get("ratio") is None
+                else f"r={d.get('ratio')}"
+            ),
             "pool_tokens": d.get("pool_tokens"),
             "calib_peak": d.get("calib_peak"),
             "seed": d.get("seed"),
@@ -327,6 +402,20 @@ def offline_table(runs: Sequence[dict]) -> List[dict]:
             for L, v in layers.items():
                 row[f"ret_{task}@{L}_full"] = v.get("full_rate")
                 row[f"ret_{task}@{L}_cover"] = v.get("cover")
+        rows_ = d.get("rows") or []
+        if rows_:
+            for kind in ("struct", "burst"):
+                st_ = _split_hit(rows_, kind)
+                row[f"hit_{kind}"] = st_["hit_pct"]
+                row[f"n_{kind}"] = st_["n"]
+        row["rho"] = _rho(d)
+        layers = []
+        for v in (d.get("layers_by_task") or {}).values():
+            layers = sorted(set(layers) | set(v or []))
+        for kind in ("struct", "burst"):
+            for L, v in _ret_from_rows(rows_, layers, kind).items():
+                row[f"ret_{kind}@{L}_full"] = v["full_rate"]
+                row[f"ret_{kind}@{L}_cover"] = v["cover"]
         for k, v in (s.get("per_task") or {}).items():
             row[f"hit_{k}"] = v.get("hit_pct")
         for k, v in (s.get("history_retention") or {}).items():
@@ -378,89 +467,114 @@ def criterion(passed: Optional[bool], name: str, detail: str) -> str:
 
 
 def judge(offline: Sequence[dict], paired: Sequence[dict], online: Sequence[dict]) -> List[str]:
+    """H1–H6 预注册判定（见 EXPERIMENT.md §1）。
+
+    ``paired`` 里是请求级配对差（单位 pp / ms）；``offline`` 是逐 run 汇总（用于 H4/H6）。
+    """
     lines = ["| 判据 | 结论 | 依据 |", "|---|---|---|"]
-    # M2: hit +5pp（对 A0，取 workload=hybrid/sharegpt 的最大提升）
-    hit_deltas = [p for p in paired if p["metric"] == "hit_pct" and p["base"] in ("A0",)]
-    best = max(hit_deltas, key=lambda p: p["mean"], default=None)
-    lines.append(
-        criterion(
-            (best["mean"] >= 5.0 and best["lo"] > 0) if best else None,
-            "M2 命中率 ≥ +5pp",
-            f"{best['arm']} vs {best['base']} @ {best['workload']} r{best['ratio']}: "
-            f"{best['mean']:+.2f}pp [{best['lo']:+.2f},{best['hi']:+.2f}]" if best else "无配对数据",
-        )
-    )
-    # M1：优先用 ≥2k 的跨会话共享前缀层；真实数据的跨会话 LCP 只有几十 token 时，
-    # 退化为「会话内历史保留度」（上一轮完整 prompt 是否仍在树上）——这才是
-    # 多轮 chat/agentic 上真正决定 TTFT 的前缀保留。
-    ret = [p for p in paired if p["metric"].startswith("ret@") and "@2048" in p["metric"]]
-    bestr = max(ret, key=lambda p: p["mean"], default=None)
-    if bestr:
-        lines.append(
-            criterion(
-                (bestr["mean"] >= 10.0 and bestr["lo"] > 0),
-                "M1 共享前缀保留 ≥ +10pp",
-                f"{bestr['arm']} vs {bestr['base']} @ {bestr['workload']} r{bestr['ratio']}: "
-                f"{bestr['mean']:+.2f}pp [{bestr['lo']:+.2f},{bestr['hi']:+.2f}]",
-            )
-        )
+    MAIN_POOL = 20000
+
+    def best(metric: str, arm: str, base: str, prefer_pool: int = MAIN_POOL):
+        cands = [p for p in paired if p["metric"] == metric and p["arm"] == arm and p["base"] == base]
+        if not cands:
+            return None
+        cands.sort(key=lambda p: (abs((p.get("pool") or 0) - prefer_pool), -p["n"]))
+        return cands[0]
+
+    def fmt(p):
+        return (f"{p['arm']} vs {p['base']} @ {p['workload']} pool={p.get('pool')}: "
+                f"{p['mean']:+.2f}pp [{p['lo']:+.2f},{p['hi']:+.2f}]")
+
+    # ---- H1 结构复用保留度 ----
+    ret = [p for p in paired if p["metric"].startswith("ret_struct@")
+           and p["arm"] == "A3" and p["base"] == "A2"]
+    if ret:
+        # 取最深的层（= 模板整段前缀）
+        depth = max(int(p["metric"].split("@")[1]) for p in ret)
+        h1 = best(f"ret_struct@{depth}", "A3", "A2")
+        ok = h1["mean"] >= 5.0 and h1["lo"] > 0
+        lines.append(criterion(ok, f"H1 保留度 ret@{depth} ≥ +5pp", fmt(h1)))
     else:
-        hist = [p for p in paired if p["metric"] == "hist_full"]
-        besth = max(hist, key=lambda p: p["mean"], default=None)
-        lines.append(
-            criterion(
-                (besth["mean"] >= 10.0 and besth["lo"] > 0) if besth else None,
-                "M1 前缀保留 ≥ +10pp（真实数据退化为会话内历史保留）",
-                f"{besth['arm']} vs {besth['base']} @ {besth['workload']} r{besth['ratio']}: "
-                f"{besth['mean']:+.2f}pp [{besth['lo']:+.2f},{besth['hi']:+.2f}]"
-                if besth else "无 ≥2k 层且无多轮数据",
-            )
-        )
-    # M3: TTFT p50 -3%
+        lines.append(criterion(None, "H1 保留度 ≥ +5pp", "无 ret_struct@ 数据（检查 synth meta 的 layers）"))
+
+    # ---- H2 命中率（成分拆分）----
+    h2s = best("hit_struct", "A3", "A2")
+    h2b = best("hit_burst", "A3", "A2")
+    if h2s and h2b:
+        ok = h2s["mean"] >= 3.0 and h2s["lo"] > 0 and h2b["mean"] >= -1.0
+        lines.append(criterion(
+            ok, "H2 结构复用子集 hit ≥ +3pp 且 burst 回退 ≤1pp",
+            f"struct {h2s['mean']:+.2f}pp [{h2s['lo']:+.2f},{h2s['hi']:+.2f}]；"
+            f"burst {h2b['mean']:+.2f}pp [{h2b['lo']:+.2f},{h2b['hi']:+.2f}]",
+        ))
+    else:
+        lines.append(criterion(None, "H2 命中率（成分拆分）", "无成分配对数据"))
+
+    # ---- H3 one-shot 消融 ----
+    h3 = best("hit_struct", "A4", "A3") or best("hit_pct", "A4", "A3")
+    if h3:
+        gain = -h3["mean"]  # A3 - A4
+        ok = gain >= 3.0 and h3["hi"] < 0
+        lines.append(criterion(ok, "H3 A3−A4 ≥ +3pp（会话内复用不进 one-shot 带）",
+                               f"A3−A4 = {gain:+.2f}pp（A4−A3 = {h3['mean']:+.2f}pp）"))
+    else:
+        lines.append(criterion(None, "H3 one-shot 消融", "未跑 A4（S4）"))
+
+    # ---- H4 无压力趋同（最大池 = 压力阶梯的最小端）----
+    pools = sorted({int(d.get("pool_tokens") or 0) for d in offline if d.get("pool_tokens")})
+    big = pools[-1] if pools else None
+    at1 = [d for d in offline if big and int(d.get("pool_tokens") or 0) == big]
+    hits = {}
+    for d in at1:
+        if d.get("arm") in ("A0", "A2", "A3"):
+            hits[d["arm"]] = (d.get("summary") or {}).get("hit_pct")
+    if len(hits) >= 2:
+        spread = max(hits.values()) - min(hits.values())
+        lines.append(criterion(spread < 0.5, f"H4 无压力（pool={big}）四臂趋同 <0.5pp",
+                               " ".join(f"{k}={v:.2f}" for k, v in sorted(hits.items()))
+                               + f" spread={spread:.3f}pp"))
+    else:
+        lines.append(criterion(None, "H4 无压力趋同", "无池容量阶梯数据"))
+
+    # ---- H5 在线 TTFT ----
     tt = [p for p in paired if p["metric"] == "ttft_p50_ms"]
-    bestt = min(tt, key=lambda p: p["mean"], default=None)
-    if bestt:
-        base = next(
-            (o for o in online if o.get("arm") == bestt["base"]), None
-        )
-        rel = (bestt["mean"] / base["ttft_p50_ms"] * 100.0) if base and base.get("ttft_p50_ms") else 0.0
-        lines.append(
-            criterion(
-                rel <= -3.0 and bestt["hi"] < 0,
-                "M3 TTFT_p50 ≤ -3%",
-                f"{bestt['arm']} vs {bestt['base']} @ {bestt['workload']}: "
-                f"{bestt['mean']:+.2f}ms ({rel:+.1f}%)",
-            )
-        )
+    if tt:
+        h5 = min(tt, key=lambda p: p["mean"])
+        base = next((o for o in online if o.get("arm") == h5["base"]), None)
+        rel = (h5["mean"] / base["ttft_p50_ms"] * 100.0) if base and base.get("ttft_p50_ms") else 0.0
+        lines.append(criterion(rel <= -3.0 and h5["hi"] < 0, "H5 在线 TTFT_p50 ≤ −3%",
+                               f"{h5['arm']} vs {h5['base']}: {h5['mean']:+.2f}ms ({rel:+.1f}%)"))
     else:
-        lines.append(criterion(None, "M3 TTFT_p50 ≤ -3%", "无在线数据"))
-    # M4 gate: qstruct 淘汰占比
-    q = [
-        d for d in offline
-        if (d.get("arm") or "").startswith("A") and d.get("arm") not in ("A0", "A1", "A2")
-    ]
-    qmax = max(
-        (max(_qstruct_pct(d), _tag_share_pct((d.get("summary") or {}).get("evicted_by_tag") or {}))
-         for d in q),
-        default=0.0,
+        lines.append(criterion(None, "H5 在线 TTFT_p50 ≤ −3%", "无在线数据（S6 需 GPU）"))
+
+    # ---- H6 收益随干扰强度 ρ 单调 ----
+    by_rho = {}
+    for d in offline:
+        if d.get("arm") != "A3":
+            continue
+        rho = _rho(d)
+        if rho is None:
+            continue
+        by_rho[(d.get("workload"), rho)] = (d.get("summary") or {}).get("hit_pct")
+    base_rho = {}
+    for d in offline:
+        if d.get("arm") != "A2":
+            continue
+        rho = _rho(d)
+        if rho is None:
+            continue
+        base_rho[(d.get("workload"), rho)] = (d.get("summary") or {}).get("hit_pct")
+    gains = sorted(
+        (key[1], by_rho[key] - base_rho[key])
+        for key in by_rho
+        if key in base_rho and by_rho[key] is not None and base_rho[key] is not None
     )
-    lines.append(
-        criterion(qmax >= 5.0 if q else None, "M4-gate qstruct 淘汰占比 ≥5%",
-                  f"最大 {qmax:.2f}%")
-    )
-    # M5: ShareGPT per_task 回退
-    guards = []
-    for p in paired:
-        if p["metric"].startswith("hit_") and "ShareGPT" in p["metric"]:
-            guards.append(p)
-    worst = min(guards, key=lambda p: p["mean"], default=None)
-    lines.append(
-        criterion(
-            (worst["mean"] >= -1.0) if worst else None,
-            "M5 ShareGPT 回退 ≤1pp",
-            f"{worst['arm']} vs {worst['base']}: {worst['mean']:+.2f}pp" if worst else "无护栏数据",
-        )
-    )
+    if len(gains) >= 3:
+        mono = all(gains[i][1] <= gains[i + 1][1] + 1e-9 for i in range(len(gains) - 1))
+        lines.append(criterion(mono, "H6 收益随 ρ 单调上升",
+                               " ".join(f"ρ={r}:{g:+.2f}pp" for r, g in gains)))
+    else:
+        lines.append(criterion(None, "H6 收益随 ρ 单调", f"ρ 数据点不足（{len(gains)} 个）"))
     return lines
 
 
@@ -657,7 +771,8 @@ def main(argv=None) -> int:
     p.add_argument("--out", default="result/analysis")
     p.add_argument("--prefix-stats", default=None,
                    help="prefix_stats.json；给了就算在线逐请求 CSV 的保留度")
-    p.add_argument("--baselines", default="A0,A2")
+    p.add_argument("--baselines", default="A0,A2,A3",
+                   help="配对基线；A3 用于 H3 的 A3−A4 消融")
     p.add_argument("--n-boot", type=int, default=5000)
     p.add_argument("--ratio-focus", type=float, default=None,
                    help="配对检验只用这个压力点（缺省=全部）")
@@ -742,9 +857,11 @@ def main(argv=None) -> int:
     for d in real_runs:
         if a.ratio_focus is not None and d.get("ratio") != a.ratio_focus:
             continue
-        by_key[(d["workload"], d.get("ratio"), d.get("seed"))][d["arm"]] = d
+        by_key[
+            (d["workload"], d.get("ratio"), d.get("pool_tokens"), d.get("seed"))
+        ][d["arm"]] = d
 
-    for (wl, ratio, seed), arms in sorted(by_key.items(), key=lambda x: str(x[0])):
+    for (wl, ratio, pool, seed), arms in sorted(by_key.items(), key=lambda x: str(x[0])):
         for base in baselines:
             if base not in arms:
                 continue
@@ -759,15 +876,15 @@ def main(argv=None) -> int:
                     (max(v) for v in (d.get("layers_by_task") or {}).values() if v),
                     default=0,
                 )
-                specs = [("hit_pct", None)]
+                specs = [("hit_pct", None), ("hit_struct", "struct"), ("hit_burst", "burst")]
                 for task in sorted({r["task"] for r in pa}):
                     if any(r["task"] == task for r in pb):
                         specs.append((f"hit_{task}", task))
                 if d.get("summary", {}).get("history_retention"):
                     specs.append(("hist_full", "hist"))
-                for L in (512, 2048, 8192):
+                for L in sorted({int(x) for v in (d.get("layers_by_task") or {}).values() for x in (v or [])}):
                     if L <= max_layer:
-                        specs.append((f"ret@{L}", L))
+                        specs.append((f"ret_struct@{L}", L))
                 if 2048 <= max_layer:
                     specs.append(("cover@2048", 2048))
 
@@ -781,15 +898,24 @@ def main(argv=None) -> int:
                         st = {**st, "mean": st["mean"] * 100,
                               "lo": st["lo"] * 100, "hi": st["hi"] * 100}
                         unit = "pp"
-                    elif metric == "hit_pct" or metric.startswith("hit_"):
+                    elif metric in ("hit_pct", "hit_struct", "hit_burst"):
+                        st = paired_ratio_delta(
+                            pa, pb,
+                            kind=None if metric == "hit_pct" else metric.split("_", 1)[1],
+                            n_boot=a.n_boot, seed=seed,
+                        )
+                        unit = "pp"
+                    elif metric.startswith("hit_"):
                         st = paired_ratio_delta(
                             pa, pb, task=arg, n_boot=a.n_boot, seed=seed
                         )
                         unit = "pp"
                     else:
                         L = int(arg)
-                        fn = retained(L) if metric.startswith("ret@") else cover(L)
-                        st = paired_delta(pa, pb, fn, n_boot=a.n_boot, seed=seed)
+                        fn = retained(L) if metric.startswith("ret_") else cover(L)
+                        pa_k = [r for r in pa if _kind(r.get("sid", "")) == "struct"]
+                        pb_k = [r for r in pb if _kind(r.get("sid", "")) == "struct"]
+                        st = paired_delta(pa_k, pb_k, fn, n_boot=a.n_boot, seed=seed)
                         st = {**st, "mean": st["mean"] * 100,
                               "lo": st["lo"] * 100, "hi": st["hi"] * 100}
                         unit = "pp"
@@ -797,7 +923,7 @@ def main(argv=None) -> int:
                         continue
                     paired.append(
                         {
-                            "workload": wl, "ratio": ratio, "seed": seed,
+                            "workload": wl, "ratio": ratio, "pool": pool, "seed": seed,
                             "arm": arm, "base": base, "metric": metric, "unit": unit,
                             "n": st["n"], "mean": round(st["mean"], 4),
                             "lo": round(st["lo"], 4), "hi": round(st["hi"], 4),
@@ -871,13 +997,13 @@ def main(argv=None) -> int:
     if off_rows:
         lines.append("## 2. 离线主表（真实后端）\n")
         rows = [r for r in off_rows if r["backend"] == "real"]
-        cols = ["arm", "workload", "ratio", "hit_pct", "regret_rate",
+        cols = ["arm", "workload", "ladder", "hit_pct", "regret_rate",
                 "protected_waste_rate", "qstruct_evicted_pct", "tag_promote", "evictions"]
-        heads = ["arm", "workload", "pool/working", "hit%", "regret", "prot_waste",
+        heads = ["arm", "workload", "压力轴", "hit%", "regret", "prot_waste",
                  "qstruct_evicted%", "promote", "evicts"]
         extra = sorted({
             k for r in rows for k in r
-            if (k.startswith("ret_") or k.startswith("hist_")) and k.endswith("_full")
+            if (k.startswith("ret_struct@") or k.startswith("hist_")) and k.endswith("_full")
         })
         for e in extra[:6]:
             cols.append(e)

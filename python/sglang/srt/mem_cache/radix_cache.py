@@ -387,8 +387,11 @@ class RadixCache(BasePrefixCache):
         )
 
         self.evictable_leaves = set()
-        # SimpleHYBRID：会话级 KV 账本（每会话 d/L/gaps），供公平淘汰使用
-        self.session_registry = SessionRegistry()
+        # SimpleHYBRID：会话级 KV 账本（每会话 d/L/gaps），供公平淘汰使用。
+        # 进程级单例：同进程内多个缓存实例共享同一本账（见 SessionRegistry 文档）。
+        # 需要隔离时（单测 / 并行对照）构造后覆盖本属性：
+        #     cache.session_registry = SessionRegistry()
+        self.session_registry = SessionRegistry.global_instance()
         self.reset()
 
         # ---- 策略无关的「按工作负载占用」采样器（env 门控，默认关）----

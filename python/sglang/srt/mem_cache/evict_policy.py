@@ -5,7 +5,6 @@ import logging
 import time
 from collections import deque
 from typing import TYPE_CHECKING, Dict, Optional, Tuple, Union
-
 from sglang.srt.mem_cache.uni_utils import (
     AlphaParams,
     node_end_offset,
@@ -20,6 +19,7 @@ from sglang.srt.mem_cache.uni_utils import (
     SimpleHybridTaskType,
     _cached_lognorm_cdf,
     task_type_of_tag,
+    SessionRegistry,
 )
 from sglang.srt.mem_cache.tag_lru import TagLruPolicy
 from sglang.srt.mem_cache.victim_override import (
@@ -28,7 +28,7 @@ from sglang.srt.mem_cache.victim_override import (
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.radix_cache import TreeNode
+    from sglang.srt.mem_cache.radix_cache import TreeNode,
 
 logger = logging.getLogger(__name__)
 
@@ -260,12 +260,14 @@ class SimpleHybridStrategy(EvictionStrategy):
                 "never be consulted. Enable only one of them."
             )
 
+
     def _task_type_of(self, node) -> SimpleHybridTaskType:
         # 队列标签由缓存状态机维护。映射表在 uni_utils，策略与改写器共用。
         # force_agentic 时短路：即使某个节点残留 QTRANS/QCHAT/QSTRUCT 标签，
         # 评分与 one-shot 判定也统一按 agentic 走（标签由缓存层同步强制为 QAGENT）。
         if self.force_agentic:
             return SimpleHybridTaskType.MULTI_TURN_AGENTIC
+        
         return task_type_of_tag(getattr(node, "queue_tag", None))
 
     def _reuse_score(self, node) -> float:

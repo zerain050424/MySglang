@@ -248,12 +248,13 @@ def schedule_single_workload(
     sigma: Optional[float] = None,
     task_name: Optional[str] = None,
     read_limit: int = 0,
+    shuffle: bool = True,
 ) -> List[Request]:
     cfg = WORKLOADS.get(workload, {})
     path = Path(data_path).resolve() if data_path else workload_path(workload)
     # 与 bench_unicache 单负载模式一致：用同一个 seed 打乱再截取（否则跨进程不可复现）
     sessions = load_sessions(
-        path, num_sessions, seed=seed, shuffle=True, read_limit=read_limit
+        path, num_sessions, seed=seed, shuffle=shuffle, read_limit=read_limit
     )
     task_cfg = dict(cfg)
     task_cfg["seed"] = seed

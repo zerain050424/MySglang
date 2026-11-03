@@ -15,12 +15,18 @@
 
 内置实现的分工：
   * `RrEvictPolicy`      —— 自带全部状态（会话轮询序号 / 配额违约计数）。
+  * `RrEvictPolicy`      —— 自带全部状态（会话轮询序号 / 配额违约计数）。
   * `TlruEvictPolicy`    —— T-LRU 的 QAGENT 候选修正（自带高水位状态）。
 
   注：Q_struct 队内策略（标签版 TinyLRU）不通过插件实现 —— 它把「类间优先级 +
-  类内 LRU」直接编码进 `SimpleHybridStrategy.victim_key`，因此这里不再有 struct 适配器。
+  类内 LRU」直接编码进 `SimpleHybridStrategy.victim_key`，因此这里不再有 struct
+  适配器。
   * `TlruEvictPolicy`    —— T-LRU 的尾部优先修正；除候选选择外，还在
     插入/分裂时维护节点上的 `_tlru_*` 高水位（缓存层会调 `on_node_inserted`）。
+  * `SlruEvictPolicy`    —— SLRU 的候选改写（probation → protected，段内 recency）。
+    `scope="non_one_shot"` 时与 `evict()` 的 one-shot 分支合起来就是
+    「带 one-shot 带的 SLRU」：带内先清空，其余按两段排序。标签版 TinyLRU 仍把
+    顺序编码进 `victim_key`，不走插件。
 """
 
 from __future__ import annotations
@@ -38,7 +44,7 @@ from sglang.srt.mem_cache.uni_utils import (
 )
 
 if TYPE_CHECKING:  # pragma: no cover
-    from sglang.srt.mem_cache.radix_cache import TreeNode
+    from sglang.srt.mem_cache.radix_cache import TreeNode,radixCache
     from sglang.srt.mem_cache.uni_utils import SessionRegistry, SessionState
 
 
@@ -167,35 +173,6 @@ class RrEvictPolicy(VictimOverride):
 
 
 class TlruEvictPolicy(VictimOverride):
-    """T-LRU的 QAGENT 候选修正。
-
-    与 `evict_policy.TLRUStrategy` 同一公式：
-
-        budget   = max(L + Q_hat - threshold, 0)
-        tel_safe = (cached_without_this_node >= budget)
-        key      = (0 if tel_safe else 1, last_access_time)
-
-    区别只在于数据来源与作用域：
-
-      * `cached_without_this_node` = `_tlru_cached_prefix_len - len(key)`，
-        与 unified 树上的口径逐字一致；
-      * `L` = `node._tlru_history_len`（**子树高水位**，单调不减）；
-      * 只修 QAGENT 叶子的候选，不接管全局排序（TLRUStrategy 对全部叶子排序）。
-
-    ## 高水位如何维护
-
-    插件拿不到插入事件时，`_tlru_history_len` 无法重建（它描述「这棵子树曾经
-    到过多深」，而不是「现在多深」）。因此缓存层在节点创建/分裂后会回调
-    `on_node_inserted(node)`，由本类写两个字段：
-
-        _tlru_cached_prefix_len = parent._tlru_cached_prefix_len + len(node.key)
-        _tlru_history_len       = max(自深, 各子树的高水位)   # split 时继承更深的子分支
-
-    然后把高水位沿祖先链上抬（与 unified 的 `_set_tlru_lens_and_raise_history`
-    等价；split 场景下祖先早已达到该深度，上抬是空操作）。
-    `_tlru_history_len` 一旦升高就不再下降——这是 T-LRU 的关键：若改用「当前
-    驻留深度」，被裁过尾的会话会永远觉得自己超额，TLRU 会一路把该会话削到 0。
-    """
 
     name = "tlru"
     queue = SimpleHybridQueueTag.QAGENT
@@ -290,3 +267,58 @@ class TlruEvictPolicy(VictimOverride):
         self.lru_picks = 0
         self.fallbacks = 0
         self.history_raises = 0
+
+class SlruEvictPolicy(VictimOverride):
+    """
+    S-LRU 的 QSTRUCT 候选修正。
+    与 `evict_policy.SLRUStrategy` 同一公式：
+
+        budget   = max(L + Q_hat - threshold, 0)
+        tel_safe = (cached_without_this_node >= budget)
+        key      = (0 if tel_safe else 1, last_access_time)
+    """
+     """插件位基类。子类只需实现 applies_to / pick。"""
+
+    name: str = "Slru"
+
+    # 观测字段：本改写器管辖的队列，仅用于 profile 记账。
+    # 不得参与仲裁判定（否则退化为 proposer 形态，见设计讨论）。
+    queue: Optional[SimpleHybridQueueTag] =  SimpleHybridQueueTag.QSTRUCT
+
+    @abstractmethod
+    def applies_to(self, node) -> bool:
+        """当前候选是否归本改写器管。"""
+         if node is None:
+            return False
+        st = radix_cache.session_registry.get(getattr(node, "session_id", None))
+        stype = st.session_type if st is not None else None
+        return stype == SessionType.STRUCT
+
+    @abstractmethod
+    def pick(self, leaves: Iterable["TreeNode"], registry) -> Optional["TreeNode"]:
+        """返回本改写器更愿意淘汰的节点；None表示不接管。"""
+        struct = [node for node in leaves if self.applies_to(node)]
+        if not agentic:
+            return None
+        nearest = None
+        victim = None
+        for node in struct:
+            now_time =  time.monotonic()
+            delta = now_time - node.last_access_time
+            if nearest is None or delta < nearest:
+                nearest = delta
+                victim = node
+        return victim
+
+
+
+    def stats(self) -> Dict[str, float]:
+        return {
+            "slru_picks": self.slru_picks,
+        }
+
+    def reset(self) -> None:
+        """清空内部状态（缓存 reset / 进程复用）。"""
+
+    def __repr__(self) -> str:  # pragma: no cover - 调试用
+        return f"<{type(self).__name__} name={self.name}>"

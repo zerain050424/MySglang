@@ -113,8 +113,10 @@ class TagLruPolicy:
         rids = int(getattr(node, "share_count", 0) or 0)
         if self._freq_of(node) >= self.struct_share_min:
             want = SimpleHybridQueueTag.QSTRUCT
-        elif self.local_hot == "chat" and rids >= self.struct_share_min:
-            # 同一会话已经复用过：保留复用语义，不丢进 one-shot 硬优先带
+        elif self.local_hot == "chat":
+            # 关键：命中本身就是「正在被复用」的证据，此时绝不能降级成 QTRANS
+            # （那会把它丢进 one-shot 硬优先带，下一轮就要重算）。
+            # 所以 chat 模式下这里只做「保持 QCHAT」，不产生任何降级。
             want = SimpleHybridQueueTag.QCHAT
         else:
             want = SimpleHybridQueueTag.QTRANS

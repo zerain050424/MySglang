@@ -399,7 +399,43 @@ class SessionRegistry:
     会话表：独立维护 KV 记账与逐步升级的会话类型。
     `observe_request` / `record_cross_session_hit` 更新分类证据；`touch`、`charge`、
     `attach` 保持 KV 记账职责。节点按鸭子类型读取 `session_id` 与 `value`。
+
+    进程级共享
+    ----------
+    缓存层通过 `global_instance()` 取用**同一个**账本，因此：
+
+      * 同一进程内所有 radix cache 实例（device/host、重复构造）看到同一份
+        `d`/`L`/`gaps`，RR 的 `loss_cap` 与分类器不会各算一套；
+      * `clear()` 是全局的 —— `/flush_cache` 清的是整本账（这正是想要的语义）；
+      * 需要隔离（单测、对照实验并行）时用 `reset_global()` 丢弃单例，或直接
+        `SessionRegistry()` 造私有实例并在构造缓存后覆盖 `cache.session_registry`。
+
+    访问方全部在调度线程（match / insert / evict）里，`sweep()` 由 `touch()` 顺带
+    触发，因此这里不加锁。
     """
+
+    # 进程级单例。用基类名访问，避免子类各持一份。
+    _global: Optional["SessionRegistry"] = None
+
+    @classmethod
+    def global_instance(cls) -> "SessionRegistry":
+        """返回进程级共享账本（首次调用时用默认 TTL 创建）。"""
+        inst = SessionRegistry._global
+        if inst is None:
+            inst = SessionRegistry()
+            SessionRegistry._global = inst
+        return inst
+
+    @classmethod
+    def reset_global(cls) -> Optional["SessionRegistry"]:
+        """丢弃单例并返回旧实例；下一次 `global_instance()` 会新建。
+
+        用于测试隔离与「换参数重建」：单例一旦创建就固定了 `idle_ttl` /
+        `empty_grace`，想换参数必须先 reset。
+        """
+        old = SessionRegistry._global
+        SessionRegistry._global = None
+        return old
 
     GAP_WINDOW = 8          # 只保留最近 8 个轮间隔样本
     SWEEP_EVERY = 256       # 每 N 次 touch 顺带回收一次

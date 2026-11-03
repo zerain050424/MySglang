@@ -82,9 +82,10 @@ def test_promotion_on_second_session():
 
     p.observe_hit(node, "sid-A", SessionType.STRUCT)
     check(node.share_sessions == 1, f"share_sessions, got {node.share_sessions}")
-    check(node.queue_tag == SimpleHybridQueueTag.QTRANS,
-          f"one session -> still QTRANS, got {node.queue_tag}")
-    check(p.stats["promote"] == 0, "no promotion yet")
+    # 默认 local_hot="chat"：命中即证明「正在被复用」，不能落回 one-shot 带
+    check(node.queue_tag == SimpleHybridQueueTag.QCHAT,
+          f"one session -> QCHAT (not one-shot), got {node.queue_tag}")
+    check(p.stats["promote"] == 0, "no QSTRUCT promotion yet")
 
     # 同一会话重复命中：去重，不涨共享数
     p.observe_hit(node, "sid-A", SessionType.STRUCT)
@@ -121,8 +122,8 @@ def test_struct_share_min_threshold():
     node = FakeNode()
     p.observe_hit(node, "s1", SessionType.STRUCT)
     p.observe_hit(node, "s2", SessionType.STRUCT)
-    check(node.queue_tag == SimpleHybridQueueTag.QTRANS,
-          f"2 sessions with min=3 -> QTRANS, got {node.queue_tag}")
+    check(node.queue_tag == SimpleHybridQueueTag.QCHAT,
+          f"2 sessions with min=3 -> QCHAT (session-local), got {node.queue_tag}")
     p.observe_hit(node, "s3", SessionType.STRUCT)
     check(node.queue_tag == SimpleHybridQueueTag.QSTRUCT,
           f"3 sessions with min=3 -> QSTRUCT, got {node.queue_tag}")
