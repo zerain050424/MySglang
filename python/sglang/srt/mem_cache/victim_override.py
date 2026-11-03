@@ -1,13 +1,10 @@
-"""淘汰候选改写器（VictimOverride）：把「选谁」从 SimpleHybridStrategy 里拆成插件位。
-
-契约（与 `StructQueuePolicy` 共用）：
-
+"""淘汰候选改写器（VictimOverride）：把选择策略变成可插拔插件。
     applies_to(node) -> bool        当前候选是否落在本改写器的管辖范围
     pick(leaves, registry) -> node  给出本改写器更愿意淘汰的节点；None = 不接管
 
 硬性约束：
-  * 改写器**不释放 KV、不删节点**，只返回候选；释放仍由 `_evict_one()` 统一执行。
-  * 返回 None 时必须回退到原候选，**不允许阻塞淘汰推进**（否则 evict 会自旋）。
+  * 改写器不释放 KV、不删节点，只返回候选；释放仍由 `_evict_one()` 统一执行。
+  * 返回 None 时必须回退到原候选，不允许阻塞淘汰推进（否则 evict 会自旋）。
   * 改写器只能从 `leaves` 里挑节点，不允许跨队列造出新的可淘汰集合。
 
 `SimpleHybridRadixCache.evict()` 按 `victim_overrides` 的注册顺序逐个询问，
@@ -55,16 +52,12 @@ class VictimOverride(ABC):
 
 
 class RrEvictPolicy(VictimOverride):
-    """Agentic 会话轮询（round-robin）改写器。
-
-    原先是 `SimpleHybridStrategy` 里的 `_pick_round_robin` / `pick_agentic_rr_victim`，
-    抽出来之后：状态（每个会话上次被选中的序号、配额违约计数）独立持有，
-    策略只负责把 `RrParams` 递进来。
-
-    语义（保持不变）：
+    """
+    Agentic 会话轮询（round-robin）。
+    语义：
       * 只处理 Agentic 队列的叶子，按会话聚合，每个会话取最深的那片叶子；
       * 本轮缺口 `d` 超过 `loss_cap(L)` 的会话直接跳过，避免把一条会话掏空；
-      * 在剩余会话里挑「最久没被服务」的那个 —— 跨会话公平。
+      * 按照访问距离进行轮询删除。
     """
 
     name = "rr"
@@ -88,7 +81,7 @@ class RrEvictPolicy(VictimOverride):
 
     # ---- 插件接口 ----
 
-    def applies_to(self, node) -> bool:
+    def applies_to(self, node) -> bool: ##检测是否属于这个策略的作用域
         if not self.params.fair_rr or node is None:
             return False
         return (
@@ -110,7 +103,7 @@ class RrEvictPolicy(VictimOverride):
     # ---- 内部 ----
 
     def _pick_round_robin(self, leaves, registry) -> Optional["TreeNode"]:
-        """挑「最久未被服务」的 Agentic 会话的最深叶子。"""
+        """挑最久未被删除的 Agentic 会话的最深叶子。"""
         tails: Dict[str, Tuple["TreeNode", "SessionState"]] = {}
         for node in leaves:
             sid = getattr(node, "session_id", None)

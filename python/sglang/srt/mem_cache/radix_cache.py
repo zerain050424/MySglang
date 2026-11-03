@@ -503,7 +503,7 @@ class RadixCache(BasePrefixCache):
         if len(key) == 0:
             return self._empty_match_result
 
-        # Q_struct 频数口径是「不同请求数」：rid 从这里透传到命中路径。
+        # Q_struct 频数是不同请求数：rid 从这里透传到命中路径。
         # 没有 req 的调用（如 chunked 自查）rid 为 None，只刷新顺序、不计数。
         rid = getattr(params.req, "rid", None) if params.req is not None else None
         value, last_node = self._match_prefix_helper(self.root_node, key, rid)

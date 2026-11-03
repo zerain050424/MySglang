@@ -21,9 +21,17 @@ tasks:
     gap_mode: fixed
     gap_s: 20.0
     seed: 42
+  - name: ShareGPT_long5
+    task_id: 4
+    data_path: TaskData/SharedGPT-multi-turn/Qwen2.5-7B-Instruct/ShareGPT_long5_session_data.jsonl
+    mu: 4.15
+    sigma: 0.971
+    gap_mode: fixed
+    gap_s: 20.0
+    seed: 42
   - name: AgentBank_alfred
     task_id: 3
-    data_path: TaskData/AgentBankData/Qwen2.5-7B-Instruct/AgentBank_alfred_scale_5000_session_data.jsonl
+    data_path: TaskData/AgentBankData/Qwen2.5-7B-Instruct/AgentBank_alfred_scale_5000_tool_call_session_data.jsonl
     mu: 1.81
     sigma: 1.092
     gap_mode: fixed
@@ -38,11 +46,13 @@ phases:
       AgentBank_apps: 1
       ShareGPT: 1
       AgentBank_alfred: 1
+      ShareGPT_long5: 1
     max_record:
       Codeparrot: 120
       AgentBank_apps: 120
       ShareGPT: 120
       AgentBank_alfred: 120
+      ShareGPT_long5: 1
   - name: struct_dominant
     duration_s: 120
     lambda_rate:
