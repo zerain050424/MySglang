@@ -49,9 +49,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.events import KVCacheEventRecorder
-from sglang.srt.mem_cache.uni_utils import (   
+from sglang.srt.mem_cache.uni_utils import (
     SessionRegistry,
+    SessionType,
     SimpleHybridQueueTag,
+    session_type_to_queue_tag,
 )
 from sglang.srt.mem_cache.utils import (
     get_eviction_strategy,
@@ -503,10 +505,21 @@ class RadixCache(BasePrefixCache):
         if len(key) == 0:
             return self._empty_match_result
 
-        # Q_struct 频数是不同请求数：rid 从这里透传到命中路径。
-        # 没有 req 的调用（如 chunked 自查）rid 为 None，只刷新顺序、不计数。
-        rid = getattr(params.req, "rid", None) if params.req is not None else None
-        value, last_node = self._match_prefix_helper(self.root_node, key, rid)
+        # Q_struct 频数按不同请求计；会话类型另按 session 生命周期累计。
+        req = params.req
+        rid = getattr(req, "rid", None) if req is not None else None
+        session_id = getattr(req, "session_id", None) if req is not None else None
+        if self._hit_recorder is not None and session_id:
+            prompt_ids = getattr(req, "origin_input_ids", None)
+            self.session_registry.observe_request(
+                session_id,
+                rid or "",
+                len(prompt_ids) if prompt_ids is not None else len(key),
+                tool_call=getattr(req, "tool_call", None),
+            )
+        value, last_node = self._match_prefix_helper(
+            self.root_node, key, rid, session_id
+        )
         if value:
             value = torch.cat(value)
         else:
@@ -814,9 +827,15 @@ class RadixCache(BasePrefixCache):
                 if child.evicted:
                     continue
                 stack.append(child)
+                session_state = self.session_registry.get(child.session_id)
                 rows.append({
-                    # 状态机的判定结果（qtrans/qstruct/qagent/qchat）
+                    # 队列标签和会话分类分别记录，避免把分叉角色当成会话真值。
                     "tag": getattr(child.queue_tag, "value", str(child.queue_tag)),
+                    "stype": (
+                        session_state.session_type.value
+                        if session_state is not None
+                        else SessionType.TRANS.value
+                    ),
                     # 真实归属：由插入该片段的请求携带，前缀即负载类别
                     "sid": child.session_id,
                     "tok": len(child.key),
@@ -933,7 +952,7 @@ class RadixCache(BasePrefixCache):
     ##### Internal Helper Functions #####
 
     def _match_prefix_helper(
-        self, node: TreeNode, key: RadixKey, rid=None
+        self, node: TreeNode, key: RadixKey, rid=None, session_id=None
     ): ## node：当前节点，key：要匹配的RadixKey
         access_time = time.monotonic()
         node.last_access_time = access_time
@@ -946,13 +965,15 @@ class RadixCache(BasePrefixCache):
             prefix_len = child.key.match(key, page_size=self.page_size) ##计算当前节点的key与子节点的key的匹配长度，返回匹配的逻辑单位数量，向下取整为page_size的整数倍
             if prefix_len < len(child.key): ## 如果匹配长度小于子节点的key长度，说明匹配结束在子节点的中间，需要将子节点拆分为两个节点，一个表示匹配的前缀，一个表示剩余的后缀
                 new_node = self._split_node(child.key, child, prefix_len)
-                self._record_node_hit(new_node, access_time, rid)
+                self._record_cross_session_hit(session_id, new_node)
+                self._record_node_hit(new_node, access_time, rid, session_id)
                 value.append(new_node.value) ## 追加KV张量
                 node = new_node ## 将当前节点更新为新创建的节点
                 break
             else:
                 value.append(child.value) ## 完全匹配追加全量张量
-                self._record_node_hit(child, access_time, rid)
+                self._record_cross_session_hit(session_id, child)
+                self._record_node_hit(child, access_time, rid, session_id)
                 node = child ## 将当前节点更新为子节点
                 key = key[prefix_len:] ## 将key截断为剩余未匹配的部分
 
@@ -961,21 +982,43 @@ class RadixCache(BasePrefixCache):
 
         return value, node
 
+    def _record_cross_session_hit(self, session_id, node: TreeNode) -> None:
+        if self._hit_recorder is None or not session_id:
+            return
+        self.session_registry.record_cross_session_hit(
+            session_id, getattr(node, "session_id", None)
+        )
+
     def _record_node_hit(
-        self, node: TreeNode, access_time: float, rid=None
+        self, node: TreeNode, access_time: float, rid=None, session_id=None
     ) -> None:
-        """根据命中间隔更新节点状态。"""
+        """Apply the session's type to owned nodes; keep fork/shared tags sticky."""
         delta = access_time - node.last_access_time
         node.hit_count += 1
         if node.queue_tag != SimpleHybridQueueTag.QSTRUCT:
-            node.queue_tag = (
-                SimpleHybridQueueTag.QAGENT
-                if delta < 8.0
-                else SimpleHybridQueueTag.QCHAT
+            state = (
+                self.session_registry.get(session_id)
+                if self._hit_recorder is not None
+                else None
             )
+            if state is not None and state.session_type == SessionType.STRUCT:
+                node.queue_tag = SimpleHybridQueueTag.QSTRUCT
+            elif (
+                state is not None
+                and node.session_id == session_id
+                and state.session_type in (SessionType.AGENTIC, SessionType.CHAT)
+            ):
+                node.queue_tag = session_type_to_queue_tag(state.session_type)
+            elif state is None or session_id is None or node.session_id is None:
+                # Preserve legacy behavior outside the session classifier.
+                node.queue_tag = (
+                    SimpleHybridQueueTag.QAGENT
+                    if delta < 8.0
+                    else SimpleHybridQueueTag.QCHAT
+                )
         node.last_access_time = access_time
         if self.struct_policy is not None:
-            # 注意：这里用 rid 去重，chunked 复查（rid=None）不会把分块自引用刷成高频
+            # rid dedup keeps chunked rechecks from inflating distinct-request sharing.
             self.struct_policy.on_hit(node, rid)
 
     def _split_node(
@@ -1081,7 +1124,12 @@ class RadixCache(BasePrefixCache):
             new_node.parent = node
             new_node.key = key
             new_node.value = value.clone()
-            new_node.queue_tag = SimpleHybridQueueTag.QTRANS
+            state = self.session_registry.get(session_id)
+            new_node.queue_tag = (
+                session_type_to_queue_tag(state.session_type)
+                if state is not None
+                else SimpleHybridQueueTag.QTRANS
+            )
             new_node.is_decode = (
                 decode_start is not None and total_prefix_length >= decode_start
             )

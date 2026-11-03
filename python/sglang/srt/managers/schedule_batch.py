@@ -1049,6 +1049,7 @@ class Req(ReqDllmMixin):
         token_indices_to_pool: Optional[List[int]] = None,
         session_id: Optional[str] = None,
         cache_salt: Optional[str] = None,
+        tool_call: Optional[Dict[str, Any]] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -1073,6 +1074,7 @@ class Req(ReqDllmMixin):
 
         self.session = session
         self.session_id = session_id
+        self.tool_call = tool_call
         # Used by the session radix cache to reject registration after a close/reopen.
         self.session_generation: Optional[int] = None
         self.input_embeds = input_embeds

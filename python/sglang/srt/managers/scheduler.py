@@ -2775,6 +2775,7 @@ class Scheduler(
                 stream=recv_req.stream,
                 lora_id=recv_req.lora_id,
                 session_id=recv_req.session_id,
+                tool_call=recv_req.tool_call,
                 input_embeds=recv_req.input_embeds,
                 positional_embed_overrides=recv_req.positional_embed_overrides,
                 token_type_ids=recv_req.token_type_ids,

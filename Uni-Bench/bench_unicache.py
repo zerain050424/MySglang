@@ -500,6 +500,7 @@ async def run_session(
         await asyncio.sleep(arrival_offset)
 
     prev_end: Optional[float] = None  # 上一轮请求完成时刻（算真实轮间隔）
+    previous_tool_call = None  # 只暴露上一轮已完成的工具调用，避免当前轮未来信息泄漏
     pause_done = False
     async with sem:  ##控制并发粒度
         for t in range(1, num_turns + 1):
@@ -512,6 +513,7 @@ async def run_session(
                 # session_id 仅用于标识会话，不选择淘汰策略。
                 "session_id": sid,
                 "rid": f"{sid}_turn_{t}",
+                "tool_call": previous_tool_call,
             }
             try:
                 r = await one_request(http, url, payload, args.timeout_s)
@@ -521,6 +523,7 @@ async def run_session(
                     r["cached_tokens"],
                     r["completion_tokens"],
                 )
+                previous_tool_call = turn.get("tool_call")
                 if r["ttft"] is not None:
                     stats.ttfts.append(r["ttft"])
                 stats.e2es.append(r["e2e"])
@@ -532,6 +535,7 @@ async def run_session(
                     "phase": task_cfg.get("phase"),
                     "session_id": sid,
                     "turn": t,
+                    "prior_tool_call": bool(payload["tool_call"]),
                     "prompt_tokens": ptok,
                     "cached_tokens": ctok,
                     "recompute_tokens": ptok - ctok,

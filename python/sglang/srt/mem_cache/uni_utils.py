@@ -21,16 +21,33 @@ class SimpleHybridTaskType(str, enum.Enum):
     RANDOM_SINGLE_TURN = "random_single_turn"
 
 
+class SessionType(str, enum.Enum):
+    TRANS = "trans"
+    STRUCT = "struct"
+    CHAT = "chat"
+    AGENTIC = "agentic"
+
+
 class SimpleHybridQueueTag(str, enum.Enum):
     """HeterCache 节点状态标签。
 
-    标签由缓存状态机根据插入、命中间隔和分支拓扑自动维护。
+    标签由会话分类器与 radix 结构证据共同维护；非会话请求保留旧命中间隔规则。
     """
 
     QTRANS = "qtrans"
     QSTRUCT = "qstruct"
     QAGENT = "qagent"
     QCHAT = "qchat"
+
+
+def session_type_to_queue_tag(session_type: SessionType) -> SimpleHybridQueueTag:
+    """Map a session classifier result to the queue used for newly owned KV."""
+    return {
+        SessionType.TRANS: SimpleHybridQueueTag.QTRANS,
+        SessionType.STRUCT: SimpleHybridQueueTag.QSTRUCT,
+        SessionType.AGENTIC: SimpleHybridQueueTag.QAGENT,
+        SessionType.CHAT: SimpleHybridQueueTag.QCHAT,
+    }[session_type]
 
 
 # ---------------------------------------------------------------------------
@@ -292,7 +309,8 @@ class SessionState:
     """一条会话的 KV记账。
 
     `d` 只在两处变化：会话自己的请求写入时归零、其片段被删时累加。
-    `gaps` 记轮间隔样本（本次请求到达 - 上次请求到达），供后续权重使用。
+    `classifier_gaps`、tool-call 与跨会话命中证据只用于更新会话类型；
+    原 `gaps` / `L` 仍服务于 KV 账本，避免分类器改变其记账语义。
     """
 
     session_id: str
@@ -304,6 +322,15 @@ class SessionState:
     gaps: List[float] = dataclasses.field(default_factory=list)
     attached: int = 0           # 累计挂到该会话名下的 token 数（调试用）
     charged: int = 0            # 累计被删的 token 数（调试用）
+    turn_count: int = 0
+    tool_call_count: int = 0
+    cross_session_shared: bool = False
+    session_type: SessionType = SessionType.TRANS
+    first_context_len: int = 0
+    latest_context_len: int = 0
+    classifier_gaps: List[float] = dataclasses.field(default_factory=list)
+    classifier_last_rid: str = ""
+    classifier_last_request_start: Optional[float] = None
 
 
 logger = logging.getLogger(__name__)
@@ -316,13 +343,16 @@ _TRACE_SID = os.environ.get("SGLANG_SESSION_TRACE_SID", "")
 
 class SessionRegistry:
     """
-    会话表,记录每个会话的状态
-    只做记账：`touch` 由插入路径调用，`charge`/`attach` 由节点新增与删除调用。
-    不依赖 radix tree，节点按鸭子类型读取 `session_id` 与 `value`。
+    会话表：独立维护 KV 记账与逐步升级的会话类型。
+    `observe_request` / `record_cross_session_hit` 更新分类证据；`touch`、`charge`、
+    `attach` 保持 KV 记账职责。节点按鸭子类型读取 `session_id` 与 `value`。
     """
 
     GAP_WINDOW = 8          # 只保留最近 8 个轮间隔样本
     SWEEP_EVERY = 256       # 每 N 次 touch 顺带回收一次
+    MULTI_TURN_MIN = 5
+    GAP_SPLIT_S = 15.0
+    AGENTIC_CONTEXT_GROWTH_TOKENS = 1500
 
     def __init__(self, idle_ttl: float = 3600.0, empty_grace: float = 60.0):
         self._sessions: Dict[str, SessionState] = {}
@@ -336,6 +366,78 @@ class SessionRegistry:
 
     def __len__(self) -> int:
         return len(self._sessions)
+
+    # ---- 会话分类证据 ----
+    def observe_request(
+        self,
+        session_id: Optional[str],
+        rid: str = "",
+        prompt_len: int = 0,
+        *,
+        tool_call=None,
+        now: Optional[float] = None,
+    ) -> Optional[SessionState]:
+        """用当前请求可见的会话证据更新分类；同一 rid（如 chunked 重入）只计一次。"""
+        if not session_id:
+            return None
+        now = time.monotonic() if now is None else now
+        st = self._sessions.get(session_id)
+        if st is None:
+            st = self._sessions[session_id] = SessionState(session_id=session_id)
+        if rid and rid == st.classifier_last_rid:
+            return st
+
+        if st.classifier_last_request_start is None:
+            st.first_context_len = prompt_len
+        else:
+            st.classifier_gaps.append(max(0.0, now - st.classifier_last_request_start))
+            if len(st.classifier_gaps) > self.GAP_WINDOW:
+                del st.classifier_gaps[0]
+        st.turn_count += 1
+        st.tool_call_count += int(bool(tool_call))
+        st.latest_context_len = prompt_len
+        st.classifier_last_request_start = now
+        st.classifier_last_rid = rid
+        st.session_type = self._classify(st)
+        return st
+
+    def record_cross_session_hit(
+        self, session_id: Optional[str], owner_session_id: Optional[str]
+    ) -> Optional[SessionState]:
+        """Record that this session reused a radix segment first inserted by another session."""
+        if not session_id or not owner_session_id or session_id == owner_session_id:
+            return self.get(session_id)
+        st = self._sessions.get(session_id)
+        if st is None:
+            st = self._sessions[session_id] = SessionState(session_id=session_id)
+        st.cross_session_shared = True
+        st.session_type = self._classify(st)
+        return st
+
+    @classmethod
+    def _classify(cls, state: SessionState) -> SessionType:
+        if state.turn_count < cls.MULTI_TURN_MIN:
+            return SessionType.STRUCT if state.cross_session_shared else SessionType.TRANS
+        if state.tool_call_count:
+            return SessionType.AGENTIC
+        if state.classifier_gaps:
+            ordered = sorted(state.classifier_gaps)
+            middle = len(ordered) // 2
+            median_gap = (
+                ordered[middle]
+                if len(ordered) % 2
+                else (ordered[middle - 1] + ordered[middle]) / 2
+            )
+            if median_gap < cls.GAP_SPLIT_S:
+                return SessionType.AGENTIC
+            if median_gap > cls.GAP_SPLIT_S:
+                return SessionType.CHAT
+        growth = state.latest_context_len - state.first_context_len
+        return (
+            SessionType.AGENTIC
+            if growth >= cls.AGENTIC_CONTEXT_GROWTH_TOKENS
+            else SessionType.CHAT
+        )
 
     # ---- 记账 ----
     def touch(

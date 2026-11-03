@@ -324,6 +324,8 @@ class Session:
             routed_dp_rank=req.routed_dp_rank,
             disagg_prefill_dp_rank=req.disagg_prefill_dp_rank,
             priority=req.priority,
+            session_id=self.session_id,
+            tool_call=req.tool_call,
             routing_key=req.routing_key,
             extra_key=req.extra_key,
             cache_salt=req.cache_salt,
