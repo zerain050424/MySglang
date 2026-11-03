@@ -314,14 +314,30 @@ def offline_table(runs: Sequence[dict]) -> List[dict]:
             "regret_rate": regret.get("regret_rate"),
             "protected_waste_rate": regret.get("protected_waste_rate"),
             "qstruct_pct": round(100.0 * vsrc.get("qstruct", 0.0) / tot_ev, 3) if tot_ev else 0.0,
+            # 标签版没有插件，按标签统计受保护前缀被淘汰的 token 占比
+            "tag_promote": (s.get("tag") or {}).get("promote"),
+            "tag_counted": (s.get("tag") or {}).get("counted"),
+            "struct_share_min": (d.get("config") or {}).get("tiny_lru", {}).get(
+                "struct_share_min"),
+            "qstruct_evicted_pct": _tag_share_pct(s.get("evicted_by_tag") or {}),
             "struct_window": (s.get("struct") or {}).get("window"),
             "struct_probation": (s.get("struct") or {}).get("probation"),
             "struct_protected": (s.get("struct") or {}).get("protected"),
             "struct_parked": (s.get("struct") or {}).get("parked"),
             "admit": (s.get("struct") or {}).get("admit"),
+            "dedup_sessions": (s.get("struct") or {}).get("dedup_sessions"),
             "reject": (s.get("struct") or {}).get("reject"),
             "ages": (s.get("struct") or {}).get("ages"),
             "forced": (s.get("struct") or {}).get("forced"),
+            "share_metric": (d.get("config") or {}).get("tiny_lru", {}).get("share_metric"),
+            "protected_budget_frac": (d.get("config") or {}).get("tiny_lru", {}).get(
+                "protected_budget_frac"),
+            "stale_grace_s": (d.get("config") or {}).get("tiny_lru", {}).get("stale_grace_s"),
+            "protected_tokens": (s.get("struct") or {}).get("protected_tokens"),
+            "probation_tokens": (s.get("struct") or {}).get("probation_tokens"),
+            "protected_budget": (s.get("struct") or {}).get("protected_budget"),
+            "budget_demote": (s.get("struct") or {}).get("budget_demote"),
+            "stale_deflect": (s.get("struct") or {}).get("stale_deflect"),
             "struct_retire": (s.get("struct") or {}).get("retire"),
             "struct_park": (s.get("struct") or {}).get("park"),
             "struct_dedup_hits": (s.get("struct") or {}).get("dedup_hits"),
@@ -442,7 +458,11 @@ def judge(offline: Sequence[dict], paired: Sequence[dict], online: Sequence[dict
         d for d in offline
         if (d.get("arm") or "").startswith("A") and d.get("arm") not in ("A0", "A1", "A2")
     ]
-    qmax = max((_qstruct_pct(d) for d in q), default=0.0)
+    qmax = max(
+        (max(_qstruct_pct(d), _tag_share_pct((d.get("summary") or {}).get("evicted_by_tag") or {}))
+         for d in q),
+        default=0.0,
+    )
     lines.append(
         criterion(qmax >= 5.0 if q else None, "M4-gate qstruct 淘汰占比 ≥5%",
                   f"最大 {qmax:.2f}%")
@@ -461,6 +481,15 @@ def judge(offline: Sequence[dict], paired: Sequence[dict], online: Sequence[dict
         )
     )
     return lines
+
+
+def _tag_share_pct(by_tag: dict) -> float:
+    """按标签统计：受保护前缀（QSTRUCT）占被淘汰 token 的比例。"""
+    total = sum(by_tag.values()) or 0.0
+    if not total:
+        return 0.0
+    q = by_tag.get("tag:qstruct", 0.0) or 0.0
+    return round(100.0 * q / total, 3)
 
 
 def _qstruct_pct(d: dict) -> float:
@@ -630,6 +659,8 @@ def struct_timeseries(paths: Sequence[str]) -> List[dict]:
                         ) if tot_tokens else None,
                         "admit": snap.get("admit"),
                         "reject": snap.get("reject"),
+                        "budget_demote": snap.get("budget_demote"),
+                        "stale_deflect": snap.get("stale_deflect"),
                         "retire": snap.get("retire"),
                         "park": snap.get("park"),
                         "ages": snap.get("ages"),
@@ -917,9 +948,10 @@ def main(argv=None) -> int:
             markdown_table(
                 rows,
                 ["tag", "evict_calls", "evict_us_p50", "evict_us_p99", "protected_share",
-                 "admit", "reject", "retire", "ages", "forced", "qstruct_pct"],
+                 "admit", "reject", "budget_demote", "stale_deflect", "retire", "ages",
+                 "forced", "qstruct_pct"],
                 ["tag", "evicts", "us_p50", "us_p99", "protected%", "admit", "reject",
-                 "retire", "ages", "forced", "qstruct%"],
+                 "budget↓", "stale↓", "retire", "ages", "forced", "qstruct%"],
             )
         )
         lines.append("")

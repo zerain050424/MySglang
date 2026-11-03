@@ -13,6 +13,7 @@
 
 import os
 import sys
+import time
 
 sys.path.insert(
     0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "python")
@@ -48,7 +49,7 @@ class FakeNode:
 
     _next_id = 0
 
-    def __init__(self, tokens=16, parent=None, share=0):
+    def __init__(self, tokens=16, parent=None, share=0, sessions=None):
         FakeNode._next_id += 1
         self.id = FakeNode._next_id
         self.value = [0] * tokens
@@ -59,6 +60,10 @@ class FakeNode:
         self.queue_tag = SimpleHybridQueueTag.QSTRUCT
         self.share_count = share
         self.rid_bloom = 0
+        # A：会话级频数（None 表示"该节点类型没有这个字段"，用于验证回退路径）
+        self.share_sessions = share if sessions is None else sessions
+        self.session_bloom = 0
+        self.last_access_time = time.monotonic()
         self.struct_ever_branch = False
         self.struct_region = REGION_NONE
         if parent is not None:
@@ -73,8 +78,8 @@ def forest():
     return root
 
 
-def fresh_leaf(root, share=0):
-    return FakeNode(parent=root, share=share)
+def fresh_leaf(root, share=0, sessions=None, tokens=16):
+    return FakeNode(parent=root, share=share, sessions=sessions, tokens=tokens)
 
 
 def state(**kw):
@@ -344,6 +349,102 @@ def test_strategy_wiring():
     check(off.victim_overrides == (), f"policy=off must register no override, got {off.victim_overrides}")
 
 
+def test_session_metric_replaces_rid_metric():
+    """A：单会话多轮不能算「跨会话共享前缀」（旧 rid 口径会把它算成高频）。"""
+    print("[A] session-level frequency (single session multi-turn is NOT shared)")
+    root = forest()
+
+    # hybrid（默认）：protected 只给跨会话；会话内热点封顶 probation
+    st = state(k=3)
+    single = fresh_leaf(root, share=6, sessions=1)  # 6 个请求，1 个会话
+    st.on_became_leaf(single)
+    check(single.struct_region == REGION_PROBATION,
+          f"single-session hot chain -> probation, got {single.struct_region}")
+
+    two = fresh_leaf(root, share=6, sessions=2)
+    st.on_became_leaf(two)
+    check(two.struct_region == REGION_PROBATION,
+          f"2 sessions -> probation, got {two.struct_region}")
+
+    three = fresh_leaf(root, share=6, sessions=3)
+    st.on_became_leaf(three)
+    check(three.struct_region == REGION_PROTECTED,
+          f"3 sessions -> protected, got {three.struct_region}")
+
+    # session 口径（消融）：完全不认会话内复用
+    sess = state(k=3, share_metric="session")
+    solo = fresh_leaf(root, share=6, sessions=1)
+    sess.on_became_leaf(solo)
+    check(solo.struct_region == REGION_NONE,
+          f"session metric drops single-session chains, got {solo.struct_region}")
+
+    # rid 口径（旧行为）：请求数 >= k 直接 protected
+    old = state(k=3, share_metric="rid")
+    again = fresh_leaf(root, share=6, sessions=1)
+    old.on_became_leaf(again)
+    check(again.struct_region == REGION_PROTECTED,
+          f"rid metric keeps legacy behaviour, got {again.struct_region}")
+
+
+def test_protected_budget_demotes_head():
+    """B：protected 超 token 预算时，队头降级到 probation 尾（只改归属）。"""
+    print("[B] protected token budget demotes the head to probation")
+    root = forest()
+    st = state(k=3, protected_budget_frac=0.5)
+
+    a = fresh_leaf(root, share=3, sessions=3, tokens=10)
+    st.on_became_leaf(a)
+    check(a.struct_region == REGION_PROTECTED, "first protected entry stays (budget guard)")
+    b = fresh_leaf(root, share=3, sessions=3, tokens=10)
+    st.on_became_leaf(b)  # 20 超预算 10 -> 队头 a 降级
+    check(a.struct_region == REGION_PROBATION,
+          f"head must be demoted to probation, got {a.struct_region}")
+    check(b.struct_region == REGION_PROTECTED, "newest stays protected")
+    check(st.stats["budget_demote"] == 1, f"budget_demote={st.stats['budget_demote']}")
+    check(st.owns(a), "demoted node is still owned (INV-2: never leaves the index)")
+    budget = st._protected_budget()
+    check(budget is None or st._tokens[REGION_PROTECTED] <= budget,
+          "protected tokens must fall back under budget")
+
+
+def test_stale_leaf_goes_to_window():
+    """C：陈旧叶子（空闲超过 stale_grace_s）落 window 重新观察，不直接 protected。"""
+    print("[C] stale leaf is deflected to the window")
+    root = forest()
+    st = state(k=3, stale_grace_s=10.0)
+
+    fresh = fresh_leaf(root, share=3, sessions=3)
+    st.on_became_leaf(fresh)
+    check(fresh.struct_region == REGION_PROTECTED, "fresh leaf keeps the inherited band")
+
+    stale = fresh_leaf(root, share=3, sessions=3)
+    stale.last_access_time = time.monotonic() - 100
+    st.on_became_leaf(stale)
+    check(stale.struct_region == REGION_WINDOW,
+          f"stale leaf must go to window, got {stale.struct_region}")
+    check(st.stats["stale_deflect"] == 1, f"stale_deflect={st.stats['stale_deflect']}")
+
+
+def test_promote_leaves_window_without_recursion():
+    """回归：window 溢出且 probation/protected 为空时，promote 不得递归爆栈。"""
+    print("[fix] promote moves out of window instead of recursing")
+    root = forest()
+    st = state(window_entries=1)
+
+    a = fresh_leaf(root, share=0, sessions=0)
+    a.struct_ever_branch = True
+    st.on_became_leaf(a)
+    b = fresh_leaf(root, share=0, sessions=0)
+    b.struct_ever_branch = True
+    st.on_became_leaf(b)  # victim=None -> 旧实现 here RecursionError
+
+    check(st.stats["admit"] >= 1, "promotion must be recorded")
+    check(a.struct_region == REGION_PROBATION,
+          f"promoted candidate leaves window, got {a.struct_region}")
+    check(len(st.regions[REGION_WINDOW]) <= st.window_entries,
+          "window must respect its quota")
+
+
 def main():
     tests = [
         test_region_by_share_count,
@@ -358,6 +459,10 @@ def main():
         test_state_is_not_an_override,
         test_override_delegates_to_state,
         test_strategy_wiring,
+        test_session_metric_replaces_rid_metric,
+        test_protected_budget_demotes_head,
+        test_stale_leaf_goes_to_window,
+        test_promote_leaves_window_without_recursion,
     ]
     for t in tests:
         try:

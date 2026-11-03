@@ -21,6 +21,8 @@ from typing import Dict, List, Optional
 DEFAULT_K = 3
 DEFAULT_WINDOW_ENTRIES = 64
 DEFAULT_EPOCH_EVENTS = 8192
+# A/B/C 的默认值：A 默认开启（口径修正），B 给 0.8（教科书 SLRU 保护占比），C 默认关（引入墙钟）
+DEFAULT_PROTECTED_BUDGET = 0.8
 
 # 注意：tiny_lru 缺省 policy="off"。这里显式写全，便于逐臂对照。
 _WTL = lambda **kw: {
@@ -32,6 +34,12 @@ _WTL = lambda **kw: {
         "admission_tie": kw.pop("admission_tie", "reject"),
         "admission_metric": kw.pop("admission_metric", "share"),
         "inherit_share": kw.pop("inherit_share", True),
+        # A：hybrid = 成员/准入用请求口径，protected 只留给跨会话共享
+        "share_metric": kw.pop("share_metric", "hybrid"),
+        # B：protected 的 token 预算（占活跃区 token）；0 = 关闭
+        "protected_budget_frac": kw.pop("protected_budget_frac", DEFAULT_PROTECTED_BUDGET),
+        # C：陈旧叶子的新鲜度闸（秒）；0 = 关闭
+        "stale_grace_s": kw.pop("stale_grace_s", 0.0),
         **kw,
     }
 }
@@ -100,6 +108,29 @@ ARMS: Dict[str, Arm] = {
     "A11": Arm("A11", "wtl_share_per_token", "simple_hybrid",
                _WTL(admission_metric="share_per_token"),
                "长度归一假设检验（设计文档 §5.4）", True),
+    # ---- A/B/C 消融（对着 A3 逐项关掉）----
+    "A12": Arm("A12", "wtl_rid_metric", "simple_hybrid",
+               _WTL(share_metric="rid"),
+               "A 消融：纯请求口径（旧行为，会话内多轮也能进 protected）", True),
+    "A13": Arm("A13", "wtl_no_budget", "simple_hybrid",
+               _WTL(protected_budget_frac=0.0),
+               "B 消融：protected 无预算（超限也不降级）", True),
+    "A14": Arm("A14", "wtl_stale60", "simple_hybrid",
+               _WTL(stale_grace_s=60.0),
+               "C 开：陈旧叶子（空闲>60s）落 window 重新观察", True),
+    "A15": Arm("A15", "wtl_session_only", "simple_hybrid",
+               _WTL(share_metric="session"),
+               "A 消融：纯会话口径（会话内复用完全不计）", True),
+    # ---- 标签版 TinyLRU（TinyLRU 分支默认实现）----
+    "A16": Arm("A16", "tag_lru_one_shot", "simple_hybrid",
+               {"tiny_lru": {"policy": "tag_lru", "local_hot": "one_shot"}},
+               "标签版（规则原样）：会话共享==1 → QTRANS → one-shot 带", True),
+    "A17": Arm("A17", "tag_lru_min3", "simple_hybrid",
+               {"tiny_lru": {"policy": "tag_lru", "struct_share_min": 3}},
+               "标签版消融：要 3 个会话共享才晋升 QSTRUCT", True),
+    "A18": Arm("A18", "tag_lru", "simple_hybrid",
+               {"tiny_lru": {"policy": "tag_lru"}},
+               "标签版默认（local_hot=chat）：会话内热点保留复用语义", True),
 }
 
 DEFAULT_ARMS = ["A0", "A2", "A3"]
@@ -142,6 +173,7 @@ def select(expr: Optional[str]) -> List[Arm]:
     return uniq
 
 
+# 主对象 A3 现在是 A+B：会话级频数 + protected 预算（C 由 A14 单独开）
 # 压力点：pool_ratio = pool_tokens / 校准工作集（见 replay 的 --pool-ratio）
 DEFAULT_POOL_RATIOS = [0.3, 0.6, 1.0]
 SANITY_POOL_RATIO = 2.0  # §10 无压力对照点：各臂必须趋同

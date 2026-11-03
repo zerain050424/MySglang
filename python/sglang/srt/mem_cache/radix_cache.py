@@ -292,6 +292,9 @@ class TreeNode: ## TreeNode 是基数树（RadixTree）的节点，每个节点�
         # Q_struct 队内 W-TinyLRU：不同 rid 数 + rid 布隆 + 区归属（0=非成员）
         self.share_count = 0
         self.rid_bloom = 0
+        # A：不同会话数（结构复用口径）+ 会话 bloom
+        self.share_sessions = 0
+        self.session_bloom = 0
         self.struct_region = 0
         # T-LRU（单例 tlru.enabled）：tokens root->self 与分支高水位。
         # 只在开启时由 TlruEvictPolicy.on_node_inserted() 写入，其余策略恒 0。
@@ -364,6 +367,8 @@ class RadixCache(BasePrefixCache):
         # Q_struct 队内 W-TinyLRU（SimpleHybridStrategy.structState；其他策略为 None）。
         # 只在策略开启时挂钩子，关闭时所有调用点都是 `is not None` 的一次判空。
         self.struct_policy = getattr(self.eviction_strategy, "structState", None)
+        # 标签版 TinyLRU（与 structState 二选一）：只维护「会话共享数 + 标签」。
+        self.tag_policy = getattr(self.eviction_strategy, "tagState", None)
         # 实验开关（SimpleHybridStrategy.force_agentic）：把所有节点直接标成 QAGENT，
         # 让 QAGENT-only 的插件（RR / T-LRU）拿到 100% 的流量。只改 queue_tag，
         # 不动 session_type —— 分类器自身的统计仍然可测。
@@ -1020,15 +1025,18 @@ class RadixCache(BasePrefixCache):
         """Apply the session's type to owned nodes; keep fork/shared tags sticky."""
         delta = access_time - node.last_access_time
         node.hit_count += 1
+        state = (
+            self.session_registry.get(session_id)
+            if self._hit_recorder is not None
+            else None
+        )
         if self.force_agentic:
             # 直达 agentic 队列：跳过 8s 间隔判定与 QSTRUCT 黏性。
             node.queue_tag = SimpleHybridQueueTag.QAGENT
+        elif self.tag_policy is not None and state is not None:
+            # 标签版：命中即完成「会话计数 + 晋升/降级」，不需要等它变成可淘汰叶子。
+            self.tag_policy.observe_hit(node, session_id, state.session_type)
         elif node.queue_tag != SimpleHybridQueueTag.QSTRUCT:
-            state = (
-                self.session_registry.get(session_id)
-                if self._hit_recorder is not None
-                else None
-            )
             if state is not None and state.session_type == SessionType.STRUCT:
                 node.queue_tag = SimpleHybridQueueTag.QSTRUCT
             elif (
@@ -1047,7 +1055,8 @@ class RadixCache(BasePrefixCache):
         node.last_access_time = access_time
         if self.struct_policy is not None:
             # rid dedup keeps chunked rechecks from inflating distinct-request sharing.
-            self.struct_policy.on_hit(node, rid)
+            # rid 去重防 chunked 自引用；session_id 供 A 的会话级频数
+            self.struct_policy.on_hit(node, rid, session_id)
 
     def _split_node(
            self,
@@ -1091,6 +1100,8 @@ class RadixCache(BasePrefixCache):
            # Q_struct：分裂不改变「哪些请求经过这段前缀」，两半都继承频数。
            new_node.share_count = child.share_count
            new_node.rid_bloom = child.rid_bloom
+           new_node.share_sessions = getattr(child, "share_sessions", 0)
+           new_node.session_bloom = getattr(child, "session_bloom", 0)
            if self.struct_policy is not None:
                self.struct_policy.on_split(new_node, child)
            # T-LRU：分裂不增加分支深度，新父节点继承 child 的高水位。
@@ -1159,6 +1170,10 @@ class RadixCache(BasePrefixCache):
             if self.force_agentic:
                 # 直达 agentic 队列：新节点不再落 QTRANS（否则会被 one-shot 带先清）
                 new_node.queue_tag = SimpleHybridQueueTag.QAGENT
+            elif self.tag_policy is not None and state is not None:
+                # 标签版：新节点是「本会话私有的一段」，先 QTRANS；
+                # 第二个会话命中它时由 observe_hit 晋升为 QSTRUCT。
+                new_node.queue_tag = self.tag_policy.initial_tag(state.session_type)
             else:
                 new_node.queue_tag = (
                     session_type_to_queue_tag(state.session_type)
@@ -1176,9 +1191,12 @@ class RadixCache(BasePrefixCache):
                 observe(new_node)
             if (
                 not self.force_agentic
+                and self.tag_policy is None
                 and node is not self.root_node
                 and len(node.children) >= 2
             ):
+                # 三区版：拓扑分叉即 QSTRUCT（成员判定的黏性证据）。
+                # 标签版：标签只由「会话类型 + 会话共享数」决定，不掺拓扑。
                 node.queue_tag = SimpleHybridQueueTag.QSTRUCT
             if self.struct_policy is not None:
                 # 刚分叉的父节点可能是新成员（M3 第一项）

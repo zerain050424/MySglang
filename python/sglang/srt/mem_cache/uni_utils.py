@@ -1,4 +1,5 @@
 import math
+import zlib
 import dataclasses
 import enum
 import logging
@@ -38,6 +39,21 @@ class SimpleHybridQueueTag(str, enum.Enum):
     QSTRUCT = "qstruct"
     QAGENT = "qagent"
     QCHAT = "qchat"
+
+
+def session_bloom_bits(session_id) -> int:
+    """session_id -> 64 bit bloom（4 函数），饱和在 ~8 个会话后误判率上升。
+
+    两套 TinyLRU（三区版 / 标签版）共用同一份位布局，切换策略时节点上的
+    ``session_bloom`` 语义不变。
+    """
+    text = "sid:" + (session_id if isinstance(session_id, str) else str(session_id))
+    h = zlib.crc32(text.encode("utf-8", "replace")) & 0xFFFFFFFF
+    h = (h * 0x9E3779B1) & 0xFFFFFFFF
+    bits = 0
+    for i in range(4):
+        bits |= 1 << ((h >> (i * 6)) & 63)
+    return bits
 
 
 def session_type_to_queue_tag(session_type: SessionType) -> SimpleHybridQueueTag:
@@ -172,18 +188,30 @@ class TinyLRUParams:
     完整语义见 python/sglang/srt/mem_cache/STRUCT_QUEUE_WTINYLRU.md。
     """
 
-    policy: str = "off"  # "off" | "wtinylru"
+    # "off" | "tag_lru"（标签版，TinyLRU 分支默认）| "wtinylru"（三区版）
+    policy: str = "tag_lru"
     k: int = 3  # protected 的 share_count 门限
     window_entries: int = 64  # 观察窗条目配额（无队列预算，按条目而非 token）
     epoch_events: int = 8192  # aging 纪元的请求数
     admission_tie: str = "reject"  # 频数相同时 "reject" | "admit"
     admission_metric: str = "share"  # "share" | "share_per_token"
     inherit_share: bool = True  # 降级叶子是否继承父节点频数
+    # A：频数口径 —— "hybrid"（默认：protected 只给跨会话）| "session" | "rid"
+    share_metric: str = "hybrid"
+    # B：protected 的 token 预算（占活跃区 token 的比例），0 = 关闭；0.8 ≈ 教科书 SLRU
+    protected_budget_frac: float = 0.0
+    # C：叶子降级的新鲜度闸（秒），0 = 关闭；>0 时陈旧叶子落 window 重新观察
+    stale_grace_s: float = 0.0
+    # 标签版：会话共享数达到该值才算「跨会话模板」-> QSTRUCT；默认 2（即 >1）
+    struct_share_min: int = 2
+    # 标签版：会话内热点（share_sessions==1）的处置 —— "chat"（默认，保留复用）| "one_shot"
+    local_hot: str = "chat"
 
     def __post_init__(self):
-        if self.policy not in ("off", "wtinylru"):
+        if self.policy not in ("off", "tag_lru", "wtinylru"):
             raise ValueError(
-                f"Unknown tiny_lru.policy: {self.policy}. Supported: 'off', 'wtinylru'."
+                f"Unknown tiny_lru.policy: {self.policy}. "
+                "Supported: 'off', 'tag_lru', 'wtinylru'."
             )
         if self.k < 2:
             raise ValueError(f"tiny_lru.k must be >= 2, got {self.k}")
@@ -203,6 +231,29 @@ class TinyLRUParams:
             raise ValueError(
                 "tiny_lru.admission_metric must be 'share' or 'share_per_token', "
                 f"got {self.admission_metric}"
+            )
+        if self.share_metric not in ("hybrid", "session", "rid"):
+            raise ValueError(
+                "tiny_lru.share_metric must be 'hybrid', 'session' or 'rid', "
+                f"got {self.share_metric}"
+            )
+        if not 0.0 <= self.protected_budget_frac <= 1.0:
+            raise ValueError(
+                "tiny_lru.protected_budget_frac must be in [0, 1], "
+                f"got {self.protected_budget_frac}"
+            )
+        if self.stale_grace_s < 0.0:
+            raise ValueError(
+                f"tiny_lru.stale_grace_s must be >= 0, got {self.stale_grace_s}"
+            )
+        if self.local_hot not in ("one_shot", "chat"):
+            raise ValueError(
+                f"tiny_lru.local_hot must be 'one_shot' or 'chat', got {self.local_hot}"
+            )
+        if self.struct_share_min < 2:
+            raise ValueError(
+                "tiny_lru.struct_share_min must be >= 2 (>1 个会话才算共享), "
+                f"got {self.struct_share_min}"
             )
 
     @classmethod

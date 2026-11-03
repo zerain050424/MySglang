@@ -22,6 +22,7 @@ from sglang.srt.mem_cache.uni_utils import (
     _cached_lognorm_cdf,
     task_type_of_tag,
 )
+from sglang.srt.mem_cache.tag_lru import TagLruPolicy
 from sglang.srt.mem_cache.victim_override import (
     RrEvictPolicy,
     StructTinyLruPolicy,
@@ -204,6 +205,9 @@ class SimpleHybridStrategy(EvictionStrategy):
                 admission_tie=self.tiny_lru.admission_tie,
                 admission_metric=self.tiny_lru.admission_metric,
                 inherit_share=self.tiny_lru.inherit_share,
+                share_metric=self.tiny_lru.share_metric,
+                protected_budget_frac=self.tiny_lru.protected_budget_frac,
+                stale_grace_s=self.tiny_lru.stale_grace_s,
             )
             if self.tiny_lru.policy == "wtinylru"
             else None
@@ -213,6 +217,24 @@ class SimpleHybridStrategy(EvictionStrategy):
             if self.structState is not None
             else None
         )
+        # 标签版（TinyLRU 分支默认）：不建三区，只按「会话类型 + 会话共享数」贴标签。
+        # 与三区版二选一；两者都关时是彻底的零开销路径。
+        self.tagState = (
+            TagLruPolicy(
+                struct_share_min=self.tiny_lru.struct_share_min,
+                share_metric=(
+                    self.tiny_lru.share_metric
+                    if self.tiny_lru.share_metric in ("session", "rid")
+                    else "session"
+                ),
+                local_hot=self.tiny_lru.local_hot,
+            )
+            if self.tiny_lru.policy == "tag_lru"
+            else None
+        )
+        # 按标签记账：标签版没有插件，`victim_src` 里不会出现 qstruct，
+        # 这里单独统计「各标签被淘汰了多少 token」，profile 与实验套件都用它。
+        self._evicted_by_tag: Dict[str, float] = {}
         # T-LRU 尾巴优先：只修 QAGENT 的候选，并在插入期维护 _tlru_* 高水位。
         # 与 struct 分属不同队列可共存；与 fair_rr 互斥（两者都修 QAGENT，
         # 链上后注册者会把前者完全遮蔽），由 _validate_scope() 拦住。
@@ -239,12 +261,31 @@ class SimpleHybridStrategy(EvictionStrategy):
         self._seen_rids.clear()
         self._rid_order.clear()
 
+    def owns_struct(self, node) -> bool:
+        """该节点是否受「结构复用」保护（死链上溯闸用，两种模式统一入口）。"""
+        if self.structState is not None:
+            return bool(self.structState.owns(node))
+        if self.tagState is not None:
+            return bool(self.tagState.owns(node))
+        return False
+
+    def tag_snapshot(self) -> Optional[dict]:
+        return self.tagState.snapshot() if self.tagState is not None else None
+
     def _validate_scope(self) -> None:
         """拦住会静默失效的插件组合。
 
         `victim_overrides` 是覆盖链（后者覆盖前者），而 RR 只要挑得出会话就会
         返回非 None，所以 fair_rr + tlru 同时开会把 TLRU 完全遮蔽。
         """
+        if self.tagState is not None and self.tlru_evict is not None:
+            # 标签版把 QSTRUCT 的 LRU 顺序放进全局 victim_key，而 T-LRU 改写的是
+            # QAGENT 候选；两者同时开会互相遮蔽，直接拦住而不是静默失效。
+            raise ValueError(
+                "tiny_lru.policy='tag_lru' and tlru.enabled are mutually exclusive: "
+                "tag_lru orders QSTRUCT via victim_key, T-LRU rewrites QAGENT "
+                "candidates, and the latter silently wins."
+            )
         if self.rr_evict is not None and self.tlru_evict is not None:
             raise ValueError(
                 "rr.fair_rr and tlru.enabled are mutually exclusive: both rewrite "
@@ -295,10 +336,28 @@ class SimpleHybridStrategy(EvictionStrategy):
     # 暴露给淘汰器的键语义
 
     def victim_key(self, node) -> tuple:
+        """统一淘汰键。
+
+        三区版：``(reuse_score, -tokens)``，队内顺序由 struct 插件改写。
+        标签版（tag_lru）：把「类间优先级 + 类内顺序」直接编码进键——
+
+        * rank 0 = QTRANS / 一次性内容：最先走（区内 LRU）
+        * rank 1 = QCHAT / QAGENT：仍按复用概率曲线（HeterCache 的 reuse_prob）
+        * rank 2 = **QSTRUCT（跨会话共享前缀）：最受保护，类内 LRU**
+
+        注意 rank 2 必须显式给 LRU，不能用 `_reuse_score` —— 后者对 STRUCT 用的是
+        `1 - end_offset/max_offset` 的位置打分，长度 ≥ max_offset 的前缀会被判 0 分、
+        反而最先淘汰。
         """
-            统一淘汰键：复用分数低者先走，同分时 token 多者先走。
-        """
-        return (self._reuse_score(node), -_node_num_tokens(node))
+        tokens = _node_num_tokens(node)
+        if self.tagState is not None:
+            task = self._task_type_of(node)
+            if task == SimpleHybridTaskType.STRUCT_SINGLE_TURN:
+                return (2, node.last_access_time, -tokens)
+            if task == SimpleHybridTaskType.RANDOM_SINGLE_TURN:
+                return (0, node.last_access_time, -tokens)
+            return (1, self._reuse_score(node), -tokens)
+        return (self._reuse_score(node), -tokens)
 
     def is_one_shot(self, node) -> bool:
         """
@@ -359,6 +418,10 @@ class SimpleHybridStrategy(EvictionStrategy):
         )
         if self.is_one_shot(node):
             self._total_evicted_one_shot += tokens
+        if self.tagState is not None:
+            tag = getattr(node, "queue_tag", None)
+            key = f"tag:{getattr(tag, 'value', tag)}"
+            self._evicted_by_tag[key] = self._evicted_by_tag.get(key, 0.0) + tokens
 
     def record_victim_source(self, source: str, tokens: float) -> None:
         """
@@ -404,6 +467,17 @@ class SimpleHybridStrategy(EvictionStrategy):
             f"  pool={pool:.0f} schedulable={schedulable:.0f} "
             f"one_shot_evicted={self._total_evicted_one_shot:.0f}"
         )
+        if self._evicted_by_tag:
+            by_tag = " ".join(
+                f"{k}={v:.0f}" for k, v in sorted(self._evicted_by_tag.items())
+            )
+            lines.append(f"  evicted_by_tag: {by_tag}")
+        if self.tagState is not None:
+            s = self.tagState.snapshot()
+            lines.append(
+                f"  tag_lru: min_share={s['struct_share_min']} "
+                f"promote={s['promote']} dedup={s['dedup']} counted={s['counted']}"
+            )
         if self._victim_sources:
             src = " ".join(
                 f"{k}={v:.0f}" for k, v in self._victim_sources.items()

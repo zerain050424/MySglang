@@ -555,3 +555,63 @@ and not struct_policy.is_member(parent)          # 模板前缀不参与死链�
 `StructQueueState.snapshot()` 返回 `window/probation/protected/parked` 条目与 token、
 `admit/reject/retire/park/ages/dedup_hits/forced` 计数，供 §9 的指标接入。
 `forced` 是从 protected 兜底淘汰的次数：显著大于 0 说明 `struct_k` 太高或 window 太小。
+
+---
+
+## 10. 增量 A/B/C（会话级频数 / 保护预算 / 新鲜度闸）
+
+三处都只改**队内**语义，不涉及跨队列仲裁；各自独立、可单变量消融。
+
+### 10.1 A —— 频数口径：`share_metric ∈ {hybrid, session, rid}`
+
+旧实现只有 `share_count`（不同 **rid** 数），于是「一个会话自己跑 3 轮」就能让
+前缀满足 `share >= k` 直接进 protected —— 实测 `protected_waste_rate = 1.0`
+（被保护的 token 事后一次都没被复用）。新增 `share_sessions` + `session_bloom`
+（同一套 4 函数 bloom，hash 输入换成 `session_id`），分三档口径：
+
+| 口径 | 成员判定 / 准入 | 分档 |
+|---|---|---|
+| `rid`（旧） | rid 数 | rid>=k → protected，==2 → probation |
+| `session`（纯） | 会话数 | 会话数>=k → protected，==2 → probation |
+| **`hybrid`（默认）** | rid 数（保留会话内热点） | **只有 会话数>=k 才 protected**；会话数==2 或 rid>=2 → probation；其余 window |
+
+`hybrid` 的动机（实测）：纯 `session` 会把聊天负载的会话内链路踢出队列，
+ShareGPT 上 `qstruct%` 从 5.6% 掉到 0、命中率退回到与 `tiny_lru=off` 相同；
+纯 `rid` 则把 18.4k token 的会话内链路塞进 protected。`hybrid` 在两者之间：
+protected 只留给跨会话模板（ShareGPT 上为 0 token），会话内热点降级为 probation。
+
+### 10.2 B —— protected 的 token 预算：`protected_budget_frac`
+
+`protected` 原本无上限，只能靠 `eviction_candidate()` 的 `forced` 兜底整段抽干。
+现在维护区级 token 计数（`_tokens[region]`，push/remove 增量维护，分裂与 aging 重算），
+当 `protected_tokens > frac × (window+probation+protected)` 时，把**队头**降级到
+probation 尾：只改归属，不释放 KV（INV-2 / INV-3 不变）。被降级的节点再次命中会
+按当时频数重新分档，所以这是「让出保护」而不是「判死刑」。默认 0（关闭），A3 用 0.8。
+
+实测提醒：在 radix 树上，成员「成为可淘汰叶子」的时刻恰好是它即将被淘汰的时刻，
+protected 很难同时积累很大的 token 量，因此 B 更多是护栏（ShareGPT/rid 口径下触发 6 次），
+不是收益来源。
+
+### 10.3 C —— 新鲜度闸：`stale_grace_s`
+
+`on_became_leaf` 原本无条件按 `share` 继承分档，于是一个早就没人用的模板会因为历史
+频数直接进 protected。现在若 `now - last_access_time > stale_grace_s`，改为落 **window**
+重新观察（`stale_deflect` 计数）。默认 0（关闭）。
+
+注意：这是本文件里**唯一读墙钟**的地方（aging 仍是事件驱动）。离线回放必须把
+`struct_queue_policy` 纳入仿真时钟补丁（`wtl/simclock.py` 已包含），否则结果不可复现。
+
+### 10.4 顺带修复：`_promote` 的无限递归
+
+旧 `_promote()` 在「候选仍属 window 区」时递归调用 `_drain_window()`；当
+probation/protected 都为空（没有 victim 可比较）时形成无界递归，实测
+`RecursionError`（`struct_queue_policy.py:255 in _drain_window`），在线服务同形态
+负载下会崩。按 §5.2「promote(cand) → probation 尾」的语义改为：晋升必然离开 window，
+且不再递归（外层 while 继续 drain）。
+
+### 10.5 新增观测字段
+
+`snapshot()` 增加：`probation_tokens` / `parked_tokens` / `protected_budget` /
+`share_metric` / `protected_budget_frac` / `stale_grace_s`，以及计数
+`dedup_sessions`（同会话重复命中）、`budget_demote`（B 降级次数）、
+`stale_deflect`（C 改道次数）。

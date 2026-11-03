@@ -74,6 +74,7 @@ def _run(requests, arm_id: str, pool_tokens: int, backend: str, layers) -> dict:
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description="Phase-0 门控")
     p.add_argument("--backend", default="auto", choices=["auto", "real", "fake"])
+    p.add_argument("--arm", default="A3", help="门控主对象（默认 A3；标签版用 A16）")
     p.add_argument("--out", default="result/gate.json")
     a = p.parse_args(argv)
 
@@ -82,6 +83,7 @@ def main(argv=None) -> int:
 
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
+        arm = a.arm
         requests = _requests(tmp)
         layers = layers_from_requests(requests, seed=7)
         # 压力点必须相对「工作集」而不是「请求总量」：
@@ -97,8 +99,8 @@ def main(argv=None) -> int:
 
         # ---------------- G1 ----------------
         try:
-            r1 = _run(requests, "A3", g2_pool, a.backend, layers)
-            r2 = _run(requests, "A3", g2_pool, a.backend, layers)
+            r1 = _run(requests, arm, g2_pool, a.backend, layers)
+            r2 = _run(requests, arm, g2_pool, a.backend, layers)
             h1, h2 = _rows_hash(r1), _rows_hash(r2)
             ok = h1 == h2
             results.append(("G1", "可复现", "PASS" if ok else "FAIL", f"{h1} vs {h2}"))
@@ -113,6 +115,8 @@ def main(argv=None) -> int:
             s = r1["summary"]
             vsrc = s.get("victim_src") or {}
             snap = s.get("struct") or {}
+            tag = s.get("tag") or {}
+            by_tag = s.get("evicted_by_tag") or {}
             tot = sum(vsrc.values()) or 0.0
             qpct = 100.0 * vsrc.get("qstruct", 0.0) / tot if tot else 0.0
             # 「被行使」的判据（实测标定，见 README §7）：
@@ -127,14 +131,30 @@ def main(argv=None) -> int:
             counters = (
                 (snap.get("admit") or 0) + (snap.get("reject") or 0) + (snap.get("ages") or 0)
             )
-            exercised = populated and (qpct > 0 or (snap.get("forced") or 0) > 0)
+            if snap or not tag:
+                exercised = populated and (qpct > 0 or (snap.get("forced") or 0) > 0)
+            else:
+                # 标签版：没有三区/插件，证据换成「晋升发生过」+「QSTRUCT 真的被淘汰过」
+                promote = int(tag.get("promote") or 0)
+                q_evicted = float(by_tag.get("tag:qstruct", 0.0) or 0.0)
+                exercised = promote > 0 and q_evicted > 0
+                populated = promote > 0
+            if snap:
+                detail = (
+                    f"qstruct={qpct:.1f}% admit={snap.get('admit')} "
+                    f"reject={snap.get('reject')} ages={snap.get('ages')} "
+                    f"parked={snap.get('parked')} regions(w/p/r)="
+                    f"{snap.get('window')}/{snap.get('probation')}/{snap.get('protected')} "
+                    f"forced={snap.get('forced')} counters={counters}"
+                )
+            else:
+                detail = (
+                    f"tag_lru promote={tag.get('promote')} counted={tag.get('counted')} "
+                    f"dedup={tag.get('dedup')} qstruct_evicted="
+                    f"{by_tag.get('tag:qstruct', 0.0):.0f}"
+                )
             results.append(
-                ("G2", "机制被行使", "PASS" if exercised else "FAIL",
-                 f"qstruct={qpct:.1f}% admit={snap.get('admit')} "
-                 f"reject={snap.get('reject')} ages={snap.get('ages')} "
-                 f"parked={snap.get('parked')} regions(w/p/r)="
-                 f"{snap.get('window')}/{snap.get('probation')}/{snap.get('protected')} "
-                 f"forced={snap.get('forced')} counters={counters}")
+                ("G2", "机制被行使", "PASS" if exercised else "FAIL", detail)
             )
             cascade = (s.get("regret") or {}).get("protected_cascade_deleted_tokens", 0)
             results.append(
@@ -142,7 +162,8 @@ def main(argv=None) -> int:
                  f"protected 级联删除 {cascade} tokens")
             )
             payload["checks"].append({"id": "G2", "pass": exercised, "qstruct_pct": qpct,
-                                      "struct": snap})
+                                      "struct": snap, "tag": tag,
+                                      "evicted_by_tag": by_tag})
             payload["checks"].append({"id": "G5", "pass": cascade == 0,
                                       "protected_cascade_tokens": cascade})
             payload["struct_activity"] = snap

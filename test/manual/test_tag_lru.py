@@ -1,0 +1,255 @@
+"""标签版 TinyLRU（`tiny_lru.policy="tag_lru"`）的 characterization tests。
+
+钉住五件事：
+
+1. **分类即晋升**：STRUCT 会话下，节点在第二个会话命中时当场从 QTRANS → QSTRUCT，
+   不需要等它变成「可淘汰叶子」（这是三区版最难等的条件）。
+2. **共享数 = 不同会话数**：同一会话重复命中不重复计数。
+3. **非 STRUCT 会话不参与晋升**：chat/agentic 的节点保持自己的队列。
+4. **类间顺序 + 类内 LRU**：`victim_key` 让 QTRANS（ranks 0）最先、chat/agentic（1）
+   其次、QSTRUCT（2）最后，且 QSTRUCT 内部按 `last_access_time` 排（不是位置打分）。
+5. **接线**：tag 模式不构造三区状态机、不注册插件；死链闸 `owns_struct` 走标签。
+
+    python test/manual/test_tag_lru.py
+"""
+
+import os
+import sys
+import time
+
+sys.path.insert(
+    0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "python")
+)
+
+from sglang.srt.mem_cache.evict_policy import SimpleHybridStrategy  # noqa: E402
+from sglang.srt.mem_cache.tag_lru import TagLruPolicy  # noqa: E402
+from sglang.srt.mem_cache.uni_utils import (  # noqa: E402
+    SessionType,
+    SimpleHybridQueueTag,
+)
+
+FAILS = []
+
+
+def check(cond, msg):
+    if not cond:
+        FAILS.append(msg)
+        print(f"  FAIL  {msg}")
+    return cond
+
+
+class FakeNode:
+    """TreeNode 的最小替身：只带标签版策略与 victim_key 读写的字段。"""
+
+    def __init__(self, tokens=16, tag=SimpleHybridQueueTag.QTRANS, last_access=None):
+        self.value = [0] * tokens
+        self.children = {}
+        self.parent = None
+        self.lock_ref = 0
+        self.evicted = False
+        self.queue_tag = tag
+        self.share_count = 0
+        self.share_sessions = 0
+        self.rid_bloom = 0
+        self.session_bloom = 0
+        self.last_access_time = time.monotonic() if last_access is None else last_access
+        self.abs_start = 0
+
+
+def test_initial_tag_by_session_type():
+    """新节点出生标签：STRUCT 会话先给 QTRANS（它只是本会话私有的一段）。"""
+    print("[1] initial tag by session type")
+    p = TagLruPolicy()  # 默认 local_hot="chat"
+    check(p.initial_tag(SessionType.STRUCT) == SimpleHybridQueueTag.QCHAT,
+          "STRUCT new node starts as QCHAT under the default (local_hot=chat)")
+    check(TagLruPolicy(local_hot="one_shot").initial_tag(SessionType.STRUCT)
+          == SimpleHybridQueueTag.QTRANS,
+          "local_hot=one_shot starts STRUCT nodes on the one-shot band")
+    check(p.initial_tag(SessionType.CHAT) == SimpleHybridQueueTag.QCHAT,
+          "CHAT -> QCHAT")
+    check(p.initial_tag(SessionType.AGENTIC) == SimpleHybridQueueTag.QAGENT,
+          "AGENTIC -> QAGENT")
+    check(p.initial_tag(SessionType.TRANS) == SimpleHybridQueueTag.QTRANS,
+          "TRANS -> QTRANS")
+    check(p.stats["born"] == 4, f"born counter, got {p.stats['born']}")
+
+
+def test_promotion_on_second_session():
+    """分类即晋升：第二个会话命中同一条前缀时当场 QTRANS -> QSTRUCT。"""
+    print("[2] promotion happens on the second session hit")
+    p = TagLruPolicy()
+    node = FakeNode()
+
+    p.observe_hit(node, "sid-A", SessionType.STRUCT)
+    check(node.share_sessions == 1, f"share_sessions, got {node.share_sessions}")
+    check(node.queue_tag == SimpleHybridQueueTag.QTRANS,
+          f"one session -> still QTRANS, got {node.queue_tag}")
+    check(p.stats["promote"] == 0, "no promotion yet")
+
+    # 同一会话重复命中：去重，不涨共享数
+    p.observe_hit(node, "sid-A", SessionType.STRUCT)
+    check(node.share_sessions == 1, f"same session must dedup, got {node.share_sessions}")
+    check(p.stats["dedup"] == 1, f"dedup counter, got {p.stats['dedup']}")
+
+    # 第二个会话命中：晋升
+    p.observe_hit(node, "sid-B", SessionType.STRUCT)
+    check(node.share_sessions == 2, f"share_sessions, got {node.share_sessions}")
+    check(node.queue_tag == SimpleHybridQueueTag.QSTRUCT,
+          f"two sessions -> QSTRUCT, got {node.queue_tag}")
+    check(p.stats["promote"] == 1, f"promote counter, got {p.stats['promote']}")
+    check(p.owns(node), "owns() must be true for QSTRUCT")
+
+
+def test_non_struct_session_does_not_promote():
+    """chat/agentic 会话不参与晋升：共享数再高也保持自己的队列标签。"""
+    print("[3] non-STRUCT sessions never promote to QSTRUCT")
+    p = TagLruPolicy()
+    node = FakeNode(tag=SimpleHybridQueueTag.QCHAT)
+    for sid in ("c1", "c2", "c3"):
+        p.observe_hit(node, sid, SessionType.CHAT)
+    check(node.share_sessions == 3, f"share_sessions, got {node.share_sessions}")
+    check(node.queue_tag == SimpleHybridQueueTag.QCHAT,
+          f"CHAT tag must be untouched, got {node.queue_tag}")
+    check(p.stats["promote"] == 0, "no promotion for chat sessions")
+    check(not p.owns(node), "chat node is not struct-owned")
+
+
+def test_struct_share_min_threshold():
+    """struct_share_min 可调：=3 时前两个会话仍留在 QTRANS。"""
+    print("[4] struct_share_min threshold")
+    p = TagLruPolicy(struct_share_min=3)
+    node = FakeNode()
+    p.observe_hit(node, "s1", SessionType.STRUCT)
+    p.observe_hit(node, "s2", SessionType.STRUCT)
+    check(node.queue_tag == SimpleHybridQueueTag.QTRANS,
+          f"2 sessions with min=3 -> QTRANS, got {node.queue_tag}")
+    p.observe_hit(node, "s3", SessionType.STRUCT)
+    check(node.queue_tag == SimpleHybridQueueTag.QSTRUCT,
+          f"3 sessions with min=3 -> QSTRUCT, got {node.queue_tag}")
+
+
+def test_local_hot_modes():
+    """会话内热点：one_shot 掉进一次性带；chat 保留复用语义（rank 1）。"""
+    print("[4b] local_hot modes for session-local reuse")
+    check(TagLruPolicy().local_hot == "chat", "default local_hot must be 'chat'")
+    one = TagLruPolicy(local_hot="one_shot")
+    node = FakeNode()
+    one.observe_hit(node, "s1", SessionType.STRUCT)      # share=1, rids=1
+    check(node.queue_tag == SimpleHybridQueueTag.QTRANS,
+          f"one_shot mode: single-session -> QTRANS, got {node.queue_tag}")
+    node.share_count = 2                                  # 同一会话第二轮
+    one.apply_tag(node, SessionType.STRUCT)
+    check(node.queue_tag == SimpleHybridQueueTag.QTRANS,
+          f"one_shot mode ignores rids, got {node.queue_tag}")
+
+    chat = TagLruPolicy(local_hot="chat")
+    n2 = FakeNode()
+    check(chat.initial_tag(SessionType.STRUCT) == SimpleHybridQueueTag.QCHAT,
+          "chat mode: new struct-session node starts as QCHAT (not one-shot)")
+    chat.observe_hit(n2, "s2", SessionType.STRUCT)
+    n2.share_count = 2
+    chat.apply_tag(n2, SessionType.STRUCT)
+    check(n2.queue_tag == SimpleHybridQueueTag.QCHAT,
+          f"chat mode keeps session-local hot nodes off the one-shot band, got {n2.queue_tag}")
+    # 第二个会话仍会晋升
+    chat.observe_hit(n2, "s3", SessionType.STRUCT)
+    check(n2.queue_tag == SimpleHybridQueueTag.QSTRUCT,
+          f"second session still promotes in chat mode, got {n2.queue_tag}")
+
+
+def test_victim_key_class_rank_and_lru():
+    """victim_key：QTRANS(0) < chat/agentic(1) < QSTRUCT(2)，QSTRUCT 内部 LRU。"""
+    print("[5] victim_key: class rank + LRU inside QSTRUCT")
+    st = SimpleHybridStrategy(tiny_lru={"policy": "tag_lru"})
+    check(st.tagState is not None, "tag mode must construct TagLruPolicy")
+
+    now = time.monotonic()
+    t = FakeNode(tag=SimpleHybridQueueTag.QTRANS, last_access=now)
+    c = FakeNode(tag=SimpleHybridQueueTag.QCHAT, last_access=now)
+    a = FakeNode(tag=SimpleHybridQueueTag.QAGENT, last_access=now)
+    old_s = FakeNode(tag=SimpleHybridQueueTag.QSTRUCT, last_access=now - 100)
+    new_s = FakeNode(tag=SimpleHybridQueueTag.QSTRUCT, last_access=now)
+
+    kt, kc, ka = st.victim_key(t), st.victim_key(c), st.victim_key(a)
+    ko, kn = st.victim_key(old_s), st.victim_key(new_s)
+
+    check(kt[0] == 0, f"QTRANS rank, got {kt[0]}")
+    check(kc[0] == 1 and ka[0] == 1, f"chat/agentic rank, got {kc[0]}/{ka[0]}")
+    check(ko[0] == 2 and kn[0] == 2, f"QSTRUCT rank, got {ko[0]}/{kn[0]}")
+    check(kt < kc < ko, f"class order must be QTRANS < chat < QSTRUCT: {kt} {kc} {ko}")
+    check(ko < kn, f"QSTRUCT is LRU: older must sort first ({ko} vs {kn})")
+
+    # 全局 min() 的语义：一次性先走、其次 chat、最后共享前缀
+    victim = min([new_s, a, t, c, old_s], key=st.victim_key)
+    check(victim is t, f"min() must pick the QTRANS node, got {victim.queue_tag}")
+
+    # 对照：三区版保持旧键（不受 class rank 影响）
+    old_mode = SimpleHybridStrategy(tiny_lru={"policy": "wtinylru"})
+    check(old_mode.tagState is None, "wtinylru must not build tagState")
+    check(len(old_mode.victim_key(t)) == 2,
+          f"three-region victim_key stays (score, -tokens), got {old_mode.victim_key(t)}")
+
+
+def test_wiring_and_dead_chain_gate():
+    """接线：tag 模式不建三区、不注册插件；owns_struct 走标签。"""
+    print("[6] wiring + dead-chain gate")
+    st = SimpleHybridStrategy(tiny_lru={"policy": "tag_lru"})
+    check(st.structState is None, "tag mode must not build the three-region state machine")
+    check(st.TinyLru_evict is None, "tag mode must not register the struct override")
+    check(st.victim_overrides == (), f"tag mode has no overrides, got {st.victim_overrides}")
+
+    shared = FakeNode(tag=SimpleHybridQueueTag.QSTRUCT)
+    private = FakeNode(tag=SimpleHybridQueueTag.QTRANS)
+    check(st.owns_struct(shared), "owns_struct(QSTRUCT) must be True")
+    check(not st.owns_struct(private), "owns_struct(QTRANS) must be False")
+
+    # off：两者都不建
+    off = SimpleHybridStrategy(tiny_lru={"policy": "off"})
+    check(off.tagState is None and off.structState is None, "off builds nothing")
+    check(not off.owns_struct(shared), "off owns nothing")
+
+
+def test_tag_and_tlru_are_mutually_exclusive():
+    """tag_lru 与 T-LRU 同时开会互相遮蔽，必须启动期报错。"""
+    print("[7] tag_lru + tlru must fail fast")
+    try:
+        SimpleHybridStrategy(
+            tiny_lru={"policy": "tag_lru"},
+            # threshold 必须 > next_prompt_estimate，否则 TlruParams 自己就会先报错
+            tlru={"enabled": True, "threshold": 1024, "next_prompt_estimate": 128},
+        )
+    except ValueError as exc:
+        check("mutually exclusive" in str(exc), f"unexpected message: {exc}")
+    else:
+        check(False, "expected ValueError for tag_lru + tlru")
+
+
+def main():
+    tests = [
+        test_initial_tag_by_session_type,
+        test_promotion_on_second_session,
+        test_non_struct_session_does_not_promote,
+        test_struct_share_min_threshold,
+        test_local_hot_modes,
+        test_victim_key_class_rank_and_lru,
+        test_wiring_and_dead_chain_gate,
+        test_tag_and_tlru_are_mutually_exclusive,
+    ]
+    for t in tests:
+        try:
+            t()
+        except Exception as exc:  # noqa: BLE001
+            FAILS.append(f"{t.__name__} raised {type(exc).__name__}: {exc}")
+            print(f"  ERROR {t.__name__}: {type(exc).__name__}: {exc}")
+    print()
+    if FAILS:
+        print(f"FAILED ({len(FAILS)} problems)")
+        for f in FAILS:
+            print("  -", f)
+        return 1
+    print("ALL PASSED")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

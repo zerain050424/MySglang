@@ -280,6 +280,8 @@ def run_replay(
         "history_retention": retention.history_summary(),
         "regret": regret.summary() if regret is not None else None,
         "struct": stats.get("struct"),
+        "tag": stats.get("tag"),
+        "evicted_by_tag": stats.get("evicted_by_tag") or {},
         "victim_src": stats.get("victim_src") or {},
         "alpha": stats.get("alpha") or {},
         "wall_s": round(time.perf_counter() - t0, 3),

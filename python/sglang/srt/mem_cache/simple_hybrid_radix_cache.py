@@ -93,7 +93,9 @@ class SimpleHybridRadixCache(RadixCache):
         """
         total = 0
         cur = node
-        struct_state = getattr(self.eviction_strategy, "structState", None)
+        # 死链上溯闸：三区版看 struct_region，标签版看 queue_tag==QSTRUCT。
+        # 统一走策略的 owns_struct()，避免两套实现各自漏一处。
+        owns_struct = getattr(self.eviction_strategy, "owns_struct", None)
         one_shot = self.eviction_strategy.is_one_shot(node)
         while True:
             parent = cur.parent
@@ -110,7 +112,7 @@ class SimpleHybridRadixCache(RadixCache):
                     and parent.lock_ref == 0 and not parent.children
                     # Q_struct 闸：模板前缀不参与 one-shot 死链级联，
                     # 否则「降级后的文档段被收割」会连带删掉刚进 protected 的前缀。
-                    and not (struct_state is not None and struct_state.owns(parent))):
+                    and not (owns_struct is not None and owns_struct(parent))):
                 cur = parent  # 死链：随 one-shot 一并删除
                 continue
             break

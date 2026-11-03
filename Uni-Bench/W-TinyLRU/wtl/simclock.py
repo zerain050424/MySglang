@@ -37,6 +37,9 @@ _PATCHED_MODULES = (
     "sglang.srt.mem_cache.simple_hybrid_radix_cache",
     "sglang.srt.mem_cache.victim_override",
     "sglang.srt.mem_cache.uni_utils",
+    # C（新鲜度闸）在 struct_queue_policy 里读 time.monotonic()：
+    # 不纳入仿真时钟的话，离线回放会按真实耗时判定「陈旧」，结果不可复现。
+    "sglang.srt.mem_cache.struct_queue_policy",
 )
 
 _EPOCH = 1_700_000_000.0  # 固定墙钟起点：只为了让 time() 看起来合理，不参与排序

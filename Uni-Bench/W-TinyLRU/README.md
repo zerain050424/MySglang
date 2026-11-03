@@ -141,6 +141,44 @@ python -m wtl.replay --arm A3 --data-path data/synth_p2048_b10/session_data.json
 
 ---
 
+## 4.0 两套队内实现：`tag_lru`（默认）与 `wtinylru`
+
+本套件同时支持两套 Q_struct 队内策略，用 `tiny_lru.policy` 切换：
+
+| policy | 机制 | 实验臂 |
+|---|---|---|
+| **`tag_lru`**（TinyLRU 分支默认） | **分类即晋升**：STRUCT 会话下，`share_sessions >= struct_share_min` → QSTRUCT（类内 LRU），会话内热点按 `local_hot` 处置（默认 QCHAT，不进 one-shot 带） | A16（一shot 版）/ A17（min=3）/ **A18（默认）** |
+| `wtinylru`（三区版） | window/probation/protected + 频数准入 + aging + protected 预算（即下面 A/B/C 的全部内容） | A3…A15 |
+| `off` | 完全关闭，零开销 | A2 |
+
+实测（ShareGPT / 合成多轮 struct，pool/工作集=0.3）：
+
+| 配置 | ShareGPT 命中率 | 会话内历史保留 | 合成负载命中率 | 后悔率 |
+|---|---|---|---|---|
+| LRU（A0） | 66.90% | 0.736 | 81.09% | 0.0638 |
+| `off`（A2） | 49.26% | 0.551 | 80.37% | 0.1810 |
+| 三区版（A3） | 49.74% | 0.593 | 80.37% | 0.1921 |
+| 标签版 `local_hot=one_shot`（A16） | 54.61% | 0.738 | 75.67% | 0.1393 |
+| **标签版默认（A18）** | **78.10%** | **0.892** | **82.46%** | **0.0202** |
+
+设计说明见 `python/sglang/srt/mem_cache/TAG_LRU.md`。
+
+## 4.0.1 三区版的 A/B/C 三项增量
+
+`struct_queue_policy.py` 现在有三个新参数（`TinyLRUParams` 同名同校验）：
+
+| 参数 | 默认 | 语义 | 消融臂 |
+|---|---|---|---|
+| `share_metric` | `"hybrid"` | 频数口径。`hybrid`：成员/准入仍按**不同请求数**，但 **protected 只留给跨会话共享**（不同会话数 ≥ k）；`session`：只数会话（会话内复用完全不计）；`rid`：只数请求（旧行为） | A12(rid) / A15(session) |
+| `protected_budget_frac` | `0.0`（A3 用 0.8） | protected 的 **token 预算**（占活跃区 token 比）。超限时把队头降级到 probation 尾，只改归属、不释放 KV | A13(0) |
+| `stale_grace_s` | `0.0`（A14 用 60） | 叶子降级时的**新鲜度闸**：空闲超过该秒数就不继承 band，先落 window 重新观察 | A14(60) |
+
+主对象 **A3 = hybrid + budget 0.8**。同时修掉 `_promote` 的无限递归（见下节）。
+
+**为什么 `hybrid` 而不是纯 `session`**（实测，见 §7.9）：纯会话口径下，ShareGPT 的
+`qstruct%` 从 5.6% 掉到 **0**、命中率退回到与 `tiny_lru=off` 完全相同——因为聊天的主要
+复用是**会话内**历史，纯会话口径把这类节点直接踢出队列（它们不再满足 M3）。
+
 ## 4.1 框架缺陷兼容补丁（`wtl/compat.py`）
 
 **实跑发现一个会打挂服务的框架 bug**（不是本套件引入的）：
@@ -267,7 +305,7 @@ def _promote(self, node) -> None:
 | §5.1 场景 A | `wtl/synth.py` + `--mode synth` |
 | §6 消融矩阵 | `wtl/arms.py` + `scripts/run_online.sh` 的 `arm_policy` |
 | §8 判定 | `analyze.judge`：M1/M2/M3/M4-gate/M5 逐条 PASS/FAIL |
-| §10 前置检查 | `wtl/gate.py`（G1–G5；G2 判据按实测标定见 §7.8） |
+| §10 前置检查 | `wtl/gate.py --arm A18`（G1–G5；G2 在标签版看 promote/evicted_by_tag） |
 
 ---
 

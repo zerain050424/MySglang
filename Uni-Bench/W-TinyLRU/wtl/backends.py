@@ -199,8 +199,12 @@ class RealBackend:
                 return super()._delete_leaf(node)
 
         self._clock = radix.time  # 已被 SimClock 替换；缓存引用省掉逐次 import
+        self._tag_mode = False  # 建好 cache 后再判定（见下）
         self._cache_cls = _Instrumented
         self.cache = _Instrumented(init_params)
+        self._tag_mode = (
+            getattr(self.cache.eviction_strategy, "tagState", None) is not None
+        )
         self._req_seq = 0
         self.pool_tokens = int(pool_tokens)
 
@@ -276,7 +280,13 @@ class RealBackend:
             return
         depth, ph = _node_path_info(node, root)
         tokens = int(len(node.value)) if node.value is not None else 0
-        region = int(getattr(node, "struct_region", 0) or 0)
+        if self._tag_mode:
+            # 标签版没有 struct_region：QSTRUCT 就是「受保护」的等价物，
+            # 这样 G5（protected 级联删除）在两种模式下都能量。
+            tag = getattr(node, "queue_tag", None)
+            region = 3 if getattr(tag, "value", tag) == "qstruct" else 0
+        else:
+            region = int(getattr(node, "struct_region", 0) or 0)
         self._on_evict(
             self._clock_now(), depth, ph, tokens, region, bool(is_victim)
         )
@@ -301,6 +311,12 @@ class RealBackend:
             "available": self._available(),
             "evictable_size": int(getattr(self.cache, "evictable_size_", 0) or 0),
             "struct": snap,
+            "tag": (
+                strategy.tag_snapshot()
+                if hasattr(strategy, "tag_snapshot")
+                else None
+            ),
+            "evicted_by_tag": dict(getattr(strategy, "_evicted_by_tag", {}) or {}),
             "victim_src": victim_src,
             "alpha": alpha,
         }
