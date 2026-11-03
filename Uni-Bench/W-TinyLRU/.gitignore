@@ -1,0 +1,5 @@
+# 实验结果与合成数据（体积大、可重跑）
+result/
+data/
+__pycache__/
+*.pyc
