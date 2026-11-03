@@ -5,6 +5,11 @@
 #   SEEDS="42" bash run_matrix.sh            # 更快的试点
 #   SEEDS="42 43 44" bash run_matrix.sh      # 全量
 #
+# 预算标定（实测）：单 run 常驻峰值 35.7k tokens，去重后就是真实工作集。
+#   BUDGET=22000 -> 1.62x（约 13.7k 被淘汰）
+#   BUDGET=30000 -> 1.19x（约 5.7k 被淘汰，最敏感的温和压力）
+#   再高（60k/100k）就没有淘汰发生，三个臂不可能有差异。
+#
 # 时间由三部分构成，且最大的一项是 server 启动（约 1.5 min/次）：
 #   启动   ~90 s   ← 只依赖 (arm, budget)，默认按该组合复用，seed/mode 之间用
 #                    /flush_cache 隔开（36 次启动 -> 6 次）
@@ -20,7 +25,7 @@ source "$BENCH_DIR/env.sh"
 
 ARMS=${ARMS:-"a0_control a1_rr a2_tlru"}
 RESUME_MODES=${RESUME_MODES:-"simultaneous batched"}
-BUDGETS=${BUDGETS:-"60000 100000"}
+BUDGETS=${BUDGETS:-"22000 30000"}
 SEEDS=${SEEDS:-"42 43"}
 
 # burst/pause 形状（三个臂必须完全一致）

@@ -39,25 +39,35 @@ victim 与搅拌流**都**被强制标成 QAGENT（`force_agentic`），所以�
 |---|---|
 | 臂 | a0 / a1 / a2 |
 | 回归方式 | simultaneous / batched |
-| KV 预算 | 60000 / 100000 |
+| KV 预算 | **22000 / 30000**（实测标定，见下） |
 | seed | **42 / 43**（默认 2 个，够做同号校验） |
 
-### 压力标定（第一轮实验的教训）
+### 压力标定（两轮实测的教训）
 
-第一轮把搅拌流设成 `max_record=300, lambda_rate=6`：60 s 窗口涌入约 360k tokens，
-是 60k 预算的 **6 倍**。结果三个臂的 resume 命中率完全相同（6.17 / 6.14），因为
-6 倍周转下任何策略都保不住东西——场景被暴露了，但策略无法介入。
-该批数据已归档到 `/root/rr_vs_tlru_runs/result_saturated_6x/`（24 个点，可作饱和区对照）。
+**第一轮：压力过大（6×）。** 搅拌流 `max_record=300, lambda_rate=6`，60 s 窗口涌入
+约 360k tokens = 60k 预算的 6 倍。三个臂的 resume 命中率完全相同（6.17 / 6.14），
+因为 6 倍周转下任何策略都保不住东西。归档：`/root/rr_vs_tlru_runs/result_saturated_6x/`。
 
-当前参数按「总需求 ≈ 1.3 × 预算」标定：
+**第二轮：压力过小（0×）。** 把搅拌流降到 70×387 token 后，整轮**零淘汰**：
+`victim_src` 一行都没打印，常驻峰值 35.7k < 预算 60k。归档：
+`/root/rr_vs_tlru_runs/result_no_eviction_60k_100k/`（12 个点，可作「无淘汰」对照）。
 
-| 项 | 值 |
-|---|---|
-| victims | 8 × 3 轮 ≈ 48k tokens |
-| 搅拌 | 70 × 1.2k ≈ 84k tokens |
-| 合计 | 132k |
-| 60k 预算 | 2.2×（预计仍饱和） |
-| 100k 预算 | **1.3×（策略有介入空间，主看点）** |
+**实测数据（budget=60k 时单 run）**：
+
+| 任务 | 请求数 | prompt tokens | 每条均值 | 命中率 |
+|---|---|---|---|---|
+| agentic_idle | 96 | 57,535 | 599 | 84.4 % |
+| agentic_active | 70 | 27,111 | **387** | 6.4 % |
+| 合计 | 166 | 84,646 | — | 59.4 % |
+| **常驻峰值** | | | | **35.7k** |
+
+关键结论：**预算是压力杠杆，搅拌流不是**。常驻 35.7k 是上界，预算必须低于它：
+
+| 预算 | 相对常驻 | 预计淘汰 | 说明 |
+|---|---|---|---|
+| 22000 | 1.62× | ~13.7k | 压力明显，策略有充足介入空间 |
+| 30000 | 1.19× | ~5.7k | 温和压力，对策略差异最敏感 |
+| ~~60000 / 100000~~ | 0.60× / 0.36× | **0** | 无淘汰，三臂必然相同 |
 
 **耗时构成**（用 `result/burst/burst_n4_base.json` 实测校准：144 请求 / 157 s）：
 
@@ -72,14 +82,14 @@ victim 与搅拌流**都**被强制标成 QAGENT（`force_agentic`），所以�
 
 | 场景 | 运行数 | server 启动 | 预估 |
 |---|---|---|---|
-| 试点（`ARMS="a1_rr a2_tlru" RESUME_MODES=simultaneous BUDGETS=60000 SEEDS="42"`） | 2 | 2 | **~7 min** |
+| 试点（`ARMS="a1_rr a2_tlru" RESUME_MODES=simultaneous BUDGETS=30000 SEEDS="42"`） | 2 | 2 | **~7 min** |
 | 快跑（默认：3 臂 × 2 模式 × 2 预算 × 2 seed） | 24 | **6** | **~1 h** |
 | 全量（3 seed） | 36 | 6 | ~1.4 h |
 | 不复用（`GROUP_BY_SERVER=0`，24 次启动） | 24 | 24 | ~1.5 h |
 
 ```bash
 # 试点（7 分钟，先确认脚本/相位都对）
-ARMS="a1_rr a2_tlru" RESUME_MODES=simultaneous BUDGETS=60000 SEEDS="42" bash run_matrix.sh
+ARMS="a1_rr a2_tlru" RESUME_MODES=simultaneous BUDGETS=30000 SEEDS="42" bash run_matrix.sh
 
 # 快跑（默认）
 bash run_matrix.sh
