@@ -364,6 +364,12 @@ class RadixCache(BasePrefixCache):
         # Q_struct 队内 W-TinyLRU（SimpleHybridStrategy.structState；其他策略为 None）。
         # 只在策略开启时挂钩子，关闭时所有调用点都是 `is not None` 的一次判空。
         self.struct_policy = getattr(self.eviction_strategy, "structState", None)
+        # 实验开关（SimpleHybridStrategy.force_agentic）：把所有节点直接标成 QAGENT，
+        # 让 QAGENT-only 的插件（RR / T-LRU）拿到 100% 的流量。只改 queue_tag，
+        # 不动 session_type —— 分类器自身的统计仍然可测。
+        self.force_agentic = bool(
+            getattr(self.eviction_strategy, "force_agentic", False)
+        )
         # 可插拔的「淘汰候选改写器」：RR 会话公平 / struct 队内顺序等。
         # 空元组表示没有任何插件，淘汰走原来的全局 victim_key。
         self.victim_overrides = tuple(
@@ -1005,7 +1011,10 @@ class RadixCache(BasePrefixCache):
         """Apply the session's type to owned nodes; keep fork/shared tags sticky."""
         delta = access_time - node.last_access_time
         node.hit_count += 1
-        if node.queue_tag != SimpleHybridQueueTag.QSTRUCT:
+        if self.force_agentic:
+            # 直达 agentic 队列：跳过 8s 间隔判定与 QSTRUCT 黏性。
+            node.queue_tag = SimpleHybridQueueTag.QAGENT
+        elif node.queue_tag != SimpleHybridQueueTag.QSTRUCT:
             state = (
                 self.session_registry.get(session_id)
                 if self._hit_recorder is not None
@@ -1138,11 +1147,15 @@ class RadixCache(BasePrefixCache):
             new_node.key = key
             new_node.value = value.clone()
             state = self.session_registry.get(session_id)
-            new_node.queue_tag = (
-                session_type_to_queue_tag(state.session_type)
-                if state is not None
-                else SimpleHybridQueueTag.QTRANS
-            )
+            if self.force_agentic:
+                # 直达 agentic 队列：新节点不再落 QTRANS（否则会被 one-shot 带先清）
+                new_node.queue_tag = SimpleHybridQueueTag.QAGENT
+            else:
+                new_node.queue_tag = (
+                    session_type_to_queue_tag(state.session_type)
+                    if state is not None
+                    else SimpleHybridQueueTag.QTRANS
+                )
             new_node.is_decode = (
                 decode_start is not None and total_prefix_length >= decode_start
             )
@@ -1152,7 +1165,11 @@ class RadixCache(BasePrefixCache):
             # T-LRU：新节点记下 root->self 的累计长度，并把高水位沿祖先链上抬。
             for observe in self._insert_observers:
                 observe(new_node)
-            if node is not self.root_node and len(node.children) >= 2:
+            if (
+                not self.force_agentic
+                and node is not self.root_node
+                and len(node.children) >= 2
+            ):
                 node.queue_tag = SimpleHybridQueueTag.QSTRUCT
             if self.struct_policy is not None:
                 # 刚分叉的父节点可能是新成员（M3 第一项）

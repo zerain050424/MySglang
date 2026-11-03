@@ -1,0 +1,9 @@
+{
+  "force_agentic": true,
+  "rr": {
+    "fair_rr": true,
+    "kappa": 0.5,
+    "min_retain_tokens": 512,
+    "min_retain_frac": 0.3
+  }
+}

@@ -142,6 +142,54 @@ class BurstGate:
             self.event.set()
 
 
+class ResumeGate:
+    """burst 窗口结束之后，按 wave 放行 victim 会话。
+
+    burst/pause 两阶段的时序（三者共用同一个时钟）：
+
+        t0            victim 同相位起跑（arrival.mode=fixed），跑到 pause_after_turn 轮
+        t_pause       全部 victim 越过 pause 点 -> BurstGate 放行搅拌流（小流量涌入）
+        t_pause+burst burst 窗口持续 burst_duration_s，期间 victim 的 KV 被挤
+        t_open        窗口关闭 -> 本类决定 victim 何时恢复：
+                        simultaneous 全部同时恢复（thundering herd）
+                        batched      victim i 在 t_open + (i // wave_size) * interval 恢复
+
+    用途：把「多会话同时回归」与「分批次回归」做成同一个矩阵里的两种轴，
+    其余条件（victim 数量、burst 时长、预算）完全相同。
+    """
+
+    def __init__(self, expect: int, mode: str = "simultaneous",
+                 wave_size: int = 4, wave_interval_s: float = 10.0):
+        self.expect = max(0, int(expect))
+        self.mode = mode
+        self.wave_size = max(1, int(wave_size))
+        self.wave_interval_s = max(0.0, float(wave_interval_s))
+        self.opened_at: Optional[float] = None
+        self.opened_event = asyncio.Event()
+        self.resumed: List[float] = []          # 每个 victim 实际恢复时刻
+
+    def victim_wave(self, victim_index: int) -> int:
+        if self.mode != "batched":
+            return 0
+        return int(victim_index) // self.wave_size
+
+    def open(self, now: Optional[float] = None) -> None:
+        if self.opened_at is not None:
+            return
+        self.opened_at = time.perf_counter() if now is None else now
+        self.opened_event.set()
+
+    async def wait(self, victim_index: int) -> None:
+        """阻塞到本 victim 所属 wave 的放行时刻。"""
+        await self.opened_event.wait()
+        wave = self.victim_wave(victim_index)
+        target = self.opened_at + wave * self.wave_interval_s
+        delay = target - time.perf_counter()
+        if delay > 0:
+            await asyncio.sleep(delay)
+        self.resumed.append(time.perf_counter())
+
+
 # --------------------------------------------------------------------------
 # 混合负载：Poisson 会话到达调度（模仿 HeterCache simulator.py init_heap）
 # --------------------------------------------------------------------------
@@ -471,6 +519,8 @@ async def run_session(
     task_cfg: Optional[Dict[str, Any]] = None,
     arrival_offset: float = 0.0,
     gate: Optional[BurstGate] = None,
+    resume_gate: Optional[ResumeGate] = None,
+    victim_index: int = 0,
 ) -> None:
     """跑一个 session 的全部轮次（会话内逐轮串行）。
 
@@ -489,7 +539,12 @@ async def run_session(
     # （模仿 HeterCache simulator.py 的 stable_seed_from_str + _init_session_rngs）
     base_seed = task_cfg.get("seed", args.seed) + task_cfg.get("task_id", 0) * 1000
     rng = random.Random(stable_seed_from_str(sid, base_seed=base_seed))
+    # 逐 task 的轮数上限：burst/pause 实验需要固定相位与有界时长（对齐 RR 实验的 12 轮）；
+    # 缺省不裁剪，行为与之前完全一致。
     num_turns = sess["num_turns"]
+    max_turns = task_cfg.get("max_turns")
+    if max_turns:
+        num_turns = min(num_turns, int(max_turns))
 
     # 带 gate_after 的流（搅拌）等 victim burst 屏障释放后才开始计到达
     if gate is not None and task_cfg.get("gate_after"):
@@ -502,9 +557,23 @@ async def run_session(
     prev_end: Optional[float] = None  # 上一轮请求完成时刻（算真实轮间隔）
     previous_tool_call = None  # 只暴露上一轮已完成的工具调用，避免当前轮未来信息泄漏
     pause_done = False
+    # pause 点是本 session 的固定轮次（burst/pause 实验的相位锚点）
+    pause_after = task_cfg.get("pause_after_turn")
     async with sem:  ##控制并发粒度
         for t in range(1, num_turns + 1):
             turn = sess[f"turn_{t}"]
+            # resume 诊断用的相位标记：resume 轮就是「挂起后第一个回归请求」
+            if pause_after:
+                if t < pause_after:
+                    resume_phase = "pre"
+                elif t == pause_after:
+                    resume_phase = "pause"
+                elif t == pause_after + 1:
+                    resume_phase = "resume"
+                else:
+                    resume_phase = "post"
+            else:
+                resume_phase = "run"
             payload = {
                 # 直发 token ids：与 HeterCache 数据逐 token 一致
                 "input_ids": turn["input_ids"],
@@ -530,7 +599,7 @@ async def run_session(
                 now = time.perf_counter()
                 ptok = r["prompt_tokens"] or len(turn["input_ids"])
                 ctok = r["cached_tokens"] or 0
-                stats.rows.append({
+                row = {
                     "task": task_name,
                     "phase": task_cfg.get("phase"),
                     "session_id": sid,
@@ -548,7 +617,10 @@ async def run_session(
                     "queue_time_ms": r["queue_time_ms"],
                     "prefill_ms": r["prefill_ms"],
                     "ts": round(time.time(), 3),
-                })
+                }
+                if resume_gate is not None:
+                    row["resume_phase"] = resume_phase
+                stats.rows.append(row)
                 prev_end = now
             except Exception as exc:  # noqa: BLE001
                 stats.errors += 1
@@ -556,12 +628,15 @@ async def run_session(
 
             # burst 段结束：计一次屏障，然后进入 pause（tool 往返/人工等待）。
             # pause 不乘 wait_scale：它是自变量，必须精确。
-            pause_after = task_cfg.get("pause_after_turn")
             if pause_after and t == pause_after:
                 pause_done = True
                 if gate is not None:
                     gate.done_one()
-                await asyncio.sleep(task_cfg.get("pause_s", 0.0))
+                if resume_gate is not None and task_cfg.get("resume_after_burst"):
+                    # 挂起直到 burst 窗口关闭（simultaneous / batched 两种放行方式）
+                    await resume_gate.wait(victim_index)
+                else:
+                    await asyncio.sleep(task_cfg.get("pause_s", 0.0))
 
             # 轮间等待（inter-turn 到达间隔，模仿 HeterCache simulator.py
             #   _maybe_schedule_next_turn）：
@@ -594,6 +669,8 @@ async def main_async(args: argparse.Namespace) -> Dict[str, Any]:
     url = args.base_url.rstrip("/") + "/generate"
 
     t0 = time.perf_counter()
+    resume_gate: Optional[ResumeGate] = None
+    phase_marks: Dict[str, float] = {}
     async with aiohttp.ClientSession(  ## 复用TCP连接
         read_bufsize=10 * 1024**2,  # 高并发下放大读缓冲
     ) as http:
@@ -635,18 +712,58 @@ async def main_async(args: argparse.Namespace) -> Dict[str, Any]:
                   f"arrival_scale={args.arrival_scale} wait_scale={args.wait_scale} "
                   f"burst_gate={gate.expect}")
 
+            # burst/pause 两阶段：burst_duration_s>0 时启用。
+            # 时序：全部 victim 越过 pause 点 -> 放行搅拌流 -> 持续 burst 窗口
+            #       -> 关闭窗口 -> ResumeGate 按 simultaneous/batched 放行 victim。
+            burst_task = None
+            if args.burst_duration_s > 0 and gate.expect > 0:
+                resume_gate = ResumeGate(
+                    gate.expect,
+                    mode=args.resume_mode,
+                    wave_size=args.resume_wave_size,
+                    wave_interval_s=args.resume_wave_interval_s,
+                )
+
+                async def _burst_window() -> None:
+                    try:
+                        await asyncio.wait_for(
+                            gate.event.wait(), timeout=args.burst_gate_timeout_s)
+                    except asyncio.TimeoutError:
+                        print("[Uni-Bench] WARN: 等待 victim 全部 pause 超时，"
+                              "提前开始 burst 窗口")
+                    phase_marks["burst_start"] = time.perf_counter()
+                    await asyncio.sleep(args.burst_duration_s)
+                    resume_gate.open(time.perf_counter())
+                    phase_marks["burst_end"] = resume_gate.opened_at
+
+                burst_task = asyncio.create_task(_burst_window())
+                print(f"[Uni-Bench] burst/pause 启用：victims={gate.expect} "
+                      f"burst={args.burst_duration_s}s resume_mode={args.resume_mode} "
+                      f"wave_size={args.resume_wave_size} "
+                      f"wave_interval={args.resume_wave_interval_s}s")
+
             # 每个 SessionArrival 一个协程：先按到达时刻 sleep，再竞争并发槽。
             # 会话间并发（sem）、会话内串行（run_session 内逐轮）。
-            tasks = [
-                asyncio.create_task(run_session(
+            # victim_index 决定 batched 模式下的 wave（按 schedule 顺序稳定分配）。
+            victim_seq = 0
+            tasks = []
+            for ev in schedule:
+                is_victim = bool(ev.task_cfg.get("pause_after_turn"))
+                v_idx = 0
+                if is_victim:
+                    v_idx = victim_seq
+                    victim_seq += 1
+                tasks.append(asyncio.create_task(run_session(
                     http, sem, ev.session, args, stats, url,
                     task_cfg=ev.task_cfg,
                     arrival_offset=ev.arrival_offset * args.arrival_scale,
                     gate=gate,
-                ))
-                for ev in schedule
-            ]
+                    resume_gate=resume_gate,
+                    victim_index=v_idx,
+                )))
             await asyncio.gather(*tasks)
+            if burst_task is not None:
+                await burst_task
         else:
             # ============================================================
             # 单负载模式（向后兼容）：所有 session 立即并发
@@ -675,6 +792,22 @@ async def main_async(args: argparse.Namespace) -> Dict[str, Any]:
     summary["base_url"] = args.base_url
     summary["concurrency"] = args.concurrency
     summary["wait_scale"] = args.wait_scale
+    if resume_gate is not None:
+        def _rel(x):
+            return round(x - t0, 3) if x is not None else None
+
+        summary["phases"] = {
+            "mode": "burst_pause",
+            "burst_duration_s": args.burst_duration_s,
+            "resume_mode": resume_gate.mode,
+            "wave_size": resume_gate.wave_size,
+            "wave_interval_s": resume_gate.wave_interval_s,
+            "victims": resume_gate.expect,
+            "burst_start_s": _rel(phase_marks.get("burst_start")),
+            "burst_end_s": _rel(phase_marks.get("burst_end")),
+            "victim_resumed_s": sorted(_rel(x) for x in resume_gate.resumed),
+        }
+
     if args.tasks_config:
         summary["mode"] = "hybrid"
         summary["tasks_config"] = args.tasks_config
@@ -716,6 +849,26 @@ def parse_args() -> argparse.Namespace:
         help="混合负载的 session 到达时刻整体缩放：1=HeterCache 真实 Poisson 节奏；"
              "0=所有 session 立即到达（等同单负载并发）；<1 加速压测",
     )
+
+    # ---- burst / pause 两阶段（RR vs T-LRU 实验）----
+    p.add_argument(
+        "--burst-duration-s",
+        type=float,
+        default=0.0,
+        help="victim 全部 pause 后，搅拌（小流量）窗口的持续秒数；0=关闭两阶段。",
+    )
+    p.add_argument(
+        "--resume-mode",
+        choices=("simultaneous", "batched"),
+        default="simultaneous",
+        help="burst 窗口关闭后 victim 的回归方式：全部同时 / 按 wave 分批。",
+    )
+    p.add_argument("--resume-wave-size", type=int, default=4,
+                   help="batched 模式每批放行的 victim 数")
+    p.add_argument("--resume-wave-interval-s", type=float, default=10.0,
+                   help="batched 模式相邻批次的间隔秒数")
+    p.add_argument("--burst-gate-timeout-s", type=float, default=600.0,
+                   help="等待「全部 victim pause」的上限；超时则提前开始 burst 窗口")
 
     p.add_argument("--base-url", default="http://127.0.0.1:30000", help="sglang server 地址")
     p.add_argument("--concurrency", type=int, default=32, help="并发会话数")

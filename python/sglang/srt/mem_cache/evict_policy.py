@@ -145,6 +145,7 @@ class SimpleHybridStrategy(EvictionStrategy):
         self,
         max_offset: int = 2048,
         *,
+        force_agentic: bool = False,
         alpha: Union[AlphaParams, dict, None] = None,
         rr: Union[RrParams, dict, None] = None,
         tiny_lru: Union[TinyLRUParams, dict, None] = None,
@@ -158,11 +159,17 @@ class SimpleHybridStrategy(EvictionStrategy):
 
         max_offset 不属于任何一组：它是 Q_struct 复用分数里的位置项上界
         （HeterCache 的 offset 语义），与 TinyLRU 的频数准入无关。
+
+        force_agentic 是实验开关（不是调参）：打开后所有节点都按 agentic 语义
+        解释（评分、one-shot、插件作用域一致），并把 queue_tag 直接标成 QAGENT。
+        用途是让 QAGENT-only 的插件拿到 100% 流量；它不修改 session_type，因此
+        分类器自身的统计仍然可测。
         """
         self.alpha = AlphaParams.from_any(alpha)
         self.rr = RrParams.from_any(rr)
         self.tiny_lru = TinyLRUParams.from_any(tiny_lru)
         self.tlru = TlruParams.from_any(tlru)
+        self.force_agentic = bool(force_agentic)
         self.max_offset = max_offset or 2048
 
         # 在线更新α状态
@@ -230,9 +237,12 @@ class SimpleHybridStrategy(EvictionStrategy):
                 "never be consulted. Enable only one of them."
             )
 
-    @staticmethod
-    def _task_type_of(node) -> SimpleHybridTaskType:
+    def _task_type_of(self, node) -> SimpleHybridTaskType:
         # 队列标签由缓存状态机维护。映射表在 uni_utils，策略与改写器共用。
+        # force_agentic 时短路：即使某个节点残留 QTRANS/QCHAT/QSTRUCT 标签，
+        # 评分与 one-shot 判定也统一按 agentic 走（标签由缓存层同步强制为 QAGENT）。
+        if self.force_agentic:
+            return SimpleHybridTaskType.MULTI_TURN_AGENTIC
         return task_type_of_tag(getattr(node, "queue_tag", None))
 
     def _reuse_score(self, node) -> float:
