@@ -3,7 +3,7 @@
 两个后端实现同一份 ``Backend`` 协议，``replay.py`` 只依赖协议：
 
     acquire(req) -> AccessResult     # 一次请求：match → evict → alloc → insert
-    stats() -> dict                  # struct 状态 + 淘汰来源
+    stats() -> dict                  # 队内策略状态 + 淘汰来源
     close()
 
 ``RealBackend``
@@ -93,7 +93,7 @@ def _node_path_info(node, root) -> tuple:
 class RealBackend:
     """真实 ``SimpleHybridRadixCache`` 的离线回放后端（CPU，无需模型）。"""
 
-    supports_struct = True
+    supports_struct = False
 
     def __init__(
         self,
@@ -281,12 +281,11 @@ class RealBackend:
         depth, ph = _node_path_info(node, root)
         tokens = int(len(node.value)) if node.value is not None else 0
         if self._tag_mode:
-            # 标签版没有 struct_region：QSTRUCT 就是「受保护」的等价物，
-            # 这样 G5（protected 级联删除）在两种模式下都能量。
+            # QSTRUCT 就是「受保护前缀」的等价物：G5（级联删除）按标签统计。
             tag = getattr(node, "queue_tag", None)
             region = 3 if getattr(tag, "value", tag) == "qstruct" else 0
         else:
-            region = int(getattr(node, "struct_region", 0) or 0)
+            region = 0
         self._on_evict(
             self._clock_now(), depth, ph, tokens, region, bool(is_victim)
         )
@@ -303,14 +302,12 @@ class RealBackend:
 
     def stats(self) -> dict:
         strategy = self.cache.eviction_strategy
-        state = getattr(strategy, "structState", None)
-        snap = state.snapshot() if state is not None else None
+        snap = None
         victim_src = dict(getattr(strategy, "_victim_sources", {}) or {})
         alpha = dict(getattr(getattr(strategy, "alpha", None), "balance", {}) or {})
         return {
             "available": self._available(),
             "evictable_size": int(getattr(self.cache, "evictable_size_", 0) or 0),
-            "struct": snap,
             "tag": (
                 strategy.tag_snapshot()
                 if hasattr(strategy, "tag_snapshot")
@@ -496,7 +493,6 @@ class FakeBackend:
         return {
             "available": self.pool - self.used,
             "evictable_size": self.used,
-            "struct": None,
             "victim_src": {},
             "alpha": {},
         }

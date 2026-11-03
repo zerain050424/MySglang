@@ -183,19 +183,20 @@ def test_victim_key_class_rank_and_lru():
     victim = min([new_s, a, t, c, old_s], key=st.victim_key)
     check(victim is t, f"min() must pick the QTRANS node, got {victim.queue_tag}")
 
-    # 对照：三区版保持旧键（不受 class rank 影响）
-    old_mode = SimpleHybridStrategy(tiny_lru={"policy": "wtinylru"})
-    check(old_mode.tagState is None, "wtinylru must not build tagState")
-    check(len(old_mode.victim_key(t)) == 2,
-          f"three-region victim_key stays (score, -tokens), got {old_mode.victim_key(t)}")
+    # 关闭时保持原键（不受 class rank 影响）
+    off_mode = SimpleHybridStrategy(tiny_lru={"policy": "off"})
+    check(off_mode.tagState is None, "off must not build tagState")
+    check(len(off_mode.victim_key(t)) == 2,
+          f"off keeps (score, -tokens), got {off_mode.victim_key(t)}")
 
 
 def test_wiring_and_dead_chain_gate():
     """接线：tag 模式不建三区、不注册插件；owns_struct 走标签。"""
     print("[6] wiring + dead-chain gate")
     st = SimpleHybridStrategy(tiny_lru={"policy": "tag_lru"})
-    check(st.structState is None, "tag mode must not build the three-region state machine")
-    check(st.TinyLru_evict is None, "tag mode must not register the struct override")
+    check(st.tagState is not None, "tag mode must build TagLruPolicy")
+    check(not hasattr(st, "structState"), "three-region state machine must be gone")
+    check(not hasattr(st, "TinyLru_evict"), "struct override must be gone")
     check(st.victim_overrides == (), f"tag mode has no overrides, got {st.victim_overrides}")
 
     shared = FakeNode(tag=SimpleHybridQueueTag.QSTRUCT)
@@ -205,7 +206,7 @@ def test_wiring_and_dead_chain_gate():
 
     # off：两者都不建
     off = SimpleHybridStrategy(tiny_lru={"policy": "off"})
-    check(off.tagState is None and off.structState is None, "off builds nothing")
+    check(off.tagState is None, "off builds nothing")
     check(not off.owns_struct(shared), "off owns nothing")
 
 

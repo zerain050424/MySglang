@@ -320,27 +320,8 @@ def offline_table(runs: Sequence[dict]) -> List[dict]:
             "struct_share_min": (d.get("config") or {}).get("tiny_lru", {}).get(
                 "struct_share_min"),
             "qstruct_evicted_pct": _tag_share_pct(s.get("evicted_by_tag") or {}),
-            "struct_window": (s.get("struct") or {}).get("window"),
-            "struct_probation": (s.get("struct") or {}).get("probation"),
-            "struct_protected": (s.get("struct") or {}).get("protected"),
-            "struct_parked": (s.get("struct") or {}).get("parked"),
-            "admit": (s.get("struct") or {}).get("admit"),
-            "dedup_sessions": (s.get("struct") or {}).get("dedup_sessions"),
-            "reject": (s.get("struct") or {}).get("reject"),
-            "ages": (s.get("struct") or {}).get("ages"),
-            "forced": (s.get("struct") or {}).get("forced"),
             "share_metric": (d.get("config") or {}).get("tiny_lru", {}).get("share_metric"),
-            "protected_budget_frac": (d.get("config") or {}).get("tiny_lru", {}).get(
-                "protected_budget_frac"),
-            "stale_grace_s": (d.get("config") or {}).get("tiny_lru", {}).get("stale_grace_s"),
-            "protected_tokens": (s.get("struct") or {}).get("protected_tokens"),
-            "probation_tokens": (s.get("struct") or {}).get("probation_tokens"),
-            "protected_budget": (s.get("struct") or {}).get("protected_budget"),
-            "budget_demote": (s.get("struct") or {}).get("budget_demote"),
-            "stale_deflect": (s.get("struct") or {}).get("stale_deflect"),
-            "struct_retire": (s.get("struct") or {}).get("retire"),
-            "struct_park": (s.get("struct") or {}).get("park"),
-            "struct_dedup_hits": (s.get("struct") or {}).get("dedup_hits"),
+            "local_hot": (d.get("config") or {}).get("tiny_lru", {}).get("local_hot"),
         }
         for task, layers in (ret or {}).items():
             for L, v in layers.items():
@@ -636,10 +617,11 @@ def struct_timeseries(paths: Sequence[str]) -> List[dict]:
                     d = json.loads(line)
                 except Exception:
                     continue
-                snap = d.get("struct") or {}
-                tot_tokens = (snap.get("window_tokens") or 0) + (snap.get("protected_tokens") or 0)
+                snap = d.get("tag") or {}
+                ebt = d.get("evicted_by_tag") or {}
+                tot_tokens = 0  # 标签版没有区级 token 账本
                 vsrc = d.get("victim_src") or {}
-                tot = sum(vsrc.values()) or 0.0
+                tot = sum(ebt.values()) or sum(vsrc.values()) or 0.0
                 rows.append(
                     {
                         "tag": d.get("tag"),
@@ -649,24 +631,16 @@ def struct_timeseries(paths: Sequence[str]) -> List[dict]:
                         "evict_us_p99": d.get("evict_us_p99"),
                         "available": d.get("available"),
                         "evictable_size": d.get("evictable_size"),
-                        "window": snap.get("window"),
-                        "probation": snap.get("probation"),
-                        "protected": snap.get("protected"),
-                        "parked": snap.get("parked"),
-                        "protected_tokens": snap.get("protected_tokens"),
-                        "protected_share": round(
-                            (snap.get("protected_tokens") or 0) / tot_tokens, 4
-                        ) if tot_tokens else None,
-                        "admit": snap.get("admit"),
-                        "reject": snap.get("reject"),
-                        "budget_demote": snap.get("budget_demote"),
-                        "stale_deflect": snap.get("stale_deflect"),
-                        "retire": snap.get("retire"),
-                        "park": snap.get("park"),
-                        "ages": snap.get("ages"),
-                        "dedup_hits": snap.get("dedup_hits"),
-                        "forced": snap.get("forced"),
-                        "qstruct_pct": round(100.0 * vsrc.get("qstruct", 0.0) / tot, 2) if tot else 0.0,
+                        "policy": snap.get("policy"),
+                        "promote": snap.get("promote"),
+                        "demote": snap.get("demote"),
+                        "counted": snap.get("counted"),
+                        "dedup": snap.get("dedup"),
+                        "struct_share_min": snap.get("struct_share_min"),
+                        "local_hot": snap.get("local_hot"),
+                        "qstruct_evicted_pct": round(
+                            100.0 * ebt.get("tag:qstruct", 0.0) / tot, 2
+                        ) if tot else 0.0,
                     }
                 )
     return rows
@@ -898,8 +872,9 @@ def main(argv=None) -> int:
         lines.append("## 2. 离线主表（真实后端）\n")
         rows = [r for r in off_rows if r["backend"] == "real"]
         cols = ["arm", "workload", "ratio", "hit_pct", "regret_rate",
-                "protected_waste_rate", "qstruct_pct", "evictions"]
-        heads = ["arm", "workload", "pool/working", "hit%", "regret", "prot_waste", "qstruct%", "evicts"]
+                "protected_waste_rate", "qstruct_evicted_pct", "tag_promote", "evictions"]
+        heads = ["arm", "workload", "pool/working", "hit%", "regret", "prot_waste",
+                 "qstruct_evicted%", "promote", "evicts"]
         extra = sorted({
             k for r in rows for k in r
             if (k.startswith("ret_") or k.startswith("hist_")) and k.endswith("_full")
@@ -947,11 +922,10 @@ def main(argv=None) -> int:
         lines.append(
             markdown_table(
                 rows,
-                ["tag", "evict_calls", "evict_us_p50", "evict_us_p99", "protected_share",
-                 "admit", "reject", "budget_demote", "stale_deflect", "retire", "ages",
-                 "forced", "qstruct_pct"],
-                ["tag", "evicts", "us_p50", "us_p99", "protected%", "admit", "reject",
-                 "budget↓", "stale↓", "retire", "ages", "forced", "qstruct%"],
+                ["tag", "evict_calls", "evict_us_p50", "evict_us_p99",
+                 "promote", "counted", "dedup", "qstruct_evicted_pct"],
+                ["tag", "evicts", "us_p50", "us_p99",
+                 "promote", "counted", "dedup", "qstruct_evicted%"],
             )
         )
         lines.append("")

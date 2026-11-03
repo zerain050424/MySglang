@@ -469,7 +469,7 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
 
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description="W-TinyLRU 离线回放（L1）")
-    p.add_argument("--arm", default="A3", help="实验臂 A0..A11")
+    p.add_argument("--arm", default="A3", help="实验臂 A0..A5（A3=标签版默认）")
     add_common_args(p)
     a = p.parse_args(argv)
 

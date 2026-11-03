@@ -6,7 +6,6 @@ import time
 from collections import deque
 from typing import TYPE_CHECKING, Dict, Optional, Tuple, Union
 
-from sglang.srt.mem_cache.struct_queue_policy import StructQueueState
 from sglang.srt.mem_cache.uni_utils import (
     AlphaParams,
     node_end_offset,
@@ -25,7 +24,6 @@ from sglang.srt.mem_cache.uni_utils import (
 from sglang.srt.mem_cache.tag_lru import TagLruPolicy
 from sglang.srt.mem_cache.victim_override import (
     RrEvictPolicy,
-    StructTinyLruPolicy,
     TlruEvictPolicy,
 )
 
@@ -191,34 +189,9 @@ class SimpleHybridStrategy(EvictionStrategy):
         self._victim_sources: Dict[str, float] = {}
 
 
-        #   self.structState    = 状态机（缓存层持有：8 个钩子 + owns 死链闸）
-        #   self.TinyLru_evict  = 淘汰面适配器（只进 victim_overrides）
-        # 若让 self.structState 直接指向适配器，radix_cache 的 8 处钩子调用会静默
-        # 变成 no-op（getattr 判空不报错），struct 策略会整体失效而日志无异常。
         self.rr_evict = RrEvictPolicy(self.rr) if self.rr.fair_rr else None
-        self.structState = (
-            StructQueueState(
-                enabled=True,
-                k=self.tiny_lru.k,
-                window_entries=self.tiny_lru.window_entries,
-                epoch_events=self.tiny_lru.epoch_events,
-                admission_tie=self.tiny_lru.admission_tie,
-                admission_metric=self.tiny_lru.admission_metric,
-                inherit_share=self.tiny_lru.inherit_share,
-                share_metric=self.tiny_lru.share_metric,
-                protected_budget_frac=self.tiny_lru.protected_budget_frac,
-                stale_grace_s=self.tiny_lru.stale_grace_s,
-            )
-            if self.tiny_lru.policy == "wtinylru"
-            else None
-        )
-        self.TinyLru_evict = (
-            StructTinyLruPolicy(self.structState)
-            if self.structState is not None
-            else None
-        )
-        # 标签版（TinyLRU 分支默认）：不建三区，只按「会话类型 + 会话共享数」贴标签。
-        # 与三区版二选一；两者都关时是彻底的零开销路径。
+        # 标签版 TinyLRU（Q_struct 队内策略）：不建队列索引，只按
+        # 「会话类型 + 会话共享数」贴标签；关闭时是彻底的零开销路径。
         self.tagState = (
             TagLruPolicy(
                 struct_share_min=self.tiny_lru.struct_share_min,
@@ -241,9 +214,7 @@ class SimpleHybridStrategy(EvictionStrategy):
         self.tlru_evict = TlruEvictPolicy(self.tlru) if self.tlru.enabled else None
         self._validate_scope()
         self.victim_overrides = tuple(
-            p
-            for p in (self.rr_evict, self.TinyLru_evict, self.tlru_evict)
-            if p is not None
+            p for p in (self.rr_evict, self.tlru_evict) if p is not None
         )
 
     def reset_bookkeeping(self) -> None:
@@ -262,12 +233,8 @@ class SimpleHybridStrategy(EvictionStrategy):
         self._rid_order.clear()
 
     def owns_struct(self, node) -> bool:
-        """该节点是否受「结构复用」保护（死链上溯闸用，两种模式统一入口）。"""
-        if self.structState is not None:
-            return bool(self.structState.owns(node))
-        if self.tagState is not None:
-            return bool(self.tagState.owns(node))
-        return False
+        """该节点是否受「结构复用」保护（one-shot 死链上溯闸用）。"""
+        return bool(self.tagState is not None and self.tagState.owns(node))
 
     def tag_snapshot(self) -> Optional[dict]:
         return self.tagState.snapshot() if self.tagState is not None else None

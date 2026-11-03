@@ -15,8 +15,10 @@
 
 内置实现的分工：
   * `RrEvictPolicy`      —— 自带全部状态（会话轮询序号 / 配额违约计数）。
-  * `StructTinyLruPolicy` —— 无状态适配器；队列状态在
-    `struct_queue_policy.StructQueueState`，本类只暴露它的区头。
+  * `TlruEvictPolicy`    —— T-LRU 的 QAGENT 候选修正（自带高水位状态）。
+
+  注：Q_struct 队内策略（标签版 TinyLRU）不通过插件实现 —— 它把「类间优先级 +
+  类内 LRU」直接编码进 `SimpleHybridStrategy.victim_key`，因此这里不再有 struct 适配器。
   * `TlruEvictPolicy`    —— T-LRU 的尾部优先修正；除候选选择外，还在
     插入/分裂时维护节点上的 `_tlru_*` 高水位（缓存层会调 `on_node_inserted`）。
 """
@@ -37,7 +39,6 @@ from sglang.srt.mem_cache.uni_utils import (
 
 if TYPE_CHECKING:  # pragma: no cover
     from sglang.srt.mem_cache.radix_cache import TreeNode
-    from sglang.srt.mem_cache.struct_queue_policy import StructQueueState
     from sglang.srt.mem_cache.uni_utils import SessionRegistry, SessionState
 
 
@@ -163,42 +164,6 @@ class RrEvictPolicy(VictimOverride):
         self._rr_last.clear()
         self._rr_seq = 0
         self.quota_breach = 0
-
-
-class StructTinyLruPolicy(VictimOverride):
-    """
-    Q_struct 队内 W-TinyLRU 的淘汰机制：把状态机的区头暴露成候选修正。
-    现在：
-      * 队列状态（成员判定 / 三区 / 准入 / aging）在
-        ``struct_queue_policy.StructQueueState``，由缓存层持有；
-      * 本类只做三件事：``applies_to = state.owns``、
-        ``pick = state.eviction_candidate``、``stats/reset`` 转发。
-    自身无状态，所以随时可以重建而不丢队列状态。
-    ``forced``（只剩 protected 被迫出队）记在状态机里：那是区域级事实，
-    不是本类的决策。
-    """
-
-    name = "struct_tinylru"
-    queue = SimpleHybridQueueTag.QSTRUCT
-
-    def __init__(self, state: "StructQueueState"):
-        self.state = state
-
-    def applies_to(self, node) -> bool:
-        """O(1)：委托状态机做成员判定。"""
-        return self.state.owns(node)
-
-    def pick(self, leaves=None, registry=None):
-        """队内区头；None = 不接管（上层保留原候选）。"""
-        return self.state.eviction_candidate()
-
-    # ---- 观测 / 生命周期（都转发）----
-
-    def stats(self) -> Dict[str, float]:
-        return dict(self.state.stats)
-
-    def reset(self) -> None:
-        self.state.reset()
 
 
 class TlruEvictPolicy(VictimOverride):

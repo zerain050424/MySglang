@@ -35,7 +35,7 @@ echo "== [0/4] prefix_stats（真实负载的分层前缀长度）"
 echo "== [1/4] gate"
 "$PY" -m wtl.gate --backend "${WTL_BACKEND:-auto}" || exit 1
 
-echo "== [2/4] offline matrix（A0-A11 × 3 压力 × 3 负载 × 3 seed）"
+echo "== [2/4] offline matrix（A0-A5 × 3 压力 × 3 负载 × 3 seed）"
 "$PY" -m wtl.run_matrix \
   --arms all --workloads sharegpt,alfred,codeparrot \
   --ratios 0.3,0.6,1.0 --seeds 42,43,44 \
@@ -43,7 +43,7 @@ echo "== [2/4] offline matrix（A0-A11 × 3 压力 × 3 负载 × 3 seed）"
   --jobs "${JOBS:-12}" || exit 1
 
 echo "== [2b/4] 合成前缀阶梯（场景 A）"
-"$PY" -m wtl.run_matrix --mode synth --arms A0,A1,A2,A3 \
+"$PY" -m wtl.run_matrix --mode synth --arms A0,A1,A2,A3,A4,A5 \
   --synth-depths 512,2048,8192 --synth-breadths 3,10 \
   --ratios 0.3,0.6 --backend "${WTL_BACKEND:-auto}" \
   --datadir result/data --jobs "${JOBS:-12}" || exit 1

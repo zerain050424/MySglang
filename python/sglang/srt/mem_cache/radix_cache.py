@@ -364,10 +364,8 @@ class RadixCache(BasePrefixCache):
         self._alpha_updater = getattr(
             self.eviction_strategy, "maybe_update_alpha", None
         )
-        # Q_struct 队内 W-TinyLRU（SimpleHybridStrategy.structState；其他策略为 None）。
-        # 只在策略开启时挂钩子，关闭时所有调用点都是 `is not None` 的一次判空。
-        self.struct_policy = getattr(self.eviction_strategy, "structState", None)
-        # 标签版 TinyLRU（与 structState 二选一）：只维护「会话共享数 + 标签」。
+        # Q_struct 队内策略（标签版 TinyLRU）：只维护「会话共享数 + 标签」。
+        # 关闭时所有调用点都是 `is not None` 的一次判空。
         self.tag_policy = getattr(self.eviction_strategy, "tagState", None)
         # 实验开关（SimpleHybridStrategy.force_agentic）：把所有节点直接标成 QAGENT，
         # 让 QAGENT-only 的插件（RR / T-LRU）拿到 100% 的流量。只改 queue_tag，
@@ -1053,10 +1051,6 @@ class RadixCache(BasePrefixCache):
                     else SimpleHybridQueueTag.QCHAT
                 )
         node.last_access_time = access_time
-        if self.struct_policy is not None:
-            # rid dedup keeps chunked rechecks from inflating distinct-request sharing.
-            # rid 去重防 chunked 自引用；session_id 供 A 的会话级频数
-            self.struct_policy.on_hit(node, rid, session_id)
 
     def _split_node(
            self,
@@ -1102,8 +1096,6 @@ class RadixCache(BasePrefixCache):
            new_node.rid_bloom = child.rid_bloom
            new_node.share_sessions = getattr(child, "share_sessions", 0)
            new_node.session_bloom = getattr(child, "session_bloom", 0)
-           if self.struct_policy is not None:
-               self.struct_policy.on_split(new_node, child)
            # T-LRU：分裂不增加分支深度，新父节点继承 child 的高水位。
            for observe in self._insert_observers:
                observe(new_node)
@@ -1195,12 +1187,9 @@ class RadixCache(BasePrefixCache):
                 and node is not self.root_node
                 and len(node.children) >= 2
             ):
-                # 三区版：拓扑分叉即 QSTRUCT（成员判定的黏性证据）。
+                # 关闭 Q_struct 队内策略时保留旧的分叉标签规则（对照组行为）。
                 # 标签版：标签只由「会话类型 + 会话共享数」决定，不掺拓扑。
                 node.queue_tag = SimpleHybridQueueTag.QSTRUCT
-            if self.struct_policy is not None:
-                # 刚分叉的父节点可能是新成员（M3 第一项）
-                self.struct_policy.on_children_added(node)
             self.evictable_size_ += len(key)
             self._update_leaf_status(node)
             self._update_leaf_status(new_node)
@@ -1237,31 +1226,22 @@ class RadixCache(BasePrefixCache):
         self.evictable_size_ -= len(node.key)
         if node in self.evictable_leaves:
             self.evictable_leaves.remove(node)
-        if self.struct_policy is not None:
-            self.struct_policy.on_delete(node)
         self._update_leaf_status(node.parent)
 
     def _update_leaf_status(self, node: TreeNode):
         if node.evicted or node.lock_ref > 0: ## 节点已被驱逐且被锁
             if node in self.evictable_leaves:
                 self.evictable_leaves.remove(node) ## 从可驱逐叶子节点集合中移除该节点
-            if self.struct_policy is not None:
-                self.struct_policy.on_no_longer_leaf(node)
             return
 
         for child in node.children.values():
             if not child.evicted: ## 如果子节点没有被驱逐，说明当前节点不是叶子节点
                 if node in self.evictable_leaves:
                     self.evictable_leaves.remove(node)
-                if self.struct_policy is not None:
-                    self.struct_policy.on_no_longer_leaf(node)
                 return
 
         if node not in self.evictable_leaves: ## 节点没有被驱逐且没有被锁，且所有子节点都已被驱逐，说明当前节点是可驱逐叶子节点，将其添加到可驱逐叶子节点集合中
             self.evictable_leaves.add(node)
-            if self.struct_policy is not None:
-                # 新降级的叶子：按继承表落区（热点模板前缀在这里被保住）
-                self.struct_policy.on_became_leaf(node)
 
     def _total_size_helper(self):
         total_size = 0

@@ -5,7 +5,7 @@
 检查项
 ------
 G1 可复现         同配置跑两遍，逐请求明细必须完全一致（含 SimClock，无 wall-clock 依赖）
-G2 机制被行使     A3 的 victim_src.qstruct > 0 且 admit+reject+ages > 0
+G2 机制被行使     标签版：晋升发生过（tag.promote>0）且 QSTRUCT 真的被淘汰过
 G3 无压力不变性   pool/工作集 = 2.0 时 A0/A1/A2/A3 的 hit% 差 < 0.5pp（对照必须是平的）
 G4 后端忠实度     真 LRU 与镜像 LRU 在同一小 trace 上的 cached_len 一致率 ≥ 99.5%
 G5 上溯闸         A3 下 protected 区被「级联删除」的 token == 0（§7.4 的最大正确性风险）
@@ -34,7 +34,7 @@ from .trace import schedule_single_workload
 SYNTH = dict(
     # 关键：**不要把一次性文档（noise）放进来**。
     # 一次性内容走 one-shot 硬优先带，会吃掉全部淘汰压力，
-    # struct 队列永远等不到「成员变成可淘汰叶子」的时刻（见 README §7）。
+    # one-shot 硬优先带一旦被一次性内容占满，队内策略就没有决策机会（见 README §7）。
     prefix_depth=2048, breadth=20, variants=2, turns=4,
     body_mu=6.0, body_sigma=0.8, noise_frac=0.0, doc_len=1200, seed=7,
     phased=True,
@@ -74,7 +74,7 @@ def _run(requests, arm_id: str, pool_tokens: int, backend: str, layers) -> dict:
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description="Phase-0 门控")
     p.add_argument("--backend", default="auto", choices=["auto", "real", "fake"])
-    p.add_argument("--arm", default="A3", help="门控主对象（默认 A3；标签版用 A16）")
+    p.add_argument("--arm", default="A3", help="门控主对象（默认 A3 = 标签版 TinyLRU）")
     p.add_argument("--out", default="result/gate.json")
     a = p.parse_args(argv)
 
@@ -113,60 +113,26 @@ def main(argv=None) -> int:
         # ---------------- G2 / G5 ----------------
         if r1 is not None and r1["backend"] == "real":
             s = r1["summary"]
-            vsrc = s.get("victim_src") or {}
-            snap = s.get("struct") or {}
             tag = s.get("tag") or {}
             by_tag = s.get("evicted_by_tag") or {}
-            tot = sum(vsrc.values()) or 0.0
-            qpct = 100.0 * vsrc.get("qstruct", 0.0) / tot if tot else 0.0
-            # 「被行使」的判据（实测标定，见 README §7）：
-            #   (a) 状态机确实在管节点；且
-            #   (b) struct 策略真的接管过淘汰（qstruct token > 0）或 protected 兜底被用过。
-            # 不要求 admit/reject>0：window 区条目一旦成为叶子就会被立刻淘汰，
-            # 很难同时积累到 window_entries(64) 以上，准入路径在真实负载上近乎不可达。
-            populated = sum(
-                int(snap.get(k) or 0)
-                for k in ("window", "probation", "protected", "parked")
-            ) > 0
-            counters = (
-                (snap.get("admit") or 0) + (snap.get("reject") or 0) + (snap.get("ages") or 0)
-            )
-            if snap or not tag:
-                exercised = populated and (qpct > 0 or (snap.get("forced") or 0) > 0)
-            else:
-                # 标签版：没有三区/插件，证据换成「晋升发生过」+「QSTRUCT 真的被淘汰过」
-                promote = int(tag.get("promote") or 0)
-                q_evicted = float(by_tag.get("tag:qstruct", 0.0) or 0.0)
-                exercised = promote > 0 and q_evicted > 0
-                populated = promote > 0
-            if snap:
-                detail = (
-                    f"qstruct={qpct:.1f}% admit={snap.get('admit')} "
-                    f"reject={snap.get('reject')} ages={snap.get('ages')} "
-                    f"parked={snap.get('parked')} regions(w/p/r)="
-                    f"{snap.get('window')}/{snap.get('probation')}/{snap.get('protected')} "
-                    f"forced={snap.get('forced')} counters={counters}"
-                )
-            else:
-                detail = (
-                    f"tag_lru promote={tag.get('promote')} counted={tag.get('counted')} "
-                    f"dedup={tag.get('dedup')} qstruct_evicted="
-                    f"{by_tag.get('tag:qstruct', 0.0):.0f}"
-                )
+            prompt = int(tag.get("promote") or 0)
+            q_evicted = float(by_tag.get("tag:qstruct", 0.0) or 0.0)
+            exercised = prompt > 0 and q_evicted > 0
             results.append(
-                ("G2", "机制被行使", "PASS" if exercised else "FAIL", detail)
+                ("G2", "机制被行使", "PASS" if exercised else "FAIL",
+                 f"tag_lru promote={prompt} counted={tag.get('counted')} "
+                 f"dedup={tag.get('dedup')} qstruct_evicted={q_evicted:.0f}")
             )
             cascade = (s.get("regret") or {}).get("protected_cascade_deleted_tokens", 0)
             results.append(
                 ("G5", "上溯闸", "PASS" if cascade == 0 else "FAIL",
-                 f"protected 级联删除 {cascade} tokens")
+                 f"受保护前缀被级联删除 {cascade} tokens")
             )
-            payload["checks"].append({"id": "G2", "pass": exercised, "qstruct_pct": qpct,
-                                      "struct": snap, "tag": tag,
+            payload["checks"].append({"id": "G2", "pass": exercised, "tag": tag,
                                       "evicted_by_tag": by_tag})
             payload["checks"].append({"id": "G5", "pass": cascade == 0,
                                       "protected_cascade_tokens": cascade})
-            payload["struct_activity"] = snap
+
         else:
             results.append(("G2", "机制被行使", "N/A", "需要 RealBackend"))
             results.append(("G5", "上溯闸", "N/A", "需要 RealBackend"))

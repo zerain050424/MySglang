@@ -1,13 +1,13 @@
 # W-TinyLRU 实验套件（Uni-Bench/W-TinyLRU）
 
-设计文档：`python/sglang/srt/mem_cache/WTINYLRU_EXPERIMENT.md`
+实现文档：`python/sglang/srt/mem_cache/TAG_LRU.md`（标签版 TinyLRU 的规则/参数/淘汰顺序/实测）
 **本目录不修改任何框架代码**：观测全部通过子类 / 运行时 monkeypatch / 运行时属性完成。
 
 ```
 W-TinyLRU/
 ├── README.md                  ← 本文件
 ├── wtl/
-│   ├── arms.py                实验臂 A0–A11（单一事实来源）
+│   ├── arms.py                实验臂 A0–A5（单一事实来源）
 │   ├── simclock.py            事件驱动仿真时钟（替换 sglang 模块内的 time）
 │   ├── trace.py               session_data.jsonl 读取 + 到达调度（与 bench_unicache 同语义）
 │   ├── synth.py               合成「共享前缀强度阶梯」trace（场景 A）
@@ -134,88 +134,51 @@ python -m wtl.replay --arm A3 --data-path data/synth_p2048_b10/session_data.json
 | 证据 | 来源 | 用途 |
 |---|---|---|
 | `victim_src`（`one_shot` / `global` / `qstruct`） | `SimpleHybridStrategy._victim_sources` | **gate**：qstruct=0 说明策略从未行使淘汰权，结论作废 |
-| `window/probation/protected/parked` + `admit/reject/ages/forced` | `StructQueueState.snapshot()` | 证明三区与准入/aging 真的在跑 |
-| `protected_tokens` 占池比时间序列 | `wtl.struct_profile`（真机 JSONL） | 看保护是否膨胀、是否压垮单轮负载 |
+| `promote / counted / dedup` | `TagLruPolicy.snapshot()` | 证明「第二个会话命中 → 晋升 QSTRUCT」真的在发生 |
+| `evicted_by_tag`（qtrans/qchat/qagent/qstruct） | `SimpleHybridStrategy._evicted_by_tag` | 一次性带占比、受保护前缀被淘汰的 token 量 |
+| `tag` 快照时间序列 | `wtl.struct_profile`（真机 JSONL） | 看晋升速率、去重率是否随负载漂移 |
 | `evict_us_p50/p99` | 同上（包在 `evict()` 外计时） | 策略 CPU 开销护栏 |
 | `protected_cascade_deleted_tokens` | `_delete_leaf(is_victim=False)` + `region==PROTECTED` | §7.4 最大正确性风险的可观测证据（门控 G5） |
 
 ---
 
-## 4.0 两套队内实现：`tag_lru`（默认）与 `wtinylru`
+## 4.0 Q_struct 队内策略：标签版 TinyLRU（`tag_lru`）
 
-本套件同时支持两套 Q_struct 队内策略，用 `tiny_lru.policy` 切换：
+**分类即晋升**：STRUCT（模板/共享前缀型）会话下，`share_sessions >= struct_share_min`
+的节点当场升为 `QSTRUCT`（类内 LRU 淘汰）；会话内热点按 `local_hot` 处置
+（默认 `QCHAT`，**不**进 one-shot 硬优先带）；真一次性内容留 `QTRANS`。
+其他会话类型沿用分类器映射，不参与晋升。
 
-| policy | 机制 | 实验臂 |
+| 臂 | 配置 | 用途 |
 |---|---|---|
-| **`tag_lru`**（TinyLRU 分支默认） | **分类即晋升**：STRUCT 会话下，`share_sessions >= struct_share_min` → QSTRUCT（类内 LRU），会话内热点按 `local_hot` 处置（默认 QCHAT，不进 one-shot 带） | A16（一shot 版）/ A17（min=3）/ **A18（默认）** |
-| `wtinylru`（三区版） | window/probation/protected + 频数准入 + aging + protected 预算（即下面 A/B/C 的全部内容） | A3…A15 |
-| `off` | 完全关闭，零开销 | A2 |
+| A0 | `lru` | 上游基线 |
+| A1 | `slru` | 上游分段 LRU 参照 |
+| A2 | `simple_hybrid` + `tiny_lru=off` | 隔离框架增益（多队列 + one-shot 带 + 分类器标签） |
+| **A3** | `tag_lru`（默认） | 主对象 |
+| A4 | `tag_lru` + `local_hot=one_shot` | 消融：会话内热点也进 one-shot 带（规则原样） |
+| A5 | `tag_lru` + `struct_share_min=3` | 消融：要 3 个会话共享才晋升 |
 
-实测（ShareGPT / 合成多轮 struct，pool/工作集=0.3）：
+实测（离线 L1，300 会话，pool/工作集=0.3）：
 
-| 配置 | ShareGPT 命中率 | 会话内历史保留 | 合成负载命中率 | 后悔率 |
-|---|---|---|---|---|
-| LRU（A0） | 66.90% | 0.736 | 81.09% | 0.0638 |
-| `off`（A2） | 49.26% | 0.551 | 80.37% | 0.1810 |
-| 三区版（A3） | 49.74% | 0.593 | 80.37% | 0.1921 |
-| 标签版 `local_hot=one_shot`（A16） | 54.61% | 0.738 | 75.67% | 0.1393 |
-| **标签版默认（A18）** | **78.10%** | **0.892** | **82.46%** | **0.0202** |
-
-设计说明见 `python/sglang/srt/mem_cache/TAG_LRU.md`。
-
-## 4.0.1 三区版的 A/B/C 三项增量
-
-`struct_queue_policy.py` 现在有三个新参数（`TinyLRUParams` 同名同校验）：
-
-| 参数 | 默认 | 语义 | 消融臂 |
+| 配置 | ShareGPT 命中率 | 会话内历史保留 | 合成 p2048/b10 |
 |---|---|---|---|
-| `share_metric` | `"hybrid"` | 频数口径。`hybrid`：成员/准入仍按**不同请求数**，但 **protected 只留给跨会话共享**（不同会话数 ≥ k）；`session`：只数会话（会话内复用完全不计）；`rid`：只数请求（旧行为） | A12(rid) / A15(session) |
-| `protected_budget_frac` | `0.0`（A3 用 0.8） | protected 的 **token 预算**（占活跃区 token 比）。超限时把队头降级到 probation 尾，只改归属、不释放 KV | A13(0) |
-| `stale_grace_s` | `0.0`（A14 用 60） | 叶子降级时的**新鲜度闸**：空闲超过该秒数就不继承 band，先落 window 重新观察 | A14(60) |
+| LRU（A0） | 66.90% | 0.736 | 81.09% |
+| `off`（A2） | 49.26% | 0.551 | 80.37% |
+| `local_hot=one_shot`（A4） | 54.61% | 0.738 | 75.67% |
+| **默认（A3）** | **78.10%** | **0.892** | **82.46%** |
 
-主对象 **A3 = hybrid + budget 0.8**。同时修掉 `_promote` 的无限递归（见下节）。
+设计说明见 `python/sglang/srt/mem_cache/TAG_LRU.md`（含参数、淘汰顺序、死链闸、限制）。
+早期「三区 + 频数准入 + aging」的实现已从本分支移除；移除理由与实测见该文档 §1。
 
-**为什么 `hybrid` 而不是纯 `session`**（实测，见 §7.9）：纯会话口径下，ShareGPT 的
-`qstruct%` 从 5.6% 掉到 **0**、命中率退回到与 `tiny_lru=off` 完全相同——因为聊天的主要
-复用是**会话内**历史，纯会话口径把这类节点直接踢出队列（它们不再满足 M3）。
+## 4.1 离线确定性平票（`wtl/compat.py`）
 
-## 4.1 框架缺陷兼容补丁（`wtl/compat.py`）
+`RadixCache.evict` 用 `min(leaves, key=...)` 在 `set` 上选候选。仿真时钟下同一请求命中的
+节点时间戳完全相同，平票极多，`min` 的结果就取决于 set 遍历顺序（对象地址）——
+同一配置两次进程内回放的淘汰序列会分叉（门控 G1 实测出现）。
 
-**实跑发现一个会打挂服务的框架 bug**（不是本套件引入的）：
-
-`StructQueueState._promote()` 在候选仍属 window 区时会**递归**调用 `_drain_window()`；
-当 probation/protected 都为空（没有可比较的 victim）时形成无界递归。
-实测在「150 个一次性分叉前缀」的 trace 上直接：
-
-```
-RecursionError: maximum recursion depth exceeded  (struct_queue_policy.py:255 in _drain_window)
-```
-
-在线服务在同样形态的负载下也会崩。语义上，设计文档 §5.2 写的是
-「`promote(cand)` → probation 尾」，即**晋升必须离开观察窗**；实现里 `_band_of()`
-对 `share<=1` 的节点仍返回 window，于是自己把自己留在原处。
-
-`wtl/compat.py` 提供**不改框架源码**的运行时补丁（默认开启，`WTL_COMPAT=0` 或
-`--no-compat` 关闭），并在结果 JSON 里记 `compat: ["struct_promote_no_window_recursion"]`。
-建议框架侧按下面 3 行修：
-
-```python
-def _promote(self, node) -> None:
-    band = self._band_of(node)
-    if band == REGION_WINDOW:        # 晋升 = 离开观察窗（§5.2）
-        band = REGION_PROBATION
-    self._index_remove(node)
-    self._push(band, node, at_head=False)
-    self.stats["admit"] += 1
-    self._note_event()
-    # 删掉这里的 if band == REGION_WINDOW: self._drain_window()（外层 while 会继续 drain）
-```
-
-另有一个**离线专用**补丁 `install_stable_ties`（默认开启，`--unstable-ties` 关闭）：
-`RadixCache.evict` 用 `min()` 在 `set` 上选 victim，仿真时钟下同一请求命中的节点时间戳完全相同、
-平票极多，`min` 的结果取决于 set 遍历顺序（对象地址），导致同配置两次回放分叉。
-补丁给排序键追加 `(路径深度, 路径 token 哈希)` 作为确定性后缀，只改变「平票时选谁」。
-**在线不安装**（真实时钟下平票少，且不应改变生产行为）。
+`install_stable_ties`（**仅离线回放安装**，`--unstable-ties` 可关）给排序键追加
+`(路径深度, 路径 token 哈希)` 作为确定性后缀，只改变「平票时选谁」，不改变策略语义。
+在线服务不安装（真实时钟下平票少，且不应改变生产行为）。
 
 ## 5. 不改框架代码是怎么做到的
 
@@ -303,9 +266,9 @@ def _promote(self, node) -> None:
 | §4.3 SGLANG_STRUCT_PROFILE | `wtl/struct_profile.py`（env 开关，零开销关闭） |
 | §4.4 分析脚本 | `wtl/analyze.py` |
 | §5.1 场景 A | `wtl/synth.py` + `--mode synth` |
-| §6 消融矩阵 | `wtl/arms.py` + `scripts/run_online.sh` 的 `arm_policy` |
+| §6 消融矩阵 | `wtl/arms.py`（A0–A5）+ `scripts/run_online.sh` 的 `arm_policy` |
 | §8 判定 | `analyze.judge`：M1/M2/M3/M4-gate/M5 逐条 PASS/FAIL |
-| §10 前置检查 | `wtl/gate.py --arm A18`（G1–G5；G2 在标签版看 promote/evicted_by_tag） |
+| §10 前置检查 | `wtl/gate.py --arm A3`（G1–G5；G2 看 tag.promote 与 evicted_by_tag） |
 
 ---
 

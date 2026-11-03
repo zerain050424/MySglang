@@ -182,73 +182,34 @@ class RrParams:
 
 @dataclasses.dataclass
 class TinyLRUParams:
-    """Q_struct 队列内部的 W-TinyLRU（队内淘汰，不做跨队列仲裁）。
+    """Q_struct 队内的标签版 TinyLRU（分类即晋升，不做跨队列仲裁）。
 
     policy="off" 时策略完全不构造，所有钩子判空跳过（零开销）。
-    完整语义见 python/sglang/srt/mem_cache/STRUCT_QUEUE_WTINYLRU.md。
+    完整语义见 python/sglang/srt/mem_cache/TAG_LRU.md。
     """
 
-    # "off" | "tag_lru"（标签版，TinyLRU 分支默认）| "wtinylru"（三区版）
+    # "off" | "tag_lru"（默认）
     policy: str = "tag_lru"
-    k: int = 3  # protected 的 share_count 门限
-    window_entries: int = 64  # 观察窗条目配额（无队列预算，按条目而非 token）
-    epoch_events: int = 8192  # aging 纪元的请求数
-    admission_tie: str = "reject"  # 频数相同时 "reject" | "admit"
-    admission_metric: str = "share"  # "share" | "share_per_token"
-    inherit_share: bool = True  # 降级叶子是否继承父节点频数
-    # A：频数口径 —— "hybrid"（默认：protected 只给跨会话）| "session" | "rid"
-    share_metric: str = "hybrid"
-    # B：protected 的 token 预算（占活跃区 token 的比例），0 = 关闭；0.8 ≈ 教科书 SLRU
-    protected_budget_frac: float = 0.0
-    # C：叶子降级的新鲜度闸（秒），0 = 关闭；>0 时陈旧叶子落 window 重新观察
-    stale_grace_s: float = 0.0
-    # 标签版：会话共享数达到该值才算「跨会话模板」-> QSTRUCT；默认 2（即 >1）
+    # 会话共享判定口径 —— "session"（默认，不同会话数）| "rid"（不同请求数，消融）
+    share_metric: str = "session"
+    # 会话共享数达到该值才算「跨会话模板」-> QSTRUCT；默认 2（即 >1）
     struct_share_min: int = 2
-    # 标签版：会话内热点（share_sessions==1）的处置 —— "chat"（默认，保留复用）| "one_shot"
+    # 会话内热点（share_sessions==1）的处置 —— "chat"（默认，保留复用）| "one_shot"
     local_hot: str = "chat"
 
     def __post_init__(self):
-        if self.policy not in ("off", "tag_lru", "wtinylru"):
+        if self.policy not in ("off", "tag_lru"):
             raise ValueError(
-                f"Unknown tiny_lru.policy: {self.policy}. "
-                "Supported: 'off', 'tag_lru', 'wtinylru'."
+                f"Unknown tiny_lru.policy: {self.policy}. Supported: 'off', 'tag_lru'."
             )
-        if self.k < 2:
-            raise ValueError(f"tiny_lru.k must be >= 2, got {self.k}")
-        if self.window_entries < 1:
+        if self.share_metric not in ("session", "rid"):
             raise ValueError(
-                f"tiny_lru.window_entries must be >= 1, got {self.window_entries}"
-            )
-        if self.epoch_events < 1:
-            raise ValueError(
-                f"tiny_lru.epoch_events must be >= 1, got {self.epoch_events}"
-            )
-        if self.admission_tie not in ("reject", "admit"):
-            raise ValueError(
-                f"tiny_lru.admission_tie must be 'reject' or 'admit', got {self.admission_tie}"
-            )
-        if self.admission_metric not in ("share", "share_per_token"):
-            raise ValueError(
-                "tiny_lru.admission_metric must be 'share' or 'share_per_token', "
-                f"got {self.admission_metric}"
-            )
-        if self.share_metric not in ("hybrid", "session", "rid"):
-            raise ValueError(
-                "tiny_lru.share_metric must be 'hybrid', 'session' or 'rid', "
+                "tiny_lru.share_metric must be 'session' or 'rid', "
                 f"got {self.share_metric}"
             )
-        if not 0.0 <= self.protected_budget_frac <= 1.0:
+        if self.local_hot not in ("chat", "one_shot"):
             raise ValueError(
-                "tiny_lru.protected_budget_frac must be in [0, 1], "
-                f"got {self.protected_budget_frac}"
-            )
-        if self.stale_grace_s < 0.0:
-            raise ValueError(
-                f"tiny_lru.stale_grace_s must be >= 0, got {self.stale_grace_s}"
-            )
-        if self.local_hot not in ("one_shot", "chat"):
-            raise ValueError(
-                f"tiny_lru.local_hot must be 'one_shot' or 'chat', got {self.local_hot}"
+                f"tiny_lru.local_hot must be 'chat' or 'one_shot', got {self.local_hot}"
             )
         if self.struct_share_min < 2:
             raise ValueError(
