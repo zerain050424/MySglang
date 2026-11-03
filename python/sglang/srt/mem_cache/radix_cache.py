@@ -22,6 +22,7 @@ The radix tree data structure for managing the KV cache.
 """
 
 import heapq
+import json
 import logging
 import os
 import sys
@@ -374,6 +375,25 @@ class RadixCache(BasePrefixCache):
             t.start()
             logger.info("[occ-sampler] thread started, alive=%s", t.is_alive())
 
+        # ---- 节点级标签快照（env 门控，默认关）----
+        # 用途：把「状态机给每个 radix 节点打的队列标签」与「节点真实归属
+        # (session_id)」一起落盘，用于节点级标注准确率统计，见
+        # Uni-Bench/evaluate_node_labels.py。只读遍历，不改变任何淘汰状态。
+        _dump_path = os.environ.get("SGLANG_NODE_LABEL_DUMP", "")
+        if _dump_path:
+            _dump_interval = float(os.environ.get("SGLANG_NODE_LABEL_INTERVAL", "30"))
+            t = threading.Thread(
+                target=self._node_label_dump_loop,
+                args=(_dump_path, _dump_interval),
+                daemon=True,
+                name="node-label-dumper",
+            )
+            t.start()
+            logger.info(
+                "[node-label] dump -> %s every %.0fs (pid=%s policy=%s)",
+                _dump_path, _dump_interval, os.getpid(), self.eviction_policy,
+            )
+
     @classmethod
     def create_simulated(
         self,
@@ -705,6 +725,12 @@ class RadixCache(BasePrefixCache):
                         f"{k}={int(v['total'])}" for k, v in sorted(counts.items())
                     )
                     logger.info("[workload occ] %s", msg)
+                tag_counts = self._per_queue_tag_token_count()
+                if tag_counts:
+                    msg = " ".join(
+                        f"{k}={v}" for k, v in sorted(tag_counts.items())
+                    )
+                    logger.info("[queue occ] %s", msg)
             except Exception:  # 采样失败不能影响主流程
                 logger.exception("workload occ sampler failed")
 
@@ -732,6 +758,83 @@ class RadixCache(BasePrefixCache):
                 rec["total"] += n
                 if self._is_one_shot(child):
                     rec["one_shot"] += n
+                stack.append(child)
+        return out
+
+    def _node_label_dump_loop(self, path: str, interval: float) -> None:
+        """后台循环：每 interval 秒把整棵树上每个节点的标签快照追加到 path(JSONL)。
+
+        与 `[workload occ]` 的区别：occupancy 只给聚合占比，这里给**逐节点**的
+        (状态机标签, 真实归属 session_id, token 数, 命中次数, 距上次访问时间,
+        子节点数, 是否 decode 段, 绝对起始偏移)，是节点级标注准确率的唯一数据源。
+
+        每行一个 JSON 对象：{"ts": 墙钟, "tick": n, "policy": ..., "nodes": [...]}。
+        只读遍历（GIL 保证不崩，最坏读到一次瞬时不一致），不改变任何淘汰状态。
+        """
+        i = 0
+        while True:
+            time.sleep(interval)
+            i += 1
+            try:
+                n = self._dump_node_labels(path, i)
+                logger.info("[node-label] tick=%s dumped %s nodes", i, n)
+            except Exception:  # 采样失败不能影响主流程
+                logger.exception("node label dump failed")
+
+    def _dump_node_labels(self, path: str, tick: int) -> int:
+        """把当前树的逐节点标签快照追加写入 path，返回节点数。"""
+        now_mono = time.monotonic()
+        rows = []
+        stack = [self.root_node]
+        while stack:
+            node = stack.pop()
+            for child in node.children.values():
+                if child.evicted:
+                    continue
+                stack.append(child)
+                rows.append({
+                    # 状态机的判定结果（qtrans/qstruct/qagent/qchat）
+                    "tag": getattr(child.queue_tag, "value", str(child.queue_tag)),
+                    # 真实归属：由插入该片段的请求携带，前缀即负载类别
+                    "sid": child.session_id,
+                    "tok": len(child.key),
+                    "hits": child.hit_count,
+                    "dt": round(now_mono - child.last_access_time, 3),
+                    "nch": len(child.children),
+                    "dec": bool(child.is_decode),
+                    "abs": child.abs_start,
+                })
+        if not rows:
+            # 空树不落盘：某些构造路径会额外创建一个空的 RadixCache（例如 lru），
+            # 不写入才不会被当成有效快照。
+            return 0
+        record = {
+            "ts": round(time.time(), 3),
+            "tick": tick,
+            "policy": self.eviction_policy,
+            "nodes": rows,
+        }
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        return len(rows)
+
+    def _per_queue_tag_token_count(self) -> dict:
+        """按**原始队列标签**统计驻留 token：qtrans/qstruct/qagent/qchat。
+
+        与 `_per_workload_token_count` 的区别：这里不经过 `workload_of` 的
+        `qtrans -> random` 折叠，因此能单独观察「非共享内容 = qtrans」的比例，
+        用于核对「共享前缀才报 qstruct」的口径（节点级标注统计用）。
+        返回 {queue_tag: token 数}，键是枚举的 value 字符串。
+        """
+        out: dict = {}
+        stack = [self.root_node]
+        while stack:
+            node = stack.pop()
+            for child in node.children.values():
+                if child.evicted:
+                    continue
+                tag = getattr(child.queue_tag, "value", str(child.queue_tag))
+                out[tag] = out.get(tag, 0) + len(child.key)
                 stack.append(child)
         return out
 

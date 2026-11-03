@@ -18,12 +18,16 @@ tasks:
     data_path: TaskData/SharedGPT-multi-turn/Qwen2.5-7B-Instruct/ShareGPT_cleaned_valid_deduplicated_session_data.jsonl
     mu: 4.15
     sigma: 0.971
+    gap_mode: fixed
+    gap_s: 20.0
     seed: 42
   - name: AgentBank_alfred
     task_id: 3
     data_path: TaskData/AgentBankData/Qwen2.5-7B-Instruct/AgentBank_alfred_scale_5000_session_data.jsonl
     mu: 1.81
     sigma: 1.092
+    gap_mode: fixed
+    gap_s: 2.0
     seed: 42
 
 phases:
@@ -74,4 +78,4 @@ phases:
       Codeparrot: 60
       AgentBank_apps: 60
       ShareGPT: 60
-      AgentBank_alfred: 240
+      AgentBank_alfred: 60

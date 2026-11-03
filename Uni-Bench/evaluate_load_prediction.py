@@ -60,7 +60,7 @@ def _parse_occ_line(line: str) -> Optional[Tuple[float, Dict[str, float]]]:
     )
     if not match:
         match = re.search(
-            r"(?P<date>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}[,.]\d+).*"
+            r"(?P<date>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[,.]\d+)?).*"
             r"\[workload occ\]\s+(?P<body>.*)",
             line,
         )
