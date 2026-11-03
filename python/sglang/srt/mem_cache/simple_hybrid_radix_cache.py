@@ -6,13 +6,15 @@
 导入本模块即注册 "--radix-cache-backend=simple_hybrid" 后端。
 """
 
+import logging
 import time
 
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams, EvictResult
 from sglang.srt.mem_cache.evict_policy import SimpleHybridStrategy
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.registry import register_radix_cache_backend
-from sglang.srt.mem_cache.uni_utils import SimpleHybridTaskType
+
+logger = logging.getLogger(__name__)
 
 
 class SimpleHybridRadixCache(RadixCache):
@@ -49,15 +51,24 @@ class SimpleHybridRadixCache(RadixCache):
                 victim = min(one_shot, key=strategy.one_shot_key)
             elif leaves:
                 victim = min(leaves, key=strategy.victim_key)
-                if strategy._task_type_of(victim) == SimpleHybridTaskType.MULTI_TURN_AGENTIC:
-                    rr_victim = strategy.pick_agentic_rr_victim(
-                        leaves, self.session_registry
-                    )
-                    if rr_victim is not None:
-                        victim = rr_victim
+                # 依次询问已注册的改写器（注册顺序 = 优先级，后者覆盖前者）。
+                # 返回 None 表示不接管 -> 保留当前候选，绝不阻塞推进（INV-4）。
+                for override in self.victim_overrides:
+                    if override.applies_to(victim):
+                        alt = override.pick(leaves, self.session_registry)
+                        if alt is not None:
+                            victim = alt
             else:
                 break
-            num_evicted += self._evict_one(victim)
+            released = self._evict_one(victim)
+            if released <= 0:
+                # 淘汰必须单调推进；否则 evict 会陷入死循环
+                logger.error(
+                    "[struct evict] victim released %d tokens, abort to avoid spin",
+                    released,
+                )
+                break
+            num_evicted += released
 
         self.update_eviction_metrics(num_evicted, start_time)
         return EvictResult(num_tokens_evicted=num_evicted)
@@ -73,6 +84,7 @@ class SimpleHybridRadixCache(RadixCache):
         """
         total = 0
         cur = node
+        struct = getattr(self.eviction_strategy, "struct", None)
         one_shot = self.eviction_strategy.is_one_shot(node)
         while True:
             parent = cur.parent
@@ -86,7 +98,10 @@ class SimpleHybridRadixCache(RadixCache):
             # 从树中删除；_delete_leaf 会顺带维护 evictable_leaves 与父节点晋升
             self._delete_leaf(cur)
             if (one_shot and parent is not None and parent is not self.root_node
-                    and parent.lock_ref == 0 and not parent.children):
+                    and parent.lock_ref == 0 and not parent.children
+                    # Q_struct 闸：模板前缀不参与 one-shot 死链级联，
+                    # 否则「降级后的文档段被收割」会连带删掉刚进 protected 的前缀。
+                    and not (struct is not None and struct.owns(parent))):
                 cur = parent  # 死链：随 one-shot 一并删除
                 continue
             break

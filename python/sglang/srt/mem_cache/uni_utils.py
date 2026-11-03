@@ -33,6 +33,241 @@ class SimpleHybridQueueTag(str, enum.Enum):
     QCHAT = "qchat"
 
 
+# ---------------------------------------------------------------------------
+# SimpleHybrid 的三组可调参数
+#
+#   AlphaParams   : alpha 在线权重的反馈控制（全局、每 update_interval 跑一次）
+#   RrParams      : Agentic 会话级轮询配额（跨会话公平）
+#   TinyLRUParams : Q_struct 队列内部的 W-TinyLRU（队内驻留/准入，见 STRUCT_QUEUE_WTINYLRU.md）
+# 用 dataclass 而不是裸 kwargs，是为了让 `eviction_policy_config` 有层级、能校验、能整体
+# 复制/日志/消融；旧的扁平键仍然接受（见 LEGACY_PARAM_ALIASES）。
+# ---------------------------------------------------------------------------
+
+
+def _coerce_params(cls, value, *, name: str):
+    """把 None / dict / 实例统一成参数组实例。"""
+    if value is None:
+        return cls()
+    if isinstance(value, cls):
+        return value
+    if isinstance(value, dict):
+        try:
+            return cls(**value)
+        except TypeError as exc:
+            known = ", ".join(f.name for f in dataclasses.fields(cls))
+            raise ValueError(
+                f"Invalid {name} parameters {sorted(value)}: {exc}. Known keys: {known}."
+            ) from None
+    raise TypeError(
+        f"{name} must be {cls.__name__}, dict or None, got {type(value).__name__}."
+    )
+
+
+DEFAULT_ALPHA_BALANCE = {
+    "chat": 1.0,
+    "agentic": 1.0,
+    "struct": 1.0,
+    "random": 1.0,
+}
+
+
+@dataclasses.dataclass
+class AlphaParams:
+    """alpha 在线权重的反馈控制参数。
+
+    `balance` 是各队列的初始权重；运行时由 update_alpha_balance() 按命中效率改写，
+    三个稳定性约束（容量份额下限 / 单步限速 / 温度+EMA）都在这里配置。
+    """
+
+    update_interval: float = 30.0  # 秒；alpha 重算与 profile 打印的间隔
+    min_cap_share: float = 0.02  # eff 分母下限，避免份额趋零时爆炸
+    max_alpha_step: float = 3.0  # 单次更新允许的最大倍数变化
+    smooth: float = 0.7  # EMA 中旧值保留权重
+    temperature: float = 0.5  # (1/temperature) 次幂放大
+    balance: Dict[str, float] = dataclasses.field(
+        default_factory=lambda: dict(DEFAULT_ALPHA_BALANCE)
+    )
+
+    def __post_init__(self):
+        # 浅拷贝 + 补齐缺省键：外部传入的字典不与自己共享引用（内部会就地改 balance），
+        # 只给部分队列（如 {"chat": 2.0}）时其余队列仍回落到 1.0。
+        merged = dict(DEFAULT_ALPHA_BALANCE)
+        merged.update(self.balance)
+        self.balance = merged
+        if self.update_interval <= 0:
+            raise ValueError(f"update_interval must be > 0, got {self.update_interval}")
+        if self.min_cap_share <= 0:
+            raise ValueError(f"min_cap_share must be > 0, got {self.min_cap_share}")
+        if self.max_alpha_step < 1.0:
+            raise ValueError(f"max_alpha_step must be >= 1, got {self.max_alpha_step}")
+        if not 0.0 <= self.smooth <= 1.0:
+            raise ValueError(f"smooth must be in [0, 1], got {self.smooth}")
+        if self.temperature <= 0:
+            raise ValueError(f"temperature must be > 0, got {self.temperature}")
+
+    @classmethod
+    def from_any(cls, value=None) -> "AlphaParams":
+        return _coerce_params(cls, value, name="alpha")
+
+    def as_dict(self) -> dict:
+        return dataclasses.asdict(self)
+
+
+@dataclasses.dataclass
+class RrParams:
+    """Agentic 会话级轮询（round-robin）配额参数。
+
+    enabled 为真时，淘汰阶段在会话之间轮询挑 victim，并用 `_loss_cap` 限制
+    单会话本轮可以承受的 KV 缺口。
+    """
+
+    fair_rr: bool = False  # Agentic 会话轮询开关
+    kappa: float = 0.5  # 单次缺口上限 = min(kappa*L, L-keep)
+    min_retain_tokens: int = 512  # 每条会话至少保留的 token
+    min_retain_frac: float = 0.3  # 每条会话至少保留的比例
+
+    def __post_init__(self):
+        if not 0.0 <= self.kappa <= 1.0:
+            raise ValueError(f"kappa must be in [0, 1], got {self.kappa}")
+        if self.min_retain_tokens < 0:
+            raise ValueError(
+                f"min_retain_tokens must be >= 0, got {self.min_retain_tokens}"
+            )
+        if not 0.0 <= self.min_retain_frac <= 1.0:
+            raise ValueError(
+                f"min_retain_frac must be in [0, 1], got {self.min_retain_frac}"
+            )
+
+    @classmethod
+    def from_any(cls, value=None) -> "RrParams":
+        return _coerce_params(cls, value, name="rr")
+
+    def as_dict(self) -> dict:
+        return dataclasses.asdict(self)
+
+
+@dataclasses.dataclass
+class TinyLRUParams:
+    """Q_struct 队列内部的 W-TinyLRU（队内淘汰，不做跨队列仲裁）。
+
+    policy="off" 时策略完全不构造，所有钩子判空跳过（零开销）。
+    完整语义见 python/sglang/srt/mem_cache/STRUCT_QUEUE_WTINYLRU.md。
+    """
+
+    policy: str = "off"  # "off" | "wtinylru"
+    k: int = 3  # protected 的 share_count 门限
+    window_entries: int = 64  # 观察窗条目配额（无队列预算，按条目而非 token）
+    epoch_events: int = 8192  # aging 纪元的请求数
+    admission_tie: str = "reject"  # 频数相同时 "reject" | "admit"
+    admission_metric: str = "share"  # "share" | "share_per_token"
+    inherit_share: bool = True  # 降级叶子是否继承父节点频数
+
+    def __post_init__(self):
+        if self.policy not in ("off", "wtinylru"):
+            raise ValueError(
+                f"Unknown tiny_lru.policy: {self.policy}. Supported: 'off', 'wtinylru'."
+            )
+        if self.k < 2:
+            raise ValueError(f"tiny_lru.k must be >= 2, got {self.k}")
+        if self.window_entries < 1:
+            raise ValueError(
+                f"tiny_lru.window_entries must be >= 1, got {self.window_entries}"
+            )
+        if self.epoch_events < 1:
+            raise ValueError(
+                f"tiny_lru.epoch_events must be >= 1, got {self.epoch_events}"
+            )
+        if self.admission_tie not in ("reject", "admit"):
+            raise ValueError(
+                f"tiny_lru.admission_tie must be 'reject' or 'admit', got {self.admission_tie}"
+            )
+        if self.admission_metric not in ("share", "share_per_token"):
+            raise ValueError(
+                "tiny_lru.admission_metric must be 'share' or 'share_per_token', "
+                f"got {self.admission_metric}"
+            )
+
+    @classmethod
+    def from_any(cls, value=None) -> "TinyLRUParams":
+        return _coerce_params(cls, value, name="tiny_lru")
+
+    def as_dict(self) -> dict:
+        return dataclasses.asdict(self)
+
+
+# 分组名 -> 参数类；供策略构造与日志使用
+SIMPLE_HYBRID_PARAM_GROUPS = {
+    "alpha": AlphaParams,
+    "rr": RrParams,
+    "tiny_lru": TinyLRUParams,
+}
+
+# 旧的扁平配置键 -> (组名, 字段名)。只为兼容历史 benchmark / 命令行 JSON。
+LEGACY_PARAM_ALIASES = {
+    # alpha
+    "update_interval": ("alpha", "update_interval"),
+    "min_cap_share": ("alpha", "min_cap_share"),
+    "max_alpha_step": ("alpha", "max_alpha_step"),
+    "alpha_smooth": ("alpha", "smooth"),
+    "alpha_temperature": ("alpha", "temperature"),
+    "alpha_balance": ("alpha", "balance"),
+    # rr
+    "fair_rr": ("rr", "fair_rr"),
+    "kappa": ("rr", "kappa"),
+    "min_retain_tokens": ("rr", "min_retain_tokens"),
+    "min_retain_frac": ("rr", "min_retain_frac"),
+    # tiny_lru
+    "struct_policy": ("tiny_lru", "policy"),
+    "struct_k": ("tiny_lru", "k"),
+    "struct_window_entries": ("tiny_lru", "window_entries"),
+    "struct_epoch_events": ("tiny_lru", "epoch_events"),
+    "struct_admission_tie": ("tiny_lru", "admission_tie"),
+    "struct_admission_metric": ("tiny_lru", "admission_metric"),
+    "struct_inherit_share": ("tiny_lru", "inherit_share"),
+}
+
+
+def split_legacy_params(**legacy) -> Dict[str, dict]:
+    """把旧的扁平 kwargs 路由到三组参数，未知键直接报错（拼错不再静默失效）。"""
+    out: Dict[str, dict] = {name: {} for name in SIMPLE_HYBRID_PARAM_GROUPS}
+    unknown = []
+    for name, value in legacy.items():
+        target = LEGACY_PARAM_ALIASES.get(name)
+        if target is None:
+            unknown.append(name)
+            continue
+        group, field = target
+        out[group][field] = value
+    if unknown:
+        known = ", ".join(sorted(LEGACY_PARAM_ALIASES))
+        raise ValueError(
+            f"Unknown eviction policy config keys: {sorted(unknown)}. "
+            f"Use the grouped form ({'/'.join(SIMPLE_HYBRID_PARAM_GROUPS)}), "
+            f"or these legacy keys: {known}."
+        )
+    return out
+
+
+def merge_param_overrides(value, overrides: dict):
+    """显式分组参数优先，旧扁平键只补齐缺失字段。
+
+    返回可直接传给 `XxxParams.from_any()` 的 dict 或原实例。
+    """
+    if not overrides:
+        return value
+    if value is None:
+        return dict(overrides)
+    if isinstance(value, dict):
+        merged = dict(value)
+        for k, v in overrides.items():
+            merged.setdefault(k, v)
+        return merged
+    base = dataclasses.asdict(value)
+    for k, v in overrides.items():
+        base.setdefault(k, v)
+    return base
+
+
 @lru_cache(maxsize=8)
 def _cached_lognorm_params(mu: float, sigma: float):
     """Cache lognormal parameters to avoid recomputation."""
@@ -90,6 +325,38 @@ def alpha_key_of(task_type) -> str:
         SimpleHybridTaskType.STRUCT_SINGLE_TURN: "struct",
         SimpleHybridTaskType.RANDOM_SINGLE_TURN: "random",
     }.get(task_type, "chat")
+
+
+# ---------------------------------------------------------------------------
+# 节点口径的小工具与标签映射
+#
+# 放在这里而不是各自的策略模块里：evict_policy / victim_override / 指标统计
+# 都要用同一套口径，重复实现迟早会漂移（abs_start 语义已经在 HeterCache 迁移中踩过一次）。
+# ---------------------------------------------------------------------------
+
+
+def node_num_tokens(node) -> int:
+    """片段长度（radix 片段的 token 数）。"""
+    return len(node.value) if node.value is not None else 0
+
+
+def node_end_offset(node) -> int:
+    """片段在整条序列中的绝对结束偏移（HeterCache 的 num_hashed_tokens）。"""
+    num_tokens = node_num_tokens(node)
+    abs_start = getattr(node, "abs_start", None)
+    if abs_start is None:
+        return num_tokens
+    return abs_start + num_tokens
+
+
+def task_type_of_tag(tag) -> SimpleHybridTaskType:
+    """queue_tag -> 任务类型。策略与淘汰改写器共用这一份映射。"""
+    return {
+        SimpleHybridQueueTag.QTRANS: SimpleHybridTaskType.RANDOM_SINGLE_TURN,
+        SimpleHybridQueueTag.QSTRUCT: SimpleHybridTaskType.STRUCT_SINGLE_TURN,
+        SimpleHybridQueueTag.QAGENT: SimpleHybridTaskType.MULTI_TURN_AGENTIC,
+        SimpleHybridQueueTag.QCHAT: SimpleHybridTaskType.MULTI_TURN_CHAT,
+    }.get(tag, SimpleHybridTaskType.MULTI_TURN_CHAT)
 
 
 @dataclasses.dataclass

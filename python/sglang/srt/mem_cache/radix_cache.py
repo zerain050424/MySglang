@@ -287,6 +287,13 @@ class TreeNode: ## TreeNode 是基数树（RadixTree）的节点，每个节点�
         self.is_decode = False
         # SimpleHYBRID：节点归属的会话（用于会话级缺口记账，见 uni_utils.SessionRegistry）
         self.session_id: Optional[str] = None
+        # Q_struct 队内 W-TinyLRU：不同 rid 数 + rid 布隆 + 区归属（0=非成员）
+        self.share_count = 0
+        self.rid_bloom = 0
+        self.struct_region = 0
+        # 曾经/正在分叉（结构证据的黏性标记）：节点失去所有子节点后仍然是成员，
+        # 直到 aging 判定它没有共享证据才退队。
+        self.struct_ever_branch = False
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
 
@@ -347,6 +354,14 @@ class RadixCache(BasePrefixCache):
         self._hit_recorder = getattr(self.eviction_strategy, "record_hit", None)
         self._alpha_updater = getattr(
             self.eviction_strategy, "maybe_update_alpha", None
+        )
+        # Q_struct 队内 W-TinyLRU（SimpleHybridStrategy.struct；其他策略为 None）。
+        # 只在策略开启时挂钩子，关闭时所有调用点都是 `is not None` 的一次判空。
+        self.struct_policy = getattr(self.eviction_strategy, "struct", None)
+        # 可插拔的「淘汰候选改写器」：RR 会话公平 / struct 队内顺序等。
+        # 空元组表示没有任何插件，淘汰走原来的全局 victim_key。
+        self.victim_overrides = tuple(
+            getattr(self.eviction_strategy, "victim_overrides", ()) or ()
         )
 
         self.evictable_leaves = set()
@@ -415,6 +430,10 @@ class RadixCache(BasePrefixCache):
     ##### Public API #####
 
     def reset(self):
+        # Q_struct 队内策略持有节点引用，必须先于树一起清空
+        struct_policy = getattr(self, "struct_policy", None)
+        if struct_policy is not None:
+            struct_policy.reset()
         # Initialize root with minimum priority so any real priority overrides it
         self.root_node = TreeNode(priority=-sys.maxsize)
         self.root_node.key = RadixKey(token_ids=array("q"), extra_key=None)
@@ -484,7 +503,10 @@ class RadixCache(BasePrefixCache):
         if len(key) == 0:
             return self._empty_match_result
 
-        value, last_node = self._match_prefix_helper(self.root_node, key)
+        # Q_struct 频数口径是「不同请求数」：rid 从这里透传到命中路径。
+        # 没有 req 的调用（如 chunked 自查）rid 为 None，只刷新顺序、不计数。
+        rid = getattr(params.req, "rid", None) if params.req is not None else None
+        value, last_node = self._match_prefix_helper(self.root_node, key, rid)
         if value:
             value = torch.cat(value)
         else:
@@ -910,7 +932,9 @@ class RadixCache(BasePrefixCache):
 
     ##### Internal Helper Functions #####
 
-    def _match_prefix_helper(self, node: TreeNode, key: RadixKey): ## node：当前节点，key：要匹配的RadixKey
+    def _match_prefix_helper(
+        self, node: TreeNode, key: RadixKey, rid=None
+    ): ## node：当前节点，key：要匹配的RadixKey
         access_time = time.monotonic()
         node.last_access_time = access_time
 
@@ -922,13 +946,13 @@ class RadixCache(BasePrefixCache):
             prefix_len = child.key.match(key, page_size=self.page_size) ##计算当前节点的key与子节点的key的匹配长度，返回匹配的逻辑单位数量，向下取整为page_size的整数倍
             if prefix_len < len(child.key): ## 如果匹配长度小于子节点的key长度，说明匹配结束在子节点的中间，需要将子节点拆分为两个节点，一个表示匹配的前缀，一个表示剩余的后缀
                 new_node = self._split_node(child.key, child, prefix_len)
-                self._record_node_hit(new_node, access_time)
+                self._record_node_hit(new_node, access_time, rid)
                 value.append(new_node.value) ## 追加KV张量
                 node = new_node ## 将当前节点更新为新创建的节点
                 break
             else:
                 value.append(child.value) ## 完全匹配追加全量张量
-                self._record_node_hit(child, access_time)
+                self._record_node_hit(child, access_time, rid)
                 node = child ## 将当前节点更新为子节点
                 key = key[prefix_len:] ## 将key截断为剩余未匹配的部分
 
@@ -937,7 +961,9 @@ class RadixCache(BasePrefixCache):
 
         return value, node
 
-    def _record_node_hit(self, node: TreeNode, access_time: float) -> None:
+    def _record_node_hit(
+        self, node: TreeNode, access_time: float, rid=None
+    ) -> None:
         """根据命中间隔更新节点状态。"""
         delta = access_time - node.last_access_time
         node.hit_count += 1
@@ -948,6 +974,9 @@ class RadixCache(BasePrefixCache):
                 else SimpleHybridQueueTag.QCHAT
             )
         node.last_access_time = access_time
+        if self.struct_policy is not None:
+            # 注意：这里用 rid 去重，chunked 复查（rid=None）不会把分块自引用刷成高频
+            self.struct_policy.on_hit(node, rid)
 
     def _split_node(
            self,
@@ -988,6 +1017,11 @@ class RadixCache(BasePrefixCache):
            new_node.event_hash_value, child.event_hash_value = split_node_hash_value(
             child.event_hash_value, split_len, self.page_size
            )
+           # Q_struct：分裂不改变「哪些请求经过这段前缀」，两半都继承频数。
+           new_node.share_count = child.share_count
+           new_node.rid_bloom = child.rid_bloom
+           if self.struct_policy is not None:
+               self.struct_policy.on_split(new_node, child)
 
            return new_node
 
@@ -1056,6 +1090,9 @@ class RadixCache(BasePrefixCache):
             node.children[child_key] = new_node
             if node is not self.root_node and len(node.children) >= 2:
                 node.queue_tag = SimpleHybridQueueTag.QSTRUCT
+            if self.struct_policy is not None:
+                # 刚分叉的父节点可能是新成员（M3 第一项）
+                self.struct_policy.on_children_added(node)
             self.evictable_size_ += len(key)
             self._update_leaf_status(node)
             self._update_leaf_status(new_node)
@@ -1092,22 +1129,31 @@ class RadixCache(BasePrefixCache):
         self.evictable_size_ -= len(node.key)
         if node in self.evictable_leaves:
             self.evictable_leaves.remove(node)
+        if self.struct_policy is not None:
+            self.struct_policy.on_delete(node)
         self._update_leaf_status(node.parent)
 
     def _update_leaf_status(self, node: TreeNode):
         if node.evicted or node.lock_ref > 0: ## 节点已被驱逐且被锁
             if node in self.evictable_leaves:
                 self.evictable_leaves.remove(node) ## 从可驱逐叶子节点集合中移除该节点
+            if self.struct_policy is not None:
+                self.struct_policy.on_no_longer_leaf(node)
             return
 
         for child in node.children.values():
             if not child.evicted: ## 如果子节点没有被驱逐，说明当前节点不是叶子节点
                 if node in self.evictable_leaves:
                     self.evictable_leaves.remove(node)
+                if self.struct_policy is not None:
+                    self.struct_policy.on_no_longer_leaf(node)
                 return
 
         if node not in self.evictable_leaves: ## 节点没有被驱逐且没有被锁，且所有子节点都已被驱逐，说明当前节点是可驱逐叶子节点，将其添加到可驱逐叶子节点集合中
             self.evictable_leaves.add(node)
+            if self.struct_policy is not None:
+                # 新降级的叶子：按继承表落区（热点模板前缀在这里被保住）
+                self.struct_policy.on_became_leaf(node)
 
     def _total_size_helper(self):
         total_size = 0

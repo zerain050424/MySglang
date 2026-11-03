@@ -6,17 +6,25 @@ import time
 from collections import deque
 from typing import TYPE_CHECKING, Dict, Iterable, Optional, Tuple, Union
 
+from sglang.srt.mem_cache.struct_queue_policy import StructQueuePolicy
 from sglang.srt.mem_cache.uni_utils import (
+    AlphaParams,
+    node_end_offset,
+    node_num_tokens,
+    RrParams,
+    TinyLRUParams,
     TASK_CONFIG,
     WORKLOAD_LABELS,
     workload_label_of,
     alpha_key_of,
-    SimpleHybridQueueTag,
     SimpleHybridTaskType,
     _cached_lognorm_cdf,
     SessionRegistry,
-    SessionState,
+    merge_param_overrides,
+    split_legacy_params,
+    task_type_of_tag,
 )
+from sglang.srt.mem_cache.victim_override import RrEvictPolicy
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.radix_cache import TreeNode
@@ -24,18 +32,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _node_num_tokens(node) -> int:
-    """节点片段的 token 数（radix 片段的长度）。"""
-    return len(node.value) if node.value is not None else 0
-
-
-def _node_end_offset(node) -> int:
-    """片段的绝对结束偏移"""
-    num_tokens = _node_num_tokens(node)
-    abs_start = getattr(node, "abs_start", None)
-    if abs_start is None:
-        return num_tokens
-    return abs_start + num_tokens
+# 节点口径与标签映射统一在 uni_utils，避免策略/改写器/指标各算一套。
+_node_num_tokens = node_num_tokens
+_node_end_offset = node_end_offset
 
 
 class EvictionStrategy(ABC):
@@ -143,46 +142,44 @@ class SimpleHybridStrategy(EvictionStrategy):
     def __init__(
         self,
         max_offset: int = 2048,
-        alpha_balance: Optional[Dict[str, float]] = None,
-        update_interval: float = 30.0,
-        min_cap_share: float = 0.02,
-        max_alpha_step: float = 3.0,
-        alpha_smooth: float = 0.7,
-        alpha_temperature: float = 0.5,
-        fair_rr: bool = False,
-        kappa: float = 0.5,
-        min_retain_tokens: int = 512,
-        min_retain_frac: float = 0.3,
+        *,
+        alpha: Union[AlphaParams, dict, None] = None,
+        rr: Union[RrParams, dict, None] = None,
+        tiny_lru: Union[TinyLRUParams, dict, None] = None,
+        **legacy,
     ):
-        self.max_offset = max_offset or 2048
-        # ---- alpha 控制器的稳定性参数----
-        # 加下限使 eff 有界。
-        self.min_cap_share = min_cap_share
-        # 单次更新允许的最大倍数变化（上/下）。防止一个噪声窗口把权重从下界直接顶到上界。
-        self.max_alpha_step = max_alpha_step
-        # EMA 中旧值的保留权重。0.7 表示每次只吸收 30% 的新观测；
-        self.alpha_smooth = alpha_smooth
-        # 做 (1/temperature) 次幂放大。
-        self.alpha_temperature = alpha_temperature
-        self.alpha_balance = ( # 直接赋值是引用共享,外部改原来的字典,内部跟着变,传入dict进行构造,可以实现浅拷贝的内外隔离
-            dict(alpha_balance)
-            if alpha_balance
-            else {
-                "chat": 1.0,
-                "agentic": 1.0,
-                "struct": 1.0,
-                "random": 1.0,
-            }
+        """三组参数分别由 AlphaParams / RrParams / TinyLRUParams 承载（uni_utils）。
+
+        配置可以用分组形式：
+            {"alpha": {...}, "rr": {...}, "tiny_lru": {...}}
+        旧的扁平键（alpha_smooth / fair_rr / struct_k ...）仍然接受，
+        由 split_legacy_params() 路由到对应组；分组显式给出的字段优先。
+
+        max_offset 不属于任何一组：它是 Q_struct 复用分数里的位置项上界
+        （HeterCache 的 offset 语义），与 TinyLRU 的频数准入无关。
+        """
+        legacy_groups = split_legacy_params(**legacy)
+        self.alpha = AlphaParams.from_any(merge_param_overrides(alpha, legacy_groups["alpha"]))
+        self.rr = RrParams.from_any(merge_param_overrides(rr, legacy_groups["rr"]))
+        self.tiny_lru = TinyLRUParams.from_any(
+            merge_param_overrides(tiny_lru, legacy_groups["tiny_lru"])
         )
-        self.fair_rr = fair_rr
-        self.kappa = kappa
-        self.min_retain_tokens = min_retain_tokens
-        self.min_retain_frac = min_retain_frac
-        self._rr_last: Dict[str, int] = {}
-        self._rr_seq = 0
-        self._quota_breach = 0
+
+        # 下面这些是只读兼容别名：真值在三个参数组里。
+        # alpha_balance 与 self.alpha.balance 是同一个 dict（测试会就地改写权重）。
+        self.max_offset = max_offset or 2048
+        self.alpha_balance: Dict[str, float] = self.alpha.balance
+        self.update_interval = self.alpha.update_interval
+        self.min_cap_share = self.alpha.min_cap_share
+        self.max_alpha_step = self.alpha.max_alpha_step
+        self.alpha_smooth = self.alpha.smooth
+        self.alpha_temperature = self.alpha.temperature
+        self.fair_rr = self.rr.fair_rr
+        self.kappa = self.rr.kappa
+        self.min_retain_tokens = self.rr.min_retain_tokens
+        self.min_retain_frac = self.rr.min_retain_frac
+
         # 在线更新α状态
-        self.update_interval = update_interval
         self._last_update = time.monotonic()
         self._hit_tokens: Dict[str, float] = {}
         self._seen_rids: set = set()
@@ -195,16 +192,29 @@ class SimpleHybridStrategy(EvictionStrategy):
         self._total_hit_tokens: Dict[str, float] = {}
         self._total_evicted_tokens: Dict[str, float] = {}
         self._total_evicted_one_shot = 0.0
+        # 两个可插拔的「候选改写器」：RR 会话公平、Q_struct 队内 W-TinyLRU。
+        # 顺序即优先级：后注册者覆盖前者（struct 对归属节点有最终发言权）。
+        self.rr_evict = RrEvictPolicy(self.rr) if self.rr.fair_rr else None
+        self.struct = (
+            StructQueuePolicy(
+                enabled=True,
+                k=self.tiny_lru.k,
+                window_entries=self.tiny_lru.window_entries,
+                epoch_events=self.tiny_lru.epoch_events,
+                admission_tie=self.tiny_lru.admission_tie,
+                admission_metric=self.tiny_lru.admission_metric,
+                inherit_share=self.tiny_lru.inherit_share,
+            )
+            if self.tiny_lru.policy == "wtinylru"
+            else None
+        )
+        self.victim_overrides = tuple(
+            p for p in (self.rr_evict, self.struct) if p is not None
+        )
     @staticmethod
     def _task_type_of(node) -> SimpleHybridTaskType:
-        # 队列标签由缓存状态机维护。固定映射为各队列提供策略语义，
-        # 不检查请求字段、会话 ID 或提示词。
-        return {
-            SimpleHybridQueueTag.QTRANS: SimpleHybridTaskType.RANDOM_SINGLE_TURN,
-            SimpleHybridQueueTag.QSTRUCT: SimpleHybridTaskType.STRUCT_SINGLE_TURN,
-            SimpleHybridQueueTag.QAGENT: SimpleHybridTaskType.MULTI_TURN_AGENTIC,
-            SimpleHybridQueueTag.QCHAT: SimpleHybridTaskType.MULTI_TURN_CHAT,
-        }.get(node.queue_tag, SimpleHybridTaskType.MULTI_TURN_CHAT)
+        # 队列标签由缓存状态机维护。映射表在 uni_utils，策略与改写器共用。
+        return task_type_of_tag(getattr(node, "queue_tag", None))
 
     def _reuse_score(self, node) -> float:
         """calculate_priority() from HeterCache, with time.monotonic() as now."""
@@ -215,11 +225,11 @@ class SimpleHybridStrategy(EvictionStrategy):
         cfg = TASK_CONFIG.get(task_type)
         if cfg is not None: ## 多轮任务
             mu, sigma, alpha_key = cfg
-            alpha = self.alpha_balance.get(alpha_key, 1.0) # 在线更新α
+            alpha = self.alpha.balance.get(alpha_key, 1.0) # 在线更新α
             reuse_prob = 1.0 - _cached_lognorm_cdf(e, mu, sigma)
             return alpha * reuse_prob
         if task_type == SimpleHybridTaskType.STRUCT_SINGLE_TURN:
-            alpha = self.alpha_balance.get("struct", 1.0)
+            alpha = self.alpha.balance.get("struct", 1.0)
             # HeterCache 的 offset 是块在序列中的绝对结束位置，不是 radix 片段长度。
             offset_factor = 1.0 - _node_end_offset(node) / (self.max_offset or 1)
             offset_factor = max(0.0, min(1.0, offset_factor))
@@ -246,61 +256,23 @@ class SimpleHybridStrategy(EvictionStrategy):
         """
         return (self._reuse_score(node), -_node_num_tokens(node))
 
-    def _loss_cap(self, chain_len: int) -> float:
-        keep = max(self.min_retain_tokens, self.min_retain_frac * chain_len)
-        return max(0.0, min(self.kappa * chain_len, chain_len - keep))
-
-    def _pick_round_robin(
-        self,
-        leaves: Iterable["TreeNode"],
-        registry: "SessionRegistry",
-    ) -> Optional["TreeNode"]:
-        """Pick the deepest leaf of the least recently served Agentic session."""
-        tails: Dict[str, Tuple["TreeNode", "SessionState"]] = {}
-        for node in leaves:
-            sid = getattr(node, "session_id", None)
-            if sid is None:
-                continue
-            state = registry.get(sid) ##获取会话KV记账状态
-            if state is None or state.L <= 0:
-                continue
-            current = tails.get(sid)
-            if current is None or _node_end_offset(node) > _node_end_offset(current[0]):
-                ## 会话内部,保留最深节点
-                tails[sid] = (node, state)
-
-        best = None
-        for sid, (node, state) in tails.items(): ## 跨对话轮询删除
-            if state.d >= self._loss_cap(state.L): ## 删除的缺口超过阈值,不再考虑
-                continue
-            last = self._rr_last.get(sid, -1) # 获取该对话上次被选中的序号,若上次未被选中,则为-1
-            if best is None or last < best[0]:
-                best = (last, sid, node)
-        if best is None:
-            return None
-
-        self._rr_last[best[1]] = self._rr_seq #选中淘汰之后更新序号
-        self._rr_seq += 1
-        return best[2]
+    # ---- 兼容 shim：RR 实现已抽到 victim_override.RrEvictPolicy ----
 
     def pick_agentic_rr_victim(
         self,
         leaves: Iterable["TreeNode"],
         registry: "SessionRegistry",
     ) -> Optional["TreeNode"]:
-        if not self.fair_rr:
+        """Deprecated：请用 ``self.victim_overrides``（或 ``self.rr_evict.pick``）。"""
+        if self.rr_evict is None:
             return None
-        agentic_leaves = [
-            node
-            for node in leaves
-            if self._task_type_of(node) == SimpleHybridTaskType.MULTI_TURN_AGENTIC
-        ]
-        if not agentic_leaves:
-            return None
-        victim = self._pick_round_robin(agentic_leaves, registry)
-        if victim is None:
-            self._quota_breach += 1
-        return victim
+        return self.rr_evict.pick(leaves, registry)
+
+    def _loss_cap(self, chain_len: int) -> float:
+        """Deprecated：RR 的配额函数现在在 RrEvictPolicy.loss_cap()。"""
+        if self.rr_evict is None:
+            return 0.0
+        return self.rr_evict.loss_cap(chain_len)
 
     def is_one_shot(self, node) -> bool:
         """
@@ -386,7 +358,7 @@ class SimpleHybridStrategy(EvictionStrategy):
             schedulable += c["total"] - c["one_shot"]
             hit = self._total_hit_tokens.get(q, 0.0)
             evicted = self._total_evicted_tokens.get(q, 0.0)
-            alpha = self.alpha_balance.get(q)
+            alpha = self.alpha.balance.get(q)
             alpha_s = f"{alpha:>6.3f}" if alpha is not None else "     -"
             occ_s = f"{c['total']:>10.0f}"
             if c["one_shot"]:
@@ -412,7 +384,7 @@ class SimpleHybridStrategy(EvictionStrategy):
     def maybe_update_alpha(self, sched, workload_occ, session_summary=None) -> None:
         # Time-guarded trigger for alpha rebalancing (called from evict()).
         now = time.monotonic()
-        if now - self._last_update < self.update_interval:
+        if now - self._last_update < self.alpha.update_interval:
             return ## 每经过一个时间间隔interval才进行更新
         self._last_update = now
         self.update_alpha_balance(sched)
@@ -453,9 +425,9 @@ class SimpleHybridStrategy(EvictionStrategy):
         占着容量却零命中的队列必须参与（eff=0），否则它永远拿不到惩罚。
         """
         if smooth is None:
-            smooth = self.alpha_smooth
+            smooth = self.alpha.smooth
         if temperature is None:
-            temperature = self.alpha_temperature
+            temperature = self.alpha.temperature
 
         hits = dict(self._hit_tokens)
         self._hit_tokens.clear()
@@ -475,7 +447,7 @@ class SimpleHybridStrategy(EvictionStrategy):
 
         # 容量份额加下限：使 eff 在 cap_share→0 时有界（约束 1）
         cap_share = {
-            q: max(c / total_cap, self.min_cap_share) for q, c in caps.items()
+            q: max(c / total_cap, self.alpha.min_cap_share) for q, c in caps.items()
         }
         eff = {q: (hits.get(q, 0.0) / total_hits) / cap_share[q] for q in caps}
 
@@ -494,10 +466,10 @@ class SimpleHybridStrategy(EvictionStrategy):
         upper = max(lower, min(10.0, mean_s + 2 * std_s))
 
         for q, val in zip(keys, scaled):
-            prev = self.alpha_balance.get(q, 1.0)
+            prev = self.alpha.balance.get(q, 1.0)
             updated = smooth * prev + (1 - smooth) * val          # EMA
             # 约束 2：单步限速，避免从下界一步跳到上界
-            lo, hi = prev / self.max_alpha_step, prev * self.max_alpha_step
+            lo, hi = prev / self.alpha.max_alpha_step, prev * self.alpha.max_alpha_step
             updated = max(lo, min(hi, updated))
-            self.alpha_balance[q] = max(lower, min(upper, updated))
+            self.alpha.balance[q] = max(lower, min(upper, updated))
     
