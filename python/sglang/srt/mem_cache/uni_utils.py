@@ -327,6 +327,38 @@ def alpha_key_of(task_type) -> str:
     }.get(task_type, "chat")
 
 
+# ---------------------------------------------------------------------------
+# 节点口径的小工具与标签映射
+#
+# 放在这里而不是各自的策略模块里：evict_policy / victim_override / 指标统计
+# 都要用同一套口径，重复实现迟早会漂移（abs_start 语义已经在 HeterCache 迁移中踩过一次）。
+# ---------------------------------------------------------------------------
+
+
+def node_num_tokens(node) -> int:
+    """片段长度（radix 片段的 token 数）。"""
+    return len(node.value) if node.value is not None else 0
+
+
+def node_end_offset(node) -> int:
+    """片段在整条序列中的绝对结束偏移（HeterCache 的 num_hashed_tokens）。"""
+    num_tokens = node_num_tokens(node)
+    abs_start = getattr(node, "abs_start", None)
+    if abs_start is None:
+        return num_tokens
+    return abs_start + num_tokens
+
+
+def task_type_of_tag(tag) -> SimpleHybridTaskType:
+    """queue_tag -> 任务类型。策略与淘汰改写器共用这一份映射。"""
+    return {
+        SimpleHybridQueueTag.QTRANS: SimpleHybridTaskType.RANDOM_SINGLE_TURN,
+        SimpleHybridQueueTag.QSTRUCT: SimpleHybridTaskType.STRUCT_SINGLE_TURN,
+        SimpleHybridQueueTag.QAGENT: SimpleHybridTaskType.MULTI_TURN_AGENTIC,
+        SimpleHybridQueueTag.QCHAT: SimpleHybridTaskType.MULTI_TURN_CHAT,
+    }.get(tag, SimpleHybridTaskType.MULTI_TURN_CHAT)
+
+
 @dataclasses.dataclass
 class SessionState:
     """一条会话的 KV记账。

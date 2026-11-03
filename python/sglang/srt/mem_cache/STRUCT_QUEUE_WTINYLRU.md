@@ -315,15 +315,34 @@ every E struct 入区/淘汰事件 (默认 E = 8192):
 
 在 `simple_hybrid_radix_cache.py:49-57` 选出 `victim` 之后、`_evict_one(victim)`（同一循环末尾）之前插入：
 
-```
-if struct_policy.enabled and struct_policy.owns(victim):
-    alt = struct_policy.victim()
-    if alt is not None:
-        victim = alt
-    # alt is None → 保留原 victim，绝不阻塞（INV-4）
+淘汰循环里已经没有 struct 的硬编码，改成**插件链**：
+
+```python
+victim = min(leaves, key=strategy.victim_key)
+for override in self.victim_overrides:        # 注册顺序 = 优先级，后者覆盖前者
+    if override.applies_to(victim):
+        alt = override.pick(leaves, self.session_registry)
+        if alt is not None:                    # None = 不接管，保留原候选（INV-4）
+            victim = alt
 ```
 
-`owns(node)` 只做一次集合/字段查，不遍历树。
+`victim_overrides` 由策略在构造时给出：`(rr_evict, struct)` —— RR 会话公平先改一次，
+struct 对「归属自己的节点」有最终发言权。`applies_to()` 都是 O(1)：RR 查 `queue_tag`，
+struct 查 `struct_region`。没有插件时（两者都关）元组为空，淘汰路径与基线逐字节等价。
+
+### 7.2.1 插件接口（`victim_override.VictimOverride`）
+
+| 方法 | 契约 |
+|---|---|
+| `applies_to(node) -> bool` | 当前候选是否归本改写器管；必须 O(1) |
+| `pick(leaves, registry) -> node \| None` | 返回更愿意淘汰的节点；None = 不接管 |
+| `stats() -> dict` | 供 profile / 日志 |
+| `reset()` | 缓存 reset 时清内部状态 |
+
+三条硬约束写进模块 docstring：不释放 KV、不阻塞推进、只能从 `leaves` 里挑。
+内置实现：`RrEvictPolicy`（RR 会话轮询，`fair_rr` 打开时构造）、`StructQueuePolicy`
+（`tiny_lru.policy="wtinylru"` 时构造，用 `applies_to = owns`、`pick = victim` 适配）。
+新增插件只需实现上面四个方法，然后拼进 `victim_overrides`，缓存层不需要任何改动。
 
 **为什么是「委托」而不是「预算」**：本期不做跨队列仲裁，所以 struct 队列不能自己决定
 我该留多少，只能在对局部的淘汰顺序上提出更优候选。这样 `evict()` 的推进语义、one-shot 优先带、
@@ -457,6 +476,9 @@ and not struct_policy.is_member(parent)          # 模板前缀不参与死链�
 | 文件 | 角色 |
 |---|---|
 | `python/sglang/srt/mem_cache/uni_utils.py` | 新增 `AlphaParams` / `RrParams` / `TinyLRUParams` 三组参数 dataclass + `split_legacy_params()` / `merge_param_overrides()` |
+| `python/sglang/srt/mem_cache/victim_override.py` | 新增 `VictimOverride` 插件基类 + `RrEvictPolicy`（RR 会话轮询从策略里拆出来的全部状态与算法） |
+| `python/sglang/srt/mem_cache/simple_hybrid_radix_cache.py` | 淘汰改为遍历 `self.victim_overrides`，不再硬编码 RR / struct 分支 |
+| `python/sglang/srt/mem_cache/radix_cache.py` | 暴露 `self.victim_overrides`（空元组 = 无插件）；`self.struct_policy` 仍供死链上溯闸使用 |
 | `python/sglang/srt/mem_cache/struct_queue_policy.py` | 新增：`StructQueuePolicy`（成员判定 / 三区 / 准入 / aging / victim）。纯 Python，只依赖 `uni_utils`，不碰 KV |
 | `python/sglang/srt/mem_cache/radix_cache.py` | `TreeNode` 新增 `share_count` / `rid_bloom` / `struct_region` / `struct_ever_branch`；6 个钩子 + `rid` 透传 + `reset()` |
 | `python/sglang/srt/mem_cache/evict_policy.py` | `SimpleHybridStrategy.__init__` 改为三组参数（`alpha` / `rr` / `tiny_lru`）+ 旧扁平键兼容路由，构造 `self.struct`（默认 `policy="off"` → `None`） |
@@ -476,6 +498,18 @@ and not struct_policy.is_member(parent)          # 模板前缀不参与死链�
 
 `struct_region` 编码：`0=非成员 / 1=window / 2=probation / 3=protected / 4=parked`。
 `owns(node)` 只读这一个字段，所以淘汰热路径是 O(1)。
+
+### 16.2.1 插件位
+
+`SimpleHybridStrategy.victim_overrides` 是唯一注入点，缓存层只按顺序询问，不认识具体策略：
+
+| 插件 | 构造条件 | 状态 |
+|---|---|---|
+| `RrEvictPolicy` | `rr.fair_rr=True` | `_rr_last` / `_rr_seq` / `quota_breach`（原先散在策略里） |
+| `StructQueuePolicy` | `tiny_lru.policy="wtinylru"` | 三区索引 / share_count / aging |
+
+`SimpleHybridStrategy.pick_agentic_rr_victim()` 与 `_loss_cap()` 保留为 **Deprecated shim**，
+转调 `self.rr_evict`，避免历史调用点炸掉。
 
 ### 16.3 与设计稿的三处偏差（均为实现期发现）
 

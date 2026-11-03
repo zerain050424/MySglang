@@ -358,6 +358,11 @@ class RadixCache(BasePrefixCache):
         # Q_struct 队内 W-TinyLRU（SimpleHybridStrategy.struct；其他策略为 None）。
         # 只在策略开启时挂钩子，关闭时所有调用点都是 `is not None` 的一次判空。
         self.struct_policy = getattr(self.eviction_strategy, "struct", None)
+        # 可插拔的「淘汰候选改写器」：RR 会话公平 / struct 队内顺序等。
+        # 空元组表示没有任何插件，淘汰走原来的全局 victim_key。
+        self.victim_overrides = tuple(
+            getattr(self.eviction_strategy, "victim_overrides", ()) or ()
+        )
 
         self.evictable_leaves = set()
         # SimpleHYBRID：会话级 KV 账本（每会话 d/L/gaps），供公平淘汰使用

@@ -13,7 +13,6 @@ from sglang.srt.mem_cache.base_prefix_cache import EvictParams, EvictResult
 from sglang.srt.mem_cache.evict_policy import SimpleHybridStrategy
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.registry import register_radix_cache_backend
-from sglang.srt.mem_cache.uni_utils import SimpleHybridTaskType
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +39,6 @@ class SimpleHybridRadixCache(RadixCache):
             )
 
         strategy = self.eviction_strategy
-        struct = getattr(strategy, "struct", None)
         num_evicted = 0
 
         # one-shot 永远先清空（one_shot_key 首项 -树上结束偏移：位置最深的块先走，
@@ -53,18 +51,13 @@ class SimpleHybridRadixCache(RadixCache):
                 victim = min(one_shot, key=strategy.one_shot_key)
             elif leaves:
                 victim = min(leaves, key=strategy.victim_key)
-                if strategy._task_type_of(victim) == SimpleHybridTaskType.MULTI_TURN_AGENTIC:
-                    rr_victim = strategy.pick_agentic_rr_victim(
-                        leaves, self.session_registry
-                    )
-                    if rr_victim is not None:
-                        victim = rr_victim
-                if struct is not None and struct.owns(victim):
-                    # 全局 victim 落在 Q_struct 成员上时，队内顺序改由 W-TinyLRU 给出。
-                    # None 表示队内暂时无候选：保留原 victim，绝不阻塞（INV-4）。
-                    alt = struct.victim()
-                    if alt is not None:
-                        victim = alt
+                # 依次询问已注册的改写器（注册顺序 = 优先级，后者覆盖前者）。
+                # 返回 None 表示不接管 -> 保留当前候选，绝不阻塞推进（INV-4）。
+                for override in self.victim_overrides:
+                    if override.applies_to(victim):
+                        alt = override.pick(leaves, self.session_registry)
+                        if alt is not None:
+                            victim = alt
             else:
                 break
             released = self._evict_one(victim)

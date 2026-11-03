@@ -43,7 +43,14 @@ _MIN_SHARE = 2
 
 
 class StructQueuePolicy:
-    """仅 Q_struct 队列内部的 W-TinyLRU（window + SLRU + 频数准入）。"""
+    """仅 Q_struct 队列内部的 W-TinyLRU（window + SLRU + 频数准入）。
+
+    同时实现 ``victim_override.VictimOverride`` 的鸭子接口
+    （``applies_to`` / ``pick`` / ``stats`` / ``reset``），因此和 RR 一样可以
+    挂进 ``SimpleHybridStrategy.victim_overrides``，不需要缓存层认识它。
+    """
+
+    name = "struct_tinylru"
 
     def __init__(
         self,
@@ -427,6 +434,16 @@ class StructQueuePolicy:
                     self.stats["forced"] += 1
                 return node
         return None
+
+    # ---- VictimOverride 插件接口 ----
+
+    def applies_to(self, node) -> bool:
+        """O(1)：当前候选是否归本队列管。"""
+        return self.owns(node)
+
+    def pick(self, leaves=None, registry=None):
+        """返回队内下一个该出的成员；None = 不接管（上层保留原候选）。"""
+        return self.victim()
 
     def reset(self) -> None:
         for table in self.regions.values():
