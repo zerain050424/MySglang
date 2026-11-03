@@ -33,27 +33,43 @@ victim 与搅拌流**都**被强制标成 QAGENT（`force_agentic`），所以�
 
 三臂共用同一棵 tree、同一套评分、同一个 one-shot 带（空）。差值可归因到插件。
 
-## 3. 矩阵
+## 3. 矩阵与耗时
 
 | 轴 | 取值 |
 |---|---|
 | 臂 | a0 / a1 / a2 |
-| 回归方式 | simultaneous / batched（`--resume-wave-size 4 --resume-wave-interval-s 10`） |
-| KV 预算 | 60000 / 100000（单卡 4090 上限约 100k，见 TLRU_VS_RR/README §1） |
-| seed | 42 / 43 / 44 |
+| 回归方式 | simultaneous / batched |
+| KV 预算 | 60000 / 100000 |
+| seed | **42 / 43**（默认 2 个，够做同号校验） |
 
-`run_matrix.sh` 会固定传 `--wait-scale 1`：victim 的 `gap_mode: fixed, gap_s: 0.2`
-只有在 `wait_scale=1` 时才会被真正执行（`sleep(gap * wait_scale)`），否则退化为 0；
-而 `wait_scale` 同时是「相位对齐」的前提（victim 必须几乎同时挂起）。
+**耗时构成**（用 `result/burst/burst_n4_base.json` 实测校准：144 请求 / 157 s）：
 
-先跑主对比（8 次）：
+| 项 | 单次 |
+|---|---|
+| server 启动 | ~90 s ← **最大固定开销** |
+| bench（396 请求 + 60 s burst 窗口） | ~110 s |
+| `/flush_cache` | ~2 s |
+
+因此 `run_matrix.sh` 默认按 `(arm, budget)` **复用 server**：server 只依赖这两个轴，
+`resume_mode` / `seed` 全在 bench 侧。seed 之间用 `/flush_cache` 隔离（见 §5）。
+
+| 场景 | 运行数 | server 启动 | 预估 |
+|---|---|---|---|
+| 试点（`ARMS="a1_rr a2_tlru" RESUME_MODES=simultaneous BUDGETS=60000 SEEDS="42"`） | 2 | 2 | **~7 min** |
+| 快跑（默认：3 臂 × 2 模式 × 2 预算 × 2 seed） | 24 | **6** | **~1 h** |
+| 全量（3 seed） | 36 | 6 | ~1.4 h |
+| 不复用（`GROUP_BY_SERVER=0`，24 次启动） | 24 | 24 | ~1.5 h |
 
 ```bash
-ARMS="a1_rr a2_tlru" RESUME_MODES="simultaneous batched" \
-BUDGETS=60000 SEEDS="42 43 44" bash run_matrix.sh
-```
+# 试点（7 分钟，先确认脚本/相位都对）
+ARMS="a1_rr a2_tlru" RESUME_MODES=simultaneous BUDGETS=60000 SEEDS="42" bash run_matrix.sh
 
-全矩阵（36 次）直接 `bash run_matrix.sh`。
+# 快跑（默认）
+bash run_matrix.sh
+
+# 全量
+SEEDS="42 43 44" bash run_matrix.sh
+```
 
 ## 4. 判据：看 resume 轮，不看全局均值
 
@@ -79,6 +95,7 @@ BUDGETS=60000 SEEDS="42 43 44" bash run_matrix.sh
 | `force_agentic` 生效 | profile 的 `victim_src` 里 `qagent` 占 ≈100%、`one_shot=0` | 标签强制没生效，插件仍在抢残余流量 |
 | burst 真的产生压力 | 记录 `phases.burst_start_s / burst_end_s`，且 resume 轮 `cached_tokens` 有明显下降 | 预算太松，没有淘汰发生 |
 | victim 真的挂起 | `phases.victim_resumed_s` 与 `burst_end_s` 的差值符合模式 | 回归逻辑没接上 |
+| seed 之间真的隔离 | 每次开始前都成功 `/flush_cache`（脚本会打印 WARN） | 复用 server 时上一轮的状态会串味 |
 
 ## 6. 产物
 

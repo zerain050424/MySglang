@@ -452,6 +452,15 @@ class RadixCache(BasePrefixCache):
         # 插件可能持有节点引用（Q_struct 的索引）/ 计数器，必须先于树一起清空
         for override in getattr(self, "victim_overrides", ()):
             override.reset()
+        # 会话账本与策略计数器同样属于「上一次 run 的状态」。`/flush_cache` 会走到
+        # 这里，因此复用同一个 server 跑多个 seed 时不会串味（RR 的 loss_cap 直接
+        # 读 SessionRegistry 的 d/L）。
+        registry = getattr(self, "session_registry", None)
+        if registry is not None:
+            registry.clear()
+        reset_bookkeeping = getattr(self.eviction_strategy, "reset_bookkeeping", None)
+        if reset_bookkeeping is not None:
+            reset_bookkeeping()
         # Initialize root with minimum priority so any real priority overrides it
         self.root_node = TreeNode(priority=-sys.maxsize)
         self.root_node.key = RadixKey(token_ids=array("q"), extra_key=None)

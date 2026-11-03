@@ -224,6 +224,21 @@ class SimpleHybridStrategy(EvictionStrategy):
             if p is not None
         )
 
+    def reset_bookkeeping(self) -> None:
+        """清空窗口/累计/来源计数（缓存 flush 与 reset 同源）。
+
+        不复位参数，也不动 `_last_update`：它只影响计时节流。
+        跨 run 复用 server 时，若不清理，`[SimpleHybrid profile]` 打印的是
+        上一轮与这一轮的混合值。
+        """
+        self._hit_tokens.clear()
+        self._total_hit_tokens.clear()
+        self._total_evicted_tokens.clear()
+        self._total_evicted_one_shot = 0.0
+        self._victim_sources.clear()
+        self._seen_rids.clear()
+        self._rid_order.clear()
+
     def _validate_scope(self) -> None:
         """拦住会静默失效的插件组合。
 

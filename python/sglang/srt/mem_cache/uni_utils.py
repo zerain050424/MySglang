@@ -424,15 +424,15 @@ class SessionRegistry:
         now = time.monotonic() if now is None else now
         st = self._sessions.get(session_id)
         if st is None:
-            st = self._sessions[session_id] = SessionState(session_id=session_id)
+            st = self._sessions[session_id] = SessionState(session_id=session_id) #获取session状态
         if rid and rid == st.classifier_last_rid:
             return st
 
         if st.classifier_last_request_start is None:
-            st.first_context_len = prompt_len
+            st.first_context_len = prompt_len ## 首次请求时记录初始上下文长度
         else:
-            st.classifier_gaps.append(max(0.0, now - st.classifier_last_request_start))
-            if len(st.classifier_gaps) > self.GAP_WINDOW:
+            st.classifier_gaps.append(max(0.0, now - st.classifier_last_request_start)) ## 记录这个会话的轮间间隔
+            if len(st.classifier_gaps) > self.GAP_WINDOW: ## 截断
                 del st.classifier_gaps[0]
         st.turn_count += 1
         st.tool_call_count += int(bool(tool_call))
@@ -451,15 +451,15 @@ class SessionRegistry:
         st = self._sessions.get(session_id)
         if st is None:
             st = self._sessions[session_id] = SessionState(session_id=session_id)
-        st.cross_session_shared = True
+        st.cross_session_shared = True # 检测是否存在跨会话复用
         st.session_type = self._classify(st)
         return st
 
     @classmethod
     def _classify(cls, state: SessionState) -> SessionType:
-        if state.turn_count < cls.MULTI_TURN_MIN:
+        if state.turn_count < cls.MULTI_TURN_MIN: # 小于阈值轮数, 认为是单轮 workload，按跨会话共享证据区分结构化与非结构化
             return SessionType.STRUCT if state.cross_session_shared else SessionType.TRANS
-        if state.tool_call_count:
+        if state.tool_call_count: # 存在Tool_call, 认为是 agentic workload
             return SessionType.AGENTIC
         if state.classifier_gaps:
             ordered = sorted(state.classifier_gaps)
@@ -469,14 +469,14 @@ class SessionRegistry:
                 if len(ordered) % 2
                 else (ordered[middle - 1] + ordered[middle]) / 2
             )
-            if median_gap < cls.GAP_SPLIT_S:
+            if median_gap < cls.GAP_SPLIT_S: # 轮间间隔小于阈值, 认为是Agentic
                 return SessionType.AGENTIC
-            if median_gap > cls.GAP_SPLIT_S:
+            if median_gap > cls.GAP_SPLIT_S: # 轮间间隔大于阈值, 认为是Chat
                 return SessionType.CHAT
         growth = state.latest_context_len - state.first_context_len
         return (
             SessionType.AGENTIC
-            if growth >= cls.AGENTIC_CONTEXT_GROWTH_TOKENS
+            if growth >= cls.AGENTIC_CONTEXT_GROWTH_TOKENS #上下文长度增长超过阈值, 认为是Agentic
             else SessionType.CHAT
         )
 
@@ -555,6 +555,14 @@ class SessionRegistry:
             st.d = st.L
 
     # ---- 回收 ----
+    def clear(self) -> None:
+        """清空全部会话记账。
+
+        缓存 flush / reset 必须调用：跨 run 复用同一个 server 时，`d`/`L`/`gaps`
+        如果残留，RR 的 loss_cap 会读到上一轮的缺口，实验之间互相污染。
+        """
+        self._sessions.clear()
+
     def sweep(self, now: Optional[float] = None) -> int:
         now = time.monotonic() if now is None else now
         dead = [

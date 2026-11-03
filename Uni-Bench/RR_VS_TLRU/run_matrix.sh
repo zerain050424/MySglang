@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
 # RR vs T-LRU burst/pause 矩阵：臂 × 回归方式 × 预算 × seed。
 #
-#   bash run_matrix.sh                      # 全矩阵
-#   ARMS="a1_rr a2_tlru" RESUME_MODES="simultaneous batched" \
-#   BUDGETS=60000 SEEDS="42 43 44" bash run_matrix.sh
+#   bash run_matrix.sh                       # 快跑（默认 2 seed，约 1 小时）
+#   SEEDS="42" bash run_matrix.sh            # 更快的试点
+#   SEEDS="42 43 44" bash run_matrix.sh      # 全量
 #
-# 幂等：result/<arm>/<mode>/<budget>/<seed>.json 已存在则跳过。
+# 时间由三部分构成，且最大的一项是 server 启动（约 1.5 min/次）：
+#   启动   ~90 s   ← 只依赖 (arm, budget)，默认按该组合复用，seed/mode 之间用
+#                    /flush_cache 隔开（36 次启动 -> 6 次）
+#   bench  ~110 s
+#   flush  ~2 s
+#
+# 幂等：result/<arm>/<mode>/<budget>/<seed>.json 已存在则跳过，可中断续跑。
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -15,7 +21,7 @@ source "$BENCH_DIR/env.sh"
 ARMS=${ARMS:-"a0_control a1_rr a2_tlru"}
 RESUME_MODES=${RESUME_MODES:-"simultaneous batched"}
 BUDGETS=${BUDGETS:-"60000 100000"}
-SEEDS=${SEEDS:-"42 43 44"}
+SEEDS=${SEEDS:-"42 43"}
 
 # burst/pause 形状（三个臂必须完全一致）
 TASKS_CONFIG=${TASKS_CONFIG:-configs/burst_pause.yaml}
@@ -28,6 +34,25 @@ TIMEOUT_S=${TIMEOUT_S:-1800}
 
 PORT=${PORT:-30000}
 BASE_URL="http://127.0.0.1:${PORT}"
+
+# server 只依赖 (arm, budget)，与 resume_mode / seed 无关：
+# 默认按 (arm, budget) 复用同一个 server，seed 之间用 /flush_cache 隔开。
+GROUP_BY_SERVER=${GROUP_BY_SERVER:-1}
+FLUSH_TIMEOUT_S=${FLUSH_TIMEOUT_S:-120}
+
+flush_cache() {
+  # GET / POST 都支持。失败不致命，但必须显式告警——否则 seed 之间会串味。
+  if curl -sf -m "$FLUSH_TIMEOUT_S" -X POST \
+      "$BASE_URL/flush_cache?timeout=$FLUSH_TIMEOUT_S" >/dev/null 2>&1; then
+    return 0
+  fi
+  if curl -sf -m "$FLUSH_TIMEOUT_S" \
+      "$BASE_URL/flush_cache?timeout=$FLUSH_TIMEOUT_S" >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "[matrix] WARN: flush_cache 失败，seed 之间的隔离可能被破坏" >&2
+  return 1
+}
 
 stop_server() {
   pkill -f "sglang.launch_server.*--port ${PORT}" 2>/dev/null || true
@@ -47,65 +72,109 @@ wait_ready() {
   return 1
 }
 
-cleanup() { stop_server; }
-trap cleanup EXIT
+start_server() {  # $1=arm $2=budget
+  PORT=$PORT bash serve_arm.sh "$1" "$2" "configs/arm_$1.json"
+}
 
-for mode in $RESUME_MODES; do
-  for budget in $BUDGETS; do
-    for arm in $ARMS; do
-      for seed in $SEEDS; do
-        out="result/${arm}/${mode}/${budget}"
-        mkdir -p "$out"
-        if [ -f "$out/${seed}.json" ]; then
-          echo "[matrix] skip ${arm}/${mode}/${budget}/seed=${seed}"
-          continue
-        fi
+run_one() {  # $1=arm $2=mode $3=budget $4=seed
+  local arm=$1 mode=$2 budget=$3 seed=$4
+  local out="result/${arm}/${mode}/${budget}"
+  mkdir -p "$out"
+  if [ -f "$out/${seed}.json" ]; then
+    echo "[matrix] skip ${arm}/${mode}/${budget}/seed=${seed}"
+    return 0
+  fi
 
-        stop_server
-        echo "[matrix] start arm=${arm} mode=${mode} budget=${budget} seed=${seed}"
-        PORT=$PORT bash serve_arm.sh "$arm" "$budget" "configs/arm_${arm}.json" \
-          > "$out/server_${seed}.log" 2>&1 &
-        SERVER_PID=$!
+  flush_cache || true
+  echo "[matrix] bench arm=${arm} mode=${mode} budget=${budget} seed=${seed}"
+  "$PY" "$BENCH_DIR/bench_unicache.py" \
+    --tasks-config "$TASKS_CONFIG" \
+    --burst-duration-s "$BURST_DURATION_S" \
+    --resume-mode "$mode" \
+    --resume-wave-size "$WAVE_SIZE" \
+    --resume-wave-interval-s "$WAVE_INTERVAL_S" \
+    --concurrency "$CONC" \
+    --wait-scale "$WAIT_SCALE" \
+    --seed "$seed" \
+    --timeout-s "$TIMEOUT_S" \
+    --base-url "$BASE_URL" \
+    --output "$out/${seed}.json" \
+    2>&1 | tee "$out/bench_${seed}.log"
 
-        if ! wait_ready; then
-          echo "[matrix] ERROR: server not ready" >&2
-          tail -40 "$out/server_${seed}.log" >&2 || true
-          kill "$SERVER_PID" 2>/dev/null || true
-          exit 1
-        fi
+  grep -E "victim_src:|tlru:|one_shot_evicted=|pool=" "$out/server_${seed}.log" \
+    > "$out/profile_${seed}.txt" 2>/dev/null || true
 
-        "$PY" "$BENCH_DIR/bench_unicache.py" \
-          --tasks-config "$TASKS_CONFIG" \
-          --burst-duration-s "$BURST_DURATION_S" \
-          --resume-mode "$mode" \
-          --resume-wave-size "$WAVE_SIZE" \
-          --resume-wave-interval-s "$WAVE_INTERVAL_S" \
-          --concurrency "$CONC" \
-          --wait-scale "$WAIT_SCALE" \
-          --seed "$seed" \
-          --timeout-s "$TIMEOUT_S" \
-          --base-url "$BASE_URL" \
-          --output "$out/${seed}.json" \
-          2>&1 | tee "$out/bench_${seed}.log"
-
-        grep -E "victim_src:|tlru:|one_shot_evicted=|pool=" "$out/server_${seed}.log" \
-          > "$out/profile_${seed}.txt" || true
-
-        "$PY" - "$out" "$arm" "$mode" "$budget" "$seed" <<'PY'
+  "$PY" - "$out" "$arm" "$mode" "$budget" "$seed" <<'META'
 import json, pathlib, sys
 out, arm, mode, budget, seed = sys.argv[1:6]
 meta = {"arm": arm, "resume_mode": mode,
         "max_total_tokens": int(budget), "seed": int(seed)}
 pathlib.Path(out, f"meta_{seed}.json").write_text(
     json.dumps(meta, ensure_ascii=False, indent=2))
-PY
+META
+}
 
-        kill "$SERVER_PID" 2>/dev/null || true
-        wait "$SERVER_PID" 2>/dev/null || true
-        stop_server
-        echo "[matrix] done ${arm}/${mode}/${budget}/seed=${seed}"
+cleanup() { stop_server; }
+trap cleanup EXIT
+
+for budget in $BUDGETS; do
+  for arm in $ARMS; do
+    pending=0
+    for mode in $RESUME_MODES; do
+      for seed in $SEEDS; do
+        [ -f "result/${arm}/${mode}/${budget}/${seed}.json" ] || pending=$((pending + 1))
       done
     done
+    if [ "$pending" -eq 0 ]; then
+      echo "[matrix] skip ${arm}/${budget}（所有 mode/seed 已完成）"
+      continue
+    fi
+
+    if [ "$GROUP_BY_SERVER" = "1" ]; then
+      stop_server
+      shared_log="result/${arm}/__server_${budget}.log"
+      mkdir -p "result/${arm}"
+      echo "[matrix] start server arm=${arm} budget=${budget}（${pending} 次运行共用）"
+      start_server "$arm" "$budget" > "$shared_log" 2>&1 &
+      SERVER_PID=$!
+      if ! wait_ready; then
+        echo "[matrix] ERROR: server 未就绪" >&2
+        tail -40 "$shared_log" >&2 || true
+        kill "$SERVER_PID" 2>/dev/null || true
+        exit 1
+      fi
+      for mode in $RESUME_MODES; do
+        for seed in $SEEDS; do
+          run_one "$arm" "$mode" "$budget" "$seed"
+          # 共享 server 的日志是合一的：给每个 seed 留一份切片，便于事后查 profile
+          mkdir -p "result/${arm}/${mode}/${budget}"
+          cp "$shared_log" "result/${arm}/${mode}/${budget}/server_${seed}.log" 2>/dev/null || true
+        done
+      done
+      kill "$SERVER_PID" 2>/dev/null || true
+      wait "$SERVER_PID" 2>/dev/null || true
+      stop_server
+    else
+      for mode in $RESUME_MODES; do
+        for seed in $SEEDS; do
+          [ -f "result/${arm}/${mode}/${budget}/${seed}.json" ] && continue
+          stop_server
+          out="result/${arm}/${mode}/${budget}"
+          mkdir -p "$out"
+          start_server "$arm" "$budget" > "$out/server_${seed}.log" 2>&1 &
+          SERVER_PID=$!
+          if ! wait_ready; then
+            echo "[matrix] ERROR: server 未就绪" >&2
+            kill "$SERVER_PID" 2>/dev/null || true
+            exit 1
+          fi
+          run_one "$arm" "$mode" "$budget" "$seed"
+          kill "$SERVER_PID" 2>/dev/null || true
+          wait "$SERVER_PID" 2>/dev/null || true
+          stop_server
+        done
+      done
+    fi
   done
 done
 
