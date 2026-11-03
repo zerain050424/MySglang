@@ -1,4 +1,7 @@
-"""淘汰候选改写器（VictimOverride）：把选择策略变成可插拔插件。
+"""淘汰候选改写器（VictimOverride）：把「选谁」从 SimpleHybridStrategy 里拆成插件位。
+
+契约（`RrEvictPolicy` / `StructTinyLruPolicy` 共用）：
+
     applies_to(node) -> bool        当前候选是否落在本改写器的管辖范围
     pick(leaves, registry) -> node  给出本改写器更愿意淘汰的节点；None = 不接管
 
@@ -9,6 +12,14 @@
 
 `SimpleHybridRadixCache.evict()` 按 `victim_overrides` 的注册顺序逐个询问，
 后注册者覆盖前者（"越靠后越硬"）：RR 会话公平先改一次，struct 队列若有归属权再改一次。
+
+`queue` 字段只做观测（profile 里打「本次淘汰由哪个队列的策略决定」），
+不得参与任何仲裁判定 —— 跨队列仲裁仍由 victim_key 全局排序完成。
+
+内置实现的分工：
+  * `RrEvictPolicy`      —— 自带全部状态（会话轮询序号 / 配额违约计数）。
+  * `StructTinyLruPolicy` —— 无状态适配器；队列状态在
+    `struct_queue_policy.StructQueueState`，本类只暴露它的区头。
 """
 
 from __future__ import annotations
@@ -18,6 +29,7 @@ from typing import TYPE_CHECKING, Dict, Iterable, Optional, Tuple
 
 from sglang.srt.mem_cache.uni_utils import (
     RrParams,
+    SimpleHybridQueueTag,
     SimpleHybridTaskType,
     node_end_offset,
     task_type_of_tag,
@@ -25,6 +37,7 @@ from sglang.srt.mem_cache.uni_utils import (
 
 if TYPE_CHECKING:  # pragma: no cover
     from sglang.srt.mem_cache.radix_cache import TreeNode
+    from sglang.srt.mem_cache.struct_queue_policy import StructQueueState
     from sglang.srt.mem_cache.uni_utils import SessionRegistry, SessionState
 
 
@@ -32,6 +45,10 @@ class VictimOverride(ABC):
     """插件位基类。子类只需实现 applies_to / pick。"""
 
     name: str = "override"
+
+    # 观测字段：本改写器管辖的队列，仅用于 profile 记账。
+    # 不得参与仲裁判定（否则退化为 proposer 形态，见设计讨论）。
+    queue: Optional[SimpleHybridQueueTag] = None
 
     @abstractmethod
     def applies_to(self, node) -> bool:
@@ -61,6 +78,7 @@ class RrEvictPolicy(VictimOverride):
     """
 
     name = "rr"
+    queue = SimpleHybridQueueTag.QAGENT
 
     def __init__(self, params: RrParams):
         self.params = params
@@ -145,3 +163,40 @@ class RrEvictPolicy(VictimOverride):
         self._rr_last.clear()
         self._rr_seq = 0
         self.quota_breach = 0
+
+
+class StructTinyLruPolicy(VictimOverride):
+    """Q_struct 队内 W-TinyLRU 的**淘汰面**：把状态机的区头暴露成候选修正。
+
+    拆分前 ``StructQueuePolicy`` 同时扮两种角色（缓存钩子宿主 + 淘汰插件）。
+    现在：
+      * 队列状态（成员判定 / 三区 / 准入 / aging）在
+        ``struct_queue_policy.StructQueueState``，由缓存层持有；
+      * 本类只做三件事：``applies_to = state.owns``、
+        ``pick = state.eviction_candidate``、``stats/reset`` 转发。
+    自身无状态，所以随时可以重建而不丢队列状态。
+    ``forced``（只剩 protected 被迫出队）记在状态机里：那是区域级事实，
+    不是本类的决策。
+    """
+
+    name = "struct_tinylru"
+    queue = SimpleHybridQueueTag.QSTRUCT
+
+    def __init__(self, state: "StructQueueState"):
+        self.state = state
+
+    def applies_to(self, node) -> bool:
+        """O(1)：委托状态机做成员判定。"""
+        return self.state.owns(node)
+
+    def pick(self, leaves=None, registry=None):
+        """队内区头；None = 不接管（上层保留原候选）。"""
+        return self.state.eviction_candidate()
+
+    # ---- 观测 / 生命周期（都转发）----
+
+    def stats(self) -> Dict[str, float]:
+        return dict(self.state.stats)
+
+    def reset(self) -> None:
+        self.state.reset()

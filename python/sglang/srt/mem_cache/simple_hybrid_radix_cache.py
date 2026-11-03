@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 class SimpleHybridRadixCache(RadixCache):
-    """RadixCache + 多级队列淘汰（面向文本对话 benchmark）。"""
+    """RadixCache + 多级队列淘汰"""
 
     def evict(self, params: EvictParams) -> EvictResult:
         # 禁用 radix cache 时无操作
@@ -47,8 +47,10 @@ class SimpleHybridRadixCache(RadixCache):
         while num_evicted < num_tokens:
             leaves = self.evictable_leaves
             one_shot = [n for n in leaves if strategy.is_one_shot(n)]
+            source = "global"
             if one_shot:
                 victim = min(one_shot, key=strategy.one_shot_key)
+                source = "one_shot"
             elif leaves:
                 victim = min(leaves, key=strategy.victim_key)
                 # 依次询问已注册的改写器（注册顺序 = 优先级，后者覆盖前者）。
@@ -58,6 +60,12 @@ class SimpleHybridRadixCache(RadixCache):
                         alt = override.pick(leaves, self.session_registry)
                         if alt is not None:
                             victim = alt
+                            # queue 仅观测：profile 打「本次淘汰由哪个队列的策略决定」。
+                            source = (
+                                override.queue.value
+                                if override.queue is not None
+                                else override.name
+                            )
             else:
                 break
             released = self._evict_one(victim)
@@ -69,6 +77,7 @@ class SimpleHybridRadixCache(RadixCache):
                 )
                 break
             num_evicted += released
+            strategy.record_victim_source(source, released)
 
         self.update_eviction_metrics(num_evicted, start_time)
         return EvictResult(num_tokens_evicted=num_evicted)
@@ -84,7 +93,7 @@ class SimpleHybridRadixCache(RadixCache):
         """
         total = 0
         cur = node
-        struct = getattr(self.eviction_strategy, "struct", None)
+        struct_state = getattr(self.eviction_strategy, "structState", None)
         one_shot = self.eviction_strategy.is_one_shot(node)
         while True:
             parent = cur.parent
@@ -101,7 +110,7 @@ class SimpleHybridRadixCache(RadixCache):
                     and parent.lock_ref == 0 and not parent.children
                     # Q_struct 闸：模板前缀不参与 one-shot 死链级联，
                     # 否则「降级后的文档段被收割」会连带删掉刚进 protected 的前缀。
-                    and not (struct is not None and struct.owns(parent))):
+                    and not (struct_state is not None and struct_state.owns(parent))):
                 cur = parent  # 死链：随 one-shot 一并删除
                 continue
             break

@@ -4,9 +4,9 @@ from abc import ABC, abstractmethod
 import logging
 import time
 from collections import deque
-from typing import TYPE_CHECKING, Dict, Iterable, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, Optional, Tuple, Union
 
-from sglang.srt.mem_cache.struct_queue_policy import StructQueuePolicy
+from sglang.srt.mem_cache.struct_queue_policy import StructQueueState
 from sglang.srt.mem_cache.uni_utils import (
     AlphaParams,
     node_end_offset,
@@ -19,12 +19,12 @@ from sglang.srt.mem_cache.uni_utils import (
     alpha_key_of,
     SimpleHybridTaskType,
     _cached_lognorm_cdf,
-    SessionRegistry,
-    merge_param_overrides,
-    split_legacy_params,
     task_type_of_tag,
 )
-from sglang.srt.mem_cache.victim_override import RrEvictPolicy
+from sglang.srt.mem_cache.victim_override import (
+    RrEvictPolicy,
+    StructTinyLruPolicy,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.radix_cache import TreeNode
@@ -146,38 +146,20 @@ class SimpleHybridStrategy(EvictionStrategy):
         alpha: Union[AlphaParams, dict, None] = None,
         rr: Union[RrParams, dict, None] = None,
         tiny_lru: Union[TinyLRUParams, dict, None] = None,
-        **legacy,
     ):
         """三组参数分别由 AlphaParams / RrParams / TinyLRUParams 承载（uni_utils）。
 
-        配置可以用分组形式：
+        配置只接受分组形式：
             {"alpha": {...}, "rr": {...}, "tiny_lru": {...}}
-        旧的扁平键（alpha_smooth / fair_rr / struct_k ...）仍然接受，
-        由 split_legacy_params() 路由到对应组；分组显式给出的字段优先。
+        未知键在参数组构造处直接报错（拼错不再静默失效）。
 
         max_offset 不属于任何一组：它是 Q_struct 复用分数里的位置项上界
         （HeterCache 的 offset 语义），与 TinyLRU 的频数准入无关。
         """
-        legacy_groups = split_legacy_params(**legacy)
-        self.alpha = AlphaParams.from_any(merge_param_overrides(alpha, legacy_groups["alpha"]))
-        self.rr = RrParams.from_any(merge_param_overrides(rr, legacy_groups["rr"]))
-        self.tiny_lru = TinyLRUParams.from_any(
-            merge_param_overrides(tiny_lru, legacy_groups["tiny_lru"])
-        )
-
-        # 下面这些是只读兼容别名：真值在三个参数组里。
-        # alpha_balance 与 self.alpha.balance 是同一个 dict（测试会就地改写权重）。
+        self.alpha = AlphaParams.from_any(alpha)
+        self.rr = RrParams.from_any(rr)
+        self.tiny_lru = TinyLRUParams.from_any(tiny_lru)
         self.max_offset = max_offset or 2048
-        self.alpha_balance: Dict[str, float] = self.alpha.balance
-        self.update_interval = self.alpha.update_interval
-        self.min_cap_share = self.alpha.min_cap_share
-        self.max_alpha_step = self.alpha.max_alpha_step
-        self.alpha_smooth = self.alpha.smooth
-        self.alpha_temperature = self.alpha.temperature
-        self.fair_rr = self.rr.fair_rr
-        self.kappa = self.rr.kappa
-        self.min_retain_tokens = self.rr.min_retain_tokens
-        self.min_retain_frac = self.rr.min_retain_frac
 
         # 在线更新α状态
         self._last_update = time.monotonic()
@@ -192,11 +174,18 @@ class SimpleHybridStrategy(EvictionStrategy):
         self._total_hit_tokens: Dict[str, float] = {}
         self._total_evicted_tokens: Dict[str, float] = {}
         self._total_evicted_one_shot = 0.0
-        # 两个可插拔的「候选改写器」：RR 会话公平、Q_struct 队内 W-TinyLRU。
-        # 顺序即优先级：后注册者覆盖前者（struct 对归属节点有最终发言权）。
+        # 淘汰来源记账：one_shot 带 / 全局 victim_key / 各插件（queue 名），
+        # 供 profile 打印「本次淘汰由哪个队列的策略决定」。
+        self._victim_sources: Dict[str, float] = {}
+
+
+        #   self.structState    = 状态机（缓存层持有：8 个钩子 + owns 死链闸）
+        #   self.TinyLru_evict  = 淘汰面适配器（只进 victim_overrides）
+        # 若让 self.structState 直接指向适配器，radix_cache 的 8 处钩子调用会静默
+        # 变成 no-op（getattr 判空不报错），struct 策略会整体失效而日志无异常。
         self.rr_evict = RrEvictPolicy(self.rr) if self.rr.fair_rr else None
-        self.struct = (
-            StructQueuePolicy(
+        self.structState = (
+            StructQueueState(
                 enabled=True,
                 k=self.tiny_lru.k,
                 window_entries=self.tiny_lru.window_entries,
@@ -208,8 +197,13 @@ class SimpleHybridStrategy(EvictionStrategy):
             if self.tiny_lru.policy == "wtinylru"
             else None
         )
+        self.TinyLru_evict = (
+            StructTinyLruPolicy(self.structState)
+            if self.structState is not None
+            else None
+        )
         self.victim_overrides = tuple(
-            p for p in (self.rr_evict, self.struct) if p is not None
+            p for p in (self.rr_evict, self.TinyLru_evict) if p is not None
         )
     @staticmethod
     def _task_type_of(node) -> SimpleHybridTaskType:
@@ -255,24 +249,6 @@ class SimpleHybridStrategy(EvictionStrategy):
             统一淘汰键：复用分数低者先走，同分时 token 多者先走。
         """
         return (self._reuse_score(node), -_node_num_tokens(node))
-
-    # ---- 兼容 shim：RR 实现已抽到 victim_override.RrEvictPolicy ----
-
-    def pick_agentic_rr_victim(
-        self,
-        leaves: Iterable["TreeNode"],
-        registry: "SessionRegistry",
-    ) -> Optional["TreeNode"]:
-        """Deprecated：请用 ``self.victim_overrides``（或 ``self.rr_evict.pick``）。"""
-        if self.rr_evict is None:
-            return None
-        return self.rr_evict.pick(leaves, registry)
-
-    def _loss_cap(self, chain_len: int) -> float:
-        """Deprecated：RR 的配额函数现在在 RrEvictPolicy.loss_cap()。"""
-        if self.rr_evict is None:
-            return 0.0
-        return self.rr_evict.loss_cap(chain_len)
 
     def is_one_shot(self, node) -> bool:
         """
@@ -334,6 +310,14 @@ class SimpleHybridStrategy(EvictionStrategy):
         if self.is_one_shot(node):
             self._total_evicted_one_shot += tokens
 
+    def record_victim_source(self, source: str, tokens: float) -> None:
+        """
+        记录本次淘汰由谁决定，按来源累计 token 数。
+        source 取值："one_shot"（硬优先带）/ "global"（全局 victim_key 竞争）/
+        插件的 queue 名（如 "qagent"、"qstruct"）。只做观测，不参与仲裁。
+        """
+        self._victim_sources[source] = self._victim_sources.get(source, 0.0) + tokens
+
     def profile_summary(self, workload_occ, session_summary=None) -> str:
         """返回各 workload 的 profile 摘要，供日志打印。
 
@@ -370,6 +354,11 @@ class SimpleHybridStrategy(EvictionStrategy):
             f"  pool={pool:.0f} schedulable={schedulable:.0f} "
             f"one_shot_evicted={self._total_evicted_one_shot:.0f}"
         )
+        if self._victim_sources:
+            src = " ".join(
+                f"{k}={v:.0f}" for k, v in self._victim_sources.items()
+            )
+            lines.append(f"  victim_src: {src}")
         if session_summary:
             # 会话级缺口：d_sum 与淘汰总量同量纲，可互相校验
             lines.append(
