@@ -291,6 +291,10 @@ class TreeNode: ## TreeNode 是基数树（RadixTree）的节点，每个节点�
         self.share_count = 0
         self.rid_bloom = 0
         self.struct_region = 0
+        # T-LRU（单例 tlru.enabled）：tokens root->self 与分支高水位。
+        # 只在开启时由 TlruEvictPolicy.on_node_inserted() 写入，其余策略恒 0。
+        self._tlru_cached_prefix_len = 0
+        self._tlru_history_len = 0
         # 曾经/正在分叉（结构证据的黏性标记）：节点失去所有子节点后仍然是成员，
         # 直到 aging 判定它没有共享证据才退队。
         self.struct_ever_branch = False
@@ -363,6 +367,13 @@ class RadixCache(BasePrefixCache):
         self.victim_overrides = tuple(
             getattr(self.eviction_strategy, "victim_overrides", ()) or ()
         )
+        # 需要「插入期记账」的插件（目前只有 TLRU 的 _tlru_* 高水位）。
+        # 在这里解析成函数元组：无插件时是空元组，插入/分裂路径只多一次空循环。
+        self._insert_observers = tuple(
+            ov.on_node_inserted
+            for ov in self.victim_overrides
+            if hasattr(ov, "on_node_inserted")
+        )
 
         self.evictable_leaves = set()
         # SimpleHYBRID：会话级 KV 账本（每会话 d/L/gaps），供公平淘汰使用
@@ -430,10 +441,9 @@ class RadixCache(BasePrefixCache):
     ##### Public API #####
 
     def reset(self):
-        # Q_struct 队内策略持有节点引用，必须先于树一起清空
-        struct_policy = getattr(self, "struct_policy", None)
-        if struct_policy is not None:
-            struct_policy.reset()
+        # 插件可能持有节点引用（Q_struct 的索引）/ 计数器，必须先于树一起清空
+        for override in getattr(self, "victim_overrides", ()):
+            override.reset()
         # Initialize root with minimum priority so any real priority overrides it
         self.root_node = TreeNode(priority=-sys.maxsize)
         self.root_node.key = RadixKey(token_ids=array("q"), extra_key=None)
@@ -1022,6 +1032,9 @@ class RadixCache(BasePrefixCache):
            new_node.rid_bloom = child.rid_bloom
            if self.struct_policy is not None:
                self.struct_policy.on_split(new_node, child)
+           # T-LRU：分裂不增加分支深度，新父节点继承 child 的高水位。
+           for observe in self._insert_observers:
+               observe(new_node)
 
            return new_node
 
@@ -1088,6 +1101,9 @@ class RadixCache(BasePrefixCache):
             new_node.session_id = session_id
             self.session_registry.attach(session_id, len(new_node.value))
             node.children[child_key] = new_node
+            # T-LRU：新节点记下 root->self 的累计长度，并把高水位沿祖先链上抬。
+            for observe in self._insert_observers:
+                observe(new_node)
             if node is not self.root_node and len(node.children) >= 2:
                 node.queue_tag = SimpleHybridQueueTag.QSTRUCT
             if self.struct_policy is not None:

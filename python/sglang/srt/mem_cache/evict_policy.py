@@ -13,6 +13,7 @@ from sglang.srt.mem_cache.uni_utils import (
     node_num_tokens,
     RrParams,
     TinyLRUParams,
+    TlruParams,
     TASK_CONFIG,
     WORKLOAD_LABELS,
     workload_label_of,
@@ -24,6 +25,7 @@ from sglang.srt.mem_cache.uni_utils import (
 from sglang.srt.mem_cache.victim_override import (
     RrEvictPolicy,
     StructTinyLruPolicy,
+    TlruEvictPolicy,
 )
 
 if TYPE_CHECKING:
@@ -146,6 +148,7 @@ class SimpleHybridStrategy(EvictionStrategy):
         alpha: Union[AlphaParams, dict, None] = None,
         rr: Union[RrParams, dict, None] = None,
         tiny_lru: Union[TinyLRUParams, dict, None] = None,
+        tlru: Union[TlruParams, dict, None] = None,
     ):
         """三组参数分别由 AlphaParams / RrParams / TinyLRUParams 承载（uni_utils）。
 
@@ -159,6 +162,7 @@ class SimpleHybridStrategy(EvictionStrategy):
         self.alpha = AlphaParams.from_any(alpha)
         self.rr = RrParams.from_any(rr)
         self.tiny_lru = TinyLRUParams.from_any(tiny_lru)
+        self.tlru = TlruParams.from_any(tlru)
         self.max_offset = max_offset or 2048
 
         # 在线更新α状态
@@ -202,9 +206,30 @@ class SimpleHybridStrategy(EvictionStrategy):
             if self.structState is not None
             else None
         )
+        # T-LRU 尾巴优先：只修 QAGENT 的候选，并在插入期维护 _tlru_* 高水位。
+        # 与 struct 分属不同队列可共存；与 fair_rr 互斥（两者都修 QAGENT，
+        # 链上后注册者会把前者完全遮蔽），由 _validate_scope() 拦住。
+        self.tlru_evict = TlruEvictPolicy(self.tlru) if self.tlru.enabled else None
+        self._validate_scope()
         self.victim_overrides = tuple(
-            p for p in (self.rr_evict, self.TinyLru_evict) if p is not None
+            p
+            for p in (self.rr_evict, self.TinyLru_evict, self.tlru_evict)
+            if p is not None
         )
+
+    def _validate_scope(self) -> None:
+        """拦住会静默失效的插件组合。
+
+        `victim_overrides` 是覆盖链（后者覆盖前者），而 RR 只要挑得出会话就会
+        返回非 None，所以 fair_rr + tlru 同时开会把 TLRU 完全遮蔽。
+        """
+        if self.rr_evict is not None and self.tlru_evict is not None:
+            raise ValueError(
+                "rr.fair_rr and tlru.enabled are mutually exclusive: both rewrite "
+                "the QAGENT candidate and the later override wins, so T-LRU would "
+                "never be consulted. Enable only one of them."
+            )
+
     @staticmethod
     def _task_type_of(node) -> SimpleHybridTaskType:
         # 队列标签由缓存状态机维护。映射表在 uni_utils，策略与改写器共用。
@@ -359,6 +384,15 @@ class SimpleHybridStrategy(EvictionStrategy):
                 f"{k}={v:.0f}" for k, v in self._victim_sources.items()
             )
             lines.append(f"  victim_src: {src}")
+        if self.tlru_evict is not None:
+            # phase1/phase2 的混合比：tel_safe 为 0 说明尾部预算没起作用。
+            s = self.tlru_evict.stats()
+            lines.append(
+                f"  tlru: tel_safe={s['tlru_tel_safe_picks']:.0f} "
+                f"lru={s['tlru_lru_picks']:.0f} "
+                f"fallback={s['tlru_fallbacks']:.0f} "
+                f"hist_raises={s['tlru_history_raises']:.0f}"
+            )
         if session_summary:
             # 会话级缺口：d_sum 与淘汰总量同量纲，可互相校验
             lines.append(

@@ -20,6 +20,8 @@
   * `RrEvictPolicy`      —— 自带全部状态（会话轮询序号 / 配额违约计数）。
   * `StructTinyLruPolicy` —— 无状态适配器；队列状态在
     `struct_queue_policy.StructQueueState`，本类只暴露它的区头。
+  * `TlruEvictPolicy`    —— T-LRU 的尾部优先修正；除候选选择外，还在
+    插入/分裂时维护节点上的 `_tlru_*` 高水位（缓存层会调 `on_node_inserted`）。
 """
 
 from __future__ import annotations
@@ -31,6 +33,7 @@ from sglang.srt.mem_cache.uni_utils import (
     RrParams,
     SimpleHybridQueueTag,
     SimpleHybridTaskType,
+    TlruParams,
     node_end_offset,
     task_type_of_tag,
 )
@@ -200,3 +203,129 @@ class StructTinyLruPolicy(VictimOverride):
 
     def reset(self) -> None:
         self.state.reset()
+
+
+class TlruEvictPolicy(VictimOverride):
+    """T-LRU的 QAGENT 候选修正。
+
+    与 `evict_policy.TLRUStrategy` 同一公式：
+
+        budget   = max(L + Q_hat - threshold, 0)
+        tel_safe = (cached_without_this_node >= budget)
+        key      = (0 if tel_safe else 1, last_access_time)
+
+    区别只在于数据来源与作用域：
+
+      * `cached_without_this_node` = `_tlru_cached_prefix_len - len(key)`，
+        与 unified 树上的口径逐字一致；
+      * `L` = `node._tlru_history_len`（**子树高水位**，单调不减）；
+      * 只修 QAGENT 叶子的候选，不接管全局排序（TLRUStrategy 对全部叶子排序）。
+
+    ## 高水位如何维护
+
+    插件拿不到插入事件时，`_tlru_history_len` 无法重建（它描述「这棵子树曾经
+    到过多深」，而不是「现在多深」）。因此缓存层在节点创建/分裂后会回调
+    `on_node_inserted(node)`，由本类写两个字段：
+
+        _tlru_cached_prefix_len = parent._tlru_cached_prefix_len + len(node.key)
+        _tlru_history_len       = max(自深, 各子树的高水位)   # split 时继承更深的子分支
+
+    然后把高水位沿祖先链上抬（与 unified 的 `_set_tlru_lens_and_raise_history`
+    等价；split 场景下祖先早已达到该深度，上抬是空操作）。
+    `_tlru_history_len` 一旦升高就不再下降——这是 T-LRU 的关键：若改用「当前
+    驻留深度」，被裁过尾的会话会永远觉得自己超额，TLRU 会一路把该会话削到 0。
+    """
+
+    name = "tlru"
+    queue = SimpleHybridQueueTag.QAGENT
+
+    def __init__(self, params: TlruParams):
+        self.params = params
+        # ---- 观测 ----
+        self.tel_safe_picks = 0     # 选中的候选里有多少是 tel-safe（phase 1）
+        self.lru_picks = 0          # tel-safe 用尽后按 recency 退化的次数（phase 2）
+        self.fallbacks = 0          # 队内无 QAGENT 叶子，交回全局候选
+        self.history_raises = 0     # 高水位上抬的次数（插入期开销的代理指标）
+
+    # ------------------------------------------------------------ 插入期记账
+
+    def on_node_inserted(self, node) -> None:
+        """维护 T-LRU 的两个结构化字段；由缓存层在节点创建/分裂后回调。
+
+        等价于 unified 的 `_set_tlru_lens_and_raise_history`，但用「自深 vs
+        子树高水位取 max」统一覆盖 split：分裂出的新父节点只有 child 一个子树，
+        max(自深, child.history) 恰好等于 child.history（分裂不增加分支深度）。
+        """
+        parent = getattr(node, "parent", None)
+        base = getattr(parent, "_tlru_cached_prefix_len", 0) if parent is not None else 0
+        node._tlru_cached_prefix_len = base + len(node.key or ())
+
+        hi = node._tlru_cached_prefix_len
+        for child in (node.children or {}).values():
+            child_hi = getattr(child, "_tlru_history_len", 0)
+            if child_hi > hi:
+                hi = child_hi
+        if getattr(node, "_tlru_history_len", 0) < hi:
+            node._tlru_history_len = hi
+
+        # 沿祖先链上抬（截断在已达标处，最常见情形是一次就停）。
+        cur = parent
+        while cur is not None and getattr(cur, "_tlru_history_len", 0) < hi:
+            cur._tlru_history_len = hi
+            self.history_raises += 1
+            cur = cur.parent
+
+    # ------------------------------------------------------------ 插件接口
+
+    def applies_to(self, node) -> bool:
+        if node is None:
+            return False
+        return (
+            task_type_of_tag(getattr(node, "queue_tag", None))
+            == SimpleHybridTaskType.MULTI_TURN_AGENTIC
+        )
+
+    def pick(self, leaves=None, registry=None) -> Optional["TreeNode"]:
+        """tel-safe 的尾巴先走；同为 tel-safe 时取最久未访问（LRU 阶段）。"""
+        if leaves is None:
+            return None
+        threshold = self.params.threshold
+        next_prompt = self.params.next_prompt_estimate
+
+        best = None
+        for node in leaves:
+            if not self.applies_to(node):
+                continue
+            history = getattr(node, "_tlru_history_len", 0)
+            budget = max(history + next_prompt - threshold, 0)
+            cached_without = getattr(node, "_tlru_cached_prefix_len", 0) - len(node.key or ())
+            tel_safe = cached_without >= budget
+            key = (0 if tel_safe else 1, node.last_access_time)
+            if best is None or key < best[0]:
+                best = (key, node, tel_safe)
+
+        if best is None:
+            self.fallbacks += 1
+            return None
+        if best[2]:
+            self.tel_safe_picks += 1
+        else:
+            self.lru_picks += 1
+        return best[1]
+
+    # ------------------------------------------------------------ 观测
+
+    def stats(self) -> Dict[str, float]:
+        return {
+            "tlru_tel_safe_picks": self.tel_safe_picks,
+            "tlru_lru_picks": self.lru_picks,
+            "tlru_fallbacks": self.fallbacks,
+            "tlru_history_raises": self.history_raises,
+        }
+
+    def reset(self) -> None:
+        """只清计数器；高水位存在节点上，随树一起丢弃。"""
+        self.tel_safe_picks = 0
+        self.lru_picks = 0
+        self.fallbacks = 0
+        self.history_raises = 0

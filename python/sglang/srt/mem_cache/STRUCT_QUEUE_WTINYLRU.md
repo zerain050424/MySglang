@@ -397,6 +397,22 @@ and not struct_policy.is_member(parent)          # 模板前缀不参与死链�
 
 加闸后，闭环变成：文档段被删 → 父（成员）成为叶子 → `on_became_leaf` → protected。
 
+### 7.5 与 T-LRU 插件的关系（`tlru.enabled`）
+
+同一套插件位里还挂了第三个改写器 `victim_override.TlruEvictPolicy`（arXiv:2510.15152）：
+
+| 项 | 内容 |
+|---|---|
+| 作用域 | 只修 **QAGENT** 叶子；与 `rr.fair_rr` 互斥（同为 QAGENT 修正，链上后者会完全遮蔽前者，`_validate_scope()` 直接报错） |
+| 判定 | `budget = max(L + Q_hat - threshold, 0)`；`cached_without = _tlru_cached_prefix_len - len(key)`；`tel_safe = cached_without >= budget` |
+| 排序 | `(0 if tel_safe else 1, last_access_time)` —— tel-safe 的尾巴先走，用尽后退化为 LRU |
+| 记账 | 缓存层在**节点创建/分裂后**回调 `on_node_inserted(node)`，写 `_tlru_cached_prefix_len`（root→self 累计长度）与 `_tlru_history_len`（子树高水位，单调不减，并沿祖先链上抬） |
+| 无插件时 | `_insert_observers` 为空元组，插入/分裂路径只多一次空循环；TreeNode 上两个字段恒 0 |
+
+高水位必须由**插入期**维护：它描述「这棵子树曾经到过多深」，不是「现在多深」。改用
+`SessionRegistry` 的 `st.L` 会在「共享前缀」与「分支改道」两种拓扑下产生双向偏差。
+观测走 `[SimpleHybrid profile]` 新增的 `tlru:` 行（tel_safe / lru / fallback / hist_raises）。
+
 ---
 
 ## 8. 复杂度与内存
