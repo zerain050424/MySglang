@@ -78,7 +78,8 @@ wait_ready() {
 }
 
 start_server() {  # $1=arm $2=budget
-  PORT=$PORT bash serve_arm.sh "$1" "$2" "configs/arm_$1.json"
+  # POLICY_CONFIG 可覆盖该臂的配置（扫 TLRU 阈值时用）
+  PORT=$PORT bash serve_arm.sh "$1" "$2" "${POLICY_CONFIG:-configs/arm_$1.json}"
 }
 
 run_one() {  # $1=arm $2=mode $3=budget $4=seed $5=当前 server 的日志路径

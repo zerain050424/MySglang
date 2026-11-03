@@ -1,6 +1,6 @@
 # RR vs T-LRU：burst / pause 两阶段 + 同时回归 vs 分批回归
 
-目标：暴露「小流量涌入把长挂起会话的 KV 挤掉」这个场景，并在同一场景下比较
+目标：暴露小流量涌入把长挂起会话的 KV 挤掉这个场景，并在同一场景下比较
 `RrEvictPolicy`（会话轮询 + 配额）与 `TlruEvictPolicy`（尾部预算）。
 
 ## 1. 场景与时序
@@ -97,6 +97,32 @@ bash run_matrix.sh
 # 全量
 SEEDS="42 43 44" bash run_matrix.sh
 ```
+
+## 3.5 第四个臂：原生 TLRU（unified 后端）
+
+前面的 a2 是「TLRU 公式做成插件」；`a3_native_tlru` 是**仓库原生的 TLRU**：
+
+| 项 | a2（插件） | a3（原生） |
+|---|---|---|
+| 后端 | `SimpleHybridRadixCache` | `UnifiedRadixCache`（registry 硬校验） |
+| 启动参数 | `--enable-simple-hybrid --radix-eviction-policy simple_hybrid` | `--radix-eviction-policy tlru`（**不加** `--enable-simple-hybrid`） |
+| 配置键 | `{"tlru": {...}}` | `{"threshold": ..., "next_prompt_estimate": ...}` |
+| 作用域 | 仅 QAGENT（`force_agentic` 下即全部） | 全局所有叶子 |
+| 记账 | `_tlru_*` 由插件在插入期维护 | `unified_tree_core` 原生维护 |
+| profile | `[SimpleHybrid profile]` 有 `victim_src` / `tlru:` | **无**（没有这套日志），只能看 resume 指标 |
+
+```bash
+# 原生 TLRU，与三个插件臂完全相同的负载/预算/seed
+ARMS=a3_native_tlru bash run_matrix.sh
+
+# 阈值敏感性（不动代码，用 POLICY_CONFIG 覆盖）
+POLICY_CONFIG=configs/arm_a3_native_tlru_200.json \
+ARMS=a3_native_tlru RESUME_MODES=simultaneous BUDGETS=22000 SEEDS="42" bash run_matrix.sh
+```
+
+阈值语义：`budget = L + Q_hat − threshold`，`threshold` 越大越激进。
+挂起点链长约 400–500 token（不是会话最终长度 3487），所以默认取 **320**
+（= 只让最后 ~250 token 可淘汰）。可选档位已备：`_200`（更保守）/ `_500`（更激进）。
 
 ## 4. 判据：看 resume 轮，不看全局均值
 
