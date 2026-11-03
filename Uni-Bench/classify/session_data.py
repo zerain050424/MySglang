@@ -71,6 +71,7 @@ class Turn:
     prior_tool_call: bool = False  # 上一轮已完成的 tool_call（生产口径：不泄漏当前轮）
     same_turn_tool_call: bool = False  # 当前轮自己的 tool_call（仅消融用）
     tokens: Optional[List[int]] = None  # 仅用于跨会话前缀共享的结构证据
+    new_tokens: int = 0  # 该轮实际写入 KV 的 token 数（trace 用 recompute_tokens）
 
 
 @dataclass
@@ -118,7 +119,41 @@ def _iter_lines(path: Path, max_sessions: Optional[int], seed: int):
                 yield line
 
 
-def _turns_of(sess: dict, keep_all_tokens: bool) -> List[Turn]:
+# ChatML 标记：<|im_start|>system\n...<|im_end|>\n
+_IM_START = 151644
+_IM_END = 151645
+_SYSTEM = 8948
+
+
+# "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
+QWEN_SYSTEM_IDS = (
+    2610, 525, 1207, 16948, 11, 3465, 553, 54364, 14817, 13, 1446, 525, 264,
+    10950, 17847, 13,
+)
+
+
+def strip_chatml_system(ids: List[int], mode: str = "all") -> List[int]:
+    """去掉 prompt 开头的 ChatML system 段。
+
+    mode="qwen"：只剥 Qwen 默认 system prompt（apps / alfred / ShareGPT 的公共样板）；
+    mode="all" ：任何 system 段都剥（连 Codeparrot 自己的领域 system prompt 一起）。
+    只剥离首段，不动其余对话。
+    """
+    if len(ids) < 3 or ids[0] != _IM_START or ids[1] != _SYSTEM:
+        return ids
+    start = 3 if ids[2] == 198 else 2
+    if mode == "qwen" and tuple(ids[start : start + len(QWEN_SYSTEM_IDS)]) != QWEN_SYSTEM_IDS:
+        return ids
+    for i in range(start, len(ids)):
+        if ids[i] == _IM_END:
+            rest = ids[i + 1 :]
+            if rest[:1] == [198]:  # 紧跟的换行
+                rest = rest[1:]
+            return rest
+    return ids
+
+
+def _turns_of(sess: dict, keep_all_tokens: bool, strip_system: str = "none") -> List[Turn]:
     turns: List[Turn] = []
     prev_call = False
     for t in range(1, int(sess["num_turns"]) + 1):
@@ -128,6 +163,9 @@ def _turns_of(sess: dict, keep_all_tokens: bool) -> List[Turn]:
         ids = turn.get("input_ids") or []
         call = bool(turn.get("tool_call"))
         tokens = ids if (t == 1 or keep_all_tokens) else None
+        if tokens is not None and strip_system not in (None, "none"):
+            tokens = strip_chatml_system(tokens, strip_system)
+            ids = tokens
         turns.append(
             Turn(
                 index=t,
@@ -136,6 +174,8 @@ def _turns_of(sess: dict, keep_all_tokens: bool) -> List[Turn]:
                 prior_tool_call=prev_call,
                 same_turn_tool_call=call,
                 tokens=tokens,
+                # 任务数据里没有命中信息，按「全部重新 prefill」估算（保守上界）。
+                new_tokens=len(ids),
             )
         )
         prev_call = call
@@ -148,6 +188,7 @@ def load_task_sessions(
     seed: int = 42,
     keep_all_tokens: bool = False,
     only_ids: Optional[Iterable[str]] = None,
+    strip_system: str = "none",
 ) -> Dict[str, SessionRecord]:
     """从任务数据构造会话记录（时序留空，由 `assign_gaps` 或真实 trace 填）。
 
@@ -168,7 +209,7 @@ def load_task_sessions(
                     if gt is None:
                         continue
                     rec = out.get(sid) or SessionRecord(session_id=sid, gt=gt, source=str(path))
-                    rec.turns = _turns_of(sess, keep_all_tokens)
+                    rec.turns = _turns_of(sess, keep_all_tokens, strip_system)
                     out[sid] = rec
     return out
 
@@ -222,7 +263,11 @@ def load_trace_sessions(
         turns: List[Turn] = []
         for i, row in enumerate(rows):
             turn = Turn(
-                index=i + 1, start=float(row["ts"]), prompt_len=int(row["prompt_tokens"])
+                index=i + 1,
+                start=float(row["ts"]),
+                prompt_len=int(row["prompt_tokens"]),
+                # 该轮真正写入的 KV = 未被缓存命中的部分（trace 实测值）
+                new_tokens=int(row.get("recompute_tokens") or 0),
             )
             if ref is not None and i < len(ref.turns):
                 src = ref.turns[i]

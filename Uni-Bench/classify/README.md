@@ -25,10 +25,15 @@
 | --- | --- |
 | `session_data.py` | 数据口径：任务数据 / 真实 trace → 会话事件流；GT 映射；轮间隔模型 |
 | `replay.py` | 把证据按真实时间顺序喂进 `SessionRegistry`；块粒度前缀归属索引（跨会话共享） |
-| `metrics.py` | 会话级 acc / macro-F1 / P-R-F1 / 混淆矩阵 / 逐轮精度 / 收敛轮 / 可达上限 |
+| `metrics.py` | 会话级 acc / macro-F1 / P-R-F1 / 混淆矩阵 / 逐轮精度 / 收敛轮 / 可达上限 / token 级错标暴露 |
 | `dataset_build.py` | CLI 参数与数据集装配 |
 | `run_eval.py` | 主实验，输出 `report.md` + `metrics.json` + `sessions.csv` |
 | `sweep.py` | 阈值与证据口径扫描（单变量） |
+| `SHARE64_SUMMARY.md` | `min_share=64` 的三件套指标实验总结（最终判定 / 逐轮精度 / token 暴露） |
+| `SYSTEM_PROMPT_ABLATION.md` | 去掉公共 Qwen system prompt 后重跑：与抬高 `min_share` 等价性验证 |
+| `分类器判定逻辑.md` | 判定逻辑全流程：证据 → 状态 → 有序规则 → 队列标签（含判定表与边界情况） |
+| `分类器实验.md` | 面向汇报的完整实验报告（数据准备 / 纯 CPU 模拟设计 / 三件套结果 / 局限），图在 `figs/` |
+| `分类器残差分析.md` | 附录 A：去掉公共 system prompt 后仍有 12 条 chat 被判 struct 的逐条证据 |
 | `run.sh` | 一键跑 4 组 |
 | `tests/test_session_accuracy.py` | 自检：口径映射、trace 回填、重放语义、指标计算 |
 
@@ -61,12 +66,21 @@ cd Uni-Bench/classify
 /root/sl_old/bin/python run_eval.py --source trace                 # 真实 trace 主结果
 /root/sl_old/bin/python run_eval.py --source task --max-per-workload 1500 --tag task
 /root/sl_old/bin/python sweep.py --source trace --tag trace        # 单变量扫描
+/root/sl_old/bin/python run_eval.py --source trace --strip-system-prompt qwen  # 去掉公共 system prompt
 bash run.sh                                                        # 以上四组一起跑
 /root/sl_old/bin/python -m pytest tests/test_session_accuracy.py -q
 ```
 
 输出在 `../result/classify/`；`sessions.csv` 逐会话给出 `gt, pred, n_turns, converged_turn,
-shared_len, preds`，可以直接和后续 node dump（`stype`）按 `session_id` join。
+shared_len, ever_wrong, mislabel_turns, mislabel_tokens, preds`，可以直接和后续 node dump
+（`stype`）按 `session_id` join。
+
+报告里同时给三套口径，缺一不可：
+
+1. **最终判定**：`accuracy` / `macro_f1` / `ceiling` / `achievement`——会话最后判对了吗；
+2. **逐轮精度**：`curve`（`acc_at_turn`）+ `convergence`——第几轮才判对；
+3. **token 级暴露**：`exposure`——进行中有多少 KV 被标错，其中 `sticky_tokens` 是
+   `qstruct` 黏性错标（改判后不会自愈），其余会在后续命中时重写。
 
 ## 结果
 

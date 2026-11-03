@@ -49,6 +49,7 @@ def main() -> None:
         "curve": rep.curve,
         "convergence": rep.convergence,
         "ceiling": rep.ceiling,
+        "exposure": rep.exposure,
         "structure_stats": rep.structure_stats,
     }
     (out / f"metrics{suffix}.json").write_text(

@@ -107,6 +107,7 @@ class SessionResult:
     preds: List[str] = field(default_factory=list)  # 每轮结束时的判定（PRED_LABEL 空间）
     shared_len: int = 0  # 观测到的跨会话共享前缀长度（结构证据）
     shared_owner: Optional[str] = None
+    new_tokens: List[int] = field(default_factory=list)  # 每轮写入 KV 的 token 数
 
     @property
     def final(self) -> str:
@@ -166,5 +167,6 @@ def replay(
             tool_call=_tool_call_of(turn, cfg.tool_call_mode),
         )
         results[sid].preds.append(PRED_LABEL[state.session_type.value])
+        results[sid].new_tokens.append(turn.new_tokens)
 
     return results

@@ -40,6 +40,13 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         help="task 模式的轮间隔：per_workload | fixed:<s> | lognormal:<mu>:<sigma>",
     )
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--strip-system-prompt",
+        choices=("none", "qwen", "all"),
+        default="none",
+        help="去掉 prompt 开头的 system 段后再重放：qwen=只去 Qwen 默认 system prompt，"
+        "all=连 Codeparrot 的领域 system prompt 一起去",
+    )
 
     # 分类器参数（缺省即生产值，改动只影响本次评测）
     parser.add_argument("--multi-turn-min", type=int, default=5)
@@ -64,7 +71,9 @@ def build(args) -> dict:
 
     if args.source == "trace":
         ids = trace_session_ids(args.trace_csv)
-        index = load_task_sessions(paths, only_ids=ids)
+        index = load_task_sessions(
+            paths, only_ids=ids, strip_system=args.strip_system_prompt
+        )
         sessions = load_trace_sessions(args.trace_csv, index, turns_limit=args.turns_limit)
         missing = sum(1 for r in sessions.values() if r.turns and r.turns[0].tokens is None)
         if missing:
@@ -75,6 +84,7 @@ def build(args) -> dict:
             max_sessions=args.max_per_workload,
             seed=args.seed,
             keep_all_tokens=args.structure_turns == "all",
+            strip_system=args.strip_system_prompt,
         )
         assign_gaps(sessions, args.gap_model, seed=args.seed)
     return sessions

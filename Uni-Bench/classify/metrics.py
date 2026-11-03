@@ -92,6 +92,46 @@ def convergence_stats(results: Sequence) -> Dict[str, Dict[str, float]]:
     return out
 
 
+def exposure(results: Sequence) -> Dict[str, Dict[str, float]]:
+    """过程口径：分类器在会话进行中把 KV 标错的暴露量。
+
+    - 逐轮错标率：pred != gt 的轮次占比；
+    - token 错标率：这些轮次里写入的 KV token 占比（每轮写入量取 trace 的
+      recompute_tokens）；
+    - `sticky_tokens`：错标发生在 `struct` 桶的 token 数。radix 的 qstruct 是黏性标签
+      （`_record_node_hit` 只改写非 qstruct 节点），这部分 KV 不会在改判后自愈；
+      其余错标（trans/chat/agentic 之间）会在后续命中时被重写。
+    """
+    out: Dict[str, Dict[str, float]] = {}
+    for lab in list(LABELS) + ["all"]:
+        subset = [r for r in results if lab == "all" or r.gt == lab]
+        turns = wrong_turns = tokens = wrong_tokens = sticky = 0
+        ever_wrong = 0
+        for r in subset:
+            if any(pred != r.gt for pred in r.preds):
+                ever_wrong += 1
+            for pred, nt in zip(r.preds, r.new_tokens):
+                turns += 1
+                tokens += nt
+                if pred != r.gt:
+                    wrong_turns += 1
+                    wrong_tokens += nt
+                    if pred == "struct":
+                        sticky += nt
+        out[lab] = {
+            "sessions": len(subset),
+            "ever_wrong": ever_wrong,
+            "ever_wrong_rate": round(ever_wrong / len(subset), 4) if subset else 0.0,
+            "turns": turns,
+            "turn_mislabel_rate": round(wrong_turns / turns, 4) if turns else 0.0,
+            "tokens": tokens,
+            "token_mislabel_rate": round(wrong_tokens / tokens, 4) if tokens else 0.0,
+            "sticky_tokens": sticky,
+            "sticky_share": round(sticky / tokens, 4) if tokens else 0.0,
+        }
+    return out
+
+
 def ceiling(results: Sequence, multi_turn_min: int) -> Dict[str, object]:
     """规则可达上限。
 
@@ -134,6 +174,7 @@ class Report:
     curve: List[Dict[str, float]]
     convergence: Dict[str, Dict[str, float]]
     ceiling: Dict[str, object]
+    exposure: Dict[str, Dict[str, float]]
     structure_stats: Dict[str, object]
     results: Optional[Sequence] = None
 
@@ -173,6 +214,7 @@ def summarize(results: Sequence, cfg, target: str) -> Report:
         curve=accuracy_curve(results),
         convergence=convergence_stats(results),
         ceiling={**ceil, "achievement": round(acc / ceil["ceiling"], 4) if ceil["ceiling"] else 0.0},
+        exposure=exposure(results),
         structure_stats=structure_stats,
         results=results,
     )
@@ -240,6 +282,20 @@ def render_markdown(rep: Report) -> str:
             lines.append(f"| {lab} | {c['median_turn']} | {c['p90_turn']} | {c['n']} |")
     lines += [
         "",
+        "## 过程口径：逐轮与 token 级错标暴露",
+        "",
+        "| 类别 | 会话 | 曾判错会话 | 逐轮错标率 | token 错标率 | qstruct 黏性错标 tok（占该类 tok） |",
+        "| --- | --- | --- | --- | --- | --- |",
+    ]
+    for lab in list(LABELS) + ["all"]:
+        e = rep.exposure[lab]
+        lines.append(
+            f"| {lab} | {e['sessions']} | {e['ever_wrong']}（{e['ever_wrong_rate']:.3f}） | "
+            f"{e['turn_mislabel_rate']:.4f} | {e['token_mislabel_rate']:.4f} | "
+            f"{e['sticky_tokens']}（{e['sticky_share']:.4f}） |"
+        )
+    lines += [
+        "",
         "## 规则不可达会话（>4 轮门槛）",
         "",
         "| 类别 | 不可达会话数 | 占该类比例 |",
@@ -257,7 +313,19 @@ def write_sessions_csv(path, results: Sequence) -> None:
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(
-            ["session_id", "gt", "pred", "correct", "n_turns", "converged_turn", "shared_len", "preds"]
+            [
+                "session_id",
+                "gt",
+                "pred",
+                "correct",
+                "n_turns",
+                "converged_turn",
+                "shared_len",
+                "ever_wrong",
+                "mislabel_turns",
+                "mislabel_tokens",
+                "preds",
+            ]
         )
         for r in results:
             w.writerow(
@@ -269,6 +337,9 @@ def write_sessions_csv(path, results: Sequence) -> None:
                     r.n_turns,
                     converged_turn(r),
                     r.shared_len,
+                    int(any(p != r.gt for p in r.preds)),
+                    sum(1 for p in r.preds if p != r.gt),
+                    sum(nt for p, nt in zip(r.preds, r.new_tokens) if p != r.gt),
                     "/".join(r.preds),
                 ]
             )
