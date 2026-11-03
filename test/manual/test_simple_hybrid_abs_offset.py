@@ -581,10 +581,10 @@ def test_alpha_symmetry_stays_neutral():
         strategy._hit_tokens.clear()
         strategy._hit_tokens.update(hits)
         strategy.update_alpha_balance(cap)
-    got = {q: round(strategy.alpha_balance[q], 6) for q in hits}
+    got = {q: round(strategy.alpha.balance[q], 6) for q in hits}
     print(f"      alpha={got}")
     for q in hits:
-        a = strategy.alpha_balance[q]
+        a = strategy.alpha.balance[q]
         check(abs(a - 1.0) < 1e-6, f"{q} alpha={a}, expected 1.0 (neutral)")
 
 
@@ -598,7 +598,7 @@ def test_alpha_rewards_productive_queue():
         strategy._hit_tokens.clear()
         strategy._hit_tokens.update(hits)
         strategy.update_alpha_balance(cap)
-    a = strategy.alpha_balance
+    a = strategy.alpha.balance
     print(f"      alpha={ {q: round(a[q], 6) for q in hits} }")
     check(a["agentic"] > 1.0, f"agentic alpha={a['agentic']:.6f}, expected > 1")
     check(a["struct"] < 1.0, f"struct alpha={a['struct']:.6f}, expected < 1")
@@ -624,7 +624,7 @@ def test_alpha_punishes_zero_hit_capacity():
         strategy._hit_tokens.clear()
         strategy._hit_tokens.update(hits)
         strategy.update_alpha_balance(cap)
-    a = strategy.alpha_balance
+    a = strategy.alpha.balance
     print(f"      alpha={ {q: round(a[q], 6) for q in cap} }")
     check(a["struct"] < 0.1,
           f"zero-hit struct alpha={a['struct']:.6f}, expected pushed below 0.1")
@@ -675,7 +675,7 @@ def test_starved_queue_does_not_explode():
         strat._hit_tokens.clear()
         strat._hit_tokens.update(hits)
         strat.update_alpha_balance(cap)
-    a = strat.alpha_balance["struct"]
+    a = strat.alpha.balance["struct"]
     print(f"      alpha(struct) after 20 windows = {a:.4f}")
     check(a < 0.1, f"starved struct alpha={a:.4f}, expected < 0.1 (no explosion)")
 
@@ -684,11 +684,11 @@ def test_alpha_step_is_rate_limited():
     """单次更新不得把 alpha 变化超过 max_alpha_step 倍，避免 Bang-Bang 跳变。"""
     print("[16] per-update alpha change is rate limited")
     strat = SimpleHybridStrategy()
-    strat.alpha_balance["struct"] = 0.001
+    strat.alpha.balance["struct"] = 0.001
     strat._hit_tokens.update({"struct": 100000.0, "agentic": 1.0})
     strat.update_alpha_balance({"struct": 50000.0, "agentic": 50000.0})
-    a = strat.alpha_balance["struct"]
-    limit = 0.001 * strat.max_alpha_step * 1.0001
+    a = strat.alpha.balance["struct"]
+    limit = 0.001 * strat.alpha.max_alpha_step * 1.0001
     print(f"      0.001 -> {a:.6f}  (limit {limit:.6f})")
     check(a <= limit, f"alpha jumped 0.001 -> {a:.6f}, expected <= {limit:.6f}")
 
@@ -704,7 +704,7 @@ def test_alpha_converges_under_steady_load():
         strat._hit_tokens.clear()
         strat._hit_tokens.update(hits)
         strat.update_alpha_balance(cap)
-        hist.append(dict(strat.alpha_balance))
+        hist.append(dict(strat.alpha.balance))
     tail = hist[-5:]
     got = {q: round(tail[-1][q], 6) for q in hits}
     print(f"      converged alpha={got}")

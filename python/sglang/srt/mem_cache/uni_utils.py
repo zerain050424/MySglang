@@ -40,7 +40,8 @@ class SimpleHybridQueueTag(str, enum.Enum):
 #   RrParams      : Agentic 会话级轮询配额（跨会话公平）
 #   TinyLRUParams : Q_struct 队列内部的 W-TinyLRU（队内驻留/准入，见 STRUCT_QUEUE_WTINYLRU.md）
 # 用 dataclass 而不是裸 kwargs，是为了让 `eviction_policy_config` 有层级、能校验、能整体
-# 复制/日志/消融；旧的扁平键仍然接受（见 LEGACY_PARAM_ALIASES）。
+# 复制/日志/消融；旧的扁平键（alpha_smooth / fair_rr / struct_k ...）已删除，
+# 配置只接受 {"alpha":{...},"rr":{...},"tiny_lru":{...}} 分组形式。
 # ---------------------------------------------------------------------------
 
 
@@ -117,8 +118,8 @@ class AlphaParams:
 class RrParams:
     """Agentic 会话级轮询（round-robin）配额参数。
 
-    enabled 为真时，淘汰阶段在会话之间轮询挑 victim，并用 `_loss_cap` 限制
-    单会话本轮可以承受的 KV 缺口。
+    enabled 为真时，淘汰阶段在会话之间轮询挑 victim，并用
+    `RrEvictPolicy.loss_cap()` 限制单会话本轮可以承受的 KV 缺口。
     """
 
     fair_rr: bool = False  # Agentic 会话轮询开关
@@ -193,79 +194,6 @@ class TinyLRUParams:
 
     def as_dict(self) -> dict:
         return dataclasses.asdict(self)
-
-
-# 分组名 -> 参数类；供策略构造与日志使用
-SIMPLE_HYBRID_PARAM_GROUPS = {
-    "alpha": AlphaParams,
-    "rr": RrParams,
-    "tiny_lru": TinyLRUParams,
-}
-
-# 旧的扁平配置键 -> (组名, 字段名)。只为兼容历史 benchmark / 命令行 JSON。
-LEGACY_PARAM_ALIASES = {
-    # alpha
-    "update_interval": ("alpha", "update_interval"),
-    "min_cap_share": ("alpha", "min_cap_share"),
-    "max_alpha_step": ("alpha", "max_alpha_step"),
-    "alpha_smooth": ("alpha", "smooth"),
-    "alpha_temperature": ("alpha", "temperature"),
-    "alpha_balance": ("alpha", "balance"),
-    # rr
-    "fair_rr": ("rr", "fair_rr"),
-    "kappa": ("rr", "kappa"),
-    "min_retain_tokens": ("rr", "min_retain_tokens"),
-    "min_retain_frac": ("rr", "min_retain_frac"),
-    # tiny_lru
-    "struct_policy": ("tiny_lru", "policy"),
-    "struct_k": ("tiny_lru", "k"),
-    "struct_window_entries": ("tiny_lru", "window_entries"),
-    "struct_epoch_events": ("tiny_lru", "epoch_events"),
-    "struct_admission_tie": ("tiny_lru", "admission_tie"),
-    "struct_admission_metric": ("tiny_lru", "admission_metric"),
-    "struct_inherit_share": ("tiny_lru", "inherit_share"),
-}
-
-
-def split_legacy_params(**legacy) -> Dict[str, dict]:
-    """把旧的扁平 kwargs 路由到三组参数，未知键直接报错（拼错不再静默失效）。"""
-    out: Dict[str, dict] = {name: {} for name in SIMPLE_HYBRID_PARAM_GROUPS}
-    unknown = []
-    for name, value in legacy.items():
-        target = LEGACY_PARAM_ALIASES.get(name)
-        if target is None:
-            unknown.append(name)
-            continue
-        group, field = target
-        out[group][field] = value
-    if unknown:
-        known = ", ".join(sorted(LEGACY_PARAM_ALIASES))
-        raise ValueError(
-            f"Unknown eviction policy config keys: {sorted(unknown)}. "
-            f"Use the grouped form ({'/'.join(SIMPLE_HYBRID_PARAM_GROUPS)}), "
-            f"or these legacy keys: {known}."
-        )
-    return out
-
-
-def merge_param_overrides(value, overrides: dict):
-    """显式分组参数优先，旧扁平键只补齐缺失字段。
-
-    返回可直接传给 `XxxParams.from_any()` 的 dict 或原实例。
-    """
-    if not overrides:
-        return value
-    if value is None:
-        return dict(overrides)
-    if isinstance(value, dict):
-        merged = dict(value)
-        for k, v in overrides.items():
-            merged.setdefault(k, v)
-        return merged
-    base = dataclasses.asdict(value)
-    for k, v in overrides.items():
-        base.setdefault(k, v)
-    return base
 
 
 @lru_cache(maxsize=8)

@@ -1,9 +1,15 @@
-"""Q_struct 队列内部的 W-TinyLRU 队内淘汰策略。
+"""Q_struct 队列内部的 W-TinyLRU **状态机**（成员 / 三区 / 准入 / aging）。
 
-设计文档：python/sglang/srt/mem_cache/STRUCT_QUEUE_WTINYLRU.md
-不释放任何 KV：
+职责边界：
+  * 本模块只回答「谁在队列里、在哪个区、区头是谁」——不回答「该淘汰谁」。
+    淘汰面由 ``victim_override.StructTinyLruPolicy`` 薄转发（applies_to / pick）。
+  * 缓存层直接持有本状态机（钩子 + ``owns``，死链上溯闸要用）；策略层把它
+    包成插件进 ``victim_overrides``。
+  * 本类不实现 ``VictimOverride``，也不 import ``victim_override``，只依赖 uni_utils。
+
+不释放任何 KV、不删节点：
   1. 某个节点是否还在 struct 队列里（成员判定 M3 + 退队）；
-  2. 若在，队内下一个该出的是谁（window → probation → protected）。
+  2. 若在，队内下一个该出的是谁（window → probation → protected 的区头）。
 
 三条需求的落点：
   * 按频数驻留      -> share_count（不同 rid 数）+ 三区分档；
@@ -42,15 +48,15 @@ _MAX_SHARE = 255
 _MIN_SHARE = 2
 
 
-class StructQueuePolicy:
-    """仅 Q_struct 队列内部的 W-TinyLRU（window + SLRU + 频数准入）。
+class StructQueueState:
+    """Q_struct 队列内部的 W-TinyLRU 队内状态（window + SLRU + 频数准入 + aging）。
 
-    同时实现 ``victim_override.VictimOverride`` 的鸭子接口
-    （``applies_to`` / ``pick`` / ``stats`` / ``reset``），因此和 RR 一样可以
-    挂进 ``SimpleHybridStrategy.victim_overrides``，不需要缓存层认识它。
+    只维护队列状态：成员判定、三区索引、准入、aging、归属查询 ``owns``。
+    淘汰候选通过 ``eviction_candidate()`` 暴露给 ``StructTinyLruPolicy``，
+    由它在 ``victim_overrides`` 链里作为「候选修正」参与全局淘汰。
+
+    设计文档：python/sglang/srt/mem_cache/STRUCT_QUEUE_WTINYLRU.md
     """
-
-    name = "struct_tinylru"
 
     def __init__(
         self,
@@ -423,8 +429,12 @@ class StructQueuePolicy:
             and getattr(node, "struct_region", REGION_NONE) != REGION_NONE
         )
 
-    def victim(self):
-        """下一个该出的成员；None 表示队内暂时没有可淘汰成员（上层必须回退）。"""
+    def eviction_candidate(self):
+        """队内下一个该出的成员；None 表示队内暂时没有可淘汰成员（上层必须回退）。
+
+        只给 ``StructTinyLruPolicy.pick()`` 用：本方法不做跨队列比较，
+        返回的是纯队内顺序（window → probation → protected 的区头）。
+        """
         if not self.enabled:
             return None
         for region in _REGION_ORDER:
@@ -435,17 +445,10 @@ class StructQueuePolicy:
                 return node
         return None
 
-    # ---- VictimOverride 插件接口 ----
-
-    def applies_to(self, node) -> bool:
-        """O(1)：当前候选是否归本队列管。"""
-        return self.owns(node)
-
-    def pick(self, leaves=None, registry=None):
-        """返回队内下一个该出的成员；None = 不接管（上层保留原候选）。"""
-        return self.victim()
+    # ------------------------------------------------------------ 生命周期
 
     def reset(self) -> None:
+        """清空三区与挂起区、复位 aging 时钟（缓存 reset / 进程复用）。"""
         for table in self.regions.values():
             for node in table.values():
                 node.struct_region = REGION_NONE

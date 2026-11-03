@@ -7,9 +7,10 @@
 
 ## 0. 一句话概述
 
-在 `SimpleHybridStrategy` 内部挂一个 **只认 Q_struct 成员** 的子策略 `StructQueuePolicy`，
-用成员判定 M3 + 三区（window/probation/protected）+ 频数准入 + 事件驱动 aging
-替换当前位置项 + LRU的队内排序，并在全局 victim 落在 struct 成员上时**委托**它给出更优 victim。
+在 `SimpleHybridStrategy` 内部挂两个对象：**队列状态机** `StructQueueState`（只认 Q_struct 成员）
+与**淘汰面适配器** `StructTinyLruPolicy`（把区头暴露成 `VictimOverride`）。
+状态机用成员判定 M3 + 三区（window/probation/protected）+ 频数准入 + 事件驱动 aging
+替换当前位置项 + LRU 的队内排序；适配器在全局 victim 落在 struct 成员上时**委托**它给出更优 victim。
 所有 KV 释放仍然只由 `SimpleHybridRadixCache._evict_one()` 执行。
 
 | 需求 | 机制 | 生效点 |
@@ -208,7 +209,7 @@ TinyLFU 假设 entry 成本相同，radix 节点长度从 1 token 到 20k token�
 ### 5.5 淘汰顺序（无准入判断）
 
 ```
-victim():
+eviction_candidate():          # 状态机的方法；适配器的 pick() 只是转发
     for region in (window, probation, protected):
         if region:
             return region.head
@@ -216,7 +217,7 @@ victim():
 ```
 
 - 只有顺序，没有拒绝（INV-4）。protected 的 head 是**兜底**，即「队内已无更差选择」。
-- `victim()` 返回 `None` 时，上层必须回退到原始全局 victim 选择，**不能 break、不能自旋**。
+- `eviction_candidate()` 返回 `None` 时，上层必须回退到原始全局 victim 选择，**不能 break、不能自旋**。
 
 ---
 
@@ -303,13 +304,21 @@ every E struct 入区/淘汰事件 (默认 E = 8192):
 }
 ```
 
-旧的扁平键仍可用（`alpha_smooth` / `fair_rr` / `struct_k` ... 见
-`uni_utils.LEGACY_PARAM_ALIASES`），由 `split_legacy_params()` 路由；
-**分组显式给出的字段优先**，未给出的字段由扁平键补齐；未知键直接 `ValueError`
-（拼错不再静默失效）。三个 dataclass 都在 `__post_init__` 里做范围校验。
+旧的扁平键（`alpha_smooth` / `fair_rr` / `struct_k` ... 见已删除的
+`uni_utils.LEGACY_PARAM_ALIASES`）已移除：配置只接受上表分组形式，
+未知键在参数组构造处直接 `ValueError`（拼错不再静默失效）。
+三个 dataclass 都在 `__post_init__` 里做范围校验。
 
-`SimpleHybridStrategy.__init__` 里构造 `StructQueuePolicy(cfg)`，字段名 `self.struct`；
-`struct_policy == "off"` 时全部钩子为 no-op 且 `victim()` 恒返回 `None`（零开销路径）。
+`SimpleHybridStrategy.__init__` 里构造两个对象：
+
+| 字段 | 类型 | 谁用 |
+|---|---|---|
+| `self.structState` | `StructQueueState`（状态机） | 缓存层：8 个 `on_*` 钩子 + `owns()` 死链闸 |
+| `self.TinyLru_evict` | `StructTinyLruPolicy`（适配器） | 只进 `victim_overrides` |
+
+**两者不可合并**：让 `self.structState` 指向适配器，`radix_cache` 的 `getattr(..., "structState", None)`
+会判空成功但钩子变成 AttributeError 或静默 no-op，struct 策略整体失效而无日志。
+`tiny_lru.policy == "off"` 时两者都是 `None`（全部钩子 no-op，零开销路径）。
 
 ### 7.2 淘汰委托点
 
@@ -326,7 +335,7 @@ for override in self.victim_overrides:        # 注册顺序 = 优先级，后�
             victim = alt
 ```
 
-`victim_overrides` 由策略在构造时给出：`(rr_evict, struct)` —— RR 会话公平先改一次，
+`victim_overrides` 由策略在构造时给出：`(rr_evict, TinyLru_evict)` —— RR 会话公平先改一次，
 struct 对「归属自己的节点」有最终发言权。`applies_to()` 都是 O(1)：RR 查 `queue_tag`，
 struct 查 `struct_region`。没有插件时（两者都关）元组为空，淘汰路径与基线逐字节等价。
 
@@ -338,11 +347,22 @@ struct 查 `struct_region`。没有插件时（两者都关）元组为空，淘
 | `pick(leaves, registry) -> node \| None` | 返回更愿意淘汰的节点；None = 不接管 |
 | `stats() -> dict` | 供 profile / 日志 |
 | `reset()` | 缓存 reset 时清内部状态 |
+| `queue`（类属性） | **仅观测**：管辖队列标签（QAGENT/QSTRUCT），
+供 profile 打「本次淘汰由哪个队列的策略决定」（`victim_src` 行）；
+不得参与任何仲裁判定 |
 
 三条硬约束写进模块 docstring：不释放 KV、不阻塞推进、只能从 `leaves` 里挑。
-内置实现：`RrEvictPolicy`（RR 会话轮询，`fair_rr` 打开时构造）、`StructQueuePolicy`
-（`tiny_lru.policy="wtinylru"` 时构造，用 `applies_to = owns`、`pick = victim` 适配）。
-新增插件只需实现上面四个方法，然后拼进 `victim_overrides`，缓存层不需要任何改动。
+内置实现：`RrEvictPolicy`（RR 会话轮询，`fair_rr` 打开时构造）、`StructTinyLruPolicy`
+（`tiny_lru.policy="wtinylru"` 时构造，`applies_to = state.owns`、`pick = state.eviction_candidate`，
+自身无状态）。状态机 `StructQueueState` **不实现** `VictimOverride`——它归缓存层持有。
+新增插件只需实现上面四个方法（并可选声明 `queue`），然后拼进 `victim_overrides`，
+缓存层不需要任何改动。
+
+**统一范围（已拍板）**：one-shot 硬优先带与 QCHAT **不**进插件 ——
+前者是「无论候选是谁先清 one-shot」的接管语义，与 `applies_to(victim)` 的
+「候选修正」模型不兼容（需要 `hard_band` 通道，本期不做）；后者拆出来与全局
+`min(leaves, key=victim_key)` 逐元素等价，是纯 no-op。淘汰循环保持
+「one-shot 硬优先带 → 全局 victim_key → 插件修正链」三段不变。
 
 **为什么是「委托」而不是「预算」**：本期不做跨队列仲裁，所以 struct 队列不能自己决定
 我该留多少，只能在对局部的淘汰顺序上提出更优候选。这样 `evict()` 的推进语义、one-shot 优先带、
@@ -352,7 +372,7 @@ alpha 更新链路全部不变。
 
 `evict()` 是 `while num_evicted < num_tokens` 的硬循环。为保证不死循环：
 
-1. `victim()` 返回的必须是 `evictable_leaves` 中的节点（INV-2 的推论）；
+1. `eviction_candidate()` 返回的必须是 `evictable_leaves` 中的节点（INV-2 的推论）；
 2. `_evict_one()` 必须返回 `len(value) > 0`（现有一致）；
 3. 加断言：每次循环 `num_evicted` 必须严格递增，否则 `logger.error` + 强制回退到全局 victim。
 
@@ -408,7 +428,7 @@ and not struct_policy.is_member(parent)          # 模板前缀不参与死链�
 | `share_hist` | 被淘汰成员的 `share_count` 直方图 | `share >= K` 的淘汰 token 占比应趋零 |
 | `template_survival` | 分叉点平均存活时长 / 被删次数 | 相比基线显著提升 |
 | `one_shot_residency` | 单次文档成员平均驻留时长 | 应压缩到 1 个淘汰周期 |
-| `victim_us` | `victim()` 平均耗时 | 相比基线 O(N) 应有量级下降 |
+| `victim_us` | `eviction_candidate()` 平均耗时 | 相比基线 O(N) 应有量级下降 |
 
 回放实验：`Uni-Bench/bench_unicache.py` + `cachewise-coding-traces`，与
 `--eviction-policy=simple_hybrid`（现状）对比，同时监控 chat/agent 命中率**不回退**
@@ -461,7 +481,7 @@ and not struct_policy.is_member(parent)          # 模板前缀不参与死链�
 | bloom 误判「少计」 | 新模板晋升更慢 | `K`/bloom 位数可配；实验环境换精确集合 |
 | `_record_node_hit` 缺 rid | 无法去重 | 从 `match_prefix` 透传 `params.req`（只透传） |
 | 采样线程访问 region | 并发结构性修改 | 观测只读 `_per_workload_token_count()`（遍历树），不碰 region 索引 |
-| 性能回退 | 钩子加在每次 match 上 | 全部 O(1) 位运算；`off` 时零开销；`victim()` 相对基线是净收益 |
+| 性能回退 | 钩子加在每次 match 上 | 全部 O(1) 位运算；`off` 时零开销；`eviction_candidate()` 相对基线是净收益 |
 
 回滚：单一开关 `struct_policy="off"`，不涉及数据结构迁移（新增字段默认 `0`/`None`）。
 `share_count` / `rid_bloom` 即使关闭也留空，不参与任何逻辑。
@@ -475,13 +495,13 @@ and not struct_policy.is_member(parent)          # 模板前缀不参与死链�
 
 | 文件 | 角色 |
 |---|---|
-| `python/sglang/srt/mem_cache/uni_utils.py` | 新增 `AlphaParams` / `RrParams` / `TinyLRUParams` 三组参数 dataclass + `split_legacy_params()` / `merge_param_overrides()` |
-| `python/sglang/srt/mem_cache/victim_override.py` | 新增 `VictimOverride` 插件基类 + `RrEvictPolicy`（RR 会话轮询从策略里拆出来的全部状态与算法） |
+| `python/sglang/srt/mem_cache/uni_utils.py` | 新增 `AlphaParams` / `RrParams` / `TinyLRUParams` 三组参数 dataclass（旧扁平键兼容路由已删除） |
+| `python/sglang/srt/mem_cache/victim_override.py` | 新增 `VictimOverride` 插件基类 + `RrEvictPolicy`（RR 会话轮询的全部状态与算法）+ `StructTinyLruPolicy`（无状态适配器，转发 `StructQueueState`） |
 | `python/sglang/srt/mem_cache/simple_hybrid_radix_cache.py` | 淘汰改为遍历 `self.victim_overrides`，不再硬编码 RR / struct 分支 |
-| `python/sglang/srt/mem_cache/radix_cache.py` | 暴露 `self.victim_overrides`（空元组 = 无插件）；`self.struct_policy` 仍供死链上溯闸使用 |
-| `python/sglang/srt/mem_cache/struct_queue_policy.py` | 新增：`StructQueuePolicy`（成员判定 / 三区 / 准入 / aging / victim）。纯 Python，只依赖 `uni_utils`，不碰 KV |
+| `python/sglang/srt/mem_cache/radix_cache.py` | 暴露 `self.victim_overrides`（空元组 = 无插件）；`self.structState_policy` 仍供死链上溯闸使用 |
+| `python/sglang/srt/mem_cache/struct_queue_policy.py` | 新增：`StructQueueState`（成员判定 / 三区 / 准入 / aging / `eviction_candidate`）。纯 Python，只依赖 `uni_utils`，不碰 KV、不依赖 `victim_override` |
 | `python/sglang/srt/mem_cache/radix_cache.py` | `TreeNode` 新增 `share_count` / `rid_bloom` / `struct_region` / `struct_ever_branch`；6 个钩子 + `rid` 透传 + `reset()` |
-| `python/sglang/srt/mem_cache/evict_policy.py` | `SimpleHybridStrategy.__init__` 改为三组参数（`alpha` / `rr` / `tiny_lru`）+ 旧扁平键兼容路由，构造 `self.struct`（默认 `policy="off"` → `None`） |
+| `python/sglang/srt/mem_cache/evict_policy.py` | `SimpleHybridStrategy.__init__` 改为三组参数（`alpha` / `rr` / `tiny_lru`，扁平键与只读别名已删除），构造 `self.structState`（状态机）与 `self.TinyLru_evict`（适配器），默认 `policy="off"` 时二者均为 `None` |
 | `python/sglang/srt/mem_cache/simple_hybrid_radix_cache.py` | 淘汰委托 + `released <= 0` 防自旋 + `_evict_one` 上溯闸 |
 
 ### 16.2 钩子与代码位置
@@ -506,10 +526,11 @@ and not struct_policy.is_member(parent)          # 模板前缀不参与死链�
 | 插件 | 构造条件 | 状态 |
 |---|---|---|
 | `RrEvictPolicy` | `rr.fair_rr=True` | `_rr_last` / `_rr_seq` / `quota_breach`（原先散在策略里） |
-| `StructQueuePolicy` | `tiny_lru.policy="wtinylru"` | 三区索引 / share_count / aging |
+| `StructTinyLruPolicy`（包装 `StructQueueState`） | `tiny_lru.policy="wtinylru"` | 自身无状态；三区索引 / share_count / aging 都在状态机里 |
 
-`SimpleHybridStrategy.pick_agentic_rr_victim()` 与 `_loss_cap()` 保留为 **Deprecated shim**，
-转调 `self.rr_evict`，避免历史调用点炸掉。
+`StructQueueState` 由缓存层持有（钩子 + `owns`），`StructTinyLruPolicy` 只出现在
+`victim_overrides` 里。`pick_agentic_rr_victim()` / `_loss_cap()` 两个 Deprecated shim
+已删除（它们没有仓库内调用者，`RrEvictPolicy` 是唯一入口）。
 
 ### 16.3 与设计稿的三处偏差（均为实现期发现）
 
@@ -531,6 +552,6 @@ and not struct_policy.is_member(parent)          # 模板前缀不参与死链�
 --radix-eviction-policy-config '{"tiny_lru": {"policy": "wtinylru", "k": 3}}'
 ```
 
-`StructQueuePolicy.snapshot()` 返回 `window/probation/protected/parked` 条目与 token、
+`StructQueueState.snapshot()` 返回 `window/probation/protected/parked` 条目与 token、
 `admit/reject/retire/park/ages/dedup_hits/forced` 计数，供 §9 的指标接入。
 `forced` 是从 protected 兜底淘汰的次数：显著大于 0 说明 `struct_k` 太高或 window 太小。
