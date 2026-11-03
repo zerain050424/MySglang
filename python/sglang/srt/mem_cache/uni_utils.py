@@ -213,6 +213,47 @@ class TinyLRUParams:
         return dataclasses.asdict(self)
 
 
+@dataclasses.dataclass
+class TlruParams:
+    """T-LRU 的尾部预算（SimpleHybrid 的 QAGENT 候选修正用）。
+
+    threshold 与 next_prompt_estimate 都是 **token** 数；论文里以 block 为单位，
+    移植时需乘 page_size。语义：
+
+        budget = max(L + Q_hat - threshold, 0)
+
+    起点已越过 budget 的片段对下一轮 prefill 的尾部延迟再无贡献（tel-safe），
+    可以优先淘汰。threshold 必须 **大于** next_prompt_estimate，否则预算永远
+    不小于 L，没有任何节点会 tel-safe，T-LRU 退化成纯 LRU。
+    """
+
+    enabled: bool = False
+    threshold: int = 0
+    next_prompt_estimate: int = 0
+
+    def __post_init__(self):
+        if self.threshold < 0:
+            raise ValueError(f"tlru.threshold must be >= 0, got {self.threshold}")
+        if self.next_prompt_estimate < 0:
+            raise ValueError(
+                "tlru.next_prompt_estimate must be >= 0, "
+                f"got {self.next_prompt_estimate}"
+            )
+        if self.enabled and self.threshold <= self.next_prompt_estimate:
+            raise ValueError(
+                "tlru.threshold must be > tlru.next_prompt_estimate, got "
+                f"{self.threshold} <= {self.next_prompt_estimate}; otherwise no "
+                "tokens are ever TEL-safe and T-LRU is exactly LRU."
+            )
+
+    @classmethod
+    def from_any(cls, value=None) -> "TlruParams":
+        return _coerce_params(cls, value, name="tlru")
+
+    def as_dict(self) -> dict:
+        return dataclasses.asdict(self)
+
+
 @lru_cache(maxsize=8)
 def _cached_lognorm_params(mu: float, sigma: float):
     """Cache lognormal parameters to avoid recomputation."""
