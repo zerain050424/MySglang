@@ -232,6 +232,68 @@ def build_hybrid_arrival_schedule(tasks_config: Dict[str, Any],
     return events
 
 
+def build_phased_arrival_schedule(
+    phases_config: Dict[str, Any], base_dir: Optional[str] = None
+) -> List[SessionArrival]:
+    """Build one continuous arrival stream from consecutive phase definitions."""
+    task_defs = {task["name"]: task for task in phases_config.get("tasks", [])}
+    events: List[SessionArrival] = []
+    counter = 0
+    phase_offset = 0.0
+    task_offsets = {name: 0 for name in task_defs}
+
+    for phase in phases_config.get("phases", []):
+        duration_s = float(phase["duration_s"])
+        rates = phase["lambda_rate"]
+        for task_name, lambda_rate in rates.items():
+            task = dict(task_defs[task_name])
+            task["lambda_rate"] = float(lambda_rate)
+            task["phase"] = phase["name"]
+            count = int(phase.get("max_record", {}).get(task_name, 0))
+            if count <= 0 or lambda_rate <= 0:
+                continue
+
+            data_path = task["data_path"]
+            if base_dir and not os.path.isabs(data_path):
+                data_path = os.path.join(base_dir, data_path)
+            pool = load_sessions(
+                data_path,
+                task_offsets[task_name] + count,
+                seed=None,
+                shuffle=False,
+            )[task_offsets[task_name] :]
+            if len(pool) < count:
+                raise ValueError(
+                    f"phase {phase['name']!r} needs {count} sessions from "
+                    f"{task_name!r}, but only {len(pool)} are available"
+                )
+            task_offsets[task_name] += count
+
+            seed = task.get("seed", 42) + task.get("task_id", 0) + counter
+            rng = random.Random(seed)
+            rng.shuffle(pool)
+            arrival_times = generate_poisson_requests(
+                float(lambda_rate), count, seed
+            )
+            for session, relative_offset in zip(pool, arrival_times):
+                if relative_offset >= duration_s:
+                    continue
+                events.append(
+                    SessionArrival(
+                        phase_offset + relative_offset,
+                        counter,
+                        task_name,
+                        task,
+                        session,
+                    )
+                )
+                counter += 1
+        phase_offset += duration_s
+
+    events.sort(key=lambda event: (event.arrival_offset, event.counter))
+    return events
+
+
 # --------------------------------------------------------------------------
 # 统计
 # --------------------------------------------------------------------------
@@ -467,6 +529,7 @@ async def run_session(
                 ctok = r["cached_tokens"] or 0
                 stats.rows.append({
                     "task": task_name,
+                    "phase": task_cfg.get("phase"),
                     "session_id": sid,
                     "turn": t,
                     "prompt_tokens": ptok,
@@ -530,7 +593,22 @@ async def main_async(args: argparse.Namespace) -> Dict[str, Any]:
     async with aiohttp.ClientSession(  ## 复用TCP连接
         read_bufsize=10 * 1024**2,  # 高并发下放大读缓冲
     ) as http:
-        if args.tasks_config:
+        if args.phases_config:
+            with open(args.phases_config, encoding="utf-8") as f:
+                phases_config = yaml.safe_load(f)
+            base_dir = str(Path(args.phases_config).resolve().parent)
+            schedule = build_phased_arrival_schedule(phases_config, base_dir)
+            print(f"[Uni-Bench] phased mode: {len(schedule)} sessions")
+            tasks = [
+                asyncio.create_task(run_session(
+                    http, sem, ev.session, args, stats, url,
+                    task_cfg=ev.task_cfg,
+                    arrival_offset=ev.arrival_offset * args.arrival_scale,
+                ))
+                for ev in schedule
+            ]
+            await asyncio.gather(*tasks)
+        elif args.tasks_config:
             # ============================================================
             # 混合负载模式：多负载按 lambda_rate 比例混成一条到达流
             # ============================================================
@@ -597,6 +675,10 @@ async def main_async(args: argparse.Namespace) -> Dict[str, Any]:
         summary["mode"] = "hybrid"
         summary["tasks_config"] = args.tasks_config
         summary["arrival_scale"] = args.arrival_scale
+    elif args.phases_config:
+        summary["mode"] = "phased"
+        summary["phases_config"] = args.phases_config
+        summary["arrival_scale"] = args.arrival_scale
     else:
         summary["mode"] = "single"
         summary["data_path"] = args.data_path
@@ -617,6 +699,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="混合负载 tasks_config.yaml 路径（模仿 HeterCache tasks_config.yaml，"
              "含多个 task 的 data_path/lambda_rate/mu/sigma/seed/max_record）",
+    )
+    p.add_argument(
+        "--phases-config",
+        default=None,
+        help="四阶段混合流量 YAML（与 --data-path/--tasks-config 互斥）",
     )
     p.add_argument(
         "--arrival-scale",
@@ -649,8 +736,12 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     # 单负载 / 混合负载必须二选一
-    if not args.tasks_config and not args.data_path:
-        raise SystemExit("请指定 --data-path（单负载）或 --tasks-config（混合负载）")
+    if sum(bool(value) for value in (
+        args.data_path, args.tasks_config, args.phases_config
+    )) != 1:
+        raise SystemExit(
+            "请在 --data-path、--tasks-config、--phases-config 中选择一个"
+        )
 
     summary, stats = asyncio.run(main_async(args))
     print("\n================ Uni-Bench 结果 ================")

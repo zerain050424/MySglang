@@ -133,3 +133,45 @@ bash Uni-Bench/run_all.sh
 
 把 `POLICIES` 改成 `"lru lfu slru simple_hybrid"` 即可多基线对比（这些策略都在
 `RADIX_EVICTION_POLICY_CHOICES` 里，无需 `--enable-simple-hybrid`）。
+
+## 四阶段负载自动预测准确率实验
+
+`phased_load_prediction.yaml` 使用现有四类 session 数据，按以下顺序生成一条连续
+到达流：
+
+1. `mixed`：Codeparrot、AgentBank apps、ShareGPT、AgentBank alfred 为 `1:1:1:1`；
+2. `struct_dominant`：Codeparrot 为主，比例 `4:1:1:1`；
+3. `chat_dominant`：ShareGPT 为主，比例 `1:1:4:1`；
+4. `agentic_dominant`：AgentBank alfred 为主，比例 `1:1:1:4`。
+
+结构复用真值仅指 Codeparrot；AgentBank apps 保留为 `random`。先启动服务，再运行：
+
+```bash
+POLICY=simple_hybrid MAX_TOTAL_TOKENS=100000 bash serve.sh
+source env.sh
+"$PY" bench_unicache.py \
+  --phases-config phased_load_prediction.yaml \
+  --base-url http://127.0.0.1:30000 \
+  --concurrency 32 --arrival-scale 1 --wait-scale 1 \
+  --output result/phased_load_prediction.json
+```
+
+服务器需要打开 workload 占用采样，才能从现有缓存分类结果计算预测标签：
+
+```bash
+SGLANG_WORKLOAD_OCC_LOG=1 SGLANG_WORKLOAD_OCC_INTERVAL=30 \
+  POLICY=simple_hybrid MAX_TOTAL_TOKENS=100000 bash serve.sh
+```
+
+实验输出的 CSV 保存真实数据集标签，`evaluate_load_prediction.py` 读取 CSV 与带时间戳
+的 `[workload occ]` 日志，按默认 60 秒窗口、30 秒步长和 10% 主导差距计算窗口级准确率：
+
+```bash
+"$PY" evaluate_load_prediction.py \
+  --requests-csv result/phased_load_prediction.csv \
+  --occ-log result/server_simple_hybrid_100000.log \
+  --output result/phased_load_prediction_accuracy.json
+```
+
+结果中的 `accuracy` 是排除 `mixed` 和 `unknown` 窗口后的窗口级准确率，`coverage` 是
+有效窗口中具有自动预测结果的比例，`by_phase` 给出四个阶段的分项结果。

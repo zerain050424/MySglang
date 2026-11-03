@@ -265,9 +265,8 @@ class TreeNode: ## TreeNode 是基数树（RadixTree）的节点，每个节点�
         self.parent: TreeNode = None
         self.key: RadixKey = None
         self.value: Optional[torch.Tensor] = None ##挂在在节点上的缓存值，通常是KV缓存的索引或数据片段
-        ## SimpleHYBRID：本节点片段第一个 token 在整条序列中的绝对偏移（从根算起）。
+        ## 本节点片段第一个 token 在整条序列中的绝对偏移（从根算起）。
         ## abs_start + len(value) 即 HeterCache/vLLM 的 num_hashed_tokens（片段结束偏移）。
-        ## 注意：radix 片段长度由「共享拓扑」决定，与序列位置无关，二者不可混用。
         self.abs_start = abs_start
         self.lock_ref = 0 ## 节点的锁引用计数，表示有多少请求正在使用该节点及其子树，防止被驱逐。
         self.last_access_time = time.monotonic() ## 节点的最后访问时间，用于LRU等驱逐策略。
@@ -283,7 +282,7 @@ class TreeNode: ## TreeNode 是基数树（RadixTree）的节点，每个节点�
 
         # is_decode: generated-output (decode) portion, never reused, evict first.
         self.priority = priority
-        self.queue_tag = SimpleHybridQueueTag.QTRANS
+        self.queue_tag = SimpleHybridQueueTag.QTRANS ## 负载类型
         self.is_decode = False
         # SimpleHYBRID：节点归属的会话（用于会话级缺口记账，见 uni_utils.SessionRegistry）
         self.session_id: Optional[str] = None
