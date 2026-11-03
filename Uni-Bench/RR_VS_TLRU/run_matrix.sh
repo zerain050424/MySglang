@@ -76,8 +76,8 @@ start_server() {  # $1=arm $2=budget
   PORT=$PORT bash serve_arm.sh "$1" "$2" "configs/arm_$1.json"
 }
 
-run_one() {  # $1=arm $2=mode $3=budget $4=seed
-  local arm=$1 mode=$2 budget=$3 seed=$4
+run_one() {  # $1=arm $2=mode $3=budget $4=seed $5=当前 server 的日志路径
+  local arm=$1 mode=$2 budget=$3 seed=$4 log=${5:-}
   local out="result/${arm}/${mode}/${budget}"
   mkdir -p "$out"
   if [ -f "$out/${seed}.json" ]; then
@@ -86,6 +86,12 @@ run_one() {  # $1=arm $2=mode $3=budget $4=seed
   fi
 
   flush_cache || true
+  # 复用 server 时日志是合一的：记下当前行号，bench 结束后只取新增部分，
+  # 这样每个 seed 的 profile 与 server 日志切片都是「本轮自己的」。
+  local mark=0
+  if [ -n "$log" ] && [ -f "$log" ]; then
+    mark=$(wc -l < "$log")
+  fi
   echo "[matrix] bench arm=${arm} mode=${mode} budget=${budget} seed=${seed}"
   "$PY" "$BENCH_DIR/bench_unicache.py" \
     --tasks-config "$TASKS_CONFIG" \
@@ -101,8 +107,11 @@ run_one() {  # $1=arm $2=mode $3=budget $4=seed
     --output "$out/${seed}.json" \
     2>&1 | tee "$out/bench_${seed}.log"
 
-  grep -E "victim_src:|tlru:|one_shot_evicted=|pool=" "$out/server_${seed}.log" \
-    > "$out/profile_${seed}.txt" 2>/dev/null || true
+  if [ -n "$log" ] && [ -f "$log" ]; then
+    tail -n "+$((mark + 1))" "$log" > "$out/server_${seed}.log"
+    grep -E "victim_src:|tlru:|one_shot_evicted=|pool=" "$out/server_${seed}.log" \
+      > "$out/profile_${seed}.txt" || true
+  fi
 
   "$PY" - "$out" "$arm" "$mode" "$budget" "$seed" <<'META'
 import json, pathlib, sys
@@ -145,10 +154,7 @@ for budget in $BUDGETS; do
       fi
       for mode in $RESUME_MODES; do
         for seed in $SEEDS; do
-          run_one "$arm" "$mode" "$budget" "$seed"
-          # 共享 server 的日志是合一的：给每个 seed 留一份切片，便于事后查 profile
-          mkdir -p "result/${arm}/${mode}/${budget}"
-          cp "$shared_log" "result/${arm}/${mode}/${budget}/server_${seed}.log" 2>/dev/null || true
+          run_one "$arm" "$mode" "$budget" "$seed" "$shared_log"
         done
       done
       kill "$SERVER_PID" 2>/dev/null || true
@@ -168,7 +174,7 @@ for budget in $BUDGETS; do
             kill "$SERVER_PID" 2>/dev/null || true
             exit 1
           fi
-          run_one "$arm" "$mode" "$budget" "$seed"
+          run_one "$arm" "$mode" "$budget" "$seed" "$out/server_${seed}.log"
           kill "$SERVER_PID" 2>/dev/null || true
           wait "$SERVER_PID" 2>/dev/null || true
           stop_server
