@@ -32,9 +32,10 @@ echo "[serve_arm] arm=$ARM budget=$BUDGET port=$PORT config=$CONFIG"
 echo "[serve_arm] policy_config=$CFG"
 
 cd "$BENCH_DIR/.."                   # sglang 仓库根
+# 只靠 --enable-simple-hybrid 选择后端（与 Uni-Bench/serve.sh 一致）；
+# 不要再传 --radix-cache-backend，两条路径会互相干预。
 exec "$PY" -m sglang.launch_server \
   --model-path "$MODEL" \
-  --radix-cache-backend simple_hybrid \
   --radix-eviction-policy simple_hybrid \
   --enable-simple-hybrid \
   --radix-eviction-policy-config "$CFG" \
