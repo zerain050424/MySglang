@@ -13,3 +13,13 @@
 - **`_reuse_score` 的 0 分陷阱**：struct 节点 `end_offset >= max_offset(2048)` 时位置分为 0，
   在 `victim_key` 里会变成首选。当前因 `pick()` 不可达而无害，但一旦 `elif` 分支可达就会咬人。
   候选修法：非一次性节点不要用位置打分，直接用 `(1, last_access_time)`。
+
+## 已搁置的下一靶心（未执行）
+
+主指标 `template_intact_min` 已到天花板（93.33 = 1−64/960）。若要继续优化，
+建议把主指标换成 **`hit_min_over_pools` = min(A3 总命中率) over {25k, 250k}**
+（当前 50.77，A0 同口径 51.49，有 0.7pp headroom），并以
+`template_intact_min >= 93` 作为硬约束。对应假设：带内改 LRU 后预热已被覆盖，
+`share_min` 从 2 提到 3 可缩小保护段、给会话内私有内容腾地方。
+`.auto/remote_eval.py` 曾改到一半（POOLS=[25000,250000] + 新增 5 个指标）后回滚，
+未执行测量。

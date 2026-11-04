@@ -350,7 +350,7 @@ class SlruEvictPolicy(VictimOverride):
 
     @staticmethod
     def share_of(node) -> int:
-        """节点已被多少个会话用过（含创建者：插入时即计 1）。"""
+        """节点已被多少个不同会话命中过（创建者首次重读计 1）。"""
         return int(getattr(node, "share_sessions", 0) or 0)
 
     # ------------------------------------------------------------ 插件接口
