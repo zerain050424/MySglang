@@ -122,8 +122,9 @@ python -m wtl.synth --out-dir data/exp/D2 \
 约束（违反就静默失真）：
 
 1. **`turns < 5`**：否则分类器判 AGENTIC/CHAT，节点不再进一次性带，靶子失效。
-2. **出生块必须放 2 个会话**：模板要在第一个 burst 之前把 `share_sessions` 顶到
-   `share_min`，否则它还是 one-shot，会被死链级联删掉。
+2. **出生块必须放 2 个会话**：创建者在插入时即计入 `share_sessions`（=1），
+   所以第一个外部会话命中就达标 `share_min=2`；出生块放 2 个会话是为了让这件事在
+   本块的 burst 之前发生，否则模板还是 one-shot，会被死链级联删掉。
 3. **私有上下文必须唯一 token**：多个会话共用会让 `share_sessions` 上涨，
    把「频次伪造」的靶子变成真模板。
 4. 私有上下文越大、模板复发间隔越长，A3 与 A0/A1 的差距应单调变大（H6）。

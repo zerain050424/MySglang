@@ -152,9 +152,13 @@ python -m wtl.replay --arm A3 --data-path data/synth_p2048_b10/session_data.json
     one_shot(node) = 会话类型 ∈ {TRANS, STRUCT} 且 share_sessions < share_min
     受保护(node)   = STRUCT 且 share_sessions >= share_min
 
-* `share_sessions` 由 `SlruEvictPolicy.on_node_hit()` 记账：不同会话命中同一节点才 +1，
-  同一会话由 `session_bloom` 去重。**同一会话反复读自己的私有上下文，永远涨不上去**
-  ——这正是它和上游 SLRU（按 `hit_count` 晋升）分出胜负的地方。
+* `share_sessions` 由 `SlruEvictPolicy` 记账：**每个不同会话 +1，创建者在插入那一刻
+  就计入**，同一会话（含创建者后续轮次的重读）由 `session_bloom` 去重。所以
+  `share_min=2` = 「共 2 个会话用过」= 创建者 + 1 次外部命中。**同一会话反复读自己的
+  私有上下文永远涨不上去**——这正是它和上游 SLRU（按 `hit_count` 晋升）分出胜负的地方。
+* 为什么插入就记创建者：计数只对活节点有意义，节点被删即归零。若不计创建者，
+  共享前缀要等第二次外部命中才达标，这段窗口里它仍是一次性内容，会被 one-shot 带
+  连同死链级联删掉，重建后计数又从 0 开始——高压力下保护状态永远建立不起来。
 * 一次性内容进硬优先带，按「树上结束偏移最深优先」清空，并沿死链级联删除；
 * 受保护段内按 LRU 挑候选（`pick` = 最久未访问者）。
 

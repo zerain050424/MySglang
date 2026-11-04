@@ -301,10 +301,10 @@ class SimpleHybridStrategy(EvictionStrategy):
         共享数才是「还会不会被复用」的证据。典型反例：TRANS 会话插入的
         文档段后来被别的会话反复命中——标签仍挂着 QTRANS，但它是热前缀。
 
-        `share_sessions >= share_min` = 除创建者外还有 >=2 个会话命中过
-        （共 >=3 个），属于跨会话模板，不进一次性带——即使它的创建者当初
-        被判成 TRANS。阈值取自 `SlruParams.share_min`，与
-        `SlruEvictPolicy.applies_to` 是同一个值。
+        `share_sessions >= share_min` = 已被 >=2 个会话用过（**创建者在插入时
+        即计入**，所以是「创建者 + 1 次外部命中」），属于跨会话模板，
+        不进一次性带——即使它的创建者当初被判成 TRANS。阈值取自
+        `SlruParams.share_min`，与 `SlruEvictPolicy.applies_to` 是同一个值。
         """
         st = self.session_registry.get(getattr(node, "session_id", None))
         if st is None:

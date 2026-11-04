@@ -288,8 +288,14 @@ class SlruEvictPolicy(VictimOverride):
     节点的初值（`TreeNode.__init__`）与分裂继承（`_split_node`）属于树结构维护，
     仍留在 radix_cache；本类只读它们。
 
-    计数口径：不同**会话**命中同一节点才 +1；创建者自己的插入不计，
-    同一会话重复命中由 `session_bloom` 去重，饱和在 `SESSION_SHARE_MAX`。
+    计数口径：**每个不同会话 +1，创建者在插入那一刻就计入**，同一会话
+    （含创建者后续轮次的重读）由 `session_bloom` 去重，饱和在 `SESSION_SHARE_MAX`。
+    因此 ``share_min = 2`` 表示「共 2 个会话用过」＝创建者 + 1 次外部命中。
+
+    为什么要记创建者：计数只对活节点有意义，节点被删就归零。若不计创建者，
+    共享前缀要等第二次外部命中才达标，这段窗口里它仍是一次性内容，
+    会被 one-shot 带连同死链一起删掉，重建后计数又从 0 开始——高压力下
+    保护状态会永远建立不起来。
 
     候选修正
     --------
@@ -319,27 +325,49 @@ class SlruEvictPolicy(VictimOverride):
 
     # ------------------------------------------------------------ 共享会话数账本
 
+    def _record_session(self, node, session_id) -> bool:
+        """把 (node, session) 记进账本；已记过则去重。返回是否真的新增。"""
+        if node is None or not session_id:
+            return False
+        bits = session_bloom_bits(session_id)
+        if getattr(node, "session_bloom", 0) & bits == bits:
+            self.share_dedup += 1
+            return False
+        node.session_bloom = getattr(node, "session_bloom", 0) | bits
+        node.share_sessions = min(
+            SESSION_SHARE_MAX, int(getattr(node, "share_sessions", 0) or 0) + 1
+        )
+        self.share_counted += 1
+        return True
+
+    def on_node_inserted(self, node) -> None:
+        """插入期记账：**创建者当场计入**（share: 0 -> 1）。
+
+        为什么要在插入时记：`share_sessions` 只统计「对活节点的命中」，
+        节点一被删计数就归零。若不把创建者算上，模板要等**第二次**外部命中
+        才达标；在这段窗口里它仍是 one-shot，会被 one-shot 带连同死链级联删掉，
+        重建后计数从 0 开始 —— 高压力下模板会长期卡在阈值以下。
+
+        同时写入 bloom 位：否则创建者自己后续那几轮重读会再 +1，
+        同会话独享的私有上下文就会被误判成「被多个会话用过」。
+
+        由 `RadixCache._insert_observers` 在新建节点 / 分裂出的父节点之后调用；
+        分裂时父节点已从子节点继承了 `share_sessions` 与 `session_bloom`，
+        这里若该会话已在位则自动去重，不会重复计数。
+        """
+        self._record_session(node, getattr(node, "session_id", None))
+
     def on_node_hit(self, node, session_id=None) -> None:
         """命中路径的记账钩子：不同会话数 +1（同一会话去重）。
 
         由缓存层 `RadixCache._record_node_hit()` 在更新 `queue_tag` 之前调用，
         保证同一次命中里账本与标签看到的是同一份事实。
         """
-        if node is None or not session_id:
-            return
-        bits = session_bloom_bits(session_id)
-        if getattr(node, "session_bloom", 0) & bits == bits:
-            self.share_dedup += 1
-            return
-        node.session_bloom = getattr(node, "session_bloom", 0) | bits
-        node.share_sessions = min(
-            SESSION_SHARE_MAX, int(getattr(node, "share_sessions", 0) or 0) + 1
-        )
-        self.share_counted += 1
+        self._record_session(node, session_id)
 
     @staticmethod
     def share_of(node) -> int:
-        """节点已被多少个「其他会话」命中过（创建者不计）。"""
+        """节点已被多少个会话用过（含创建者：插入时即计 1）。"""
         return int(getattr(node, "share_sessions", 0) or 0)
 
     # ------------------------------------------------------------ 插件接口

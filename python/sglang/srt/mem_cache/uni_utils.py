@@ -199,9 +199,10 @@ class SlruParams:
 
     配置形式：``--radix-eviction-policy-config '{"slru": {"share_min": 2}}'``。
 
-    共享数由 `SlruEvictPolicy.on_node_hit()` 记账（见 victim_override）：
-    除创建者外每多一个会话命中同一节点就 +1，同一会话由 `session_bloom` 去重。
-    因此 `share_min = 2` 意味着「共 3 个会话用过」才算跨会话模板，才开始受保护；
+    共享数由 `SlruEvictPolicy` 记账（见 victim_override）：**每个不同会话 +1，
+    创建者在节点插入那一刻就计入**，同一会话（含创建者后续轮次的重读）由
+    `session_bloom` 去重。因此 `share_min = 2` 意味着「共 2 个会话用过」
+    ＝创建者 + 1 次外部命中，才算跨会话模板、才开始受保护；
     低于该值的节点（以及 TRANS 会话的节点）进 one-shot 带优先淘汰。
     """
 

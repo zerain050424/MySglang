@@ -43,13 +43,14 @@ def check(cond, msg):
 class FakeNode:
     """TreeNode 的最小替身：只带 one-shot / SLRU 判定读的字段。"""
 
-    def __init__(self, session_id=None, tag=SimpleHybridQueueTag.QTRANS, decode=False):
+    def __init__(self, session_id=None, tag=SimpleHybridQueueTag.QTRANS, decode=False,
+                 share_sessions=0):
         self.value = [0] * 16
         self.key = [0] * 16
         self.session_id = session_id
         self.queue_tag = tag
         self.is_decode = decode
-        self.share_sessions = 0
+        self.share_sessions = share_sessions
         self.session_bloom = 0
         self.abs_start = 0
         self.last_access_time = 0.0
@@ -133,6 +134,43 @@ def test_queue_tag_is_irrelevant():
           "a QTRANS-tagged but widely reused node must leave the one-shot band")
     check(reused.queue_tag == SimpleHybridQueueTag.QTRANS,
           "sanity: the tag itself was never consulted")
+
+
+def test_creator_counted_at_insert():
+    """插入即记创建者：share 0->1，且自读去重（私有上下文不会误达标）。"""
+    print("[4b] creator is counted at insert; self re-reads dedup")
+    st, _ = make_strategy({"s1": SessionType.STRUCT})
+    node = FakeNode(session_id="s1")
+
+    st.slru_evict.on_node_inserted(node)
+    check(node.share_sessions == 1, f"insert must count creator, got {node.share_sessions}")
+    check(node.session_bloom != 0, "creator's bloom bits must be written at insert")
+    check(st.is_one_shot(node) is True, "share=1 (<min) is still one-shot")
+
+    # 创建者后续轮次重读：必须去重
+    for _ in range(3):
+        st.slru_evict.on_node_hit(node, "s1")
+    check(node.share_sessions == 1, f"self re-reads must dedup, got {node.share_sessions}")
+    check(st.is_one_shot(node) is True, "private context must stay one-shot")
+    check(st.slru_evict.applies_to(node) is False, "private context must not be protected")
+
+    # 1 次外部命中即达阈值（这正是本次修改的目的）
+    st.slru_evict.on_node_hit(node, "s2")
+    check(node.share_sessions == 2, f"one foreign hit must reach min, got {node.share_sessions}")
+    check(st.is_one_shot(node) is False, "cross-session template leaves the band")
+    check(st.slru_evict.applies_to(node) is True, "cross-session template is protected")
+
+    # 分裂出的父节点继承计数后不重复计
+    split_parent = FakeNode(session_id="s1", share_sessions=1)
+    split_parent.session_bloom = node.session_bloom
+    st.slru_evict.on_node_inserted(split_parent)
+    check(split_parent.share_sessions == 1,
+          f"split parent must not double count, got {split_parent.share_sessions}")
+
+    # 无 session 的节点不记
+    orphan = FakeNode(session_id=None)
+    st.slru_evict.on_node_inserted(orphan)
+    check(orphan.share_sessions == 0, "node without session must not be counted")
 
 
 def test_no_session_is_not_one_shot():
@@ -220,6 +258,7 @@ def main():
         test_struct_threshold,
         test_multiturn_never_one_shot,
         test_queue_tag_is_irrelevant,
+        test_creator_counted_at_insert,
         test_no_session_is_not_one_shot,
         test_is_one_shot_and_applies_to_agree,
         test_works_under_force_agentic,
