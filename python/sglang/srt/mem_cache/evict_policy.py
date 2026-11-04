@@ -320,11 +320,18 @@ class SimpleHybridStrategy(EvictionStrategy):
         return workload_label_of(self._task_type_of(node))
 
     def one_shot_key(self, node) -> tuple:
+        """one-shot 带内排序：最久未访问者先走（LRU）。
+
+        原先用「树上结束偏移最深优先」(`-end_offset`)，理由是序列尾部最不可能
+        被当作前缀复用。但它有个反效果：**刚插入、正在预热的一次性链**
+        （例如模板会话的 [变体+私有] 段，end_offset ≈ 2850）比同块里那些
+        2048 token 的扫描文档「更深」，于是预热中的模板链会被优先清掉，
+        等不到第二次跨会话命中就消失，保护永远建立不起来。
+
+        改成 LRU 后，同块内刚被读过的内容（含预热中的模板链）排在
+        早已插完、之后再没被碰过的扫描文档之后，预热窗口才真正存在。
         """
-        one-shot 带内排序：树上结束偏移最深的块先淘汰。
-        口径对齐 HeterCache 的 evict_first 堆键（-num_hashed_tokens，
-        即块的绝对结束位置）：序列里越靠后的生成段越先走。"""
-        return (-_node_end_offset(node), node.last_access_time)
+        return (node.last_access_time,)
 
     # ---- online alpha balancing ----
 
