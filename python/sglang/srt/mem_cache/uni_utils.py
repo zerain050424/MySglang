@@ -45,7 +45,7 @@ def session_bloom_bits(session_id) -> int:
     """session_id -> 64 bit bloom（4 函数），饱和在 ~8 个会话后误判率上升。
 
     位布局归共享会话数账本的所有者（SlruEvictPolicy）使用；
-    节点上的 ``session_bloom`` 语义因此与 tiny_lru 的开关无关。
+    节点上的 ``session_bloom`` 语义因此与任何标签策略无关。
     """
     text = "sid:" + (session_id if isinstance(session_id, str) else str(session_id))
     h = zlib.crc32(text.encode("utf-8", "replace")) & 0xFFFFFFFF
@@ -75,10 +75,10 @@ def session_type_to_queue_tag(session_type: SessionType) -> SimpleHybridQueueTag
 #
 #   AlphaParams   : alpha 在线权重的反馈控制（全局、每 update_interval 跑一次）
 #   RrParams      : Agentic 会话级轮询配额（跨会话公平）
-#   TinyLRUParams : Q_struct 队列内部的 W-TinyLRU（队内驻留/准入，见 STRUCT_QUEUE_WTINYLRU.md）
+#   SlruParams    : SLRU 的共享会话数阈值（决定 one-shot 分界与保护范围）
 # 用 dataclass 而不是裸 kwargs，是为了让 `eviction_policy_config` 有层级、能校验、能整体
 # 复制/日志/消融；旧的扁平键（alpha_smooth / fair_rr / struct_k ...）已删除，
-# 配置只接受 {"alpha":{...},"rr":{...},"tiny_lru":{...}} 分组形式。
+# 配置只接受 {"alpha":{...},"rr":{...},"slru":{...}} 分组形式。
 # ---------------------------------------------------------------------------
 
 
@@ -188,52 +188,35 @@ class RrParams:
 #
 # 语义：除创建者外还有 >= N 个会话命中过同一节点（即共 >= N+1 个会话用过）。
 # 它同时决定两件事，两处必须同源，所以只允许配置一处：
-#   * TagLruPolicy.apply_tag  : 是否晋升为 QSTRUCT（标签口径）
-#   * SlruEvictPolicy         : 是否受 SLRU 保护 / 是否退出 one-shot 带
-DEFAULT_STRUCT_SHARE_MIN = 2
+#   * SlruEvictPolicy.applies_to       : 是否受 SLRU 保护（进候选池）
+#   * SimpleHybridStrategy.is_one_shot : 是否退出 one-shot 带
+DEFAULT_SHARE_MIN = 2
 
 
 @dataclasses.dataclass
-class TinyLRUParams:
-    """Q_struct 队内的标签版 TinyLRU（分类即晋升，不做跨队列仲裁）。
+class SlruParams:
+    """SLRU 的共享会话数阈值。
 
-    policy="off" 时策略完全不构造，所有钩子判空跳过（零开销）。
-    完整语义见 python/sglang/srt/mem_cache/TAG_LRU.md。
+    配置形式：``--radix-eviction-policy-config '{"slru": {"share_min": 2}}'``。
+
+    共享数由 `SlruEvictPolicy.on_node_hit()` 记账（见 victim_override）：
+    除创建者外每多一个会话命中同一节点就 +1，同一会话由 `session_bloom` 去重。
+    因此 `share_min = 2` 意味着「共 3 个会话用过」才算跨会话模板，才开始受保护；
+    低于该值的节点（以及 TRANS 会话的节点）进 one-shot 带优先淘汰。
     """
 
-    # "off" | "tag_lru"（默认）
-    policy: str = "tag_lru"
-    # 会话共享判定口径 —— "session"（默认，不同会话数）| "rid"（不同请求数，消融）
-    share_metric: str = "session"
-    # 会话共享数达到该值才算「跨会话模板」；默认 2（即 >1）。
-    # 同时是 SLRU 的保护阈值与 one-shot 的分界（见 DEFAULT_STRUCT_SHARE_MIN）。
-    struct_share_min: int = DEFAULT_STRUCT_SHARE_MIN
-    # 会话内热点（share_sessions==1）的处置 —— "chat"（默认，保留复用）| "one_shot"
-    local_hot: str = "chat"
+    share_min: int = DEFAULT_SHARE_MIN
 
     def __post_init__(self):
-        if self.policy not in ("off", "tag_lru"):
+        if self.share_min < 2:
             raise ValueError(
-                f"Unknown tiny_lru.policy: {self.policy}. Supported: 'off', 'tag_lru'."
-            )
-        if self.share_metric not in ("session", "rid"):
-            raise ValueError(
-                "tiny_lru.share_metric must be 'session' or 'rid', "
-                f"got {self.share_metric}"
-            )
-        if self.local_hot not in ("chat", "one_shot"):
-            raise ValueError(
-                f"tiny_lru.local_hot must be 'chat' or 'one_shot', got {self.local_hot}"
-            )
-        if self.struct_share_min < 2:
-            raise ValueError(
-                "tiny_lru.struct_share_min must be >= 2 (>1 个会话才算共享), "
-                f"got {self.struct_share_min}"
+                "slru.share_min must be >= 2 (>1 个外部会话才算共享), "
+                f"got {self.share_min}"
             )
 
     @classmethod
-    def from_any(cls, value=None) -> "TinyLRUParams":
-        return _coerce_params(cls, value, name="tiny_lru")
+    def from_any(cls, value=None) -> "SlruParams":
+        return _coerce_params(cls, value, name="slru")
 
     def as_dict(self) -> dict:
         return dataclasses.asdict(self)

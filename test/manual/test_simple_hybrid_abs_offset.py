@@ -36,6 +36,9 @@ from sglang.srt.mem_cache.simple_hybrid_radix_cache import (  # noqa: E402
 from sglang.srt.mem_cache.evict_policy import SimpleHybridStrategy  # noqa: E402
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey  # noqa: E402
 from sglang.srt.mem_cache.uni_utils import (  # noqa: E402
+    SessionRegistry,
+    SessionState,
+    SessionType,
     SimpleHybridQueueTag,
     SimpleHybridTaskType,
 )
@@ -746,11 +749,30 @@ def test_workload_and_band_are_orthogonal():
     """
     print("[18] workload label vs eviction band must be orthogonal")
     st = SimpleHybridStrategy()
+    # one-shot 判定看「会话类型 + 跨会话共享数」，因此节点需要会话证据。
+    reg = SessionRegistry()
+    st.session_registry = reg
+    st.slru_evict.session_registry = reg
+    for sid, stype in (
+        ("ag", SessionType.AGENTIC),
+        ("rnd", SessionType.TRANS),
+        ("code", SessionType.STRUCT),
+    ):
+        reg._sessions[sid] = SessionState(session_id=sid, session_type=stype)
+
     prompt = _mk_node(32, 0, task_type=SimpleHybridTaskType.MULTI_TURN_AGENTIC)
+    prompt.session_id = "ag"
     resp = _mk_node(32, 32, task_type=SimpleHybridTaskType.MULTI_TURN_AGENTIC)
     resp.is_decode = True
+    resp.session_id = "ag"
     rnd = _mk_node(32, 0, task_type=SimpleHybridTaskType.RANDOM_SINGLE_TURN)
+    rnd.session_id = "rnd"
     code = _mk_node(32, 0, task_type=SimpleHybridTaskType.STRUCT_SINGLE_TURN)
+    code.session_id = "code"
+    shared = _mk_node(32, 0, task_type=SimpleHybridTaskType.STRUCT_SINGLE_TURN)
+    shared.session_id = "code"
+    # 被 >= share_min 个外部会话命中过：跨会话模板，退出 one-shot 带
+    shared.share_sessions = st.slru_evict.share_min
 
     check(st.workload_of(prompt) == "agentic", "agentic prompt workload")
     check(
@@ -758,6 +780,14 @@ def test_workload_and_band_are_orthogonal():
         "多轮 agentic 的 response 应留在 agentic 队列，而不是 one-shot",
     )
     check(st.is_one_shot(rnd), "random request is one-shot")
+    check(
+        st.is_one_shot(code),
+        "STRUCT 会话里未被跨会话复用的前缀仍是一次性内容",
+    )
+    check(
+        not st.is_one_shot(shared),
+        "STRUCT 前缀一旦被 >=share_min 个外部会话复用就不再是一次性内容",
+    )
     check(st.workload_of(rnd) == "random", "apps/mind2web must not fold into 'single'")
     check(st.workload_of(code) == "struct", "codeparrot workload = struct")
 
@@ -767,20 +797,37 @@ def test_workload_occ_accounting_adds_up():
     print("[19] workload occupancy accounting must add up")
     cache = _sh_cache()
 
-    def ins(tokens, task, decode_start=None):
+    # one-shot 判定看会话类型 + 共享数，所以插入时要带 session_id 并预先登记类型
+    reg = cache.session_registry
+    for sid, stype in (
+        ("ag", SessionType.AGENTIC),
+        ("rnd", SessionType.TRANS),
+        ("code", SessionType.STRUCT),
+    ):
+        reg._sessions[sid] = SessionState(session_id=sid, session_type=stype)
+
+    def ins(tokens, task, decode_start=None, session_id=None):
         result = cache.insert(
             InsertParams(
                 key=RadixKey(array("q", tokens)),
                 value=torch.tensor(tokens, dtype=torch.int64),
                 decode_start=decode_start,
+                session_id=session_id,
             )
         )
         result.last_device_node.queue_tag = _queue_tag_for(task)
+        return result.last_device_node
 
-    ins(list(range(0, 1000)), SimpleHybridTaskType.MULTI_TURN_AGENTIC, decode_start=1000)
-    ins(list(range(0, 2000)), SimpleHybridTaskType.MULTI_TURN_AGENTIC, decode_start=1000)
-    ins(list(range(5000, 5100)), SimpleHybridTaskType.RANDOM_SINGLE_TURN)
-    ins(list(range(9000, 9100)), SimpleHybridTaskType.STRUCT_SINGLE_TURN)
+    ins(list(range(0, 1000)), SimpleHybridTaskType.MULTI_TURN_AGENTIC,
+        decode_start=1000, session_id="ag")
+    ins(list(range(0, 2000)), SimpleHybridTaskType.MULTI_TURN_AGENTIC,
+        decode_start=1000, session_id="ag")
+    ins(list(range(5000, 5100)), SimpleHybridTaskType.RANDOM_SINGLE_TURN,
+        session_id="rnd")
+    shared = ins(list(range(9000, 9100)), SimpleHybridTaskType.STRUCT_SINGLE_TURN,
+                 session_id="code")
+    # 把 struct 前缀标记成「已被足够多外部会话复用」：它应退出 one-shot 带
+    shared.share_sessions = cache.eviction_strategy.slru_evict.share_min
 
     wl = cache._per_workload_token_count()
     cap = cache._schedulable_per_alpha_key(wl)
@@ -796,7 +843,11 @@ def test_workload_occ_accounting_adds_up():
     check(rn.get("total") == 100, f"random total={rn.get('total')}, expected 100")
     check(rn.get("one_shot") == 100, "random 全部是一次性内容")
     cd = wl.get("struct", {})
-    check(cd.get("one_shot") == 0, f"struct one_shot={cd.get('one_shot')}, expected 0")
+    check(cd.get("one_shot") == 0,
+          f"struct one_shot={cd.get('one_shot')}, expected 0 (已跨会话复用)")
+
+    for sid in ("ag", "rnd", "code"):
+        reg._sessions.pop(sid, None)
 
     tot_total = sum(v["total"] for v in wl.values())
     tot_os = sum(v["one_shot"] for v in wl.values())

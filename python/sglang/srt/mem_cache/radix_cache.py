@@ -289,13 +289,9 @@ class TreeNode: ## TreeNode 是基数树（RadixTree）的节点，每个节点�
         self.is_decode = False
         # SimpleHYBRID：节点归属的会话（用于会话级缺口记账，见 uni_utils.SessionRegistry）
         self.session_id: Optional[str] = None
-        # Q_struct 队内 W-TinyLRU：不同 rid 数 + rid 布隆 + 区归属（0=非成员）
-        self.share_count = 0
-        self.rid_bloom = 0
-        # A：不同会话数（结构复用口径）+ 会话 bloom
+        # 跨会话共享数 + 会话 bloom（写者是 SlruEvictPolicy.on_node_hit）
         self.share_sessions = 0
         self.session_bloom = 0
-        self.struct_region = 0
         # T-LRU（单例 tlru.enabled）：tokens root->self 与分支高水位。
         # 只在开启时由 TlruEvictPolicy.on_node_inserted() 写入，其余策略恒 0。
         self._tlru_cached_prefix_len = 0
@@ -364,9 +360,6 @@ class RadixCache(BasePrefixCache):
         self._alpha_updater = getattr(
             self.eviction_strategy, "maybe_update_alpha", None
         )
-        # Q_struct 队内策略（标签版 TinyLRU）：只维护「会话共享数 + 标签」。
-        # 关闭时所有调用点都是 `is not None` 的一次判空。
-        self.tag_policy = getattr(self.eviction_strategy, "tagState", None)
         # 实验开关（SimpleHybridStrategy.force_agentic）：把所有节点直接标成 QAGENT，
         # 让 QAGENT-only 的插件（RR / T-LRU）拿到 100% 的流量。只改 queue_tag，
         # 不动 session_type —— 分类器自身的统计仍然可测。
@@ -386,8 +379,8 @@ class RadixCache(BasePrefixCache):
             if hasattr(ov, "on_node_inserted")
         )
         # 需要命中期记录的插件（目前是 SLRU 的共享会话数账本）。
-        # 特意不经过 tag_policy：`tiny_lru.policy="off"` / `force_agentic` 时
-        # 共享数仍然要被记录，否则 SLRU 的准入条件会退化成恒真/恒假。
+        # 不经过任何标签策略：`force_agentic` 等实验开关下账本同样要维护，
+        # 否则 SLRU 的准入条件会退化成恒真/恒假。
         self._hit_observers = tuple(
             ov.on_node_hit
             for ov in self.victim_overrides
@@ -1034,7 +1027,7 @@ class RadixCache(BasePrefixCache):
         """Apply the session's type to owned nodes; keep fork/shared tags sticky."""
         delta = access_time - node.last_access_time
         node.hit_count += 1
-        # 共享会话数账本（SlruEvictPolicy）：必须早于贴标签，apply_tag 要读新值；
+        # 共享会话数账本（SlruEvictPolicy）：必须早于 queue_tag 更新，
         # 也必须早于 force_agentic 短路，否则该实验开关会让账本永远停在 0。
         for observe in self._hit_observers:
             observe(node, session_id)
@@ -1046,9 +1039,6 @@ class RadixCache(BasePrefixCache):
         if self.force_agentic:
             # 直达 agentic 队列：跳过 8s 间隔判定与 QSTRUCT 黏性。
             node.queue_tag = SimpleHybridQueueTag.QAGENT
-        elif self.tag_policy is not None and state is not None:
-            # 标签版：命中即完成「会话计数 + 晋升/降级」，不需要等它变成可淘汰叶子。
-            self.tag_policy.observe_hit(node, session_id, state.session_type)
         elif node.queue_tag != SimpleHybridQueueTag.QSTRUCT:
             if state is not None and state.session_type == SessionType.STRUCT:
                 node.queue_tag = SimpleHybridQueueTag.QSTRUCT
@@ -1106,9 +1096,7 @@ class RadixCache(BasePrefixCache):
            new_node.event_hash_value, child.event_hash_value = split_node_hash_value(
             child.event_hash_value, split_len, self.page_size
            )
-           # Q_struct：分裂不改变「哪些请求经过这段前缀」，两半都继承频数。
-           new_node.share_count = child.share_count
-           new_node.rid_bloom = child.rid_bloom
+           # 共享会话数：分裂不改变「哪些请求经过这段前缀」，两半都继承。
            new_node.share_sessions = getattr(child, "share_sessions", 0)
            new_node.session_bloom = getattr(child, "session_bloom", 0)
            # T-LRU：分裂不增加分支深度，新父节点继承 child 的高水位。
@@ -1177,11 +1165,9 @@ class RadixCache(BasePrefixCache):
             if self.force_agentic:
                 # 直达 agentic 队列：新节点不再落 QTRANS（否则会被 one-shot 带先清）
                 new_node.queue_tag = SimpleHybridQueueTag.QAGENT
-            elif self.tag_policy is not None and state is not None:
-                # 标签版：新节点是「本会话私有的一段」，先 QTRANS；
-                # 第二个会话命中它时由 observe_hit 晋升为 QSTRUCT。
-                new_node.queue_tag = self.tag_policy.initial_tag(state.session_type)
             else:
+                # 出生标签只看「谁创建了这段」；跨会话共享的事实由
+                # SlruEvictPolicy 的共享数账本记录，与标签无关。
                 new_node.queue_tag = (
                     session_type_to_queue_tag(state.session_type)
                     if state is not None
@@ -1198,12 +1184,10 @@ class RadixCache(BasePrefixCache):
                 observe(new_node)
             if (
                 not self.force_agentic
-                and self.tag_policy is None
                 and node is not self.root_node
                 and len(node.children) >= 2
             ):
-                # 关闭 Q_struct 队内策略时保留旧的分叉标签规则（对照组行为）。
-                # 标签版：标签只由「会话类型 + 会话共享数」决定，不掺拓扑。
+                # 分叉点即「多请求共用前缀」的结构证据，直接标 QSTRUCT。
                 node.queue_tag = SimpleHybridQueueTag.QSTRUCT
             self.evictable_size_ += len(key)
             self._update_leaf_status(node)

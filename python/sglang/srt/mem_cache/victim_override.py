@@ -23,11 +23,11 @@
   适配器。
   * `TlruEvictPolicy`    —— T-LRU 的尾部优先修正；除候选选择外，还在
     插入/分裂时维护节点上的 `_tlru_*` 高水位（缓存层会调 `on_node_inserted`）。
-  * `SlruEvictPolicy`    —— SLRU 的候选改写（probation → protected，段内 recency），
+  * `SlruEvictPolicy`    —— SLRU 的唯一实现：候选改写（probation → protected，
+    段内 recency）
     同时独占「节点共享会话数」账本（`on_node_hit` 由缓存层命中路径调用）。
     `scope="non_one_shot"` 时与 `evict()` 的 one-shot 分支合起来就是
-    「带 one-shot 带的 SLRU」：带内先清空，其余按两段排序。标签版 TinyLRU 仍把
-    顺序编码进 `victim_key`，不走插件。
+    「带 one-shot 带的 SLRU」：带内先清空，其余按两段排序。
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Dict, Iterable, Optional, Tuple
 import time
 from sglang.srt.mem_cache.uni_utils import (
-    DEFAULT_STRUCT_SHARE_MIN,
+    DEFAULT_SHARE_MIN,
     RrParams,
     SESSION_SHARE_MAX,
     SessionRegistry,
@@ -283,8 +283,8 @@ class SlruEvictPolicy(VictimOverride):
     账本（本类独占）
     ----------------
     写 `node.share_sessions` / `node.session_bloom` 的唯一位置是 `on_node_hit()`；
-    缓存层在命中路径上通过 `_hit_observers` 调用它，**与 `tiny_lru.policy` /
-    `force_agentic` 无关**，所以关掉标签策略后账本照常维护。
+    缓存层在命中路径上通过 `_hit_observers` 调用它，**与 `force_agentic`
+    等实验开关无关**，所以账本在所有配置下都成立。
     节点的初值（`TreeNode.__init__`）与分裂继承（`_split_node`）属于树结构维护，
     仍留在 radix_cache；本类只读它们。
 
@@ -293,31 +293,26 @@ class SlruEvictPolicy(VictimOverride):
 
     候选修正
     --------
-    `applies_to` 命中「STRUCT 会话 + 已被 >= struct_share_min 个外部会话
-    命中过」的叶子，`pick` 在它们中间取最久未访问者（段内 LRU）。
-    阈值与 TagLruPolicy 的晋升阈值是同一个旋钮
-    （`TinyLRUParams.struct_share_min`），因此标签与淘汰不会各算一套。
+    `applies_to` 命中「STRUCT 会话 + 已被 >= share_min 个外部会话命中过」
+    的叶子，`pick` 在它们中间取最久未访问者（段内 LRU）。
+    阈值来自 `SlruParams.share_min`，与 `is_one_shot` 的分界同源。
     """
 
     # 观测字段：本改写器管辖的队列，仅用于 profile 记账。
     # 不得参与仲裁判定（否则退化为 proposer 形态，见设计讨论）。
     queue: Optional[SimpleHybridQueueTag] =  SimpleHybridQueueTag.QSTRUCT
 
-    def __init__(self, session_registry=None, struct_share_min=None) -> None:
+    def __init__(self, session_registry=None, share_min=None) -> None:
         # 与策略共用同一本会话账（SimpleHybridStrategy.__init__ 注入），
         # 保证 is_one_shot 与 applies_to 看到同一份 session_type。
         self.session_registry = session_registry or SessionRegistry.global_instance()
-        # 共享数阈值：唯一旋钮是 TinyLRUParams.struct_share_min（由策略注入）。
+        # 共享数阈值：唯一配置入口是 SlruParams.share_min（由策略注入）。
         # 它同时决定「是否受 SLRU 保护」与「是否退出 one-shot 带」。
-        self.struct_share_min = max(
+        self.share_min = max(
             2,
-            int(
-                DEFAULT_STRUCT_SHARE_MIN
-                if struct_share_min is None
-                else struct_share_min
-            ),
+            int(DEFAULT_SHARE_MIN if share_min is None else share_min),
         )
-        # 共享会话数账本的观测（原属 TagLruPolicy，已随记账一起搬过来）
+        # 共享会话数账本的观测（唯一写者就是本类）
         self.share_counted = 0   # 计入 share_sessions 的命中次数
         self.share_dedup = 0     # 同一会话重复命中的去重次数
         self.slru_picks = 0      # 本改写器实际给出的候选数
@@ -327,8 +322,8 @@ class SlruEvictPolicy(VictimOverride):
     def on_node_hit(self, node, session_id=None) -> None:
         """命中路径的记账钩子：不同会话数 +1（同一会话去重）。
 
-        由缓存层 `RadixCache._record_node_hit()` 在贴标签之前调用，
-        因此 `tag_lru.apply_tag()` 读到的是本次命中后的新值。
+        由缓存层 `RadixCache._record_node_hit()` 在更新 `queue_tag` 之前调用，
+        保证同一次命中里账本与标签看到的是同一份事实。
         """
         if node is None or not session_id:
             return
@@ -357,7 +352,7 @@ class SlruEvictPolicy(VictimOverride):
         stype = st.session_type if st is not None else None
         return (
             stype == SessionType.STRUCT
-            and self.share_of(node) >= self.struct_share_min
+            and self.share_of(node) >= self.share_min
         )
 
     def pick(self, leaves: Iterable["TreeNode"], registry=None) -> Optional["TreeNode"]:

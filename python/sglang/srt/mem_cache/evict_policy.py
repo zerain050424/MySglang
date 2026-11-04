@@ -12,7 +12,7 @@ from sglang.srt.mem_cache.uni_utils import (
     RrParams,
     SessionRegistry,
     SessionType,
-    TinyLRUParams,
+    SlruParams,
     TlruParams,
     TASK_CONFIG,
     WORKLOAD_LABELS,
@@ -22,7 +22,6 @@ from sglang.srt.mem_cache.uni_utils import (
     _cached_lognorm_cdf,
     task_type_of_tag,
 )
-from sglang.srt.mem_cache.tag_lru import TagLruPolicy
 from sglang.srt.mem_cache.victim_override import (
     RrEvictPolicy,
     TlruEvictPolicy,
@@ -149,17 +148,17 @@ class SimpleHybridStrategy(EvictionStrategy):
         force_agentic: bool = False,
         alpha: Union[AlphaParams, dict, None] = None,
         rr: Union[RrParams, dict, None] = None,
-        tiny_lru: Union[TinyLRUParams, dict, None] = None,
+        slru: Union[SlruParams, dict, None] = None,
         tlru: Union[TlruParams, dict, None] = None,
     ):
         """
-        三组参数分别由 AlphaParams / RrParams / TinyLRUParams 承载（uni_utils）。
+        参数组由 AlphaParams / RrParams / SlruParams 承载（uni_utils）。
         配置只接受分组形式：
-            {"alpha": {...}, "rr": {...}, "tiny_lru": {...}}
+            {"alpha": {...}, "rr": {...}, "slru": {...}}
         未知键在参数组构造处直接报错（拼错不再静默失效）。
 
-        max_offset 不属于任何一组：它是 Q_struct 复用分数里的位置项上界
-        （HeterCache 的 offset 语义），与 TinyLRU 的频数准入无关。
+        max_offset 不属于任何一组：它是 struct 复用分数里的位置项上界
+        （HeterCache 的 offset 语义）。
 
         force_agentic 是实验开关（不是调参）：打开后所有节点都按 agentic 语义
         解释（评分、one-shot、插件作用域一致），并把 queue_tag 直接标成 QAGENT。
@@ -168,7 +167,7 @@ class SimpleHybridStrategy(EvictionStrategy):
         """
         self.alpha = AlphaParams.from_any(alpha)
         self.rr = RrParams.from_any(rr)
-        self.tiny_lru = TinyLRUParams.from_any(tiny_lru)
+        self.slru = SlruParams.from_any(slru)
         self.tlru = TlruParams.from_any(tlru)
         self.force_agentic = bool(force_agentic)
         self.max_offset = max_offset or 2048
@@ -194,29 +193,11 @@ class SimpleHybridStrategy(EvictionStrategy):
         self.rr_evict = RrEvictPolicy(self.rr) if self.rr.fair_rr else None
         # 会话账本必须先就位：SLRU 的共享数账本与 one-shot 判定共用它。
         self.session_registry = SessionRegistry.global_instance()
-        # 共享数阈值只有一处配置：TinyLRUParams.struct_share_min。
+        # 共享数阈值只有一处配置：SlruParams.share_min。
         # 它同时喂给 SLRU 的准入判定与 one-shot 的分界。
         self.slru_evict = SlruEvictPolicy(
-            self.session_registry, self.tiny_lru.struct_share_min
+            self.session_registry, self.slru.share_min
         )
-        # 标签版 TinyLRU（Q_struct 队内策略）：不建队列索引，只按
-        # 「会话类型 + 会话共享数」贴标签；关闭时是彻底的零开销路径。
-        self.tagState = (
-            TagLruPolicy(
-                struct_share_min=self.tiny_lru.struct_share_min,
-                share_metric=(
-                    self.tiny_lru.share_metric
-                    if self.tiny_lru.share_metric in ("session", "rid")
-                    else "session"
-                ),
-                local_hot=self.tiny_lru.local_hot,
-            )
-            if self.tiny_lru.policy == "tag_lru"
-            else None
-        )
-        # 按标签记账：标签版没有插件，`victim_src` 里不会出现 qstruct，
-        # 这里单独统计各标签被淘汰了多少 token，profile 与实验套件都用它。
-        self._evicted_by_tag: Dict[str, float] = {}
         # T-LRU 尾巴优先：只修 QAGENT 的候选，并在插入期维护 _tlru_* 高水位。
         # 与 struct 分属不同队列可共存；与 fair_rr 互斥（两者都修 QAGENT，
         # 链上后注册者会把前者完全遮蔽），由 _validate_scope() 拦住。
@@ -241,31 +222,14 @@ class SimpleHybridStrategy(EvictionStrategy):
         self._seen_rids.clear()
         self._rid_order.clear()
 
-    def owns_struct(self, node) -> bool:
-        """该节点是否带着 QSTRUCT 标签（**仅观测 / 测试用**）。
-
-        淘汰路径已不再用它做闸：一次性判定与死链上溯都改成看共享数
-        (is_one_shot / struct_share_min)，否则标签与共享数分叉时两边打架。
-        """
-        return bool(self.tagState is not None and self.tagState.owns(node))
-
-    def tag_snapshot(self) -> Optional[dict]:
-        return self.tagState.snapshot() if self.tagState is not None else None
 
     def _validate_scope(self) -> None:
         """拦住会静默失效的插件组合。
 
         `victim_overrides` 是覆盖链（后者覆盖前者），而 RR 只要挑得出会话就会
-        返回非 None，所以 fair_rr + tlru 同时开会把 TLRU 完全遮蔽。
+        返回非 None，所以 fair_rr + tlru 同时开会把 TLRU 完全遮蔽。SLRU 只认
+        STRUCT 叶子，与这两者的作用域不相交，不需要互斥检查。
         """
-        if self.tagState is not None and self.tlru_evict is not None:
-            # 标签版把 QSTRUCT 的 LRU 顺序放进全局 victim_key，而 T-LRU 改写的是
-            # QAGENT 候选；两者同时开会互相遮蔽，直接拦住而不是静默失效。
-            raise ValueError(
-                "tiny_lru.policy='tag_lru' and tlru.enabled are mutually exclusive: "
-                "tag_lru orders QSTRUCT via victim_key, T-LRU rewrites QAGENT "
-                "candidates, and the latter silently wins."
-            )
         if self.rr_evict is not None and self.tlru_evict is not None:
             raise ValueError(
                 "rr.fair_rr and tlru.enabled are mutually exclusive: both rewrite "
@@ -277,7 +241,8 @@ class SimpleHybridStrategy(EvictionStrategy):
     def _task_type_of(self, node) -> SimpleHybridTaskType:
         # 队列标签由缓存状态机维护。映射表在 uni_utils，策略与改写器共用。
         # force_agentic 时短路：即使某个节点残留 QTRANS/QCHAT/QSTRUCT 标签，
-        # 评分与 one-shot 判定也统一按 agentic 走（标签由缓存层同步强制为 QAGENT）。
+        # 评分与队列归属也统一按 agentic 走（缓存层会同步把标签强制成 QAGENT）。
+        # 注意：one-shot 判定不走这里 —— 它只看会话类型 + 跨会话共享数。
         if self.force_agentic:
             return SimpleHybridTaskType.MULTI_TURN_AGENTIC
         
@@ -318,40 +283,34 @@ class SimpleHybridStrategy(EvictionStrategy):
     # 暴露给淘汰器的键语义
 
     def victim_key(self, node) -> tuple:
+        """全局基础候选键：复用分数最低者先走，同分时 token 多者先走。
+
+        队列内部顺序由插件接管（SLRU 对受保护的 struct 叶子改写成段内 LRU），
+        因此这里不再编码「类间 rank」。
         """
-        """
-        tokens = _node_num_tokens(node)
-        if self.tagState is not None:
-            task = self._task_type_of(node)
-            if task == SimpleHybridTaskType.STRUCT_SINGLE_TURN:
-                return (2, node.last_access_time, -tokens)
-            if task == SimpleHybridTaskType.RANDOM_SINGLE_TURN:
-                return (0, node.last_access_time, -tokens)
-            return (1, self._reuse_score(node), -tokens)
-        return (self._reuse_score(node), -tokens)
+        return (self._reuse_score(node), -_node_num_tokens(node))
 
     def is_one_shot(self, node) -> bool:
         """一次性内容（one-shot）：淘汰顺序永远先于可调度内容。
 
         判定只看「会话类型 + 跨会话共享数」，**不看 `queue_tag`**：
 
-            one_shot = 会话类型 ∈ {TRANS, STRUCT} 且 share_sessions < struct_share_min
+            one_shot = 会话类型 ∈ {TRANS, STRUCT} 且 share_sessions < share_min
 
-        为什么不能看标签：`queue_tag` 由 `tag_lru` 维护，而它与共享数在
-        命中者类型不同时会分叉 —— 只有 STRUCT 会话命中才会触发晋升，
-        但 CHAT/AGENTIC 命中同样会涨共享数。拿标签当闸门会漏掉真正的
-        共享前缀（典型：TRANS 会话插入的文档段被别的会话复用）。
+        为什么不能看标签：`queue_tag` 是「谁创建了这段」的粗粒度标记，而
+        共享数才是「还会不会被复用」的证据。典型反例：TRANS 会话插入的
+        文档段后来被别的会话反复命中——标签仍挂着 QTRANS，但它是热前缀。
 
-        `share_sessions >= struct_share_min` = 除创建者外还有 >=2 个会话
-        命中过（共 >=3 个），属于跨会话模板，不进一次性带——即使它的
-        创建者当初被判成 TRANS。阈值取自 `TinyLRUParams.struct_share_min`
-        注入到 `SlruEvictPolicy` 的同一个值，标签与淘汰不会各算一套。
+        `share_sessions >= share_min` = 除创建者外还有 >=2 个会话命中过
+        （共 >=3 个），属于跨会话模板，不进一次性带——即使它的创建者当初
+        被判成 TRANS。阈值取自 `SlruParams.share_min`，与
+        `SlruEvictPolicy.applies_to` 是同一个值。
         """
         st = self.session_registry.get(getattr(node, "session_id", None))
         if st is None:
             # 无会话证据（客户端未带 session_id，或账本已被 sweep）：不判 one-shot。
             return False
-        if self.slru_evict.share_of(node) >= self.slru_evict.struct_share_min:
+        if self.slru_evict.share_of(node) >= self.slru_evict.share_min:
             # 已被足够多会话复用：即便创建者是 TRANS 也不再是一次性内容。
             return False
         return st.session_type in (SessionType.TRANS, SessionType.STRUCT)
@@ -401,10 +360,6 @@ class SimpleHybridStrategy(EvictionStrategy):
         )
         if self.is_one_shot(node):
             self._total_evicted_one_shot += tokens
-        if self.tagState is not None:
-            tag = getattr(node, "queue_tag", None)
-            key = f"tag:{getattr(tag, 'value', tag)}"
-            self._evicted_by_tag[key] = self._evicted_by_tag.get(key, 0.0) + tokens
 
     def record_victim_source(self, source: str, tokens: float) -> None:
         """
@@ -450,22 +405,11 @@ class SimpleHybridStrategy(EvictionStrategy):
             f"  pool={pool:.0f} schedulable={schedulable:.0f} "
             f"one_shot_evicted={self._total_evicted_one_shot:.0f}"
         )
-        if self._evicted_by_tag:
-            by_tag = " ".join(
-                f"{k}={v:.0f}" for k, v in sorted(self._evicted_by_tag.items())
-            )
-            lines.append(f"  evicted_by_tag: {by_tag}")
-        if self.tagState is not None:
-            s = self.tagState.snapshot()
-            lines.append(
-                f"  tag_lru: min_share={s['struct_share_min']} "
-                f"promote={s['promote']} demote={s['demote']}"
-            )
         if self.slru_evict is not None:
             # 共享会话数账本 + 本改写器实际给出的候选数。
             s = self.slru_evict.stats()
             lines.append(
-                f"  slru: min_share={self.slru_evict.struct_share_min} "
+                f"  slru: min_share={self.slru_evict.share_min} "
                 f"picks={s['slru_picks']:.0f} "
                 f"share_counted={s['share_counted']:.0f} "
                 f"share_dedup={s['share_dedup']:.0f}"

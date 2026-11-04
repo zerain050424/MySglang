@@ -157,7 +157,8 @@ def make_cache(cache_cls, strategy, nodes):
     cache.kv_events = FakeEvents()
     cache.deleted = []
     cache.metrics = []
-    cache.root_node = FakeNode(None, strategy.tagState and None or None)
+    uni = sys.modules["sglang.srt.mem_cache.uni_utils"]
+    cache.root_node = FakeNode(None, uni.SimpleHybridQueueTag.QTRANS)
     cache.root_node.ckey = "root"
     cache.evictable_leaves = set()
     for n in nodes:
@@ -196,7 +197,6 @@ def _bootstrap():
     _install_stubs()
     _load("sglang.srt.mem_cache.uni_utils", "sglang/srt/mem_cache/uni_utils.py")
     _load("sglang.srt.mem_cache.victim_override", "sglang/srt/mem_cache/victim_override.py")
-    _load("sglang.srt.mem_cache.tag_lru", "sglang/srt/mem_cache/tag_lru.py")
     ep = _load("sglang.srt.mem_cache.evict_policy", "sglang/srt/mem_cache/evict_policy.py")
     shc = _load(
         "sglang.srt.mem_cache.simple_hybrid_radix_cache",
@@ -209,8 +209,8 @@ def _bootstrap():
     return ep, shc, sys.modules["sglang.srt.mem_cache.base_prefix_cache"]
 
 
-def _strategy(ep, sessions, **tiny_lru):
-    st = ep.SimpleHybridStrategy(tiny_lru=tiny_lru or None)
+def _strategy(ep, sessions, **slru):
+    st = ep.SimpleHybridStrategy(slru=slru or None)
     reg = sys.modules["sglang.srt.mem_cache.uni_utils"].SessionRegistry()
     uni = sys.modules["sglang.srt.mem_cache.uni_utils"]
     for sid, stype in sessions.items():
@@ -283,7 +283,7 @@ def test_one_shot_band_first(ep, shc, base):
     deep = FakeNode("t1", uni.SimpleHybridQueueTag.QTRANS, tokens=16, abs_start=256)
     shared = FakeNode(
         "s1", uni.SimpleHybridQueueTag.QSTRUCT, tokens=16, abs_start=0,
-        share_sessions=st.slru_evict.struct_share_min,
+        share_sessions=st.slru_evict.share_min,
     )
     check(st.is_one_shot(deep) is True, "sanity: trans node is one-shot")
     check(st.is_one_shot(shared) is False, "sanity: shared struct is protected")
@@ -302,7 +302,7 @@ def test_slru_rewrites_struct_candidate(ep, shc, base):
     print("[4] SLRU rewrites the candidate among protected struct leaves")
     uni = sys.modules["sglang.srt.mem_cache.uni_utils"]
     st = _strategy(ep, {"s1": uni.SessionType.STRUCT})
-    thr = st.slru_evict.struct_share_min
+    thr = st.slru_evict.share_min
     old = FakeNode(
         "s1", uni.SimpleHybridQueueTag.QSTRUCT, tokens=16,
         last_access=1_000.0, share_sessions=thr,
@@ -322,15 +322,16 @@ def test_slru_rewrites_struct_candidate(ep, shc, base):
 
 
 def test_slru_actually_rewrites_with_tag_off(ep, shc, base):
-    """tiny_lru=off：基础候选按位置打分，SLRU 把它改写成年限最久的那个。
+    """基础候选按位置打分，SLRU 把它改写成最久未访问的那个。
 
-    这条证明 SLRU 不是只改个 source 标签 —— 默认 tag 模式下 victim_key 的
-    rank-2 分支已经是 struct 内 LRU，与 SLRU 的挑选重合，看不出差别。
+    这条证明 SLRU 不是只改个 source 标签：victim_key 对 struct 用的是
+    `1 - end_offset/max_offset` 位置打分（长前缀会被判 0 分），与 SLRU 的
+    LRU 口径不同，二者会挑出不同节点。
     """
-    print("[4b] with tiny_lru=off, SLRU rewrites the base candidate")
+    print("[4b] SLRU rewrites the position-scored base candidate")
     uni = sys.modules["sglang.srt.mem_cache.uni_utils"]
-    st = _strategy(ep, {"s1": uni.SessionType.STRUCT}, policy="off")
-    thr = st.slru_evict.struct_share_min
+    st = _strategy(ep, {"s1": uni.SessionType.STRUCT})
+    thr = st.slru_evict.share_min
     # 位置打分偏向「结束偏移小」的节点 -> 基础候选会挑 deep（offset 越界被截成 0 分）
     old_lru = FakeNode(
         "s1", uni.SimpleHybridQueueTag.QSTRUCT, tokens=16,

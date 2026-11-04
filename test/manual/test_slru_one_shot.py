@@ -1,14 +1,14 @@
-"""SLRU / one-shot 判定的 characterization tests（tag_lru 已退出判定链）。
+"""SLRU / one-shot 判定的 characterization tests。
 
 钉住四件事：
 
 1. **一次性判定只看「会话类型 + 跨会话共享数」**：
-   `one_shot = type ∈ {TRANS, STRUCT} and share_sessions < 2`
+   `one_shot = type ∈ {TRANS, STRUCT} and share_sessions < share_min`
 2. **共享数达到阈值就退出一次性带**，即使创建者当初被判成 TRANS。
 3. **`queue_tag` 不参与判定**：QSTRUCT 标签救不了私有的 TRANS 节点，
    QTRANS 标签也不会把已被多次复用的节点拉回一次性带。
 4. **阈值同源**：`is_one_shot` 与 `SlruEvictPolicy.applies_to` 用同一个
-   `struct_share_min`，且共用同一本会话账。
+   `share_min`，且共用同一本会话账。
 
     python test/manual/test_slru_one_shot.py
 """
@@ -22,7 +22,7 @@ sys.path.insert(
 
 from sglang.srt.mem_cache.evict_policy import SimpleHybridStrategy  # noqa: E402
 from sglang.srt.mem_cache.uni_utils import (  # noqa: E402
-    DEFAULT_STRUCT_SHARE_MIN,
+    DEFAULT_SHARE_MIN,
     SessionRegistry,
     SessionState,
     SessionType,
@@ -55,10 +55,10 @@ class FakeNode:
         self.last_access_time = 0.0
 
 
-def make_strategy(session_types, *, policy="tag_lru", force_agentic=False, **tiny_lru):
+def make_strategy(session_types, *, force_agentic=False, **slru):
     """构造策略 + 私有会话账（不污染进程级单例）。"""
     st = SimpleHybridStrategy(
-        tiny_lru={"policy": policy, **tiny_lru}, force_agentic=force_agentic
+        slru=slru or None, force_agentic=force_agentic
     )
     reg = SessionRegistry()
     for sid, stype in session_types.items():
@@ -77,9 +77,9 @@ def test_trans_unshared_vs_shared():
 
     check(st.is_one_shot(n) is True, "TRANS with share=0 must be one-shot")
 
-    for i in range(st.slru_evict.struct_share_min):
+    for i in range(st.slru_evict.share_min):
         st.slru_evict.on_node_hit(n, f"other-{i}")
-    check(n.share_sessions == st.slru_evict.struct_share_min,
+    check(n.share_sessions == st.slru_evict.share_min,
           f"share_sessions, got {n.share_sessions}")
     check(st.is_one_shot(n) is False,
           "TRANS node reused by enough sessions must leave the one-shot band")
@@ -87,10 +87,10 @@ def test_trans_unshared_vs_shared():
 
 def test_struct_threshold():
     """STRUCT：share < 阈值 -> one-shot；达到阈值 -> 退出。"""
-    print("[2] STRUCT: threshold is struct_share_min")
+    print("[2] STRUCT: threshold is share_min")
     st, _ = make_strategy({"s1": SessionType.STRUCT})
     n = FakeNode(session_id="s1")
-    thr = st.slru_evict.struct_share_min
+    thr = st.slru_evict.share_min
     check(thr == 2, f"expected threshold 2 (share < 2 <=> sessions <= 2), got {thr}")
 
     for k in range(thr):
@@ -127,12 +127,12 @@ def test_queue_tag_is_irrelevant():
 
     # 方向 B：打着 QTRANS 标签、已被多次复用的节点，不再是
     reused = FakeNode(session_id="t1", tag=SimpleHybridQueueTag.QTRANS)
-    for i in range(st.slru_evict.struct_share_min):
+    for i in range(st.slru_evict.share_min):
         st.slru_evict.on_node_hit(reused, f"y{i}")
     check(st.is_one_shot(reused) is False,
           "a QTRANS-tagged but widely reused node must leave the one-shot band")
-    # owns_struct 仅观测，不再是闸
-    check(st.owns_struct(reused) is False, "sanity: no QSTRUCT tag on reused node")
+    check(reused.queue_tag == SimpleHybridQueueTag.QTRANS,
+          "sanity: the tag itself was never consulted")
 
 
 def test_no_session_is_not_one_shot():
@@ -154,38 +154,37 @@ def test_is_one_shot_and_applies_to_agree():
     check(st.slru_evict.applies_to(node) is False, "share=0 must not be SLRU-scoped")
     check(st.is_one_shot(node) is True, "share=0 must be one-shot")
 
-    for i in range(st.slru_evict.struct_share_min):
+    for i in range(st.slru_evict.share_min):
         st.slru_evict.on_node_hit(node, f"z{i}")
     check(st.slru_evict.applies_to(node) is True,
           "at threshold the node becomes SLRU-scoped")
     check(st.is_one_shot(node) is False, "at threshold the node leaves the band")
 
 
-def test_works_without_tag_lru():
-    """tag_lru 关闭 / force_agentic 时，判定与账本仍然一致。"""
-    print("[7] decision holds with tiny_lru=off and force_agentic")
+def test_works_under_force_agentic():
+    """force_agentic 实验开关下，判定与账本仍然一致。"""
+    print("[7] decision and ledger hold under force_agentic")
     for kwargs in (
-        {"policy": "off"},
-        {"policy": "off", "force_agentic": True},
+        {},
+        {"force_agentic": True},
     ):
         st, _ = make_strategy({"t1": SessionType.TRANS}, **kwargs)
         n = FakeNode(session_id="t1", tag=SimpleHybridQueueTag.QAGENT)
         check(st.is_one_shot(n) is True, f"{kwargs}: unshared TRANS is one-shot")
-        for i in range(st.slru_evict.struct_share_min):
+        for i in range(st.slru_evict.share_min):
             st.slru_evict.on_node_hit(n, f"w{i}")
-        check(n.share_sessions == st.slru_evict.struct_share_min,
+        check(n.share_sessions == st.slru_evict.share_min,
               f"{kwargs}: ledger must still count, got {n.share_sessions}")
         check(st.is_one_shot(n) is False, f"{kwargs}: reused TRANS is protected")
 
 
 def test_share_min_is_single_knob():
-    """struct_share_min 是唯一旋钮：标签晋升 / one-shot / SLRU 三处同值。"""
-    print("[8] struct_share_min drives tag promotion, one-shot and SLRU together")
-    st, _ = make_strategy({"s1": SessionType.STRUCT}, struct_share_min=3)
-    check(st.slru_evict.struct_share_min == 3,
-          f"SLRU threshold must follow config, got {st.slru_evict.struct_share_min}")
-    check(st.tagState is not None and st.tagState.struct_share_min == 3,
-          "tag_lru must see the same value")
+    """share_min 是唯一旋钮：配置 / one-shot / SLRU 三处同值。"""
+    print("[8] share_min drives config, one-shot and SLRU together")
+    st, _ = make_strategy({"s1": SessionType.STRUCT}, share_min=3)
+    check(st.slru_evict.share_min == 3,
+          f"SLRU threshold must follow config, got {st.slru_evict.share_min}")
+    check(st.slru.share_min == 3, "SlruParams must carry the configured value")
 
     node = FakeNode(session_id="s1")
     for k in (0, 1):
@@ -200,19 +199,19 @@ def test_share_min_is_single_knob():
     check(st.is_one_shot(node) is False, "share=3 leaves the one-shot band")
     check(st.slru_evict.applies_to(node) is True, "share=3 is SLRU-scoped")
 
-    # 默认值：配置不写时两边都回落到 DEFAULT_STRUCT_SHARE_MIN
+    # 默认值：配置不写时两边都回落到 DEFAULT_SHARE_MIN
     d, _ = make_strategy({"s1": SessionType.STRUCT})
-    check(d.slru_evict.struct_share_min == DEFAULT_STRUCT_SHARE_MIN,
-          "default threshold must come from DEFAULT_STRUCT_SHARE_MIN")
-    check(DEFAULT_STRUCT_SHARE_MIN == 2, "documented default is 2 (sessions <= 2)")
+    check(d.slru_evict.share_min == DEFAULT_SHARE_MIN,
+          "default threshold must come from DEFAULT_SHARE_MIN")
+    check(DEFAULT_SHARE_MIN == 2, "documented default is 2 (sessions <= 2)")
 
-    # 配置非法值由 TinyLRUParams 拦住（<2 没有意义）
+    # 配置非法值由 SlruParams 拦住（<2 没有意义）
     try:
-        SimpleHybridStrategy(tiny_lru={"struct_share_min": 1})
+        SimpleHybridStrategy(slru={"share_min": 1})
     except ValueError as exc:
-        check("struct_share_min" in str(exc), f"unexpected message: {exc}")
+        check("share_min" in str(exc), f"unexpected message: {exc}")
     else:
-        check(False, "struct_share_min=1 must be rejected")
+        check(False, "share_min=1 must be rejected")
 
 
 def main():
@@ -223,7 +222,7 @@ def main():
         test_queue_tag_is_irrelevant,
         test_no_session_is_not_one_shot,
         test_is_one_shot_and_applies_to_agree,
-        test_works_without_tag_lru,
+        test_works_under_force_agentic,
         test_share_min_is_single_knob,
     ]
     for t in tests:
