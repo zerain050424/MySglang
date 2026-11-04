@@ -10,6 +10,8 @@ from sglang.srt.mem_cache.uni_utils import (
     node_end_offset,
     node_num_tokens,
     RrParams,
+    SessionRegistry,
+    SessionType,
     TinyLRUParams,
     TlruParams,
     TASK_CONFIG,
@@ -19,16 +21,16 @@ from sglang.srt.mem_cache.uni_utils import (
     SimpleHybridTaskType,
     _cached_lognorm_cdf,
     task_type_of_tag,
-    SessionRegistry,
 )
 from sglang.srt.mem_cache.tag_lru import TagLruPolicy
 from sglang.srt.mem_cache.victim_override import (
     RrEvictPolicy,
     TlruEvictPolicy,
+    SlruEvictPolicy,
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.radix_cache import TreeNode,
+    from sglang.srt.mem_cache.radix_cache import TreeNode
 
 logger = logging.getLogger(__name__)
 
@@ -190,6 +192,7 @@ class SimpleHybridStrategy(EvictionStrategy):
 
 
         self.rr_evict = RrEvictPolicy(self.rr) if self.rr.fair_rr else None
+        self.slru_evict = SlruEvictPolicy()
         # 标签版 TinyLRU（Q_struct 队内策略）：不建队列索引，只按
         # 「会话类型 + 会话共享数」贴标签；关闭时是彻底的零开销路径。
         self.tagState = (
@@ -206,7 +209,7 @@ class SimpleHybridStrategy(EvictionStrategy):
             else None
         )
         # 按标签记账：标签版没有插件，`victim_src` 里不会出现 qstruct，
-        # 这里单独统计「各标签被淘汰了多少 token」，profile 与实验套件都用它。
+        # 这里单独统计各标签被淘汰了多少 token，profile 与实验套件都用它。
         self._evicted_by_tag: Dict[str, float] = {}
         # T-LRU 尾巴优先：只修 QAGENT 的候选，并在插入期维护 _tlru_* 高水位。
         # 与 struct 分属不同队列可共存；与 fair_rr 互斥（两者都修 QAGENT，
@@ -214,9 +217,9 @@ class SimpleHybridStrategy(EvictionStrategy):
         self.tlru_evict = TlruEvictPolicy(self.tlru) if self.tlru.enabled else None
         self._validate_scope()
         self.victim_overrides = tuple(
-            p for p in (self.rr_evict, self.tlru_evict) if p is not None
+            p for p in (self.rr_evict, self.tlru_evict,self.slru_evict) if p is not None
         )
-
+        self.session_registry = SessionRegistry.global_instance()
     def reset_bookkeeping(self) -> None:
         """清空窗口/累计/来源计数（缓存 flush 与 reset 同源）。
 
@@ -305,18 +308,7 @@ class SimpleHybridStrategy(EvictionStrategy):
     # 暴露给淘汰器的键语义
 
     def victim_key(self, node) -> tuple:
-        """统一淘汰键。
-
-        三区版：``(reuse_score, -tokens)``，队内顺序由 struct 插件改写。
-        标签版（tag_lru）：把「类间优先级 + 类内顺序」直接编码进键——
-
-        * rank 0 = QTRANS / 一次性内容：最先走（区内 LRU）
-        * rank 1 = QCHAT / QAGENT：仍按复用概率曲线（HeterCache 的 reuse_prob）
-        * rank 2 = **QSTRUCT（跨会话共享前缀）：最受保护，类内 LRU**
-
-        注意 rank 2 必须显式给 LRU，不能用 `_reuse_score` —— 后者对 STRUCT 用的是
-        `1 - end_offset/max_offset` 的位置打分，长度 ≥ max_offset 的前缀会被判 0 分、
-        反而最先淘汰。
+        """
         """
         tokens = _node_num_tokens(node)
         if self.tagState is not None:
@@ -331,15 +323,20 @@ class SimpleHybridStrategy(EvictionStrategy):
     def is_one_shot(self, node) -> bool:
         """
         一次性内容（one-shot）：淘汰顺序永远先于可调度内容。
-          - RANDOM_SINGLE_TURN：随机单轮，跨会话几乎不复用；
-          - STRUCT_SINGLE_TURN 的生成段：会话发完即弃，response 不会再被任何请求当作前缀。
-        多轮负载的 response 段不在此列：下一轮会复用，与其 prompt 段同队列参与调度。
+          - RANDOM_SINGLE_TURN：无复用的随机单轮，跨会话几乎不复用；
+          - STRUCT_SINGLE_TURN： 的生成段：会话发完即弃，response 不会再被任何请求当作前缀。
         """
-        task_type = self._task_type_of(node)
-        if task_type == SimpleHybridTaskType.RANDOM_SINGLE_TURN:
+        st = self.session_registry.get(getattr(node, "session_id", None))
+        # task_type = self._task_type_of(node)
+        if st is None:
+            # 无会话证据（客户端未带 session_id，或账本已被 sweep）：不判 one-shot。
+            return False
+        if st.session_type == SessionType.STRUCT and getattr(node, "share_sessions", 0) < 2:
+            return True
+        if st.session_type == SessionType.TRANS:
             return True
         return node.is_decode and (
-            task_type == SimpleHybridTaskType.STRUCT_SINGLE_TURN
+           st.session_type ==  SessionType.STRUCT or st.session_type == SessionType.TRANS
         )
 
     def workload_of(self, node) -> str:
@@ -347,8 +344,8 @@ class SimpleHybridStrategy(EvictionStrategy):
         return workload_label_of(self._task_type_of(node))
 
     def one_shot_key(self, node) -> tuple:
-        """one-shot 带内排序：树上结束偏移最深的块先淘汰。
-
+        """
+        one-shot 带内排序：树上结束偏移最深的块先淘汰。
         口径对齐 HeterCache 的 evict_first 堆键（-num_hashed_tokens，
         即块的绝对结束位置）：序列里越靠后的生成段越先走。"""
         return (-_node_end_offset(node), node.last_access_time)

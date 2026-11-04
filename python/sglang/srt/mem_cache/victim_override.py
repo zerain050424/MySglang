@@ -33,9 +33,11 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Dict, Iterable, Optional, Tuple
-
+import time
 from sglang.srt.mem_cache.uni_utils import (
     RrParams,
+    SessionRegistry,
+    SessionType,
     SimpleHybridQueueTag,
     SimpleHybridTaskType,
     TlruParams,
@@ -44,15 +46,15 @@ from sglang.srt.mem_cache.uni_utils import (
 )
 
 if TYPE_CHECKING:  # pragma: no cover
-    from sglang.srt.mem_cache.radix_cache import TreeNode,radixCache
-    from sglang.srt.mem_cache.uni_utils import SessionRegistry, SessionState
+    from sglang.srt.mem_cache.radix_cache import TreeNode
+    from sglang.srt.mem_cache.uni_utils import SessionState
 
 
 class VictimOverride(ABC):
     """插件位基类。子类只需实现 applies_to / pick。"""
 
     name: str = "override"
-
+    session_registry = SessionRegistry.global_instance()
     # 观测字段：本改写器管辖的队列，仅用于 profile 记账。
     # 不得参与仲裁判定（否则退化为 proposer 形态，见设计讨论）。
     queue: Optional[SimpleHybridQueueTag] = None
@@ -277,7 +279,6 @@ class SlruEvictPolicy(VictimOverride):
         tel_safe = (cached_without_this_node >= budget)
         key      = (0 if tel_safe else 1, last_access_time)
     """
-     """插件位基类。子类只需实现 applies_to / pick。"""
 
     name: str = "Slru"
 
@@ -285,27 +286,25 @@ class SlruEvictPolicy(VictimOverride):
     # 不得参与仲裁判定（否则退化为 proposer 形态，见设计讨论）。
     queue: Optional[SimpleHybridQueueTag] =  SimpleHybridQueueTag.QSTRUCT
 
-    @abstractmethod
     def applies_to(self, node) -> bool:
         """当前候选是否归本改写器管。"""
-         if node is None:
+        if node is None:
             return False
-        st = radix_cache.session_registry.get(getattr(node, "session_id", None))
+        st = self.session_registry.get(getattr(node, "session_id", None))
         stype = st.session_type if st is not None else None
-        return stype == SessionType.STRUCT
+        return stype == SessionType.STRUCT and getattr(node, "share_sessions", 0) >= 2
 
-    @abstractmethod
     def pick(self, leaves: Iterable["TreeNode"], registry) -> Optional["TreeNode"]:
         """返回本改写器更愿意淘汰的节点；None表示不接管。"""
         struct = [node for node in leaves if self.applies_to(node)]
-        if not agentic:
+        if not struct:
             return None
         nearest = None
         victim = None
         for node in struct:
             now_time =  time.monotonic()
             delta = now_time - node.last_access_time
-            if nearest is None or delta < nearest:
+            if nearest is None or delta > nearest:
                 nearest = delta
                 victim = node
         return victim
