@@ -1,13 +1,13 @@
 # W-TinyLRU 实验套件（Uni-Bench/W-TinyLRU）
 
-设计文档：`python/sglang/srt/mem_cache/WTINYLRU_EXPERIMENT.md`
+实现文档：`python/sglang/srt/mem_cache/TAG_LRU.md`（标签版 TinyLRU 的规则/参数/淘汰顺序/实测）
 **本目录不修改任何框架代码**：观测全部通过子类 / 运行时 monkeypatch / 运行时属性完成。
 
 ```
 W-TinyLRU/
 ├── README.md                  ← 本文件
 ├── wtl/
-│   ├── arms.py                实验臂 A0–A11（单一事实来源）
+│   ├── arms.py                实验臂 A0–A5（单一事实来源）
 │   ├── simclock.py            事件驱动仿真时钟（替换 sglang 模块内的 time）
 │   ├── trace.py               session_data.jsonl 读取 + 到达调度（与 bench_unicache 同语义）
 │   ├── synth.py               合成「共享前缀强度阶梯」trace（场景 A）
@@ -39,6 +39,8 @@ python tests/test_smoke.py
 ```
 
 `RealBackend` 需要能 `import sglang.srt.mem_cache.*` 且 `torch` 可用（CPU 即可，**不需要 GPU、不需要模型权重**）。
+大文件（AgentBank/ShareGPT 的 jsonl 有 2~3GB）用 `--read-limit N` 只读前 N 行再打乱，
+否则全量读入会吃掉几十 GB 内存；该设置会写进结果 meta，报告里要注明采样子集。
 导入失败时会给出明确提示，`--backend auto` 自动退回 `FakeBackend` 并在结果里标 `"backend":"fake"`；
 `analyze.py` **拒绝**把 fake 结果算进主表与判据。
 
@@ -132,12 +134,51 @@ python -m wtl.replay --arm A3 --data-path data/synth_p2048_b10/session_data.json
 | 证据 | 来源 | 用途 |
 |---|---|---|
 | `victim_src`（`one_shot` / `global` / `qstruct`） | `SimpleHybridStrategy._victim_sources` | **gate**：qstruct=0 说明策略从未行使淘汰权，结论作废 |
-| `window/probation/protected/parked` + `admit/reject/ages/forced` | `StructQueueState.snapshot()` | 证明三区与准入/aging 真的在跑 |
-| `protected_tokens` 占池比时间序列 | `wtl.struct_profile`（真机 JSONL） | 看保护是否膨胀、是否压垮单轮负载 |
+| `promote / counted / dedup` | `TagLruPolicy.snapshot()` | 证明「第二个会话命中 → 晋升 QSTRUCT」真的在发生 |
+| `evicted_by_tag`（qtrans/qchat/qagent/qstruct） | `SimpleHybridStrategy._evicted_by_tag` | 一次性带占比、受保护前缀被淘汰的 token 量 |
+| `tag` 快照时间序列 | `wtl.struct_profile`（真机 JSONL） | 看晋升速率、去重率是否随负载漂移 |
 | `evict_us_p50/p99` | 同上（包在 `evict()` 外计时） | 策略 CPU 开销护栏 |
 | `protected_cascade_deleted_tokens` | `_delete_leaf(is_victim=False)` + `region==PROTECTED` | §7.4 最大正确性风险的可观测证据（门控 G5） |
 
 ---
+
+## 4.0 Q_struct 队内策略：标签版 TinyLRU（`tag_lru`）
+
+**分类即晋升**：STRUCT（模板/共享前缀型）会话下，`share_sessions >= struct_share_min`
+的节点当场升为 `QSTRUCT`（类内 LRU 淘汰）；会话内热点按 `local_hot` 处置
+（默认 `QCHAT`，**不**进 one-shot 硬优先带）；真一次性内容留 `QTRANS`。
+其他会话类型沿用分类器映射，不参与晋升。
+
+| 臂 | 配置 | 用途 |
+|---|---|---|
+| A0 | `lru` | 上游基线 |
+| A1 | `slru` | 上游分段 LRU 参照 |
+| A2 | `simple_hybrid` + `tiny_lru=off` | 隔离框架增益（多队列 + one-shot 带 + 分类器标签） |
+| **A3** | `tag_lru`（默认） | 主对象 |
+| A4 | `tag_lru` + `local_hot=one_shot` | 消融：会话内热点也进 one-shot 带（规则原样） |
+| A5 | `tag_lru` + `struct_share_min=3` | 消融：要 3 个会话共享才晋升 |
+
+实测（离线 L1，300 会话，pool/工作集=0.3）：
+
+| 配置 | ShareGPT 命中率 | 会话内历史保留 | 合成 p2048/b10 |
+|---|---|---|---|
+| LRU（A0） | 66.90% | 0.736 | 81.09% |
+| `off`（A2） | 49.26% | 0.551 | 80.37% |
+| `local_hot=one_shot`（A4） | 54.61% | 0.738 | 75.67% |
+| **默认（A3）** | **78.10%** | **0.892** | **82.46%** |
+
+设计说明见 `python/sglang/srt/mem_cache/TAG_LRU.md`（含参数、淘汰顺序、死链闸、限制）。
+早期「三区 + 频数准入 + aging」的实现已从本分支移除；移除理由与实测见该文档 §1。
+
+## 4.1 离线确定性平票（`wtl/compat.py`）
+
+`RadixCache.evict` 用 `min(leaves, key=...)` 在 `set` 上选候选。仿真时钟下同一请求命中的
+节点时间戳完全相同，平票极多，`min` 的结果就取决于 set 遍历顺序（对象地址）——
+同一配置两次进程内回放的淘汰序列会分叉（门控 G1 实测出现）。
+
+`install_stable_ties`（**仅离线回放安装**，`--unstable-ties` 可关）给排序键追加
+`(路径深度, 路径 token 哈希)` 作为确定性后缀，只改变「平票时选谁」，不改变策略语义。
+在线服务不安装（真实时钟下平票少，且不应改变生产行为）。
 
 ## 5. 不改框架代码是怎么做到的
 
@@ -197,6 +238,17 @@ python -m wtl.replay --arm A3 --data-path data/synth_p2048_b10/session_data.json
    而真机在 chunked 预填路径上可能再 `+1`。这会影响 SLRU/LFU 的段位判定，故 **A1 的解释边界**
    要写明（见设计文档 §6 的 limitation）。
 5. **fake 后端**只用于链路验证：`analyze` 会排除，`gate` 会把 G2/G3/G4 记 N/A。
+6. **真实 TaskData 的跨会话共享前缀极短**：`prefix_stats` 实测 turn_1 的成对 LCP 中位数
+   ——Codeparrot 317、AgentBank_apps 24、ShareGPT 24、AgentBank_alfred 24。
+   因此 M1 在真实数据上退化为**会话内历史保留度**（`history_retention`：
+   本轮是否仍命中上一轮完整 prompt），跨会话分层前缀只在合成梯子上有意义。
+7. **one-shot 硬优先带会吃掉绝大部分淘汰压力**：合成 trace 里只要掺入一次性文档，
+   实测 `victim_src` 里 `one_shot` 占 90%+，struct 队列永远等不到「成员变成可淘汰叶子」，
+   策略相当于空转。门控 G2 的 trace 因此**不放一次性文档**。
+8. **频数准入（`admit/reject`）在真实负载上近乎不可达**：window 里的成员一旦成为叶子
+   往往立刻被淘汰，很难同时积累到 `window_entries=64` 以上；A3 与 A6（w=16）在实测中
+   结果完全相同。于是 G2 改为「状态机在管节点 + struct 策略真的接管过淘汰
+   （`qstruct>0` 或 `forced>0`）」，不再要求 `reject>0`（设计文档 §8.5 的判据需要修正）。
 
 ---
 
@@ -214,9 +266,9 @@ python -m wtl.replay --arm A3 --data-path data/synth_p2048_b10/session_data.json
 | §4.3 SGLANG_STRUCT_PROFILE | `wtl/struct_profile.py`（env 开关，零开销关闭） |
 | §4.4 分析脚本 | `wtl/analyze.py` |
 | §5.1 场景 A | `wtl/synth.py` + `--mode synth` |
-| §6 消融矩阵 | `wtl/arms.py` + `scripts/run_online.sh` 的 `arm_policy` |
+| §6 消融矩阵 | `wtl/arms.py`（A0–A5）+ `scripts/run_online.sh` 的 `arm_policy` |
 | §8 判定 | `analyze.judge`：M1/M2/M3/M4-gate/M5 逐条 PASS/FAIL |
-| §10 前置检查 | `wtl/gate.py`（G1–G5） |
+| §10 前置检查 | `wtl/gate.py --arm A3`（G1–G5；G2 看 tag.promote 与 evicted_by_tag） |
 
 ---
 

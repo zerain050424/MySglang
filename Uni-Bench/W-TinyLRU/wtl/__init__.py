@@ -1,11 +1,11 @@
 """W-TinyLRU 效果实验工具包（离线回放 / 真机埋点 / 分析 / 门控）。
 
-设计文档：``python/sglang/srt/mem_cache/WTINYLRU_EXPERIMENT.md``
+实现文档：``python/sglang/srt/mem_cache/TAG_LRU.md``
 本包**不修改**框架代码：所有观测都通过子类、monkeypatch、或运行时属性实现。
 
 模块分工
 --------
-arms.py         实验臂（A0-A11）矩阵，单一事实来源
+arms.py         实验臂（A0-A5）矩阵，单一事实来源
 simclock.py     事件驱动仿真时钟（替换 sglang 模块内的 time）
 trace.py        session_data.jsonl 读取与到达调度生成
 synth.py        合成「共享前缀强度阶梯」trace（场景 A）

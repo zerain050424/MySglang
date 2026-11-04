@@ -238,13 +238,11 @@ def run_replay(
 
             if regret is not None:
                 regret.on_request(req.ts, req.prompt, min(res.cached_len, req.prompt_len))
-            ret = retention.add(req.task, min(res.cached_len, req.prompt_len))
-            retention.add_history(
-                req.task, min(res.cached_len, req.prompt_len),
-                prev_prompt.get(req.sid, 0),
-            )
+            cached_on_prompt = min(res.cached_len, req.prompt_len)
+            prev_len = prev_prompt.get(req.sid, 0)   # 必须在覆盖之前取
+            ret = retention.add(req.task, cached_on_prompt)
+            retention.add_history(req.task, cached_on_prompt, prev_len)
             prev_prompt[req.sid] = req.prompt_len
-            prev_len = prev_prompt.get(req.sid, 0)
             if collect_rows:
                 rows.append(
                     {
@@ -282,6 +280,8 @@ def run_replay(
         "history_retention": retention.history_summary(),
         "regret": regret.summary() if regret is not None else None,
         "struct": stats.get("struct"),
+        "tag": stats.get("tag"),
+        "evicted_by_tag": stats.get("evicted_by_tag") or {},
         "victim_src": stats.get("victim_src") or {},
         "alpha": stats.get("alpha") or {},
         "wall_s": round(time.perf_counter() - t0, 3),
@@ -356,6 +356,7 @@ def build_requests(args) -> tuple[List[Request], dict]:
             sigma=args.sigma,
             task_name=task_name,
             read_limit=args.read_limit,
+            shuffle=not args.no_shuffle,
         )
         label = dpath.stem
         meta = {"source": str(dpath.resolve()), "workload": label}
@@ -396,6 +397,7 @@ def build_requests(args) -> tuple[List[Request], dict]:
         mu=args.mu,
         sigma=args.sigma,
         read_limit=args.read_limit,
+        shuffle=not args.no_shuffle,
     )
     return requests, {"source": str(WORKLOADS.get(args.workload, {}).get("path", "")),
                       "workload": args.workload}
@@ -432,6 +434,8 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
     src.add_argument("--num-sessions", type=int, default=300, help="-1=全部")
     src.add_argument("--read-limit", type=int, default=0,
                      help="只读 jsonl 前 N 行再打乱（大文件加速，0=全量）")
+    src.add_argument("--no-shuffle", action="store_true",
+                     help="保持 jsonl 原始 session 顺序（phased 合成负载的块顺序必须保留）")
     src.add_argument("--seed", type=int, default=42)
     src.add_argument("--wait-scale", type=float, default=1.0,
                      help="轮间等待缩放（0=不等，1=真实 lognormal）")
@@ -469,7 +473,7 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
 
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description="W-TinyLRU 离线回放（L1）")
-    p.add_argument("--arm", default="A3", help="实验臂 A0..A11")
+    p.add_argument("--arm", default="A3", help="实验臂 A0..A5（A3=标签版默认）")
     add_common_args(p)
     a = p.parse_args(argv)
 
@@ -546,6 +550,7 @@ def main(argv=None) -> int:
     result["seed"] = a.seed
     result["num_sessions"] = a.num_sessions
     result["read_limit"] = a.read_limit
+    result["shuffle"] = not a.no_shuffle
     result["wait_scale"] = a.wait_scale
     result["arrival_scale"] = a.arrival_scale
 

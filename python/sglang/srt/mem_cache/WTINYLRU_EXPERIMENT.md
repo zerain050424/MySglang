@@ -314,3 +314,43 @@ struct_snapshot_us
 | P2 | L1 全消融（A0-A11 × 3 压力 × 3 负载 × 3 seed） | 图 1/2 + 筛出 4-5 臂 | 2 天机时 |
 | P3 | L2 真机 45 次跑 | 图 3 + TTFT 结论表 | 1-2 天机时 |
 | P4 | 4.4 分析脚本 + 报告 | results.csv + 报告 | 1 天 |
+
+
+---
+
+## 附录 A：首次实跑的实测校准（2026-11，`Uni-Bench/W-TinyLRU`）
+
+这一节是**跑过之后**对上面设计的修正，实施时以这里为准。
+
+### A.1 框架缺陷（会打挂服务，建议修）
+
+`StructQueueState._promote()` 在候选仍属 window 区时递归调用 `_drain_window()`；
+probation/protected 都为空时无界递归 → `RecursionError`（实测 `struct_queue_policy.py:255`）。
+设计文档 §5.2 的语义是「promote(cand) → probation 尾」，即晋升必须离开 window。
+最小修复：`band = max(band, REGION_PROBATION)`，并删除 `_promote` 里的递归 `_drain_window()`。
+实验套件用 `wtl/compat.py` 在进程内打同一补丁（结果 JSON 记 `compat` 字段）。
+
+### A.2 门控判据需要改
+
+- 原 §8.5 的「`reject==0` → 策略未被行使」**不成立**：window 条目成为叶子后往往立刻被淘汰，
+  很难同时堆积到 `window_entries` 以上；A3 与 A6(w=16) 实测逐请求结果相同。
+- 改用：状态机在管节点（`parked+regions>0`）且 `victim_src.qstruct>0` 或 `forced>0`。
+- G4「后端忠实度」必须在**无限池**下比（有淘汰时真/假 LRU 的平票打破顺序不同，属实现细节）。
+
+### A.3 负载侧两个必须知道的偏差
+
+1. **一次性内容（noise / 单轮文档）会被 one-shot 硬优先带全部吃掉**：实测 `one_shot`
+   占淘汰 token 的 90%+，struct 队列永远等不到「成员变叶子」，策略空转。
+   要测 struct 必须用**多轮、无一次性文档**的负载。
+2. **真实 TaskData 的跨会话 LCP 只有 24~317 token**（Codeparrot 317，其余 24）。
+   跨会话「深共享前缀」只存在于合成梯子；真实数据上 M1 应退化为
+   **会话内历史保留度**（本轮是否命中上一轮完整 prompt，已实现为 `history_retention`）。
+
+### A.4 首批结果（离线，40+8 组）
+
+- **A1（SLRU）明显有害**：ShareGPT 在 pool/工作集=0.3 时命中率 46.1% vs LRU 66.9%（−20.8pp），
+  会话内历史保留 0.38 vs 0.74 —— 单调「只升不降」的保护在多轮会话上会挤掉别人的链。
+- **A3 与 A2（`tiny_lru=off`）几乎逐请求等价**：命中率差 0~0.7pp，而 `qstruct` 已占淘汰 token
+  的 5%~15.8%，说明当前实现接管了淘汰但没有改变选择结果。
+- **A3 在 ShareGPT/pool=0.3 的 protected 保护浪费率 = 1.00**：protected 区被淘汰的 token
+  事后一次都没有再被命中 —— 保护错配，是下一步最值得改的点。

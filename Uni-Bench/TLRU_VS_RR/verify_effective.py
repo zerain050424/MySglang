@@ -81,6 +81,7 @@ def main() -> int:
 
     warn_one_shot = []
     warn_telru = []
+    warn_degenerate = []
     agg: Dict[str, List[float]] = defaultdict(list)
 
     for arm, budget, seed, s in rows:
@@ -99,6 +100,13 @@ def main() -> int:
             warn_one_shot.append((arm, budget, seed, os_share))
         if arm == "a2_tlru" and s.get("tlru_tel_safe_picks", 0) == 0:
             warn_telru.append((arm, budget, seed))
+            continue
+        if arm == "a2_tlru":
+            tel = s.get("tlru_tel_safe_picks", 0.0)
+            lru = s.get("tlru_lru_picks", 0.0)
+            picks = tel + lru
+            if picks > 0 and tel / picks >= 0.98:
+                warn_degenerate.append((arm, budget, seed, tel / picks))
 
     print()
     problems = 0
@@ -114,6 +122,13 @@ def main() -> int:
         for arm, budget, seed in warn_telru[:10]:
             print(f"   - {arm}/{budget}/seed={seed}")
         print("   => 用 calibrate_tlru.py 重新取阈值，确认 threshold > next_prompt_estimate。")
+    if warn_degenerate:
+        problems += 1
+        print("⚠ a2_tlru 几乎所有候选都是 tel-safe（threshold 过大 → budget=0）：")
+        for arm, budget, seed, share in warn_degenerate[:10]:
+            print(f"   - {arm}/{budget}/seed={seed}: tel_safe 占比={share:.1%}")
+        print("   => 此时所有节点同档，排序退化为 last_access_time = 纯 LRU，")
+        print("      实验会得出「TLRU 与 LRU 无差异」的假象；请降 threshold（参考 calibrate_tlru.py）。")
     if not problems:
         print("✅ 有效性检查通过：插件被询问、tel-safe 命中非零、one-shot 未主导。")
     return 0

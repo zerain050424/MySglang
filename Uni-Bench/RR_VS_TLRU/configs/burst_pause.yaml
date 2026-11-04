@@ -1,0 +1,44 @@
+# burst / pause 两阶段负载：victim（长挂起）+ 搅拌（小流量涌入）
+#
+# 时序由 bench 的 --burst-duration-s 驱动（见 README §1）：
+#   全部 victim 越过 pause_after_turn → BurstGate 放行搅拌流 → 持续 burst 窗口
+#   → 关闭窗口 → ResumeGate 按 simultaneous/batched 放行 victim。
+#
+# 注意：两个 task 都必须能被 force_agentic 标成 QAGENT（arm 配置里开启）。
+tasks:
+  # --- victim：长挂起会话（alfred 多轮，截断到 12 轮）---
+  - name: agentic_idle
+    task_id: 0
+    data_path: ../../TaskData/AgentBankData/Qwen2.5-7B-Instruct/AgentBank_alfred_scale_5000_session_data.jsonl
+    max_record: 8                 # 8 个 victim，每个约 3×2000 token 的链
+    max_turns: 12                 # 对齐 RR 实验的 12 轮规模（原始 p50=35 轮）
+    pause_after_turn: 3           # 跑 3 轮后挂起，等 burst 窗口结束再回归
+    resume_after_burst: true      # 由 ResumeGate 放行（而不是固定 pause_s）
+    # 注意：victim 绝不能设 gate_after —— 那会让它等「自己挂起」的屏障而死锁
+    gap_mode: fixed
+    gap_s: 0.2                    # 挂起前 3 轮用固定间隔，保证相位对齐
+    mu: 1.81
+    sigma: 1.092
+    seed: 42
+    shuffle: true
+    # 同相位起跑：Poisson 会把 pause 点打散，固定步长才能让 victim 同时挂起
+    arrival:
+      mode: fixed
+      offset_s: 0.0
+      step_s: 0.05
+
+  # --- 搅拌：小流量涌入（apps 单轮，短请求，高频）---
+  - name: agentic_active
+    task_id: 1
+    data_path: ../../TaskData/AgentBankData/Qwen2.5-7B-Instruct/AgentBank_apps_session_data.jsonl
+    # 压力标定（按实测，不按估算）：
+    #   单 run 常驻峰值 35.7k tokens（budget=60k 时从未填满 -> 零淘汰）
+    #   apps 每条 prompt 仅 387 token，70 条 ≈ 27k
+    #   -> 预算才是压力杠杆：22000 = 1.62x；30000 = 1.19x（见 run_matrix.sh 默认值）
+    max_record: 70                # 70 × 1.2k ≈ 84k tokens
+    lambda_rate: 1.2              # 70/1.2 ≈ 58 s，正好铺满 burst_duration_s=60
+    gate_after: true              # 等全部 victim 挂起后才开始涌入
+    mu: 0
+    sigma: 0
+    seed: 42
+    shuffle: true

@@ -48,6 +48,31 @@
 输出 `Q_hat`（下一轮 prompt 增量中位数）与 3 档阈值候选（`threshold = Q_hat + x·median(L)`）。
 `TlruParams` 要求 `threshold > next_prompt_estimate`，否则启动即报错。
 
+### 已校准结果（AgentBank alfred，前 800 个 session）
+
+| 统计量 | 值 |
+|---|---|
+| session 数 / 轮数 | 800 / 31199 |
+| 每轮 prompt 长度 p50 / p90 / max | 2001 / 4986 / 9547 |
+| 每个 session 末轮长度 p50 / p90 | 3487 / 6187 |
+| **下一轮增量 `Q_hat`**（p50） | **71**（p90=193，max=494） |
+| 阈值候选（0.10/0.25/0.50 × L_p50） | **420 / 943 / 1815** |
+
+`configs/a2_tlru.json` 默认取中间档 `threshold=943, next_prompt_estimate=71`。
+
+### 两个"退化端"（扫参时必须避开）
+
+因为 `budget = max(L + Q_hat - threshold, 0)`，两端都会退化成纯 LRU：
+
+| 条件 | 后果 |
+|---|---|
+| `threshold <= Q_hat` | `budget > L`，没有任何节点 tel-safe → 纯 LRU（`TlruParams` 直接报错拦住） |
+| `threshold >= max(L) + Q_hat` | `budget = 0`，**所有**节点 tel-safe → 全部同一优先级，仍按 `last_access_time` 排序 = 纯 LRU |
+
+所以只有 `Q_hat < threshold < max(L)+Q_hat` 区间才有真实效果。在 alfred 上大约就是
+**71 … 9600**；若用 `threshold=9216` 这种值，实验会得到“TLRU 与 LRU 完全一致”的假象。
+`verify_effective.py` 用 `tel_safe` 计数占比来识别这种情形（全 tel-safe 时报吿）。
+
 RR 侧默认 `kappa=0.5 / min_retain_tokens=512 / min_retain_frac=0.3`；
 若要对 TLRU 扫阈值，就同步对 RR 扫 `kappa ∈ {0.3, 0.5, 0.7}`，两边都报「默认」与「各自最优」。
 

@@ -1,0 +1,8 @@
+{
+  "force_agentic": true,
+  "tlru": {
+    "enabled": true,
+    "threshold": 943,
+    "next_prompt_estimate": 71
+  }
+}

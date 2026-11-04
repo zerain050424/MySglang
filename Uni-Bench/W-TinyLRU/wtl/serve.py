@@ -10,7 +10,7 @@
     SGLANG_STRUCT_PROFILE_TAG=A3_hybrid_100k \\
     $PY -m wtl.serve --model-path $MODEL \\
         --enable-simple-hybrid --radix-eviction-policy simple_hybrid \\
-        --radix-eviction-policy-config '{"tiny_lru":{"policy":"wtinylru","k":3}}' \\
+        --radix-eviction-policy-config '{"tiny_lru":{"policy":"tag_lru"}}' \\
         --max-total-tokens 100000 --enable-metrics --port 30000
 
 注意：``PYTHONPATH`` 需要包含仓库的 ``python/`` 目录（与直接 ``python -m
@@ -27,8 +27,8 @@ from .struct_profile import install_from_env
 
 
 def main() -> None:
-    # 框架缺陷补丁（WTL_COMPAT=0 可关闭）：不装的话，
-    # 命中「window 晋升」路径时 struct_queue_policy 会无限递归把服务打挂。
+    # 框架缺陷补丁（WTL_COMPAT=0 可关闭）：保留给旧实现/其他模块的兼容修复，
+    # 标签版 TinyLRU 自身不需要它。
     apply_compat()
     install_from_env()
 

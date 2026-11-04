@@ -119,7 +119,57 @@ def build_synth_jobs(a, outdir: Path, datadir: Path) -> List[Job]:
                     ]
                     if a.no_outputs:
                         argv += ["--no-outputs"]
+                    if a.no_shuffle:
+                        argv.append("--no-shuffle")
                     jobs.append(Job(run_id, argv, outdir / f"{run_id}.json"))
+    return jobs
+
+
+def build_datadir_jobs(a, outdir: Path) -> List[Job]:
+    """回放一个已生成的 synth 目录（正式实验的 D1/D2/D3 走这条路径）。"""
+    ddir = Path(a.data_dir)
+    if not ddir.is_absolute():
+        ddir = (HERE / ddir).resolve()
+    data = ddir / "session_data.jsonl"
+    meta = ddir / "meta.json"
+    if not data.exists():
+        raise SystemExit(f"[matrix] 找不到 {data}")
+    tag = ddir.name
+    jobs: List[Job] = []
+    pools = a.pool_tokens or [None]
+    ratios = [None] if a.pool_tokens else a.ratios   # 绝对池优先，避免无谓重复
+    for arm in select_arms(a.arms):
+        for ratio in ratios:
+          for pool in pools:
+            for seed in a.seeds:
+                run_id = _name(arm.id, f"exp_{tag}",
+                               (pool / 1000.0) if pool else ratio, seed)
+                argv = [
+                    "-m", "wtl.replay",
+                    "--arm", arm.id,
+                    "--data-path", str(data),
+                    "--synth-meta", str(meta) if meta.exists() else "",
+                    "--num-sessions", "-1",
+                    "--seed", str(seed),
+                    "--wait-scale", str(a.wait_scale),
+                    "--arrival-scale", str(a.arrival_scale),
+                    "--service-ms-per-1k", str(a.service_ms_per_1k),
+                    "--calib-file", str(outdir.parent / "calib.json"),
+                    "--backend", a.backend,
+                    "--regret-window", str(a.regret_window),
+                    "--out", str(outdir / f"{run_id}.json"),
+                ]
+                if pool:
+                    argv += ["--pool-tokens", str(pool)]
+                else:
+                    argv += ["--pool-ratio", str(ratio)]
+                if not (meta.exists()):
+                    argv = [x for x in argv if x != ""]
+                    i = argv.index("--synth-meta")
+                    del argv[i:i + 2]
+                if a.no_shuffle:
+                    argv.append("--no-shuffle")
+                jobs.append(Job(run_id, argv, outdir / f"{run_id}.json"))
     return jobs
 
 
@@ -150,6 +200,8 @@ def main(argv=None) -> int:
     p.add_argument("--arms", default="A0,A1,A2,A3")
     p.add_argument("--workloads", default="sharegpt,alfred")
     p.add_argument("--ratios", default="0.3,0.6,1.0")
+    p.add_argument("--pool-tokens", default="",
+                   help="绝对池容量（token，逗号分隔）；给了就覆盖 --ratios（显存压力阶梯用）")
     p.add_argument("--seeds", default="42")
     p.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 4) // 2))
     p.add_argument("--num-sessions", type=int, default=300)
@@ -164,6 +216,11 @@ def main(argv=None) -> int:
     p.add_argument("--no-outputs", action="store_true")
     p.add_argument("--outdir", default="result/offline")
     p.add_argument("--datadir", default="data/synth")
+    p.add_argument("--data-dir", default=None,
+                   help="已生成的 synth 目录（含 session_data.jsonl + meta.json）："
+                        "直接回放，不重新生成（正式实验用 D1/D2/D3）")
+    p.add_argument("--no-shuffle", action="store_true",
+                   help="保持 jsonl 原始顺序（phased 负载必须；默认打乱）")
     p.add_argument("--resume", action="store_true", default=True)
     p.add_argument("--no-resume", dest="resume", action="store_false")
     p.add_argument("--dry-run", action="store_true")
@@ -181,6 +238,7 @@ def main(argv=None) -> int:
 
     a.workloads = [w.strip() for w in a.workloads.split(",") if w.strip()]
     a.ratios = [float(x) for x in a.ratios.split(",") if x.strip()]
+    a.pool_tokens = [int(x) for x in str(a.pool_tokens).split(",") if x.strip()]
     a.seeds = [int(x) for x in a.seeds.split(",") if x.strip()]
     a.synth_depths = [int(x) for x in a.synth_depths.split(",") if x.strip()]
     a.synth_breadths = [int(x) for x in a.synth_breadths.split(",") if x.strip()]
@@ -194,11 +252,12 @@ def main(argv=None) -> int:
     outdir.mkdir(parents=True, exist_ok=True)
     datadir = (HERE / a.datadir).resolve()
 
-    jobs = (
-        build_synth_jobs(a, outdir, datadir)
-        if a.mode == "synth"
-        else build_trace_jobs(a, outdir)
-    )
+    if a.data_dir:
+        jobs = build_datadir_jobs(a, outdir)
+    elif a.mode == "synth":
+        jobs = build_synth_jobs(a, outdir, datadir)
+    else:
+        jobs = build_trace_jobs(a, outdir)
 
     if a.resume:
         todo = [j for j in jobs if not j.out.exists()]

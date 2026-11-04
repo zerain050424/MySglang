@@ -22,7 +22,7 @@
     sglang.srt.mem_cache.victim_override
     sglang.srt.mem_cache.uni_utils
 
-``struct_queue_policy`` 不依赖时间（aging 是事件驱动），故不在此列。
+标签版 TinyLRU（``tag_lru``）不读时间，故不在此列。
 """
 
 from __future__ import annotations

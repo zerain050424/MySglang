@@ -17,26 +17,12 @@ import dataclasses
 import json
 from typing import Dict, List, Optional
 
-# 默认参数（与 STRUCT_QUEUE_WTINYLRU.md §7.1 一致）
-DEFAULT_K = 3
-DEFAULT_WINDOW_ENTRIES = 64
-DEFAULT_EPOCH_EVENTS = 8192
+# 默认参数（与 TAG_LRU.md §6 一致）
+# 标签版 TinyLRU 的默认值（与 TAG_LRU.md 一致）
+DEFAULT_STRUCT_SHARE_MIN = 2
+DEFAULT_LOCAL_HOT = "chat"
 
 # 注意：tiny_lru 缺省 policy="off"。这里显式写全，便于逐臂对照。
-_WTL = lambda **kw: {
-    "tiny_lru": {
-        "policy": "wtinylru",
-        "k": kw.pop("k", DEFAULT_K),
-        "window_entries": kw.pop("window_entries", DEFAULT_WINDOW_ENTRIES),
-        "epoch_events": kw.pop("epoch_events", DEFAULT_EPOCH_EVENTS),
-        "admission_tie": kw.pop("admission_tie", "reject"),
-        "admission_metric": kw.pop("admission_metric", "share"),
-        "inherit_share": kw.pop("inherit_share", True),
-        **kw,
-    }
-}
-
-
 @dataclasses.dataclass(frozen=True)
 class Arm:
     id: str
@@ -70,36 +56,29 @@ class Arm:
 
 
 ARMS: Dict[str, Arm] = {
-    "A0": Arm("A0", "lru", "lru", None, "SGLang 默认基线", False),
+    "A0": Arm("A0", "lru", "lru", None, "SGLang 默认基线（LRU）", False),
     "A1": Arm(
         "A1", "slru", "slru", {"protected_threshold": 2},
         "上游分段 LRU：能力上限参照（无准入/无 aging）", False,
     ),
     "A2": Arm(
         "A2", "hybrid_off", "simple_hybrid", {"tiny_lru": {"policy": "off"}},
-        "隔离框架增益：多队列 + alpha，struct 关闭", False,
+        "隔离框架增益：多队列 + one-shot 带 + 分类器标签，Q_struct 策略关闭", False,
     ),
     "A3": Arm(
-        "A3", "wtl_default", "simple_hybrid", _WTL(),
-        "主对象：k=3, window=64, epoch=8192", True,
+        "A3", "tag_lru", "simple_hybrid", {"tiny_lru": {"policy": "tag_lru"}},
+        "默认：标签版 TinyLRU（分类即晋升，跨会话共享→QSTRUCT·LRU）", True,
     ),
-    "A4": Arm("A4", "wtl_k2", "simple_hybrid", _WTL(k=2),
-              "保护门槛更低（更早进 protected）", True),
-    "A5": Arm("A5", "wtl_k5", "simple_hybrid", _WTL(k=5),
-              "保护门槛更高（只有强共享才留）", True),
-    "A6": Arm("A6", "wtl_win16", "simple_hybrid", _WTL(window_entries=16),
-              "观察窗过小：准入几乎不发生", True),
-    "A7": Arm("A7", "wtl_win256", "simple_hybrid", _WTL(window_entries=256),
-              "观察窗过大：策略迟钝，逼近 A2", True),
-    "A8": Arm("A8", "wtl_admit", "simple_hybrid", _WTL(admission_tie="admit"),
-              "平票放宽：看后悔率是否上升", True),
-    "A9": Arm("A9", "wtl_age512", "simple_hybrid", _WTL(epoch_events=512),
-              "激进 aging：旧模板快速失权", True),
-    "A10": Arm("A10", "wtl_noage", "simple_hybrid", _WTL(epoch_events=10**9),
-               "关闭 aging：暴露频数永不衰减的代价", True),
-    "A11": Arm("A11", "wtl_share_per_token", "simple_hybrid",
-               _WTL(admission_metric="share_per_token"),
-               "长度归一假设检验（设计文档 §5.4）", True),
+    "A4": Arm(
+        "A4", "tag_lru_one_shot", "simple_hybrid",
+        {"tiny_lru": {"policy": "tag_lru", "local_hot": "one_shot"}},
+        "消融：会话内热点也进 one-shot 硬优先带（规则原样）", True,
+    ),
+    "A5": Arm(
+        "A5", "tag_lru_min3", "simple_hybrid",
+        {"tiny_lru": {"policy": "tag_lru", "struct_share_min": 3}},
+        "消融：要 3 个会话共享才晋升 QSTRUCT", True,
+    ),
 }
 
 DEFAULT_ARMS = ["A0", "A2", "A3"]
@@ -142,7 +121,7 @@ def select(expr: Optional[str]) -> List[Arm]:
     return uniq
 
 
-# 压力点：pool_ratio = pool_tokens / 校准工作集（见 replay 的 --pool-ratio）
+# # 压力点：pool_ratio = pool_tokens / 校准工作集（见 replay 的 --pool-ratio）
 DEFAULT_POOL_RATIOS = [0.3, 0.6, 1.0]
 SANITY_POOL_RATIO = 2.0  # §10 无压力对照点：各臂必须趋同
 

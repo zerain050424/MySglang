@@ -1,7 +1,7 @@
 {
   "tlru": {
     "enabled": true,
-    "threshold": 9216,
-    "next_prompt_estimate": 2048
+    "threshold": 943,
+    "next_prompt_estimate": 71
   }
 }

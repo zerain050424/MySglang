@@ -54,15 +54,9 @@ arm_policy() {
     A0) echo "lru|" ;;
     A1) echo 'slru|{"protected_threshold":2}' ;;
     A2) echo 'simple_hybrid|{"tiny_lru":{"policy":"off"}}' ;;
-    A3) echo 'simple_hybrid|{"tiny_lru":{"policy":"wtinylru","k":3,"window_entries":64,"epoch_events":8192}}' ;;
-    A4) echo 'simple_hybrid|{"tiny_lru":{"policy":"wtinylru","k":2,"window_entries":64,"epoch_events":8192}}' ;;
-    A5) echo 'simple_hybrid|{"tiny_lru":{"policy":"wtinylru","k":5,"window_entries":64,"epoch_events":8192}}' ;;
-    A6) echo 'simple_hybrid|{"tiny_lru":{"policy":"wtinylru","k":3,"window_entries":16,"epoch_events":8192}}' ;;
-    A7) echo 'simple_hybrid|{"tiny_lru":{"policy":"wtinylru","k":3,"window_entries":256,"epoch_events":8192}}' ;;
-    A8) echo 'simple_hybrid|{"tiny_lru":{"policy":"wtinylru","k":3,"window_entries":64,"epoch_events":8192,"admission_tie":"admit"}}' ;;
-    A9) echo 'simple_hybrid|{"tiny_lru":{"policy":"wtinylru","k":3,"window_entries":64,"epoch_events":512}}' ;;
-    A10) echo 'simple_hybrid|{"tiny_lru":{"policy":"wtinylru","k":3,"window_entries":64,"epoch_events":1000000000}}' ;;
-    A11) echo 'simple_hybrid|{"tiny_lru":{"policy":"wtinylru","k":3,"window_entries":64,"epoch_events":8192,"admission_metric":"share_per_token"}}' ;;
+    A3) echo 'simple_hybrid|{"tiny_lru":{"policy":"tag_lru"}}' ;;
+    A4) echo 'simple_hybrid|{"tiny_lru":{"policy":"tag_lru","local_hot":"one_shot"}}' ;;
+    A5) echo 'simple_hybrid|{"tiny_lru":{"policy":"tag_lru","struct_share_min":3}}' ;;
     *) echo "??|" ;;
   esac
 }
