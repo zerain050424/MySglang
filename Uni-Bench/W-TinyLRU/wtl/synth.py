@@ -190,14 +190,19 @@ def build_dslru(
     blocks = max(1, int(blocks))
     sessions_per_template = max(3, int(sessions_per_template))
 
-    # 模板 v 的会话落在哪些块：出生块 2 个 + 之后每 +2 块 1 个
+    # 模板 v 的会话落在哪些块：出生块 2 个 + 之后均匀铺到后面的块。
+    # 注意：**不能取模**——(birth + 2k) % blocks 会把复发会话绕回出生块之前，
+    # 于是该会话到达时模板还没被创建，测出来的"模板未命中的"其实是"还没插过"，
+    # 会把 A3 的成绩系统性压低（实测约 49% 的模板请求踩到这个假阴性）。
     per_block: Dict[int, List[Dict[str, object]]] = {b: [] for b in range(blocks)}
     private_lens: List[int] = []
     template_uses: Dict[int, int] = {}
+    tail_slots = max(1, sessions_per_template - 2)
     for v in range(variants):
         birth = v % blocks
+        span = max(0, blocks - 1 - birth)
         schedule = [birth, birth] + [
-            (birth + 2 * k) % blocks for k in range(1, sessions_per_template - 1)
+            birth + (j * span) // tail_slots for j in range(1, tail_slots + 1)
         ]
         for j, blk in enumerate(schedule):
             sid = f"dslru-t{v}-s{j}-seed{seed}"
