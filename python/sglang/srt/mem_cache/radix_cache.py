@@ -385,6 +385,14 @@ class RadixCache(BasePrefixCache):
             for ov in self.victim_overrides
             if hasattr(ov, "on_node_inserted")
         )
+        # 需要命中期记录的插件（目前是 SLRU 的共享会话数账本）。
+        # 特意不经过 tag_policy：`tiny_lru.policy="off"` / `force_agentic` 时
+        # 共享数仍然要被记录，否则 SLRU 的准入条件会退化成恒真/恒假。
+        self._hit_observers = tuple(
+            ov.on_node_hit
+            for ov in self.victim_overrides
+            if hasattr(ov, "on_node_hit")
+        )
 
         self.evictable_leaves = set()
         # SimpleHYBRID：会话级 KV 账本（每会话 d/L/gaps），供公平淘汰使用。
@@ -1026,6 +1034,10 @@ class RadixCache(BasePrefixCache):
         """Apply the session's type to owned nodes; keep fork/shared tags sticky."""
         delta = access_time - node.last_access_time
         node.hit_count += 1
+        # 共享会话数账本（SlruEvictPolicy）：必须早于贴标签，apply_tag 要读新值；
+        # 也必须早于 force_agentic 短路，否则该实验开关会让账本永远停在 0。
+        for observe in self._hit_observers:
+            observe(node, session_id)
         state = (
             self.session_registry.get(session_id)
             if self._hit_recorder is not None

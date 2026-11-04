@@ -21,21 +21,23 @@ TinyLRU 分支的默认实现（`tiny_lru.policy = "tag_lru"`）。它把「谁�
 3. **不需要三区索引 / 准入 / aging / 预算**：`QSTRUCT` 内部按 LRU 排序由
    `SimpleHybridStrategy.victim_key` 的 class-rank 分支负责（见 evict_policy）。
 
+账本归属
+--------
+`share_sessions` / `session_bloom` 的**写入**归 `SlruEvictPolicy`
+（`on_node_hit`），本类只负责贴标签，不再计数。因此
+`tiny_lru.policy="off"` 时共享数依旧准确，SLRU 的准入条件不会退化。
 与三区版共享的字段：`share_count`（rid 计数，诊断用）、`share_sessions`、
 `rid_bloom`、`session_bloom`。两套策略可以随时切换，节点状态不用迁移。
 """
 
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Dict
 
 from sglang.srt.mem_cache.uni_utils import (
     SessionType,
     SimpleHybridQueueTag,
-    session_bloom_bits,
 )
-
-_MAX_SHARE = 255
 
 
 class TagLruPolicy:
@@ -60,32 +62,21 @@ class TagLruPolicy:
         # 合成多轮 struct 负载 82.46% vs 75.67%。默认必须是 chat。
         self.local_hot = local_hot if local_hot in ("one_shot", "chat") else "chat"
 
-        # 同一会话连续命中整条路径：bloom bits 做一次局部缓存
-        self._last_sid: Optional[str] = None
-        self._last_sbits = 0
-
         self.stats = {
             "promote": 0,   # QTRANS/QCHAT/QAGENT -> QSTRUCT 的次数
             "demote": 0,    # QSTRUCT -> QTRANS 的次数（当前规则下不会发生）
-            "dedup": 0,     # 同一会话重复命中同一个节点
-            "counted": 0,   # 计入 share_sessions 的命中次数
             "born": 0,      # 新节点出生打标次数
         }
 
     # ------------------------------------------------------------------ 频数
 
     def _freq_of(self, node) -> int:
+        """读共享数账本（写者只有一个：SlruEvictPolicy.on_node_hit）。"""
         if self.share_metric == "session":
             sessions = getattr(node, "share_sessions", None)
             if sessions is not None:
                 return int(sessions)
         return int(getattr(node, "share_count", 0) or 0)
-
-    def _sid_bits(self, session_id) -> int:
-        if session_id != self._last_sid:
-            self._last_sid = session_id
-            self._last_sbits = session_bloom_bits(session_id)
-        return self._last_sbits
 
     # ------------------------------------------------------------------ 标签
 
@@ -132,20 +123,13 @@ class TagLruPolicy:
     # ------------------------------------------------------------------ 钩子
 
     def observe_hit(self, node, session_id, session_type) -> None:
-        """命中路径：先记「不同会话数」，再按规则贴标签。
+        """命中路径：只负责贴标签。
 
-        这一步就是「分类过程中的晋升」：第二个会话命中同一条前缀时，
-        该前缀当场从 QTRANS 变成 QSTRUCT，不需要等它变成可淘汰叶子。
+        共享会话数的记账（去重 + 自增）已移到 `SlruEvictPolicy.on_node_hit`，
+        缓存层会先调它、再调本方法，所以 `apply_tag` 读到的是本次命中后的新值。
         """
         if node is None or session_id is None:
             return
-        bits = self._sid_bits(session_id)
-        if (getattr(node, "session_bloom", 0) & bits) == bits:
-            self.stats["dedup"] += 1
-            return
-        node.session_bloom = getattr(node, "session_bloom", 0) | bits
-        node.share_sessions = min(_MAX_SHARE, getattr(node, "share_sessions", 0) + 1)
-        self.stats["counted"] += 1
         self.apply_tag(node, session_type)
 
     def on_split(self, prefix_half, suffix_half=None) -> None:
@@ -170,16 +154,14 @@ class TagLruPolicy:
         }
 
     def reset(self) -> None:
-        self._last_sid = None
-        self._last_sbits = 0
         for key in self.stats:
             self.stats[key] = 0
 
     def __repr__(self) -> str:  # pragma: no cover - 调试用
         s = self.snapshot()
         return (
-            "[tag_lru] min={struct_share_min} promote={promote} "
-            "dedup={dedup} counted={counted}".format(**s)
+            "[tag_lru] min={struct_share_min} promote={promote} demote={demote}"
+            .format(**s)
         )
 
 

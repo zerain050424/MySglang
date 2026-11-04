@@ -192,7 +192,13 @@ class SimpleHybridStrategy(EvictionStrategy):
 
 
         self.rr_evict = RrEvictPolicy(self.rr) if self.rr.fair_rr else None
-        self.slru_evict = SlruEvictPolicy()
+        # 会话账本必须先就位：SLRU 的共享数账本与 one-shot 判定共用它。
+        self.session_registry = SessionRegistry.global_instance()
+        # 共享数阈值只有一处配置：TinyLRUParams.struct_share_min。
+        # 它同时喂给 SLRU 的准入判定与 one-shot 的分界。
+        self.slru_evict = SlruEvictPolicy(
+            self.session_registry, self.tiny_lru.struct_share_min
+        )
         # 标签版 TinyLRU（Q_struct 队内策略）：不建队列索引，只按
         # 「会话类型 + 会话共享数」贴标签；关闭时是彻底的零开销路径。
         self.tagState = (
@@ -217,9 +223,9 @@ class SimpleHybridStrategy(EvictionStrategy):
         self.tlru_evict = TlruEvictPolicy(self.tlru) if self.tlru.enabled else None
         self._validate_scope()
         self.victim_overrides = tuple(
-            p for p in (self.rr_evict, self.tlru_evict,self.slru_evict) if p is not None
+            p for p in (self.rr_evict, self.tlru_evict, self.slru_evict) if p is not None
         )
-        self.session_registry = SessionRegistry.global_instance()
+
     def reset_bookkeeping(self) -> None:
         """清空窗口/累计/来源计数（缓存 flush 与 reset 同源）。
 
@@ -236,7 +242,11 @@ class SimpleHybridStrategy(EvictionStrategy):
         self._rid_order.clear()
 
     def owns_struct(self, node) -> bool:
-        """该节点是否受「结构复用」保护（one-shot 死链上溯闸用）。"""
+        """该节点是否带着 QSTRUCT 标签（**仅观测 / 测试用**）。
+
+        淘汰路径已不再用它做闸：一次性判定与死链上溯都改成看共享数
+        (is_one_shot / struct_share_min)，否则标签与共享数分叉时两边打架。
+        """
         return bool(self.tagState is not None and self.tagState.owns(node))
 
     def tag_snapshot(self) -> Optional[dict]:
@@ -321,23 +331,30 @@ class SimpleHybridStrategy(EvictionStrategy):
         return (self._reuse_score(node), -tokens)
 
     def is_one_shot(self, node) -> bool:
-        """
-        一次性内容（one-shot）：淘汰顺序永远先于可调度内容。
-          - RANDOM_SINGLE_TURN：无复用的随机单轮，跨会话几乎不复用；
-          - STRUCT_SINGLE_TURN： 的生成段：会话发完即弃，response 不会再被任何请求当作前缀。
+        """一次性内容（one-shot）：淘汰顺序永远先于可调度内容。
+
+        判定只看「会话类型 + 跨会话共享数」，**不看 `queue_tag`**：
+
+            one_shot = 会话类型 ∈ {TRANS, STRUCT} 且 share_sessions < struct_share_min
+
+        为什么不能看标签：`queue_tag` 由 `tag_lru` 维护，而它与共享数在
+        命中者类型不同时会分叉 —— 只有 STRUCT 会话命中才会触发晋升，
+        但 CHAT/AGENTIC 命中同样会涨共享数。拿标签当闸门会漏掉真正的
+        共享前缀（典型：TRANS 会话插入的文档段被别的会话复用）。
+
+        `share_sessions >= struct_share_min` = 除创建者外还有 >=2 个会话
+        命中过（共 >=3 个），属于跨会话模板，不进一次性带——即使它的
+        创建者当初被判成 TRANS。阈值取自 `TinyLRUParams.struct_share_min`
+        注入到 `SlruEvictPolicy` 的同一个值，标签与淘汰不会各算一套。
         """
         st = self.session_registry.get(getattr(node, "session_id", None))
-        # task_type = self._task_type_of(node)
         if st is None:
             # 无会话证据（客户端未带 session_id，或账本已被 sweep）：不判 one-shot。
             return False
-        if st.session_type == SessionType.STRUCT and getattr(node, "share_sessions", 0) < 2:
-            return True
-        if st.session_type == SessionType.TRANS:
-            return True
-        return node.is_decode and (
-           st.session_type ==  SessionType.STRUCT or st.session_type == SessionType.TRANS
-        )
+        if self.slru_evict.share_of(node) >= self.slru_evict.struct_share_min:
+            # 已被足够多会话复用：即便创建者是 TRANS 也不再是一次性内容。
+            return False
+        return st.session_type in (SessionType.TRANS, SessionType.STRUCT)
 
     def workload_of(self, node) -> str:
         """节点所属的工作负载。"""
@@ -442,7 +459,16 @@ class SimpleHybridStrategy(EvictionStrategy):
             s = self.tagState.snapshot()
             lines.append(
                 f"  tag_lru: min_share={s['struct_share_min']} "
-                f"promote={s['promote']} dedup={s['dedup']} counted={s['counted']}"
+                f"promote={s['promote']} demote={s['demote']}"
+            )
+        if self.slru_evict is not None:
+            # 共享会话数账本 + 本改写器实际给出的候选数。
+            s = self.slru_evict.stats()
+            lines.append(
+                f"  slru: min_share={self.slru_evict.struct_share_min} "
+                f"picks={s['slru_picks']:.0f} "
+                f"share_counted={s['share_counted']:.0f} "
+                f"share_dedup={s['share_dedup']:.0f}"
             )
         if self._victim_sources:
             src = " ".join(

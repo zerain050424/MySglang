@@ -44,8 +44,8 @@ class SimpleHybridQueueTag(str, enum.Enum):
 def session_bloom_bits(session_id) -> int:
     """session_id -> 64 bit bloom（4 函数），饱和在 ~8 个会话后误判率上升。
 
-    两套 TinyLRU（三区版 / 标签版）共用同一份位布局，切换策略时节点上的
-    ``session_bloom`` 语义不变。
+    位布局归共享会话数账本的所有者（SlruEvictPolicy）使用；
+    节点上的 ``session_bloom`` 语义因此与 tiny_lru 的开关无关。
     """
     text = "sid:" + (session_id if isinstance(session_id, str) else str(session_id))
     h = zlib.crc32(text.encode("utf-8", "replace")) & 0xFFFFFFFF
@@ -54,6 +54,10 @@ def session_bloom_bits(session_id) -> int:
     for i in range(4):
         bits |= 1 << ((h >> (i * 6)) & 63)
     return bits
+
+
+# 节点共享会话数的饱和上界（8 bit，够用且能塞进诊断快照）。
+SESSION_SHARE_MAX = 255
 
 
 def session_type_to_queue_tag(session_type: SessionType) -> SimpleHybridQueueTag:
@@ -180,6 +184,15 @@ class RrParams:
         return dataclasses.asdict(self)
 
 
+# 「跨会话模板」的共享会话数阈值（唯一旋钮）。
+#
+# 语义：除创建者外还有 >= N 个会话命中过同一节点（即共 >= N+1 个会话用过）。
+# 它同时决定两件事，两处必须同源，所以只允许配置一处：
+#   * TagLruPolicy.apply_tag  : 是否晋升为 QSTRUCT（标签口径）
+#   * SlruEvictPolicy         : 是否受 SLRU 保护 / 是否退出 one-shot 带
+DEFAULT_STRUCT_SHARE_MIN = 2
+
+
 @dataclasses.dataclass
 class TinyLRUParams:
     """Q_struct 队内的标签版 TinyLRU（分类即晋升，不做跨队列仲裁）。
@@ -192,8 +205,9 @@ class TinyLRUParams:
     policy: str = "tag_lru"
     # 会话共享判定口径 —— "session"（默认，不同会话数）| "rid"（不同请求数，消融）
     share_metric: str = "session"
-    # 会话共享数达到该值才算「跨会话模板」-> QSTRUCT；默认 2（即 >1）
-    struct_share_min: int = 2
+    # 会话共享数达到该值才算「跨会话模板」；默认 2（即 >1）。
+    # 同时是 SLRU 的保护阈值与 one-shot 的分界（见 DEFAULT_STRUCT_SHARE_MIN）。
+    struct_share_min: int = DEFAULT_STRUCT_SHARE_MIN
     # 会话内热点（share_sessions==1）的处置 —— "chat"（默认，保留复用）| "one_shot"
     local_hot: str = "chat"
 

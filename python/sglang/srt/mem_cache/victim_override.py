@@ -23,7 +23,8 @@
   适配器。
   * `TlruEvictPolicy`    —— T-LRU 的尾部优先修正；除候选选择外，还在
     插入/分裂时维护节点上的 `_tlru_*` 高水位（缓存层会调 `on_node_inserted`）。
-  * `SlruEvictPolicy`    —— SLRU 的候选改写（probation → protected，段内 recency）。
+  * `SlruEvictPolicy`    —— SLRU 的候选改写（probation → protected，段内 recency），
+    同时独占「节点共享会话数」账本（`on_node_hit` 由缓存层命中路径调用）。
     `scope="non_one_shot"` 时与 `evict()` 的 one-shot 分支合起来就是
     「带 one-shot 带的 SLRU」：带内先清空，其余按两段排序。标签版 TinyLRU 仍把
     顺序编码进 `victim_key`，不走插件。
@@ -35,13 +36,16 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Dict, Iterable, Optional, Tuple
 import time
 from sglang.srt.mem_cache.uni_utils import (
+    DEFAULT_STRUCT_SHARE_MIN,
     RrParams,
+    SESSION_SHARE_MAX,
     SessionRegistry,
     SessionType,
     SimpleHybridQueueTag,
     SimpleHybridTaskType,
     TlruParams,
     node_end_offset,
+    session_bloom_bits,
     task_type_of_tag,
 )
 
@@ -54,7 +58,9 @@ class VictimOverride(ABC):
     """插件位基类。子类只需实现 applies_to / pick。"""
 
     name: str = "override"
-    session_registry = SessionRegistry.global_instance()
+    # 会话账本由构造方注入（见 SlruEvictPolicy.__init__）。基类不得在 import
+    # 时抓死全局单例，否则 SessionRegistry.reset_global() / 测试里的
+    # `cache.session_registry = SessionRegistry()` 都到不了插件。
     # 观测字段：本改写器管辖的队列，仅用于 profile 记账。
     # 不得参与仲裁判定（否则退化为 proposer 形态，见设计讨论）。
     queue: Optional[SimpleHybridQueueTag] = None
@@ -270,21 +276,78 @@ class TlruEvictPolicy(VictimOverride):
         self.fallbacks = 0
         self.history_raises = 0
 
+
 class SlruEvictPolicy(VictimOverride):
-    """
-    S-LRU 的 QSTRUCT 候选修正。
-    与 `evict_policy.SLRUStrategy` 同一公式：
+    """S-LRU 的 QSTRUCT 候选修正，同时是「节点共享会话数」账本的唯一所有者。
 
-        budget   = max(L + Q_hat - threshold, 0)
-        tel_safe = (cached_without_this_node >= budget)
-        key      = (0 if tel_safe else 1, last_access_time)
-    """
+    账本（本类独占）
+    ----------------
+    写 `node.share_sessions` / `node.session_bloom` 的唯一位置是 `on_node_hit()`；
+    缓存层在命中路径上通过 `_hit_observers` 调用它，**与 `tiny_lru.policy` /
+    `force_agentic` 无关**，所以关掉标签策略后账本照常维护。
+    节点的初值（`TreeNode.__init__`）与分裂继承（`_split_node`）属于树结构维护，
+    仍留在 radix_cache；本类只读它们。
 
-    name: str = "Slru"
+    计数口径：不同**会话**命中同一节点才 +1；创建者自己的插入不计，
+    同一会话重复命中由 `session_bloom` 去重，饱和在 `SESSION_SHARE_MAX`。
+
+    候选修正
+    --------
+    `applies_to` 命中「STRUCT 会话 + 已被 >= struct_share_min 个外部会话
+    命中过」的叶子，`pick` 在它们中间取最久未访问者（段内 LRU）。
+    阈值与 TagLruPolicy 的晋升阈值是同一个旋钮
+    （`TinyLRUParams.struct_share_min`），因此标签与淘汰不会各算一套。
+    """
 
     # 观测字段：本改写器管辖的队列，仅用于 profile 记账。
     # 不得参与仲裁判定（否则退化为 proposer 形态，见设计讨论）。
     queue: Optional[SimpleHybridQueueTag] =  SimpleHybridQueueTag.QSTRUCT
+
+    def __init__(self, session_registry=None, struct_share_min=None) -> None:
+        # 与策略共用同一本会话账（SimpleHybridStrategy.__init__ 注入），
+        # 保证 is_one_shot 与 applies_to 看到同一份 session_type。
+        self.session_registry = session_registry or SessionRegistry.global_instance()
+        # 共享数阈值：唯一旋钮是 TinyLRUParams.struct_share_min（由策略注入）。
+        # 它同时决定「是否受 SLRU 保护」与「是否退出 one-shot 带」。
+        self.struct_share_min = max(
+            2,
+            int(
+                DEFAULT_STRUCT_SHARE_MIN
+                if struct_share_min is None
+                else struct_share_min
+            ),
+        )
+        # 共享会话数账本的观测（原属 TagLruPolicy，已随记账一起搬过来）
+        self.share_counted = 0   # 计入 share_sessions 的命中次数
+        self.share_dedup = 0     # 同一会话重复命中的去重次数
+        self.slru_picks = 0      # 本改写器实际给出的候选数
+
+    # ------------------------------------------------------------ 共享会话数账本
+
+    def on_node_hit(self, node, session_id=None) -> None:
+        """命中路径的记账钩子：不同会话数 +1（同一会话去重）。
+
+        由缓存层 `RadixCache._record_node_hit()` 在贴标签之前调用，
+        因此 `tag_lru.apply_tag()` 读到的是本次命中后的新值。
+        """
+        if node is None or not session_id:
+            return
+        bits = session_bloom_bits(session_id)
+        if getattr(node, "session_bloom", 0) & bits == bits:
+            self.share_dedup += 1
+            return
+        node.session_bloom = getattr(node, "session_bloom", 0) | bits
+        node.share_sessions = min(
+            SESSION_SHARE_MAX, int(getattr(node, "share_sessions", 0) or 0) + 1
+        )
+        self.share_counted += 1
+
+    @staticmethod
+    def share_of(node) -> int:
+        """节点已被多少个「其他会话」命中过（创建者不计）。"""
+        return int(getattr(node, "share_sessions", 0) or 0)
+
+    # ------------------------------------------------------------ 插件接口
 
     def applies_to(self, node) -> bool:
         """当前候选是否归本改写器管。"""
@@ -292,32 +355,42 @@ class SlruEvictPolicy(VictimOverride):
             return False
         st = self.session_registry.get(getattr(node, "session_id", None))
         stype = st.session_type if st is not None else None
-        return stype == SessionType.STRUCT and getattr(node, "share_sessions", 0) >= 2
+        return (
+            stype == SessionType.STRUCT
+            and self.share_of(node) >= self.struct_share_min
+        )
 
-    def pick(self, leaves: Iterable["TreeNode"], registry) -> Optional["TreeNode"]:
+    def pick(self, leaves: Iterable["TreeNode"], registry=None) -> Optional["TreeNode"]:
         """返回本改写器更愿意淘汰的节点；None表示不接管。"""
         struct = [node for node in leaves if self.applies_to(node)]
         if not struct:
             return None
+        now = time.monotonic()
         nearest = None
         victim = None
         for node in struct:
-            now_time =  time.monotonic()
-            delta = now_time - node.last_access_time
+            delta = now - node.last_access_time
             if nearest is None or delta > nearest:
                 nearest = delta
                 victim = node
+        self.slru_picks += 1
         return victim
-
-
 
     def stats(self) -> Dict[str, float]:
         return {
             "slru_picks": self.slru_picks,
+            "share_counted": self.share_counted,
+            "share_dedup": self.share_dedup,
         }
 
     def reset(self) -> None:
-        """清空内部状态（缓存 reset / 进程复用）。"""
+        """清空内部状态（缓存 reset / 进程复用）。
+
+        节点上的 `share_sessions` / `session_bloom` 随树一起丢弃，不用清。
+        """
+        self.share_counted = 0
+        self.share_dedup = 0
+        self.slru_picks = 0
 
     def __repr__(self) -> str:  # pragma: no cover - 调试用
         return f"<{type(self).__name__} name={self.name}>"

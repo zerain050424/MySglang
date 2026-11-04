@@ -40,11 +40,13 @@ class SimpleHybridRadixCache(RadixCache):
 
         strategy = self.eviction_strategy
         num_evicted = 0
-        victim = None
         # one-shot 永远先清空（one_shot_key 首项 -树上结束偏移：位置最深的块先走，
         # 对齐 HeterCache evict_first 的 -num_hashed_tokens 口径）；
         # 清空后可调度内容按 victim_key 全局竞争（分数最低，同分 token 多者先走）。
         while num_evicted < num_tokens:
+            # 不变式：下面两个分支必定给 victim 赋值（one-shot 带 / victim_key
+            # 基础候选），第三分支直接 break。因此 victim 绝不跨轮复用、也绝不
+            # 为 None —— 复用上一轮已删除的 victim 会二次释放同一段 KV。
             leaves = self.evictable_leaves
             one_shot = [n for n in leaves if strategy.is_one_shot(n)]
             source = "global"
@@ -93,10 +95,11 @@ class SimpleHybridRadixCache(RadixCache):
         """
         total = 0
         cur = node
-        # 死链上溯闸：三区版看 struct_region，标签版看 queue_tag==QSTRUCT。
-        # 统一走策略的 owns_struct()，避免两套实现各自漏一处。
-        owns_struct = getattr(self.eviction_strategy, "owns_struct", None)
-        one_shot = self.eviction_strategy.is_one_shot(node)
+        # 死链上溯闸与 evict() 的 one-shot 带同源：只为一次性内容级联。
+        # 祖先也得自己是一次性内容（未被跨会话共享）才能跟着删，否则会
+        # 连带删掉刚进 protected 的共享前缀。这里不再读 queue_tag。
+        strategy = self.eviction_strategy
+        one_shot = strategy.is_one_shot(node)
         while True:
             parent = cur.parent
             # 累计该队列的淘汰 token（供 profile）
@@ -110,9 +113,8 @@ class SimpleHybridRadixCache(RadixCache):
             self._delete_leaf(cur)
             if (one_shot and parent is not None and parent is not self.root_node
                     and parent.lock_ref == 0 and not parent.children
-                    # Q_struct 闸：模板前缀不参与 one-shot 死链级联，
-                    # 否则「降级后的文档段被收割」会连带删掉刚进 protected 的前缀。
-                    and not (owns_struct is not None and owns_struct(parent))):
+                    # 同源闸：祖先必须也是 one-shot（共享数未达保护阈值）。
+                    and strategy.is_one_shot(parent)):
                 cur = parent  # 死链：随 one-shot 一并删除
                 continue
             break
