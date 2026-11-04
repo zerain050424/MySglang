@@ -10,7 +10,7 @@
     SGLANG_STRUCT_PROFILE_TAG=A3_hybrid_100k \\
     $PY -m wtl.serve --model-path $MODEL \\
         --enable-simple-hybrid --radix-eviction-policy simple_hybrid \\
-        --radix-eviction-policy-config '{"tiny_lru":{"policy":"tag_lru"}}' \\
+        --radix-eviction-policy-config '{"slru":{"share_min":2}}' \\
         --max-total-tokens 100000 --enable-metrics --port 30000
 
 注意：``PYTHONPATH`` 需要包含仓库的 ``python/`` 目录（与直接 ``python -m

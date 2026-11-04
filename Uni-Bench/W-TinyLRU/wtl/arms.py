@@ -7,8 +7,12 @@
 ----
 * ``policy`` 直接对应 ``--radix-eviction-policy``；
 * ``config`` 直接对应 ``--radix-eviction-policy-config``（即策略构造 kwargs）；
-* ``A2`` 是隔离框架增益的基线（simple_hybrid + tiny_lru=off），
-  ``A0/A1`` 是上游能力边界（lru / slru），``A3`` 是主对象。
+* ``A0/A1`` 是上游能力边界（lru / slru）；
+* ``A2`` 是「只有 one-shot 带」的基线（simple_hybrid + share_min 调到不可达），
+  ``A3`` 是主对象（两带 SLRU：one-shot 带 + 跨会话保护），``A4`` 是阈值消融。
+
+共享数阈值只有一个旋钮 ``slru.share_min``（框架侧 ``SlruParams``）：
+它是「退出 one-shot 带 / 进入 SLRU 保护段」的分界，``share_min`` 越大保护越难触发。
 """
 
 from __future__ import annotations
@@ -17,12 +21,10 @@ import dataclasses
 import json
 from typing import Dict, List, Optional
 
-# 默认参数（与 TAG_LRU.md §6 一致）
-# 标签版 TinyLRU 的默认值（与 TAG_LRU.md 一致）
-DEFAULT_STRUCT_SHARE_MIN = 2
-DEFAULT_LOCAL_HOT = "chat"
-
-# 注意：tiny_lru 缺省 policy="off"。这里显式写全，便于逐臂对照。
+# 框架侧默认值（与 sglang.srt.mem_cache.uni_utils.SlruParams 保持一致）
+DEFAULT_SHARE_MIN = 2
+# 不可达阈值：任何节点都进不了保护段 → 等价于「只有 one-shot 带」。
+BAND_ONLY_SHARE_MIN = 10 ** 6
 @dataclasses.dataclass(frozen=True)
 class Arm:
     id: str
@@ -34,8 +36,12 @@ class Arm:
     expect_struct: bool = False
 
     @property
-    def tiny_lru(self) -> dict:
-        return (self.config or {}).get("tiny_lru", {})
+    def slru(self) -> dict:
+        return (self.config or {}).get("slru", {})
+
+    @property
+    def share_min(self):
+        return self.slru.get("share_min")
 
     @property
     def is_baseline(self) -> bool:
@@ -62,22 +68,17 @@ ARMS: Dict[str, Arm] = {
         "上游分段 LRU：能力上限参照（无准入/无 aging）", False,
     ),
     "A2": Arm(
-        "A2", "hybrid_off", "simple_hybrid", {"tiny_lru": {"policy": "off"}},
-        "隔离框架增益：多队列 + one-shot 带 + 分类器标签，Q_struct 策略关闭", False,
+        "A2", "hybrid_band_only", "simple_hybrid",
+        {"slru": {"share_min": BAND_ONLY_SHARE_MIN}},
+        "只有 one-shot 带：保护段不可达（隔离「保护机制」的贡献）", False,
     ),
     "A3": Arm(
-        "A3", "tag_lru", "simple_hybrid", {"tiny_lru": {"policy": "tag_lru"}},
-        "默认：标签版 TinyLRU（分类即晋升，跨会话共享→QSTRUCT·LRU）", True,
+        "A3", "slru_two_band", "simple_hybrid", {"slru": {"share_min": 2}},
+        "主对象：两带 SLRU（one-shot 带 + 跨会话共享保护段 · 段内 LRU）", True,
     ),
     "A4": Arm(
-        "A4", "tag_lru_one_shot", "simple_hybrid",
-        {"tiny_lru": {"policy": "tag_lru", "local_hot": "one_shot"}},
-        "消融：会话内热点也进 one-shot 硬优先带（规则原样）", True,
-    ),
-    "A5": Arm(
-        "A5", "tag_lru_min3", "simple_hybrid",
-        {"tiny_lru": {"policy": "tag_lru", "struct_share_min": 3}},
-        "消融：要 3 个会话共享才晋升 QSTRUCT", True,
+        "A4", "slru_min3", "simple_hybrid", {"slru": {"share_min": 3}},
+        "消融：要 3 个会话命中过才进保护段（阈值敏感性）", True,
     ),
 }
 
@@ -95,7 +96,7 @@ def get(arm_id: str) -> Arm:
 
 
 def select(expr: Optional[str]) -> List[Arm]:
-    """解析 ``A0,A3-A5`` / ``all`` / ``default`` 表达式，保持输入顺序。"""
+    """解析 ``A0,A2-A4`` / ``all`` / ``default`` 表达式，保持输入顺序。"""
     if not expr or expr in ("default", "DEFAULT"):
         return [ARMS[a] for a in DEFAULT_ARMS]
     if expr in ("all", "ALL", "*"):

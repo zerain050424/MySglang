@@ -388,15 +388,14 @@ def offline_table(runs: Sequence[dict]) -> List[dict]:
             "evictions": s.get("evictions"),
             "regret_rate": regret.get("regret_rate"),
             "protected_waste_rate": regret.get("protected_waste_rate"),
+            "one_shot_pct": round(100.0 * vsrc.get("one_shot", 0.0) / tot_ev, 3) if tot_ev else 0.0,
             "qstruct_pct": round(100.0 * vsrc.get("qstruct", 0.0) / tot_ev, 3) if tot_ev else 0.0,
-            # 标签版没有插件，按标签统计受保护前缀被淘汰的 token 占比
-            "tag_promote": (s.get("tag") or {}).get("promote"),
-            "tag_counted": (s.get("tag") or {}).get("counted"),
-            "struct_share_min": (d.get("config") or {}).get("tiny_lru", {}).get(
-                "struct_share_min"),
-            "qstruct_evicted_pct": _tag_share_pct(s.get("evicted_by_tag") or {}),
-            "share_metric": (d.get("config") or {}).get("tiny_lru", {}).get("share_metric"),
-            "local_hot": (d.get("config") or {}).get("tiny_lru", {}).get("local_hot"),
+            # 机制证据：共享数账本 + SLRU 实际给出的候选数
+            "slru_picks": (s.get("slru") or {}).get("slru_picks"),
+            "share_counted": (s.get("slru") or {}).get("share_counted"),
+            "share_dedup": (s.get("slru") or {}).get("share_dedup"),
+            # 唯一旋钮：越大保护越难触发（A2 用不可达值做基线）
+            "share_min": (d.get("config") or {}).get("slru", {}).get("share_min"),
         }
         for task, layers in (ret or {}).items():
             for L, v in layers.items():
@@ -578,13 +577,12 @@ def judge(offline: Sequence[dict], paired: Sequence[dict], online: Sequence[dict
     return lines
 
 
-def _tag_share_pct(by_tag: dict) -> float:
-    """按标签统计：受保护前缀（QSTRUCT）占被淘汰 token 的比例。"""
-    total = sum(by_tag.values()) or 0.0
+def _src_share_pct(victim_src: dict, key: str) -> float:
+    """某个淘汰来源（one_shot / qstruct / global）占被淘汰 token 的比例。"""
+    total = sum(victim_src.values()) or 0.0
     if not total:
         return 0.0
-    q = by_tag.get("tag:qstruct", 0.0) or 0.0
-    return round(100.0 * q / total, 3)
+    return round(100.0 * (victim_src.get(key, 0.0) or 0.0) / total, 3)
 
 
 def _qstruct_pct(d: dict) -> float:
@@ -731,29 +729,27 @@ def struct_timeseries(paths: Sequence[str]) -> List[dict]:
                     d = json.loads(line)
                 except Exception:
                     continue
-                snap = d.get("tag") or {}
-                ebt = d.get("evicted_by_tag") or {}
-                tot_tokens = 0  # 标签版没有区级 token 账本
+                snap = d.get("slru") or {}
                 vsrc = d.get("victim_src") or {}
-                tot = sum(ebt.values()) or sum(vsrc.values()) or 0.0
+                tot = sum(vsrc.values()) or 0.0
                 rows.append(
                     {
-                        "tag": d.get("tag"),
+                        "slru": d.get("slru"),
                         "ts": d.get("ts"),
                         "evict_calls": d.get("evict_calls"),
                         "evict_us_p50": d.get("evict_us_p50"),
                         "evict_us_p99": d.get("evict_us_p99"),
                         "available": d.get("available"),
                         "evictable_size": d.get("evictable_size"),
-                        "policy": snap.get("policy"),
-                        "promote": snap.get("promote"),
-                        "demote": snap.get("demote"),
-                        "counted": snap.get("counted"),
-                        "dedup": snap.get("dedup"),
-                        "struct_share_min": snap.get("struct_share_min"),
-                        "local_hot": snap.get("local_hot"),
+                        "slru_picks": snap.get("slru_picks"),
+                        "share_counted": snap.get("share_counted"),
+                        "share_dedup": snap.get("share_dedup"),
+                        "share_min": d.get("slru_share_min"),
+                        "one_shot_evicted_pct": round(
+                            100.0 * (vsrc.get("one_shot", 0.0) or 0.0) / tot, 2
+                        ) if tot else 0.0,
                         "qstruct_evicted_pct": round(
-                            100.0 * ebt.get("tag:qstruct", 0.0) / tot, 2
+                            100.0 * (vsrc.get("qstruct", 0.0) or 0.0) / tot, 2
                         ) if tot else 0.0,
                     }
                 )
@@ -998,9 +994,11 @@ def main(argv=None) -> int:
         lines.append("## 2. 离线主表（真实后端）\n")
         rows = [r for r in off_rows if r["backend"] == "real"]
         cols = ["arm", "workload", "ladder", "hit_pct", "regret_rate",
-                "protected_waste_rate", "qstruct_evicted_pct", "tag_promote", "evictions"]
+                "protected_waste_rate", "one_shot_pct", "qstruct_evicted_pct",
+                "share_counted", "slru_picks", "evictions"]
         heads = ["arm", "workload", "压力轴", "hit%", "regret", "prot_waste",
-                 "qstruct_evicted%", "promote", "evicts"]
+                 "one_shot_evict%", "qstruct_evicted%", "share_counted", "picks",
+                 "evicts"]
         extra = sorted({
             k for r in rows for k in r
             if (k.startswith("ret_struct@") or k.startswith("hist_")) and k.endswith("_full")

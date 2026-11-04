@@ -22,7 +22,8 @@
     sglang.srt.mem_cache.victim_override
     sglang.srt.mem_cache.uni_utils
 
-标签版 TinyLRU（``tag_lru``）不读时间，故不在此列。
+SLRU 的共享数账本不读时间（只读命中会话），故不在此列；
+它的 `pick()` 读 `time.monotonic()`，因此本模块必须覆盖 `victim_override`。
 """
 
 from __future__ import annotations

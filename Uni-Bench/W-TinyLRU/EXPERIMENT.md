@@ -1,8 +1,9 @@
-# TinyLRU 正式实验方案（one-shot × 结构复用）
+# 两带 SLRU 正式实验方案（one-shot 带 × 跨会话保护）
 
-> 范围声明：**只考察 one-shot 硬优先带与 Q_struct 队内策略（标签版 TinyLRU）**。
+> 范围声明：**只考察 one-shot 硬优先带与「跨会话共享 → 保护段」两级结构**。
 > 不考察 Agentic 队列、RR 会话公平、T-LRU、跨队列 alpha 仲裁——这些一律关闭或冻结。
 > 对照组只用 **SGLang 原生 LRU / SLRU**。
+> 唯一旋钮是 `--radix-eviction-policy-config '{"slru": {"share_min": N}}'`。
 
 ---
 
@@ -10,9 +11,9 @@
 
 | # | 假设 | 判据（跑之前定死） |
 |---|---|---|
-| **H1** | 有 KV 压力时，TinyLRU 让**结构复用前缀**更久驻留 | `ret@P full_rate` 相对 A2（one-shot 带、无 TinyLRU）≥ **+5pp**，请求级配对 bootstrap 95% CI 排除 0 |
-| **H2** | 该驻留转化为命中率，且**不靠牺牲干扰项** | 结构复用子集 hit ≥ **+3pp**；干扰（burst）子集 hit 回退 ≤ **1pp** |
-| **H3** | 收益来自「会话内复用不被打进 one-shot 带」 | A3 − A4 ≥ **+3pp**（A4 = `local_hot=one_shot`，规则原样），且 A4 的 `qtrans` 淘汰占比显著更高 |
+| **H1** | 有 KV 压力时，两带 SLRU 让**跨会话模板**更久驻留 | `ret@P full_rate` 相对 A2（只有 one-shot 带）≥ **+5pp**，请求级配对 bootstrap 95% CI 排除 0 |
+| **H2** | 该驻留转化为命中率，且**不靠牺牲干扰项** | 模板子集 hit ≥ **+3pp**；干扰（burst）子集 hit 回退 ≤ **1pp** |
+| **H3** | 收益来自「按跨会话共享准入」，而非按访问频次 | A3 − A1 ≥ **+3pp**（A1 = 上游 SLRU，按 `hit_count` 晋升），且 A1 的 `protected_waste_rate` 显著更高 |
 | **H4** | 无压力时策略应退化为等价 | `pool/工作集 = 1.0` 时 A0/A2/A3 的 hit 极差 < **0.5pp** |
 | **H5** | 命中率传导到 TTFT | 在线 `ttft_p50` ≤ **−3%**，`ttft_p99` 回退 ≤ **5%** |
 | **H6** | 干扰强度越大，TinyLRU 的相对收益越大 | 收益随「每块 burst token / 池容量」单调上升（比值 0.5 → 1 → 2） |
@@ -27,11 +28,11 @@
 
 | 臂 | 配置 | 隔离出的贡献 |
 |---|---|---|
-| **A0** | `--radix-eviction-policy lru` | SGLang 原生基线（无 one-shot 带、无队列标签） |
-| **A1** | `--radix-eviction-policy slru` | 上游分段 LRU（外部参照：说明「自研是否值得」） |
-| **A2** | `simple_hybrid` + `tiny_lru.policy="off"` | **one-shot 带 + 分类器标签** 的贡献 = A2 − A0 |
-| **A3** | `simple_hybrid` + `tiny_lru.policy="tag_lru"` | **TinyLRU** 的贡献 = A3 − A2（主对象） |
-| **A4** | A3 + `local_hot="one_shot"` | H3 消融：把会话内复用也打进 one-shot 带（只在主压力点跑） |
+| **A0** | `--radix-eviction-policy lru` | SGLang 原生基线（无 one-shot 带、无跨会话保护） |
+| **A1** | `--radix-eviction-policy slru` | 上游分段 LRU（按 `hit_count>=2` 晋升 protected） |
+| **A2** | `simple_hybrid` + `{"slru":{"share_min":1000000}}` | **one-shot 带 + 分类器** 的贡献 = A2 − A0；保护段不可达 |
+| **A3** | `simple_hybrid` + `{"slru":{"share_min":2}}` | **跨会话保护** 的贡献 = A3 − A2（主对象） |
+| **A4** | `simple_hybrid` + `{"slru":{"share_min":3}}` | 阈值消融：要 3 个会话命中过才进保护段 |
 
 固定配置（所有臂一致，避免混入跨队列因素）：
 
@@ -48,7 +49,13 @@
 
 ---
 
-## 3. 负载构造：结构复用 + 单轮 burst 干扰
+## 3. 负载构造
+
+本轮主场景是 **D-SLRU**（§3.3），它同时放大「LRU 的 recency 反转」与
+「上游 SLRU 的频次伪造」。§3.0–3.2 的前缀阶梯保留为副场景（验证在纯共享前缀
+强度变化下结论是否一致）。
+
+### 3.0 前缀阶梯（副场景，旧）
 
 用 `wtl/synth.py` 生成，**两个成分必须可分辨**（分析时按 `session_id` 前缀分组，不需要改代码）：
 
@@ -89,8 +96,46 @@ python -m wtl.synth --out-dir data/exp/D2 \
 ```
 
 > `noise_frac=2.0` ⇒ burst 会话数 = 2 × 模板会话数；`--phased` 把 burst 均分到每个模板块之后。
-> 需要 `wtl/replay.py --no-shuffle`（约 5 行改动）才能保住块顺序；在线端用
-> `bench_unicache.py --no-shuffle`（已支持）。
+> 需要 `--no-shuffle` 才能保住块顺序；在线端用 `bench_unicache.py --no-shuffle`（已支持）。
+
+### 3.3 D-SLRU（主场景）
+
+三个成分，各自对准一条机制弱点：
+
+| 成分 | session id | 形态 | 打谁 |
+|---|---|---|---|
+| **模板层** | `dslru-t<v>-s<j>` | 2048 token 模板，每模板 5 个会话，**跨块长间隔复发** | LRU：按 recency 把模板挤掉 |
+| **会话私有层** | 同上（紧跟模板） | 每会话 ~2000 token **唯一**上下文，3 轮里每轮重读 | 上游 SLRU：`hit_count>=2` 把它晋升进 protected |
+| **burst** | `dslru-noise-<i>` | 单轮 1024 token 唯一文档 | 制造真实容量压力 |
+
+单请求结构（顺序不能变）：`[模板 2048+256][私有 ~2000][历史输出][本轮用户 128] → 256`。
+
+调度公式（决定性）：模板 `v` 在 `v % blocks` 块出生（放 2 个会话），
+之后 `+2 / +4 / +6` 块各复发 1 个 → 相邻两次使用之间总隔着一整个 burst 块。
+
+    python -m wtl.synth --out-dir result/data/dslru --scenario dslru \
+      --prefix-depth 2048 --variants 16 --sessions-per-template 5 --turns 3 \
+      --blocks 8 --burst-sessions 384 --seed 42
+    python -m wtl.run_matrix --mode synth --data-dir result/data/dslru --no-shuffle \
+      --arms A0,A1,A2,A3,A4 --ratios 0.2,0.35,0.6,1.0 --jobs 12
+
+约束（违反就静默失真）：
+
+1. **`turns < 5`**：否则分类器判 AGENTIC/CHAT，节点不再进一次性带，靶子失效。
+2. **出生块必须放 2 个会话**：模板要在第一个 burst 之前把 `share_sessions` 顶到
+   `share_min`，否则它还是 one-shot，会被死链级联删掉。
+3. **私有上下文必须唯一 token**：多个会话共用会让 `share_sessions` 上涨，
+   把「频次伪造」的靶子变成真模板。
+4. 私有上下文越大、模板复发间隔越长，A3 与 A0/A1 的差距应单调变大（H6）。
+
+预期（跑之前定死，写在 `analyze` 的判据里）：
+
+| 臂 | 模板层命中率 |
+|---|---|
+| A0 LRU | 10–25% |
+| A1 上游 SLRU | 50–65%（protected 被废弃的私有上下文占满） |
+| A2 只有 one-shot 带 | 30–45%（模板也被判一次性） |
+| **A3 两带 SLRU** | **≥85%** |
 
 ---
 
@@ -132,8 +177,11 @@ python -m wtl.synth --out-dir data/exp/D2 \
 
 | 指标 | 来源 | 期望 |
 |---|---|---|
-| `qtrans` 淘汰 token 占比（one-shot 带压力） | `evicted_by_tag` | A2 高（>80%）、A3 显著下降（<50%） |
-| `tag.promote` / `counted` / `dedup` | `tag.snapshot()` | promote > 0 且随数据量上升 |
+| `victim_src.one_shot` 占比 | `_victim_sources` | A2/A3 高（>60%）：一次性带在干活 |
+| `victim_src.qstruct` 占比 | 同上 | A3 > 0 且 A2 = 0（保护段真的接管过淘汰） |
+| `slru.share_counted` / `share_dedup` | `SlruEvictPolicy.stats()` | counted > 0；dedup > 0 证明同一会话去重生效 |
+| `slru.slru_picks` | 同上 | > 0（机制被行使，门控 G2） |
+| `protected_waste_rate` | `RegretTracker`（`region==3` = `not is_one_shot`） | A1 高、A3 低：上游把废弃私有上下文保护起来了 |
 
 ---
 
@@ -185,17 +233,14 @@ export PYTHONPATH=/path/to/sglang/python
 # 0) 前置门控（机制没被行使就别跑正式矩阵）
 python -m wtl.gate --backend real --arm A3
 
-# 1) 生成三档负载（D1/D2/D3）
-for d in D1:8 D2:16 D3:32; do
-  n=${d%%:*}; m=${d##*:}
-  python -m wtl.synth --out-dir data/exp/$n --prefix-depth 1024 \
-    --variants $m --breadth 8 --turns 3 --body-mu 5.5 --body-sigma 0.6 \
-    --noise-frac 2.0 --doc-len 800 --phased
-done
+# 1) 生成主负载 D-SLRU
+python -m wtl.synth --out-dir result/data/dslru --scenario dslru \
+  --prefix-depth 2048 --variants 16 --sessions-per-template 5 --turns 3 \
+  --blocks 8 --burst-sessions 384 --seed 42
 
-# 2) S1 主链路（16 组）
-python -m wtl.run_matrix --no-shuffle --data-dir data/exp/D2 --arms A0,A1,A2,A3 \
-  --ratios 1.0,0.6,0.35,0.2 --seeds 42 --jobs 12 --backend real
+# 2) S1 主链路（5 臂 × 4 个压力点）
+python -m wtl.run_matrix --mode synth --no-shuffle --data-dir result/data/dslru \
+  --arms A0,A1,A2,A3,A4 --ratios 1.0,0.6,0.35,0.2 --seeds 42 --jobs 12 --backend real
 
 # 3) S2/S3/S4/S5 见 §6 表格（同一入口，换 --data-dir / --ratios / --arms / --seeds）
 
@@ -238,8 +283,12 @@ ARMS="A0 A2 A3" MODES=exp_D2 TOKENS_LIST="200000 50000" SEEDS=42 \
 
 ## 11. 与早期方案的关系
 
-早先的三区版方案（window/probation/protected + 频数准入 + aging）已随实现一起从本分支移除。
-本方案只保留它的两个有用结论作为设计前提：
+三代实现依次是：「三区 + 频数准入 + aging」→「标签版 TinyLRU（`tag_lru`）」→
+「两带 SLRU（当前）」。前两代已随实现一起从框架与本套件中移除。
+本方案保留它们的三条有用结论作为设计前提：
 
 1. **one-shot 硬优先带会吃掉 80%+ 的淘汰压力**（所以 A2−A0 是必须单独测的一项）；
-2. **准入与 aging 在现实 trace 上基本不触发**（所以不再为它们设计实验）。
+2. **准入与 aging 在现实 trace 上基本不触发**（所以不再为它们设计实验）；
+3. **标签（`queue_tag`）与共享数在命中者类型不同时会分叉**，因此一次性判定
+   与死链上溯闸都只认共享数（`share_sessions`），不再看标签——A2/A3 的差值
+   因此可以干净地归因到「跨会话保护」这一件事上。

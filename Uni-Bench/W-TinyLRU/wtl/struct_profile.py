@@ -1,7 +1,7 @@
 """真机 struct 状态埋点（**运行时 monkeypatch，不改框架代码**）。
 
-标签版 TinyLRU 的队列状态（``TagLruPolicy.snapshot()``）、按标签的淘汰量
-（``_evicted_by_tag``）与 ``victim_src`` 需要落盘，但框架里没有 dump 点，
+SLRU 的共享数账本（``SlruEvictPolicy.stats()``）、它实际给出的候选数
+（``slru_picks``）与 ``victim_src`` 需要落盘，但框架里没有 dump 点，
 而本实验约定「不改主体框架代码」。因此这里在 ``SimpleHybridRadixCache.evict``
 外面包一层：**只在 evict 返回之后再读状态**，不改变任何淘汰语义。
 
@@ -16,14 +16,14 @@
 
     {"ts":..., "tag":..., "evict_calls":n, "evict_us_p50":..,"evict_us_p99":..,
      "available":.., "evictable_size":.., "protected_size":..,
-     "struct":{"window":..,"probation":..,"protected":..,"parked":..,
-               "admit":..,"reject":..,"ages":..,"forced":.., ...},
-     "victim_src":{"one_shot":..,"qstruct":..}, "alpha":{...},
+     "slru":{"slru_picks":..,"share_counted":..,"share_dedup":..},
+     "slru_share_min":2,
+     "victim_src":{"one_shot":..,"qstruct":..,"global":..}, "alpha":{...},
      "profile":"..."}
 
 分析侧（``wtl.analyze``）用它画两件事：
-  1. protected token 占池比的时间序列（策略是否真的在保护前缀）；
-  2. qstruct 淘汰占比（机制是否被行使——§8.5 的 gate）。
+  1. 受保护段（region 3）被淘汰的 token 序列 → 保护是否真的在起作用；
+  2. one_shot / qstruct 淘汰占比（机制是否被行使——§8.5 的 gate）。
 """
 
 from __future__ import annotations
@@ -52,7 +52,8 @@ def _pct(xs, p):
 
 def _record(cache, tag: str, samples: list, calls: int) -> dict:
     strategy = getattr(cache, "eviction_strategy", None)
-    snap = strategy.tag_snapshot() if hasattr(strategy, "tag_snapshot") else None
+    slru = getattr(strategy, "slru_evict", None)
+    snap = slru.stats() if slru is not None else None
     victim_src = dict(getattr(strategy, "_victim_sources", {}) or {})
     alpha = dict(getattr(getattr(strategy, "alpha", None), "balance", {}) or {})
     rec = {
@@ -65,8 +66,8 @@ def _record(cache, tag: str, samples: list, calls: int) -> dict:
         "available": int(cache.token_to_kv_pool_allocator.available_size()),
         "evictable_size": int(getattr(cache, "evictable_size_", 0) or 0),
         "protected_size": int(getattr(cache, "protected_size_", 0) or 0),
-        "tag": snap,
-        "evicted_by_tag": dict(getattr(strategy, "_evicted_by_tag", {}) or {}),
+        "slru": snap,
+        "slru_share_min": getattr(slru, "share_min", None),
         "victim_src": victim_src,
         "alpha": alpha,
     }
