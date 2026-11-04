@@ -136,40 +136,36 @@ def test_queue_tag_is_irrelevant():
           "sanity: the tag itself was never consulted")
 
 
-def test_creator_counted_at_insert():
-    """插入即记创建者：share 0->1，且自读去重（私有上下文不会误达标）。"""
-    print("[4b] creator is counted at insert; self re-reads dedup")
+def test_ledger_semantics():
+    """账本语义：计数只来自「命中」；自读去重，首次外部命中即达阈值。"""
+    print("[4b] ledger: first self-hit counts 1, self re-reads dedup, 1 foreign hit promotes")
     st, _ = make_strategy({"s1": SessionType.STRUCT})
     node = FakeNode(session_id="s1")
 
-    st.slru_evict.on_node_inserted(node)
-    check(node.share_sessions == 1, f"insert must count creator, got {node.share_sessions}")
-    check(node.session_bloom != 0, "creator's bloom bits must be written at insert")
-    check(st.is_one_shot(node) is True, "share=1 (<min) is still one-shot")
+    check(node.share_sessions == 0, "a fresh node has no counted session")
+    check(st.is_one_shot(node) is True, "share=0 is one-shot")
 
-    # 创建者后续轮次重读：必须去重
+    # 创建者第一次重读：计入 1
+    st.slru_evict.on_node_hit(node, "s1")
+    check(node.share_sessions == 1, f"first self-hit must count, got {node.share_sessions}")
+    check(node.session_bloom != 0, "session bloom must be written on the first counted hit")
+    check(st.is_one_shot(node) is True, "share=1 is still one-shot")
+
+    # 创建者后续轮次重读：去重
     for _ in range(3):
         st.slru_evict.on_node_hit(node, "s1")
     check(node.share_sessions == 1, f"self re-reads must dedup, got {node.share_sessions}")
-    check(st.is_one_shot(node) is True, "private context must stay one-shot")
     check(st.slru_evict.applies_to(node) is False, "private context must not be protected")
 
-    # 1 次外部命中即达阈值（这正是本次修改的目的）
+    # 1 次外部命中即达阈值
     st.slru_evict.on_node_hit(node, "s2")
     check(node.share_sessions == 2, f"one foreign hit must reach min, got {node.share_sessions}")
     check(st.is_one_shot(node) is False, "cross-session template leaves the band")
     check(st.slru_evict.applies_to(node) is True, "cross-session template is protected")
 
-    # 分裂出的父节点继承计数后不重复计
-    split_parent = FakeNode(session_id="s1", share_sessions=1)
-    split_parent.session_bloom = node.session_bloom
-    st.slru_evict.on_node_inserted(split_parent)
-    check(split_parent.share_sessions == 1,
-          f"split parent must not double count, got {split_parent.share_sessions}")
-
     # 无 session 的节点不记
     orphan = FakeNode(session_id=None)
-    st.slru_evict.on_node_inserted(orphan)
+    st.slru_evict.on_node_hit(orphan, None)
     check(orphan.share_sessions == 0, "node without session must not be counted")
 
 
@@ -258,7 +254,7 @@ def main():
         test_struct_threshold,
         test_multiturn_never_one_shot,
         test_queue_tag_is_irrelevant,
-        test_creator_counted_at_insert,
+        test_ledger_semantics,
         test_no_session_is_not_one_shot,
         test_is_one_shot_and_applies_to_agree,
         test_works_under_force_agentic,
