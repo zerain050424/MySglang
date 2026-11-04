@@ -40,8 +40,7 @@ class SimpleHybridRadixCache(RadixCache):
 
         strategy = self.eviction_strategy
         num_evicted = 0
-        # one-shot 永远先清空（one_shot_key 首项 -树上结束偏移：位置最深的块先走，
-        # 对齐 HeterCache evict_first 的 -num_hashed_tokens 口径）；
+        # one-shot 永远先清空（one_shot_key = 带内 LRU：最久未访问的一次性内容先走）；
         # 清空后可调度内容按 victim_key 全局竞争（分数最低，同分 token 多者先走）。
         while num_evicted < num_tokens:
             # 不变式：下面两个分支必定给 victim 赋值（one-shot 带 / victim_key

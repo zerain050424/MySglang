@@ -273,7 +273,7 @@ class SimpleHybridStrategy(EvictionStrategy):
     def get_priority(self, node: TreeNode) -> Tuple[int, float, float]:
         """
         全序优先级：带 0 = 一次性内容（random / 单轮 response 段）先淘汰，
-        带内按树上结束偏移降序（与 one_shot_key 同口径）；带 1 = 可调度内容
+        带内按 last_access 升序（与 one_shot_key 同口径）；带 1 = 可调度内容
         按 reuse_score 竞争。
         """
         if self.is_one_shot(node):
