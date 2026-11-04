@@ -257,7 +257,10 @@ def build_dslru(
         "shared_prefix_tokens": prefix_depth,
         "variant_len": _VARIANT_LEN,
         "template_len": template_len,
-        "variants": [{"variant": v, "sessions": len(per_block[v])} for v in range(variants)],
+        # 注意：per_block 以「块」为键，与变体下标无关（variants 常常 > blocks）。
+        "variants": [
+            {"variant": v, "sessions": sessions_per_template} for v in range(variants)
+        ],
         "breadth": sessions_per_template,
         "turns": turns,
         "blocks": blocks,
