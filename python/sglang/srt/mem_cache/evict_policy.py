@@ -200,7 +200,7 @@ class SimpleHybridStrategy(EvictionStrategy):
         # T-LRU 尾巴优先：只修 QAGENT 的候选，并在插入期维护 _tlru_* 历史最长会话长度。
         self.tlru_evict = TlruEvictPolicy(self.tlru) if self.tlru.enabled else None
         # 多轮对话（QCHAT）带内改写器：1-prob(e) 排序（默认启用，见 MultiTurnParams）
-        self.mt_evict = MultiTurnEvictPolicy(self.mt) if self.mt.enabled else None
+        self.mt_evict = MultiTurnEvictPolicy(self.mt, self.session_registry) if self.mt.enabled else None
         self._validate_scope()
         self.victim_overrides = tuple(
             p for p in (self.rr_evict, self.tlru_evict, self.slru_evict, self.mt_evict) if p is not None

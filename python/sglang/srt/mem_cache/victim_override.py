@@ -459,41 +459,54 @@ class SlruEvictPolicy(VictimOverride):
 
 
 class MultiTurnEvictPolicy(VictimOverride):
-    """多轮对话（QCHAT）的带内改写器：复用 UniCache 的 lognormal 复用机制。
+    """多轮对话的带内改写器：复用 UniCache 的 lognormal 复用机制
+    （带内归属按 SessionType ∈ {CHAT, AGENTIC} 判定）。
 
-    【权重定义（1 − prob(e)）】
+    【权重定义（1 - prob(e)）】
     带内排序权重 = 复用时间已过期的概率：
 
-        w = 1 − reuse_prob = CDF(elapsed; μ, σ)
+        w = 1 - reuse_prob = CDF(elapsed; μ, σ)
 
-    其中 reuse_prob = 1 − CDF 是 UniCache calculate_priority 对多轮任务
+    其中 reuse_prob = 1 - CDF 是 UniCache calculate_priority 对多轮任务
     的原有口径（lognormal，μ/σ 来自 TASK_CONFIG）；**越大越先淘汰**。
     带内不乘 alpha：QCHAT 带内 alpha 恒同，排序结果不受影响（口径见
     MultiTurnParams）。同权重时退化为段内 LRU（最久未访问先走）。
 
     【接管语义】
-    与 SLRU 占用 QSTRUCT、RR/TLRU 占用 QAGENT 对应，本类是 QCHAT 带的
-    带内排序器；由调用链的 ``applies_to(victim)`` 门禁保证只在 victim
-    落进 QCHAT 带时接管，绝不跨队列改写。
+    带内归属按 **SessionType ∈ {CHAT, AGENTIC}** 判定（多轮两类负载），
+    而非节点标签——分类器产出会话类型，NodeTag 不一定与之对齐。调用链
+    的 applies_to(victim) 门禁只对落入本带的 victim 接管，绝不跨带改写。
+
     """
 
     name = "mt"
     queue = SimpleHybridQueueTag.QCHAT
 
-    def __init__(self, params: MultiTurnParams) -> None:
+    def __init__(self, params: MultiTurnParams, registry=None) -> None:
         self.params = params
+        # 会话账本：applies_to 按 SessionType 判定（节点标签与会话类型可能不对齐，
+        # 与 SlruEvictPolicy / is_one_shot 同用一本账，判定同源）。
+        self.registry = registry or SessionRegistry.global_instance()
         # ---- 观测 ----
         self.mt_picks = 0       # 带内实际改写的次数
-        self.mt_fallbacks = 0   # 管辖带内无可淘汰 QCHAT 叶子
+        self.mt_fallbacks = 0   # 管辖带内无可淘汰 多轮叶子
 
     # ------------------------------------------------------------ 插件接口
 
     def applies_to(self, node) -> bool:
+        """按 SessionType 判定（CHAT / AGENTIC 两类多轮负载）。
+
+        分类器产出的是**会话类型**，而节点标签（queue_tag）不一定与之对齐；
+        因此带内归属只认 SessionRegistry——与 one-shot 判定同源，规避标签
+        漂移。无会话证据（session_id 缺失，或账本已被 sweep）时不接管，
+        保留原候选。
+        """
         if node is None:
             return False
-        return (
-            task_type_of_tag(getattr(node, "queue_tag", None))
-            == SimpleHybridTaskType.MULTI_TURN_CHAT
+        st = self.registry.get(getattr(node, "session_id", None))
+        return st is not None and st.session_type in (
+            SessionType.CHAT,
+            SessionType.AGENTIC,
         )
 
     def pick(self, leaves, registry=None) -> Optional["TreeNode"]:
@@ -501,9 +514,18 @@ class MultiTurnEvictPolicy(VictimOverride):
         if not mt_nodes:
             self.mt_fallbacks += 1
             return None
-        mu, sigma, _alpha_key = TASK_CONFIG[SimpleHybridTaskType.MULTI_TURN_CHAT]
+        # CHAT 取 TASK_CONFIG[MULTI_TURN_CHAT]（μ=4.77 / σ=1.279）；AGENTIC 取
+        # TASK_CONFIG[MULTI_TURN_AGENTIC]（μ=1.81 / σ=1.092）——与 _reuse_score 同一套参数。
         best = None
         for node in mt_nodes:
+            st = self.registry.get(getattr(node, "session_id", None))
+            stype = st.session_type if st is not None else SessionType.CHAT
+            cfg_key = (
+                SimpleHybridTaskType.MULTI_TURN_AGENTIC
+                if stype == SessionType.AGENTIC
+                else SimpleHybridTaskType.MULTI_TURN_CHAT
+            )
+            mu, sigma, _alpha_key = TASK_CONFIG[cfg_key]
             elapsed = time.monotonic() - node.last_access_time
             weight = _cached_lognorm_cdf(int(elapsed), mu, sigma)  # 1-prob(e)
             # 权重大者先走；同分退化为 LRU（更久未访问 = 更小的 last_access）
@@ -527,4 +549,4 @@ class MultiTurnEvictPolicy(VictimOverride):
         self.mt_fallbacks = 0
 
     def __repr__(self) -> str:  # pragma: no cover - 调试用
-        return f"<{type(self).__name__} name={self.name}>"
+        return f"<{type(self).__name__} name={self.name}>"
