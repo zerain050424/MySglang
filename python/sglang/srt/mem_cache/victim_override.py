@@ -48,6 +48,9 @@ from sglang.srt.mem_cache.uni_utils import (
     SimpleHybridQueueTag,
     SimpleHybridTaskType,
     TlruParams,
+    MultiTurnParams,
+    TASK_CONFIG,
+    _cached_lognorm_cdf,
     node_end_offset,
     session_bloom_bits,
     task_type_of_tag,
@@ -453,3 +456,75 @@ class SlruEvictPolicy(VictimOverride):
 
     def __repr__(self) -> str:  # pragma: no cover - 调试用
         return f"<{type(self).__name__} name={self.name}>"
+
+
+class MultiTurnEvictPolicy(VictimOverride):
+    """多轮对话（QCHAT）的带内改写器：复用 UniCache 的 lognormal 复用机制。
+
+    【权重定义（1 − prob(e)）】
+    带内排序权重 = 复用时间已过期的概率：
+
+        w = 1 − reuse_prob = CDF(elapsed; μ, σ)
+
+    其中 reuse_prob = 1 − CDF 是 UniCache calculate_priority 对多轮任务
+    的原有口径（lognormal，μ/σ 来自 TASK_CONFIG）；**越大越先淘汰**。
+    带内不乘 alpha：QCHAT 带内 alpha 恒同，排序结果不受影响（口径见
+    MultiTurnParams）。同权重时退化为段内 LRU（最久未访问先走）。
+
+    【接管语义】
+    与 SLRU 占用 QSTRUCT、RR/TLRU 占用 QAGENT 对应，本类是 QCHAT 带的
+    带内排序器；由调用链的 ``applies_to(victim)`` 门禁保证只在 victim
+    落进 QCHAT 带时接管，绝不跨队列改写。
+    """
+
+    name = "mt"
+    queue = SimpleHybridQueueTag.QCHAT
+
+    def __init__(self, params: MultiTurnParams) -> None:
+        self.params = params
+        # ---- 观测 ----
+        self.mt_picks = 0       # 带内实际改写的次数
+        self.mt_fallbacks = 0   # 管辖带内无可淘汰 QCHAT 叶子
+
+    # ------------------------------------------------------------ 插件接口
+
+    def applies_to(self, node) -> bool:
+        if node is None:
+            return False
+        return (
+            task_type_of_tag(getattr(node, "queue_tag", None))
+            == SimpleHybridTaskType.MULTI_TURN_CHAT
+        )
+
+    def pick(self, leaves, registry=None) -> Optional["TreeNode"]:
+        mt_nodes = [node for node in (leaves or ()) if self.applies_to(node)]
+        if not mt_nodes:
+            self.mt_fallbacks += 1
+            return None
+        mu, sigma, _alpha_key = TASK_CONFIG[SimpleHybridTaskType.MULTI_TURN_CHAT]
+        best = None
+        for node in mt_nodes:
+            elapsed = time.monotonic() - node.last_access_time
+            weight = _cached_lognorm_cdf(int(elapsed), mu, sigma)  # 1-prob(e)
+            # 权重大者先走；同分退化为 LRU（更久未访问 = 更小的 last_access）
+            key = (weight, -node.last_access_time)
+            if best is None or key > best[0]:
+                best = (key, node)
+        self.mt_picks += 1
+        return best[1]
+
+    # ------------------------------------------------------------ 观测
+
+    def stats(self) -> Dict[str, float]:
+        return {
+            "mt_picks": self.mt_picks,
+            "mt_fallbacks": self.mt_fallbacks,
+        }
+
+    def reset(self) -> None:
+        """只清计数器；1-prob 权重无状态，无需清理。"""
+        self.mt_picks = 0
+        self.mt_fallbacks = 0
+
+    def __repr__(self) -> str:  # pragma: no cover - 调试用
+        return f"<{type(self).__name__} name={self.name}>"

@@ -263,6 +263,34 @@ class TlruParams:
         return dataclasses.asdict(self)
 
 
+@dataclasses.dataclass
+class MultiTurnParams:
+    """多轮对话（QCHAT）带内改写器的参数。
+
+    配置形式：``--radix-eviction-policy-config '{"mt": {"enabled": true}}'``。
+
+    带内权重 1 − prob(e) = CDF(elapsed; μ, σ)，μ/σ 取
+    ``TASK_CONFIG[MULTI_TURN_CHAT]``（UniCache 原机制，μ=4.77 / σ=1.279）；
+    带内排序不乘 alpha——QCHAT 带内 alpha 恒同，乘不乘排序结果一致。
+    enabled 默认 True：mt 改写器只在 victim 落入 QCHAT 带时接管
+    （调用链 applies_to 门禁），带内语义与全局 victim_key 等价，
+    差异仅在 tie-break=LRU，默认不改变淘汰分布。
+    """
+
+    enabled: bool = True
+
+    def __post_init__(self):
+        if not isinstance(self.enabled, bool):
+            raise ValueError(f"mt.enabled must be bool, got {self.enabled!r}")
+
+    @classmethod
+    def from_any(cls, value=None) -> "MultiTurnParams":
+        return _coerce_params(cls, value, name="multi-turn")
+
+    def as_dict(self) -> dict:
+        return dataclasses.asdict(self)
+
+
 @lru_cache(maxsize=8)
 def _cached_lognorm_params(mu: float, sigma: float):
     """Cache lognormal parameters to avoid recomputation."""

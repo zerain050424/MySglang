@@ -10,6 +10,7 @@ from sglang.srt.mem_cache.uni_utils import (
     node_end_offset,
     node_num_tokens,
     RrParams,
+    MultiTurnParams,
     SessionRegistry,
     SessionType,
     SlruParams,
@@ -26,6 +27,7 @@ from sglang.srt.mem_cache.victim_override import (
     RrEvictPolicy,
     TlruEvictPolicy,
     SlruEvictPolicy,
+    MultiTurnEvictPolicy,
     tlru_lens,
 )
 from sglang.srt.mem_cache.heter_logging import heterlog, HeterProfiler
@@ -153,6 +155,7 @@ class SimpleHybridStrategy(EvictionStrategy):
         rr: Union[RrParams, dict, None] = None,
         slru: Union[SlruParams, dict, None] = None,
         tlru: Union[TlruParams, dict, None] = None,
+        mt: Union[MultiTurnParams, dict, None] = None,
     ):
         """
         参数组由 AlphaParams / RrParams / SlruParams 承载（uni_utils）。
@@ -171,6 +174,7 @@ class SimpleHybridStrategy(EvictionStrategy):
         self.rr = RrParams.from_any(rr)
         self.slru = SlruParams.from_any(slru)
         self.tlru = TlruParams.from_any(tlru)
+        self.mt = MultiTurnParams.from_any(mt)
         self.force_agentic = bool(force_agentic)
         self.max_offset = max_offset or 2048
 
@@ -195,9 +199,11 @@ class SimpleHybridStrategy(EvictionStrategy):
         )
         # T-LRU 尾巴优先：只修 QAGENT 的候选，并在插入期维护 _tlru_* 历史最长会话长度。
         self.tlru_evict = TlruEvictPolicy(self.tlru) if self.tlru.enabled else None
+        # 多轮对话（QCHAT）带内改写器：1-prob(e) 排序（默认启用，见 MultiTurnParams）
+        self.mt_evict = MultiTurnEvictPolicy(self.mt) if self.mt.enabled else None
         self._validate_scope()
         self.victim_overrides = tuple(
-            p for p in (self.rr_evict, self.tlru_evict, self.slru_evict) if p is not None
+            p for p in (self.rr_evict, self.tlru_evict, self.slru_evict, self.mt_evict) if p is not None
         )
 
     def reset_bookkeeping(self) -> None:
@@ -391,6 +397,7 @@ class SimpleHybridStrategy(EvictionStrategy):
             alpha_balance=self.alpha.balance,
             slru_policy=self.slru_evict,
             tlru_policy=self.tlru_evict,
+            mt_policy=self.mt_evict,
         )
         heterlog.info("AlphaBalance", f"[SimpleHybrid profile]\n{_profile}")
 

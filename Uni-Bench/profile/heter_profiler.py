@@ -88,7 +88,8 @@ class HeterProfiler:
                 session_summary=None,
                 alpha_balance=None,
                 slru_policy=None,
-                tlru_policy=None) -> str:
+                tlru_policy=None,
+                mt_policy=None) -> str:
         """返回各 workload 的 profile 摘要，打印形态不变。
 
         字段含义：
@@ -147,6 +148,13 @@ class HeterProfiler:
                 f"lru={s['tlru_lru_picks']:.0f} "
                 f"fallback={s['tlru_fallbacks']:.0f} "
                 f"hist_raises={s['tlru_history_raises']:.0f}"
+            )
+        if mt_policy is not None:
+            # 多轮带内改写器（1-prob(e)）：picks=0 说明窗口内没有 QCHAT victim。
+            s = mt_policy.stats()
+            lines.append(
+                f"  mt: picks={s['mt_picks']:.0f} "
+                f"fallback={s['mt_fallbacks']:.0f}"
             )
         if session_summary:
             # 会话级缺口：d_sum 与淘汰总量同量纲，可互相校验
