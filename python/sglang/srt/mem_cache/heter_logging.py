@@ -21,6 +21,11 @@ _LOG_DIR = os.path.abspath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../../..",
                  "Uni-Bench", "log"))
 
+# 观测账本目录：HeterProfiler 与 HeterLogger 同构落位（unning in scheduler 进程）
+_PROFILE_DIR = os.path.abspath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../../..",
+                 "Uni-Bench", "profile"))
+
 if os.path.isdir(_LOG_DIR):
     if _LOG_DIR not in sys.path:
         sys.path.insert(0, _LOG_DIR)
@@ -28,6 +33,12 @@ if os.path.isdir(_LOG_DIR):
 
     if os.environ.get("HETER_STRATEGY_EVENTS"):
         heterlog.start_capture(os.environ["HETER_STRATEGY_EVENTS"])
+    # HeterProfiler：SimpleHybridStrategy 的观测账本/渲染器（Uni-Bench/profile）
+    if os.path.isdir(_PROFILE_DIR):
+        if _PROFILE_DIR not in sys.path:
+            sys.path.insert(0, _PROFILE_DIR)
+        from heter_profiler import HeterProfiler  # noqa: F401, E402
+        heterprofiler = HeterProfiler()
 else:
     # 兜底：mem_cache 被单独打包/迁移、Uni-Bench/log 不在旁边时，
     # 退化为普通命名空间 logger（不落盘、不异常，策略调用点无须判空）。
