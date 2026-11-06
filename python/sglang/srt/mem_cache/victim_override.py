@@ -35,6 +35,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Dict, Iterable, Optional, Tuple
 import time
+import weakref
 from sglang.srt.mem_cache.uni_utils import (
     DEFAULT_SHARE_MIN,
     RrParams,
@@ -52,6 +53,25 @@ from sglang.srt.mem_cache.uni_utils import (
 if TYPE_CHECKING:  # pragma: no cover
     from sglang.srt.mem_cache.radix_cache import TreeNode
     from sglang.srt.mem_cache.uni_utils import SessionState
+
+
+# ---- HeterCache 插件侧表：替代 TreeNode 上的内嵌插件状态（方案 B 解耦）----
+# 设计：策略插件私有状态不再内嵌 TreeNode 字段，改由本模块持侧表。
+# WeakKeyDictionary 以节点为弱键：节点被 GC（分裂清理/驱逐/reset）时
+# 条目自动消失，与旧内嵌字段生命周期等价，无需显式清理钩子。
+# 键为 TreeNode，读侧缺省为 0，与旧节点字段初始值语义一致。
+_TLRU_META = weakref.WeakKeyDictionary()  # node -> [cached_prefix_len, history_len]
+_SLRU_META = weakref.WeakKeyDictionary()  # node -> [share_sessions, session_bloom]
+
+
+def tlru_lens(node) -> Tuple[int, int]:
+    """读取 T-LRU 侧表；节点无条目按 (0, 0)，与旧节点字段初始值等价。
+
+    读方：TlruEvictPolicy.pick / TLRUStrategy.get_priority（独立策略）。
+    写方：TlruEvictPolicy.on_node_inserted（插入/分裂期唯一写者）。
+    """
+    _e = _TLRU_META.get(node)
+    return (_e[0], _e[1]) if _e else (0, 0)
 
 
 class VictimOverride(ABC):
@@ -196,28 +216,34 @@ class TlruEvictPolicy(VictimOverride):
     # ------------------------------------------------------------ 插入期记账
 
     def on_node_inserted(self, node) -> None:
-        """维护 T-LRU 的两个结构化字段；由缓存层在节点创建/分裂后回调。
+        """维护 T-LRU 的两个结构化字段（存于 _TLRU_META 侧表）；由缓存层在节点创建/分裂后回调。
 
         等价于 unified 的 `_set_tlru_lens_and_raise_history`，但用「自深 vs
         子树高水位取 max」统一覆盖 split：分裂出的新父节点只有 child 一个子树，
         max(自深, child.history) 恰好等于 child.history（分裂不增加分支深度）。
+        分裂时 child 的字段值不变（新 cached = 旧 base + 新前缀，数学上与旧
+        公式一致），故只需回调新父节点。
         """
         parent = getattr(node, "parent", None)
-        base = getattr(parent, "_tlru_cached_prefix_len", 0) if parent is not None else 0
-        node._tlru_cached_prefix_len = base + len(node.key or ())
+        base = tlru_lens(parent)[0] if parent is not None else 0
+        entry = _TLRU_META.setdefault(node, [0, 0])
+        entry[0] = base + len(node.key or ())
 
-        hi = node._tlru_cached_prefix_len
+        hi = entry[0]
         for child in (node.children or {}).values():
-            child_hi = getattr(child, "_tlru_history_len", 0)
+            child_hi = tlru_lens(child)[1]
             if child_hi > hi:
                 hi = child_hi
-        if getattr(node, "_tlru_history_len", 0) < hi:
-            node._tlru_history_len = hi
+        if entry[1] < hi:
+            entry[1] = hi
 
         # 沿祖先链上抬（截断在已达标处，最常见情形是一次就停）。
         cur = parent
-        while cur is not None and getattr(cur, "_tlru_history_len", 0) < hi:
-            cur._tlru_history_len = hi
+        while cur is not None:
+            ce = _TLRU_META.setdefault(cur, [0, 0])
+            if ce[1] >= hi:
+                break
+            ce[1] = hi
             self.history_raises += 1
             cur = cur.parent
 
@@ -242,9 +268,9 @@ class TlruEvictPolicy(VictimOverride):
         for node in leaves:
             if not self.applies_to(node):
                 continue
-            history = getattr(node, "_tlru_history_len", 0)
+            cached, history = tlru_lens(node)
             budget = max(history + next_prompt - threshold, 0)
-            cached_without = getattr(node, "_tlru_cached_prefix_len", 0) - len(node.key or ())
+            cached_without = cached - len(node.key or ())
             tel_safe = cached_without >= budget
             key = (0 if tel_safe else 1, node.last_access_time)
             if best is None or key < best[0]:
@@ -270,7 +296,7 @@ class TlruEvictPolicy(VictimOverride):
         }
 
     def reset(self) -> None:
-        """只清计数器；高水位存在节点上，随树一起丢弃。"""
+        """只清计数器；高水位在 _TLRU_META 侧表，随节点 GC 一起丢弃。"""
         self.tel_safe_picks = 0
         self.lru_picks = 0
         self.fallbacks = 0
@@ -282,11 +308,12 @@ class SlruEvictPolicy(VictimOverride):
 
     账本（本类独占）
     ----------------
-    写 `node.share_sessions` / `node.session_bloom` 的唯一位置是 `on_node_hit()`；
-    缓存层在命中路径上通过 `_hit_observers` 调用它，**与 `force_agentic`
-    等实验开关无关**，所以账本在所有配置下都成立。
-    节点的初值（`TreeNode.__init__`）与分裂继承（`_split_node`）属于树结构维护，
-    仍留在 radix_cache；本类只读它们。
+    共享会话账（share_sessions / session_bloom，存于 _SLRU_META 侧表）的唯一
+    写入口是 `on_node_hit()`；分裂时的继承拷贝走 `on_node_inserted()`，分别由
+    缓存层的 `_hit_observers` / `_insert_observers` 调度，**与 `force_agentic`
+    等实验开关无关**。
+    共享账本由本类独占持有（WeakKeyDictionary，节点被 GC 时条目自动消失），
+    TreeNode 不再内嵌插件字段；树结构维护（节点创建、分裂）仍留在 radix_cache。
 
     计数口径：**每个不同会话 +1，创建者在插入那一刻就计入**，同一会话
     （含创建者后续轮次的重读）由 `session_bloom` 去重，饱和在 `SESSION_SHARE_MAX`。
@@ -326,19 +353,38 @@ class SlruEvictPolicy(VictimOverride):
     # ------------------------------------------------------------ 共享会话数账本
 
     def _record_session(self, node, session_id) -> bool:
-        """把 (node, session) 记进账本；已记过则去重。返回是否真的新增。"""
+        """把 (node, session) 记进账本（_SLRU_META 侧表）；已记过则去重。返回是否真的新增。"""
         if node is None or not session_id:
             return False
         bits = session_bloom_bits(session_id)
-        if getattr(node, "session_bloom", 0) & bits == bits:
+        entry = _SLRU_META.setdefault(node, [0, 0])
+        if entry[1] & bits == bits:
             self.share_dedup += 1
             return False
-        node.session_bloom = getattr(node, "session_bloom", 0) | bits
-        node.share_sessions = min(
-            SESSION_SHARE_MAX, int(getattr(node, "share_sessions", 0) or 0) + 1
-        )
+        entry[1] |= bits
+        entry[0] = min(SESSION_SHARE_MAX, entry[0] + 1)
         self.share_counted += 1
         return True
+
+    def on_node_inserted(self, node) -> None:
+        """分裂回调：新父节点继承 child 的共享账本条目。
+
+        分裂不改变「哪些请求经过这段前缀」，两半都继承（旧实现是
+        radix_cache 分裂路径里的显式字段拷贝）；分裂出的新父节点只有一个
+        子树。非分裂的普通插入不带子节点，自然落回 (0, 0) 缺省，不建条目。
+        """
+        if not node.children:
+            return
+        share = 0
+        bloom = 0
+        for child in node.children.values():
+            ce = _SLRU_META.get(child)
+            if ce:
+                if ce[0] > share:
+                    share = ce[0]
+                bloom |= ce[1]
+        if share or bloom:
+            _SLRU_META[node] = [share, bloom]
 
     def on_node_hit(self, node, session_id=None) -> None:
         """命中路径的记账钩子：不同会话数 +1（同一会话去重）。
@@ -350,8 +396,9 @@ class SlruEvictPolicy(VictimOverride):
 
     @staticmethod
     def share_of(node) -> int:
-        """节点已被多少个不同会话命中过（创建者首次重读计 1）。"""
-        return int(getattr(node, "share_sessions", 0) or 0)
+        """节点已被多少个不同会话命中过（创建者首次重读计 1）；读 _SLRU_META 侧表。"""
+        entry = _SLRU_META.get(node)
+        return int(entry[0]) if entry else 0
 
     # ------------------------------------------------------------ 插件接口
 
@@ -392,7 +439,7 @@ class SlruEvictPolicy(VictimOverride):
     def reset(self) -> None:
         """清空内部状态（缓存 reset / 进程复用）。
 
-        节点上的 `share_sessions` / `session_bloom` 随树一起丢弃，不用清。
+        共享账本条目在 _SLRU_META 侧表，随节点 GC 一起丢弃，不用清。
         """
         self.share_counted = 0
         self.share_dedup = 0

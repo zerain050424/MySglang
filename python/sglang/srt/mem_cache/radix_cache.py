@@ -284,6 +284,9 @@ class TreeNode: ## TreeNode 是基数树（RadixTree）的节点，每个节点�
         TreeNode.counter += 1
 
         # ---- HeterCache（SimpleHYBRID / T-LRU / SLRU）相关状态 ----
+        # 注意：插件私有记账（SLRU 共享账 / TLRU 高水位）已改为外挂侧表
+        # （见 victim_override._SLRU_META / _TLRU_META，WeakKeyDictionary，
+        # 节点 GC 时条目自动消失），不再内嵌在 TreeNode 上。
         ## 本节点片段第一个 token 在整条序列中的绝对偏移（从根算起）。
         ## abs_start + len(value) 即 HeterCache/vLLM 的 num_hashed_tokens（片段结束偏移）。
         self.abs_start = abs_start
@@ -293,16 +296,6 @@ class TreeNode: ## TreeNode 是基数树（RadixTree）的节点，每个节点�
         self.is_decode = False
         # SimpleHYBRID：节点归属的会话（用于会话级缺口记账，见 uni_utils.SessionRegistry）
         self.session_id: Optional[str] = None
-        # 跨会话共享数 + 会话 bloom（写者是 SlruEvictPolicy.on_node_hit）
-        self.share_sessions = 0
-        self.session_bloom = 0
-        # T-LRU（单例 tlru.enabled）：tokens root->self 与分支高水位。
-        # 只在开启时由 TlruEvictPolicy.on_node_inserted() 写入，其余策略恒 0。
-        self._tlru_cached_prefix_len = 0
-        self._tlru_history_len = 0
-        # 曾经/正在分叉（结构证据的黏性标记）：节点失去所有子节点后仍然是成员，
-        # 直到 aging 判定它没有共享证据才退队。
-        self.struct_ever_branch = False
 
     @property
     def evicted(self): ## 节点是否已经被驱逐，判断依据是节点的值是否为None。
@@ -1099,10 +1092,10 @@ class RadixCache(BasePrefixCache):
            new_node.event_hash_value, child.event_hash_value = split_node_hash_value(
             child.event_hash_value, split_len, self.page_size
            )
-           # 共享会话数：分裂不改变「哪些请求经过这段前缀」，两半都继承。
-           new_node.share_sessions = getattr(child, "share_sessions", 0)
-           new_node.session_bloom = getattr(child, "session_bloom", 0)
            # T-LRU：分裂不增加分支深度，新父节点继承 child 的高水位。
+           # SLRU：共享账本的新父节点继承由 SlruEvictPolicy.on_node_inserted
+           # 在下方观察者回调里完成（分裂不改变「哪些请求经过这段前缀」，
+           # 两半都继承），不再新增占位字段。
            for observe in self._insert_observers:
                observe(new_node)
 
