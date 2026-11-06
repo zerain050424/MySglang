@@ -77,7 +77,6 @@ def session_type_to_queue_tag(session_type: SessionType) -> SimpleHybridQueueTag
 #   RrParams      : Agentic 会话级轮询配额（跨会话公平）
 #   SlruParams    : SLRU 的共享会话数阈值（决定 one-shot 分界与保护范围）
 # 用 dataclass 而不是裸 kwargs，是为了让 `eviction_policy_config` 有层级、能校验、能整体
-# 复制/日志/消融；旧的扁平键（alpha_smooth / fair_rr / struct_k ...）已删除，
 # 配置只接受 {"alpha":{...},"rr":{...},"slru":{...}} 分组形式。
 # ---------------------------------------------------------------------------
 
@@ -184,7 +183,7 @@ class RrParams:
         return dataclasses.asdict(self)
 
 
-# 「跨会话模板」的共享会话数阈值（唯一旋钮）。
+# 跨会话模板的共享会话数阈值。
 #
 # 语义：除创建者外还有 >= N 个会话命中过同一节点（即共 >= N+1 个会话用过）。
 # 它同时决定两件事，两处必须同源，所以只允许配置一处：
@@ -199,9 +198,9 @@ class SlruParams:
 
     配置形式：``--radix-eviction-policy-config '{"slru": {"share_min": 2}}'``。
 
-    共享数由 `SlruEvictPolicy` 记账（见 victim_override）：**每个不同会话 +1，
-    创建者在节点插入那一刻就计入**，同一会话（含创建者后续轮次的重读）由
-    `session_bloom` 去重。因此 `share_min = 2` 意味着「共 2 个会话用过」
+    共享数由 `SlruEvictPolicy` 记账（见 victim_override）：每个不同会话 +1，
+    创建者在节点插入那一刻就计入，同一会话由`session_bloom` 去重。
+    因此 `share_min = 2` 意味着共 2 个会话用过
     ＝创建者 + 1 次外部命中，才算跨会话模板、才开始受保护；
     低于该值的节点（以及 TRANS 会话的节点）进 one-shot 带优先淘汰。
     """

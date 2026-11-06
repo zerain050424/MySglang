@@ -286,15 +286,12 @@ class TreeNode: ## TreeNode 是基数树（RadixTree）的节点，每个节点�
         # ---- HeterCache（SimpleHYBRID / T-LRU / SLRU）相关状态 ----
         # 注意：插件私有记账（SLRU 共享账 / TLRU 高水位）已改为外挂侧表
         # （见 victim_override._SLRU_META / _TLRU_META，WeakKeyDictionary，
-        # 节点 GC 时条目自动消失），不再内嵌在 TreeNode 上。
-        ## 本节点片段第一个 token 在整条序列中的绝对偏移（从根算起）。
-        ## abs_start + len(value) 即 HeterCache/vLLM 的 num_hashed_tokens（片段结束偏移）。
+        # 节点回收时条目自动消失），不再内嵌在 TreeNode 上。
+
         self.abs_start = abs_start
-        # SimpleHYBRID (HeterCache) workload metadata.
-        # is_decode: generated-output (decode) portion, never reused, evict first.
         self.queue_tag = SimpleHybridQueueTag.QTRANS ## 负载类型
         self.is_decode = False
-        # SimpleHYBRID：节点归属的会话（用于会话级缺口记账，见 uni_utils.SessionRegistry）
+        # SimpleHYBRID：节点归属的会话
         self.session_id: Optional[str] = None
 
     @property
@@ -361,7 +358,7 @@ class RadixCache(BasePrefixCache):
         self.force_agentic = bool(
             getattr(self.eviction_strategy, "force_agentic", False)
         )
-        # 可插拔的「淘汰候选改写器」：RR 会话公平 / struct 队内顺序等。
+        # 可插拔的淘汰候选改写器：RR 会话公平 / struct 队内顺序等。
         # 空元组表示没有任何插件，淘汰走原来的全局 victim_key。
         self.victim_overrides = tuple(
             getattr(self.eviction_strategy, "victim_overrides", ()) or ()
@@ -412,8 +409,8 @@ class RadixCache(BasePrefixCache):
             heterlog.info("OccSampler", f"thread started, alive={t.is_alive()}")
 
         # ---- 节点级标签快照（env 门控，默认关）----
-        # 用途：把「状态机给每个 radix 节点打的队列标签」与「节点真实归属
-        # (session_id)」一起落盘，用于节点级标注准确率统计，见
+        # 用途：把状态机给每个 radix 节点打的队列标签 与 节点真实归属
+        # (session_id)一起落盘，用于节点级标注准确率统计，见
         # Uni-Bench/evaluate_node_labels.py。只读遍历，不改变任何淘汰状态。
         _dump_path = os.environ.get("SGLANG_NODE_LABEL_DUMP", "")
         if _dump_path:

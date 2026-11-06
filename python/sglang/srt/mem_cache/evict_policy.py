@@ -296,12 +296,12 @@ class SimpleHybridStrategy(EvictionStrategy):
     def is_one_shot(self, node) -> bool:
         """一次性内容（one-shot）：淘汰顺序永远先于可调度内容。
 
-        判定只看「会话类型 + 跨会话共享数」，**不看 `queue_tag`**：
+        判定只看会话类型与跨会话共享数
 
-            one_shot = 会话类型 ∈ {TRANS, STRUCT} 且 share_sessions < share_min
+        one_shot = 会话类型 ∈ {TRANS, STRUCT} 且 share_sessions < share_min
 
-        为什么不能看标签：`queue_tag` 是「谁创建了这段」的粗粒度标记，而
-        共享数才是「还会不会被复用」的证据。典型反例：TRANS 会话插入的
+        为什么不能看标签：`queue_tag` 是谁创建了这段的粗粒度标记，而
+        共享数才是还会不会被复用的证据。典型反例：TRANS 会话插入的
         文档段后来被别的会话反复命中——标签仍挂着 QTRANS，但它是热前缀。
 
         `share_sessions >= share_min` = 已被 >=2 个不同会话命中过（创建者

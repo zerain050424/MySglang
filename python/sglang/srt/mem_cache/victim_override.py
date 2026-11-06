@@ -1,33 +1,36 @@
-"""淘汰候选改写器（VictimOverride）：把选择淘汰从 SimpleHybridStrategy 里拆成插件位。
-    applies_to(node) -> bool        当前候选是否落在本改写器的管辖范围
-    pick(leaves, registry) -> node  给出本改写器更愿意淘汰的节点；None = 不接管
+"""VictimOverride: 淘汰候选节点改写器插件。
 
-硬性约束：
-  * 改写器不释放 KV、不删节点，只返回候选；释放仍由 `_evict_one()` 统一执行。
-  * 返回 None 时必须回退到原候选，不允许阻塞淘汰推进（否则 evict 会自旋）。
-  * 改写器只能从 `leaves` 里挑节点，不允许跨队列造出新的可淘汰集合。
+【功能定位】
+将多样化的淘汰裁决逻辑从SimpleHybridStrategy中解耦，提供可插拔的候选重选能力。
+允许不同策略根据自身状态（如会话配额、分段水位等），对全局选出的默认淘汰候选进行重定向。
 
-`SimpleHybridRadixCache.evict()` 按 `victim_overrides` 的注册顺序逐个询问，
-后注册者覆盖前者（"越靠后越硬"）：RR 会话公平先改一次，struct 队列若有归属权再改一次。
+【核心接口协议】
+    - applies_to(node) -> bool:
+        判断当前候选节点是否落在该改写器的管辖范围内。
+    - pick(leaves, registry) -> Optional[Node]:
+        在合法的叶子节点池中挑出本策略优先淘汰的节点；返回 None 表示弃权/不干预。
 
-`queue` 字段只做观测（profile 里打本次淘汰由哪个队列的策略决定），
-不得参与任何仲裁判定 —— 跨队列仲裁仍由 victim_key 全局排序完成。
+【调度规则与硬性约束】
+1. 链式覆盖原则（Last-in Precedence）：
+   - 缓存层按注册顺序逐个询问改写器，后注册者若生效将覆盖前者的选择（如：会话级 RR 策略先修正一次，结构队列策略若命中管辖权可再次覆盖）。
+2. 只挑不删（Separation of Concerns）：
+   - 改写器仅负责挑选候选节点，绝对不执行释放 KV 或删除节点的操作，最终驱逐仍由 `_evict_one()` 统一落盘执行。
+3. 安全回退（Fall-through Guarantee）：
+   - 若返回 None 或无法决策，必须立即安全回退到原候选节点，严禁阻塞淘汰推进（防止 evict 循环自旋）。
+4. 候选集封闭（Scope Boundary）：
+   - 只能在传入的 `leaves`（可淘汰叶子集合）内部做重选，禁止跨范围构造或越界选取新节点。
+5. 观测与仲裁分离：
+   - 节点的 `queue` 属性仅用于性能分析与日志观测（记录该淘汰归属于哪个策略队列），绝对不得参与跨队列的仲裁判定（跨队列仲裁统一由全局 `victim_key` 排序决定）。
 
-内置实现的分工：
-  * `RrEvictPolicy`      —— 自带全部状态（会话轮询序号 / 配额违约计数）。
-  * `RrEvictPolicy`      —— 自带全部状态（会话轮询序号 / 配额违约计数）。
-  * `TlruEvictPolicy`    —— T-LRU 的 QAGENT 候选修正（自带高水位状态）。
+【内置策略实现清单】
+- RrEvictPolicy:
+    实现会话级轮询公平性（Round-Robin），内部维护独立的会话轮询序号及配额违约计数。
+- TlruEvictPolicy:
+    实现 T-LRU 尾部优先淘汰修正；除选点外，还会通过 `on_node_inserted` 钩子在节点插入与分裂时维护其 `_tlru_*` 高水位状态。
+- SlruEvictPolicy:
+    分段式 LRU（Probation → Protected，段内按 recency 排序）。同时独占维护节点共享会话数账本（通过 `on_node_hit` 触发）。
+    配合 `scope="non_one_shot"` 可组装为带 One-shot 隔离带的 SLRU模式。
 
-  注：Q_struct 队内策略（标签版 TinyLRU）不通过插件实现 —— 它把「类间优先级 +
-  类内 LRU」直接编码进 `SimpleHybridStrategy.victim_key`，因此这里不再有 struct
-  适配器。
-  * `TlruEvictPolicy`    —— T-LRU 的尾部优先修正；除候选选择外，还在
-    插入/分裂时维护节点上的 `_tlru_*` 高水位（缓存层会调 `on_node_inserted`）。
-  * `SlruEvictPolicy`    —— SLRU 的唯一实现：候选改写（probation → protected，
-    段内 recency）
-    同时独占「节点共享会话数」账本（`on_node_hit` 由缓存层命中路径调用）。
-    `scope="non_one_shot"` 时与 `evict()` 的 one-shot 分支合起来就是
-    「带 one-shot 带的 SLRU」：带内先清空，其余按两段排序。
 """
 
 from __future__ import annotations
@@ -304,31 +307,34 @@ class TlruEvictPolicy(VictimOverride):
 
 
 class SlruEvictPolicy(VictimOverride):
-    """S-LRU 的 QSTRUCT 候选修正，同时是「节点共享会话数」账本的唯一所有者。
+    """S-LRU 针对 QSTRUCT 队列的淘汰候选改写器。
 
-    账本（本类独占）
-    ----------------
-    共享会话账（share_sessions / session_bloom，存于 _SLRU_META 侧表）的唯一
-    写入口是 `on_node_hit()`；分裂时的继承拷贝走 `on_node_inserted()`，分别由
-    缓存层的 `_hit_observers` / `_insert_observers` 调度，**与 `force_agentic`
-    等实验开关无关**。
-    共享账本由本类独占持有（WeakKeyDictionary，节点被 GC 时条目自动消失），
-    TreeNode 不再内嵌插件字段；树结构维护（节点创建、分裂）仍留在 radix_cache。
+    【功能定位】
+    本类承担双重职责：
+    1. 独占维护全局的节点共享会话数（Node Share Sessions）账本。
+    2. 针对 STRUCT 队列中脱离一次性带（One-shot）、进入共享保护段的节点，执行段内 LRU 候选改写。
 
-    计数口径：**每个不同会话 +1，创建者在插入那一刻就计入**，同一会话
-    （含创建者后续轮次的重读）由 `session_bloom` 去重，饱和在 `SESSION_SHARE_MAX`。
-    因此 ``share_min = 2`` 表示「共 2 个会话用过」＝创建者 + 1 次外部命中。
+    【账本维护机制（独占所有权）】
+    - 独占写入点：
+    共享会话账（`share_sessions` / `session_bloom`，存于本模块 `_SLRU_META`
+    侧表）的唯一写入口为 `on_node_hit()`；分裂时的继承拷贝走
+    `on_node_inserted()`。两者的触发分别由缓存层 `_hit_observers` 与
+    `_insert_observers` 统一调度。
+    - 职责边界划分：
+    树基础拓扑维护（节点创建、分裂）仍留在 RadixCache 树核心层；共享账本
+    由本类以侧表独占持有（节点被正常 GC 时条目随之消失），节点字段不再内嵌。
 
-    为什么要记创建者：计数只对活节点有意义，节点被删就归零。若不计创建者，
-    共享前缀要等第二次外部命中才达标，这段窗口里它仍是一次性内容，
-    会被 one-shot 带连同死链一起删掉，重建后计数又从 0 开始——高压力下
-    保护状态会永远建立不起来。
+    【计数口径与设计权衡】
+    - 去重与饱和计数：
+    按独立会话为粒度计数，通过 `session_bloom` 过滤同一会话内的后续多轮重复命中，计数上限受限于 `SESSION_SHARE_MAX`。
 
-    候选修正
-    --------
-    `applies_to` 命中「STRUCT 会话 + 已被 >= share_min 个外部会话命中过」
-    的叶子，`pick` 在它们中间取最久未访问者（段内 LRU）。
-    阈值来自 `SlruParams.share_min`，与 `is_one_shot` 的分界同源。
+    【候选改写裁决（Victim Selection）】
+    - `applies_to(node) -> bool`:
+    筛选落在管辖范围内的候选叶子：属于 STRUCT 会话，且跨会话使用计数已达标（`share_sessions >= share_min`）。
+    - `pick(leaves, registry) -> Optional[Node]`:
+    在受管辖的叶子节点集合中，挑选访问时间戳最早的节点返回（执行段内 LRU）。
+    - 判定边界：
+    阈值直接采用 `SlruParams.share_min`，确保候选拦截范围与系统的 `is_one_shot` 判定标准源头一致。
     """
 
     # 观测字段：本改写器管辖的队列，仅用于 profile 记账。
