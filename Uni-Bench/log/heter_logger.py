@@ -86,20 +86,42 @@ class HeterLogger:
     # ------------------------------------------------------------------
     # 结构化事件 API（文本 debug + JSONL 同源双写）
     # ------------------------------------------------------------------
-    def evict(self, block_id, queue, score=None, alpha=None, step=None,
-              hash_key=None):
-        """一次驱逐事件（每个驱逐函数只在出口调用一次）。"""
+    def evict(self, node_id, workload, tokens, task_type=None, source=None,
+              one_shot=None, step=None):
+        """一次驱逐事件（sglang-radix 节点语义：node_id/workload/tokens）。"""
         self._log.debug(
-            "[Evict] block=%s queue=%s score=%s alpha=%s step=%s hash=%s",
-            block_id, queue, score, alpha, step, hash_key)
+            "[Evict] node=%s workload=%s tokens=%s task_type=%s source=%s one_shot=%s step=%s",
+            node_id, workload, tokens, task_type, source, one_shot, step)
         self._record({
             "ev": "evict",
-            "block": block_id,
-            "queue": queue,
-            "score": score,
-            "alpha": alpha,
+            "node": node_id,
+            "workload": workload,
+            "tokens": tokens,
+            "task_type": str(task_type) if task_type is not None else None,
+            "source": source,
+            "one_shot": one_shot,
             "step": step,
-            "hash": hash_key,
+        })
+
+    def hit(self, workload=None, task_type=None, hit_tokens=0, req=None):
+        """一次前缀命中事件（record_hit 收口）。"""
+        self._log.debug("[Hit] workload=%s task_type=%s tokens=%s req=%s",
+                        workload, task_type, hit_tokens, req)
+        self._record({
+            "ev": "hit",
+            "workload": workload,
+            "task_type": str(task_type) if task_type is not None else None,
+            "tokens": hit_tokens,
+            "req": req,
+        })
+
+    def victim_source(self, source, tokens):
+        """本次淘汰的裁决来源记账（record_victim_source 收口）。"""
+        self._log.debug("[VictimSource] source=%s tokens=%s", source, tokens)
+        self._record({
+            "ev": "victim_source",
+            "source": source,
+            "tokens": tokens,
         })
 
     def admit(self, block_id, task_type, queue):
