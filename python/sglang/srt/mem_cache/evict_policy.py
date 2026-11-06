@@ -27,6 +27,7 @@ from sglang.srt.mem_cache.victim_override import (
     TlruEvictPolicy,
     SlruEvictPolicy,
 )
+from sglang.srt.mem_cache.heter_logging import heterlog
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.radix_cache import TreeNode
@@ -355,6 +356,12 @@ class SimpleHybridStrategy(EvictionStrategy):
         # 累计命中。
         wkey = workload_label_of(task_type)
         self._total_hit_tokens[wkey] = self._total_hit_tokens.get(wkey, 0.0) + hit_tokens
+        # 策略事件流：高频路径，DEBUG 级别短路
+        if heterlog.enabled:
+            heterlog.hit(workload=wkey,
+                         task_type=task_type,
+                         hit_tokens=hit_tokens,
+                         req=rid)
 
     def record_evict(self, node) -> None:
         """累计被淘汰的 token 数，按 workload 记账（与 hit 同口径，可比较）。
@@ -367,6 +374,11 @@ class SimpleHybridStrategy(EvictionStrategy):
         )
         if self.is_one_shot(node):
             self._total_evicted_one_shot += tokens
+        # 策略事件流：节点级驱逐事件（供 Uni-Bench 结果矩阵分析）
+        heterlog.evict(node_id=id(node),
+                       workload=wkey,
+                       tokens=tokens,
+                       one_shot=self.is_one_shot(node))
 
     def record_victim_source(self, source: str, tokens: float) -> None:
         """
@@ -375,6 +387,8 @@ class SimpleHybridStrategy(EvictionStrategy):
         插件的 queue 名（如 "qagent"、"qstruct"）。只做观测，不参与仲裁。
         """
         self._victim_sources[source] = self._victim_sources.get(source, 0.0) + tokens
+        # 策略事件流：淘汰裁决来源
+        heterlog.victim_source(source, tokens)
 
     def profile_summary(self, workload_occ, session_summary=None) -> str:
         """返回各 workload 的 profile 摘要，供日志打印。
@@ -454,10 +468,8 @@ class SimpleHybridStrategy(EvictionStrategy):
         self._last_update = now
         self.update_alpha_balance(sched)
         # 每个 update_interval 秒打印一次各 workload profile 摘要
-        logger.info(
-            "[SimpleHybrid profile]\n%s",
-            self.profile_summary(workload_occ, session_summary),
-        )
+        _profile = self.profile_summary(workload_occ, session_summary)
+        heterlog.info("AlphaBalance", f"[SimpleHybrid profile]\n{_profile}")
 
     def update_alpha_balance(
         self,

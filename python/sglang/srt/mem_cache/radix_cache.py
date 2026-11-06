@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.heter_logging import heterlog
 
 """
 Copyright 2023-2024 SGLang Team
@@ -401,9 +402,9 @@ class RadixCache(BasePrefixCache):
         # 周期性调 _per_workload_token_count()（基类方法，树上节点带 queue_tag，
         # 任何策略都可用）。默认关闭：无 env 时这里只做一次 os.environ.get 判空。
         _occ_env = os.environ.get("SGLANG_WORKLOAD_OCC_LOG", "0")
-        logger.info(
-            "[occ-sampler] env=%s pid=%s policy=%s",
-            _occ_env, os.getpid(), self.eviction_policy,
+        heterlog.info(
+            "OccSampler",
+            f"env={_occ_env} pid={os.getpid()} policy={self.eviction_policy}",
         )
         if _occ_env == "1":
             interval = int(os.environ.get("SGLANG_WORKLOAD_OCC_INTERVAL", "30"))
@@ -414,7 +415,7 @@ class RadixCache(BasePrefixCache):
                 name="workload-occ-sampler",
             )
             t.start()
-            logger.info("[occ-sampler] thread started, alive=%s", t.is_alive())
+            heterlog.info("OccSampler", f"thread started, alive={t.is_alive()}")
 
         # ---- 节点级标签快照（env 门控，默认关）----
         # 用途：把「状态机给每个 radix 节点打的队列标签」与「节点真实归属
@@ -430,9 +431,10 @@ class RadixCache(BasePrefixCache):
                 name="node-label-dumper",
             )
             t.start()
-            logger.info(
-                "[node-label] dump -> %s every %.0fs (pid=%s policy=%s)",
-                _dump_path, _dump_interval, os.getpid(), self.eviction_policy,
+            heterlog.info(
+                "NodeLabel",
+                f"dump -> {_dump_path} every {_dump_interval:.0f}s "
+                f"(pid={os.getpid()} policy={self.eviction_policy})",
             )
 
     @classmethod
@@ -783,21 +785,21 @@ class RadixCache(BasePrefixCache):
             i += 1
             try:
                 counts = self._per_workload_token_count()
-                logger.info(
-                    "[occ-sampler] tick=%s counts=%s", i,
-                    {k: int(v['total']) for k, v in sorted(counts.items())} if counts else {},
-                )
+                _snapshot = {
+                    k: int(v['total']) for k, v in sorted(counts.items())
+                } if counts else {}
+                heterlog.info("OccSampler", f"tick={i} counts={_snapshot}")
                 if counts:
                     msg = " ".join(
                         f"{k}={int(v['total'])}" for k, v in sorted(counts.items())
                     )
-                    logger.info("[workload occ] %s", msg)
+                    heterlog.info("WorkloadOcc", msg)
                 tag_counts = self._per_queue_tag_token_count()
                 if tag_counts:
                     msg = " ".join(
                         f"{k}={v}" for k, v in sorted(tag_counts.items())
                     )
-                    logger.info("[queue occ] %s", msg)
+                    heterlog.info("QueueOcc", msg)
             except Exception:  # 采样失败不能影响主流程
                 logger.exception("workload occ sampler failed")
 
@@ -844,7 +846,7 @@ class RadixCache(BasePrefixCache):
             i += 1
             try:
                 n = self._dump_node_labels(path, i)
-                logger.info("[node-label] tick=%s dumped %s nodes", i, n)
+                heterlog.info("NodeLabel", f"tick={i} dumped {n} nodes")
             except Exception:  # 采样失败不能影响主流程
                 logger.exception("node label dump failed")
 
