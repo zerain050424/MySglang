@@ -380,11 +380,21 @@ class SimpleHybridStrategy(EvictionStrategy):
             tlru_policy=self.tlru_evict,
         )
 
+    def alpha_update_due(self) -> bool:
+        """调用点门禁：到 update_interval 才值得做一次全树口径计算。
+
+        evict() 热路径先问这个，再做 _profile_token_counts() 的全树遍历，
+        避免在节流窗口内白白遍历整棵树（口径只在 alpha 真正更新时才被
+        消费）。maybe_update_alpha 内部保留同一判定，双保险且不改对外
+        语义；其他策略没有此方法，调用点 getattr 判空回退原路径。
+        """
+        return time.monotonic() - self._last_update >= self.alpha.update_interval
+
     def maybe_update_alpha(self, sched, workload_occ, session_summary=None) -> None:
         # Time-guarded trigger for alpha rebalancing (called from evict()).
         now = time.monotonic()
         if now - self._last_update < self.alpha.update_interval:
-            return ## 每经过一个时间间隔interval才进行更新
+            return ## 每经过一个时间间隔interval才进行更新（调用点已由 alpha_update_due 门禁预筛，这里双保险）
         self._last_update = now
         self.update_alpha_balance(sched)
         # 每个 update_interval 秒打印一次各 workload profile 摘要

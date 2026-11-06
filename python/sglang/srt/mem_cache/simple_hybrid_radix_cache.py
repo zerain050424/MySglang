@@ -31,11 +31,14 @@ class SimpleHybridRadixCache(RadixCache):
         start_time = time.perf_counter()
         num_tokens = params.num_tokens
         # 每隔 update_interval 秒按命中效率刷新各类型 α 权重
+        # 门禁：仅当 alpha 更新到期才做全树遍历（否则节流窗口内白发全线）
         if self._alpha_updater is not None:
-            # 传三份口径：alpha 用可调度容量，profile 用 workload 占用与会话缺口
-            self._alpha_updater(
-                *self._profile_token_counts(), self.session_registry.summary()
-            )
+            _alpha_due = getattr(self.eviction_strategy, "alpha_update_due", None)
+            if _alpha_due is None or _alpha_due():
+                # 传三份口径：alpha 用可调度容量，profile 用 workload 占用与会话缺口
+                self._alpha_updater(
+                    *self._profile_token_counts(), self.session_registry.summary()
+                )
 
         strategy = self.eviction_strategy
         num_evicted = 0
