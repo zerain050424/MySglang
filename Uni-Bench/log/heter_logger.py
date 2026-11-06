@@ -1,23 +1,22 @@
-# HeterLogger — HeterCache 策略调试日志唯一出口
-#
-# 目标（解耦契约）：
-#   1. 策略代码（evictor / block tracker / wa_helper）只做一件事：
-#      在决策出口调用 heterlog.evict(...) / heterlog.mark(...) 等一行式 API，
-#      传入原始数据；f-string 组装、字段命名、级别门槛、JSON 序列化全部收敛在本类。
-#   2. 与 vLLM 全局日志栈隔离：独立命名空间 + propagate=False，
-#      开 DEBUG 不再连带打开整条 vLLM 内部日志。
-#   3. 双写：文本日志（可过滤）+ 可选 JSONL 事件流（实验分析、结果矩阵复用）。
-#
-# 用法（策略模块中）：
-#   import sys
-#   _HETER_LOG_DIR = "/home/rain/MySglang/Uni-Bench/log"
-#   if _HETER_LOG_DIR not in sys.path:
-#       sys.path.insert(0, _HETER_LOG_DIR)
-#   from heter_logger import heterlog
-#
-# 级别控制：
-#   环境变量 STRAT_LOG_LEVEL=DEBUG 打开策略 debug；
-#   默认 INFO（与改造前行为一致：默认终端无多余输出）。
+"""HeterLogger: HeterCache 策略专用日志与打点组件。
+
+【模块定位】
+统一管理 HeterCache 策略层（evictor / block tracker / wa_helper 等）的日志输出与事件追踪，
+解决传统 print/logger 导致的代码侵入性高、日志格式不统一以及底层框架日志刷屏的问题。
+
+【核心设计】
+1. 业务逻辑解耦：
+   - 策略决策代码只需单行调用高层 API（例如 `heterlog.evict(...)`、`heterlog.mark(...)`）并传入原生变量。
+   - 字符串拼接、字段命名规范、日志门槛判断和 JSON 序列化统一在此处执行。
+2. 双通道输出支持：
+   - 文本日志：用于控制台实时观察和关键词 grep 过滤。
+   - JSONL 事件流（可选）：以结构化数据落盘，便于后续离线分析、评测矩阵复现与可视化绘图。
+
+【配置说明】
+    - 环境变量: STRAT_LOG_LEVEL
+      * 设为 `DEBUG`：打印详细的策略决策过程与细节打点。
+      * 设为 `INFO`（默认值）：保持终端清爽，避免高频输出影响性能与观测。
+"""
 
 import json
 import logging
@@ -37,7 +36,7 @@ class HeterLogger:
 
     def __init__(self):
         self._log = logging.getLogger(self.NAMESPACE)
-        self._log.propagate = False  # 关键：不冒泡到 vllm / root logger
+        self._log.propagate = False
         if not self._log.handlers:
             _h = logging.StreamHandler(sys.stdout)
             _h.setFormatter(
@@ -61,7 +60,7 @@ class HeterLogger:
         self._log.setLevel(str(level).upper())
 
     # ------------------------------------------------------------------
-    # JSONL 事件捕获（实验留存）
+    # JSONL 事件捕获
     # ------------------------------------------------------------------
     def start_capture(self, path: str) -> None:
         """开启 JSONL 事件流落盘；重复调用会先关闭旧的。"""
@@ -104,7 +103,7 @@ class HeterLogger:
         })
 
     def hit(self, workload=None, task_type=None, hit_tokens=0, req=None):
-        """一次前缀命中事件（record_hit 收口）。"""
+        """一次前缀命中事件"""
         self._log.debug("[Hit] workload=%s task_type=%s tokens=%s req=%s",
                         workload, task_type, hit_tokens, req)
         self._record({
@@ -124,62 +123,8 @@ class HeterLogger:
             "tokens": tokens,
         })
 
-    def admit(self, block_id, task_type, queue):
-        """block 进入驱逐候选队列（add 路径出口）。"""
-        self._log.debug("block=%s admitted: task_type=%s queue=%s",
-                        block_id, task_type, queue)
-        self._record({
-            "ev": "admit",
-            "block": block_id,
-            "task_type": str(task_type),
-            "queue": queue,
-        })
-
-    def hit_interval(self, task_type, interval, block_id=None, now=None,
-                     last=None):
-        """WA 命中区间采集事件。"""
-        self._log.debug(
-            "[WA Hit] task=%s interval=%.3f block=%s now=%s last=%s",
-            task_type, interval, block_id, now, last)
-        self._record({
-            "ev": "hit",
-            "task": str(task_type),
-            "interval": interval,
-            "block": block_id,
-            "now": now,
-            "last": last,
-        })
-
-    def mark(self, block_id, attr, value):
-        """block 属性标记（task_type / block_type / last_hit 等）。"""
-        self._log.debug("block=%s set %s=%s", block_id, attr, value)
-        self._record({
-            "ev": "mark",
-            "block": block_id,
-            "attr": attr,
-            "value": str(value),
-        })
-
-    def classify_error(self, key_id, detail):
-        """任务分类失败诊断（统一替代散落的裸 print）。"""
-        self._log.error("task classification failed: key_id=%s detail=%s",
-                        key_id, detail)
-        self._record({
-            "ev": "classify_error",
-            "key_id": key_id,
-            "detail": str(detail),
-        })
-
-    def lecar_arc_miss(self, content_hash):
-        """LeCaR/ARC 缓存未命中事件。"""
-        self._log.debug("LeCaR/ARC miss hash=%s", content_hash)
-        self._record({
-            "ev": "lecar_arc_miss",
-            "hash": content_hash,
-        })
-
     # ------------------------------------------------------------------
-    # 通用透传（供 wa_helper 等还没有专属事件的模块过渡使用）
+    # 通用透传（未形成专属事件前的过渡出口；调用点自行控制频率）
     # ------------------------------------------------------------------
     def debug(self, tag, msg):
         if self._log.isEnabledFor(logging.DEBUG):
