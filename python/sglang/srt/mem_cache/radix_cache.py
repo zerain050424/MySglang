@@ -265,27 +265,30 @@ class TreeNode: ## TreeNode 是基数树（RadixTree）的节点，每个节点�
     def __init__(
         self, id: Optional[int] = None, priority: int = 0, abs_start: int = 0
     ):
+        # ---- 基础基数树元信息（与策略无关）----
         self.children = defaultdict(TreeNode)
         self.parent: TreeNode = None
         self.key: RadixKey = None
         self.value: Optional[torch.Tensor] = None ##挂在在节点上的缓存值，通常是KV缓存的索引或数据片段
-        ## 本节点片段第一个 token 在整条序列中的绝对偏移（从根算起）。
-        ## abs_start + len(value) 即 HeterCache/vLLM 的 num_hashed_tokens（片段结束偏移）。
-        self.abs_start = abs_start
         self.lock_ref = 0 ## 节点的锁引用计数，表示有多少请求正在使用该节点及其子树，防止被驱逐。
         self.last_access_time = time.monotonic() ## 节点的最后访问时间，用于LRU等驱逐策略。
         self.creation_time = time.monotonic() ## 节点的创建时间，用于统计和调试。
-
         self.hit_count = 0
         # store hash values of each pages
         self.hash_value: Optional[List[str]] = None 
         # Namespace-aware hashes used only for external KV events.
         self.event_hash_value: Optional[List[str]] = None
         # priority for priority-aware eviction
-        # SimpleHYBRID (HeterCache) workload metadata.
-
-        # is_decode: generated-output (decode) portion, never reused, evict first.
         self.priority = priority
+        self.id = TreeNode.counter if id is None else id
+        TreeNode.counter += 1
+
+        # ---- HeterCache（SimpleHYBRID / T-LRU / SLRU）相关状态 ----
+        ## 本节点片段第一个 token 在整条序列中的绝对偏移（从根算起）。
+        ## abs_start + len(value) 即 HeterCache/vLLM 的 num_hashed_tokens（片段结束偏移）。
+        self.abs_start = abs_start
+        # SimpleHYBRID (HeterCache) workload metadata.
+        # is_decode: generated-output (decode) portion, never reused, evict first.
         self.queue_tag = SimpleHybridQueueTag.QTRANS ## 负载类型
         self.is_decode = False
         # SimpleHYBRID：节点归属的会话（用于会话级缺口记账，见 uni_utils.SessionRegistry）
@@ -300,8 +303,6 @@ class TreeNode: ## TreeNode 是基数树（RadixTree）的节点，每个节点�
         # 曾经/正在分叉（结构证据的黏性标记）：节点失去所有子节点后仍然是成员，
         # 直到 aging 判定它没有共享证据才退队。
         self.struct_ever_branch = False
-        self.id = TreeNode.counter if id is None else id
-        TreeNode.counter += 1
 
     @property
     def evicted(self): ## 节点是否已经被驱逐，判断依据是节点的值是否为None。
