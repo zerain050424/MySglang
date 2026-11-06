@@ -366,19 +366,6 @@ class SimpleHybridStrategy(EvictionStrategy):
         # 策略事件流：淘汰裁决来源
         heterlog.victim_source(source, tokens)
 
-    def profile_summary(self, workload_occ, session_summary=None) -> str:
-        """返回各 workload 的 profile 摘要，供日志打印。
-
-        字段含义与渲染格式见 HeterProfiler.summary（Uni-Bench/profile /
-        heter_profiler.py）；本方法为薄委托，外部调用形态不变。
-        """
-        return self.profiler.summary(
-            workload_occ,
-            session_summary,
-            alpha_balance=self.alpha.balance,
-            slru_policy=self.slru_evict,
-            tlru_policy=self.tlru_evict,
-        )
 
     def alpha_update_due(self) -> bool:
         """调用点门禁：到 update_interval 才值得做一次全树口径计算。
@@ -397,8 +384,14 @@ class SimpleHybridStrategy(EvictionStrategy):
             return ## 每经过一个时间间隔interval才进行更新（调用点已由 alpha_update_due 门禁预筛，这里双保险）
         self._last_update = now
         self.update_alpha_balance(sched)
-        # 每个 update_interval 秒打印一次各 workload profile 摘要
-        _profile = self.profile_summary(workload_occ, session_summary)
+        # 每个 update_interval 秒打印一次各 workload profile 摘要（直接进 Profiler，无薄委托层）
+        _profile = self.profiler.summary(
+            workload_occ,
+            session_summary,
+            alpha_balance=self.alpha.balance,
+            slru_policy=self.slru_evict,
+            tlru_policy=self.tlru_evict,
+        )
         heterlog.info("AlphaBalance", f"[SimpleHybrid profile]\n{_profile}")
 
     def update_alpha_balance(
