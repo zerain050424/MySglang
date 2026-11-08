@@ -344,6 +344,106 @@ def test_quota_gap_gate():
           "under-target queue must not constrain RR")
 
 
+def test_stage0_one_shot_preempts_quota():
+    """组合顺序：one-shot 带永远先清空，即使配额点名了别的队列。"""
+    print("[17] stage 0: one-shot drains first even when quota names a queue")
+    st = _strategy()
+    st.reconcile_occupancy({"struct": {"total": 900, "one_shot": 0},
+                            "agentic": {"total": 0, "one_shot": 0},
+                            "chat": {"total": 0, "one_shot": 0}}, capacity=1000)
+    # struct 严重超配额；但同时存在一个 one-shot 叶子
+    struct_node = _leaf(TAG["struct"], 100, ts=1.0)
+    one = _leaf(TAG["struct"], 40, ts=99.0, session_id="s1")
+    st.session_registry.touch("s1", "r1", prompt_len=40)
+    st.session_registry.get("s1").session_type = uni.SessionType.TRANS
+    check(st.is_one_shot(one), "precondition: TRANS node is one-shot")
+    victim, source = qs.pick_victim(
+        strategy=st, leaves=[struct_node, one], capacity=1000, page_size=1,
+        overrides=st.victim_overrides, session_registry=st.session_registry)
+    check(victim is one and source == "one_shot",
+          f"one-shot must win, got source={source}")
+    check("struct" in st.quota_ranking(1000, 1), "precondition: struct is over cap")
+
+
+def test_stage1_quota_labels_and_skip():
+    """组合顺序：点名队列出 victim 时标 quota:<queue>；无候选则跳队。"""
+    print("[18] stage 1: quota names a queue, skips empty ones")
+    st = _strategy()
+    st.reconcile_occupancy({"struct": {"total": 900, "one_shot": 0},
+                            "agentic": {"total": 600, "one_shot": 0},
+                            "chat": {"total": 0, "one_shot": 0}}, capacity=1000)
+    rank = st.quota_ranking(1000, 1)
+    check(rank[0] == "struct", f"struct overshoots most (900-200), got {rank}")
+
+    # 第一名 struct 无候选（一个 struct 叶子都没给）-> 应跳到 agentic
+    agentic_node = _leaf(TAG["agentic"], 100, ts=1.0)
+    victim, source = qs.pick_victim(
+        strategy=st, leaves=[agentic_node], capacity=1000, page_size=1,
+        overrides=st.victim_overrides, session_registry=st.session_registry)
+    check(victim is agentic_node and source == "quota:agentic",
+          f"must skip the empty struct queue, got {source}")
+
+    # 所有队列都没候选 -> 兜底，不 busy-loop
+    victim, source = qs.pick_victim(
+        strategy=st, leaves=[], capacity=1000, page_size=1,
+        overrides=st.victim_overrides, session_registry=st.session_registry)
+    check(victim is None and source is None,
+          f"empty leaves must yield (None, None), got {(victim, source)}")
+
+
+def test_stage1_fallback_is_seeded_random():
+    """兜底：固定种子可复现，且不污染全局 random。"""
+    print("[19] stage 1 fallback: seeded RNG, reproducible, isolated")
+    import random as _random
+
+    leaves = [_leaf(TAG["chat"], 10, ts=float(i)) for i in range(30)]
+    index = {id(n): i for i, n in enumerate(leaves)}
+
+    def run(seed):
+        # 各队列都低于下限 -> ranking 为空 -> 走兜底抽样
+        # 下限=上限 且占用均低于下限 -> 无队列可点名 -> 直接走兜底
+        st = ep.SimpleHybridStrategy(
+            quota={"caps": {"struct": 0.2, "agentic": 0.5, "chat": 0.3},
+                   "reservations": {"struct": 0.2, "agentic": 0.5, "chat": 0.3},
+                   "seed": seed}
+        )
+        st.reconcile_occupancy({"struct": {"total": 100, "one_shot": 0},
+                                "agentic": {"total": 100, "one_shot": 0},
+                                "chat": {"total": 100, "one_shot": 0}}, capacity=1000)
+        picks = []
+        for _ in range(6):
+            victim, source = qs.pick_victim(
+                strategy=st, leaves=leaves, capacity=1000, page_size=1,
+                overrides=st.victim_overrides, session_registry=st.session_registry)
+            picks.append((index[id(victim)], source))
+        return picks
+
+    a, b, c = run(0), run(0), run(7)
+    check(a == b, f"same seed must reproduce, got {a} vs {b}")
+    check(a != c, "different seed should differ")
+    check(all(src == "quota:fallback" for _, src in a),
+          f"all picks must be labelled quota:fallback, got {a}")
+    state_before = _random.getstate()
+    run(0)
+    check(_random.getstate() == state_before, "fallback must not touch global random")
+
+
+def test_stage2_unchanged_without_quota():
+    """未配置配额：走原路径（全局 victim_key + 改写器链），标签回到 global。"""
+    print("[20] stage 2: no quota config keeps the original path")
+    st = ep.SimpleHybridStrategy()
+    check(st.quota.enabled is False, "precondition: quota off")
+    # 时间必须是相对 now 的：绝对值会让 elapsed 大到 reuse_prob 全部归零
+    now = uni.time.monotonic() if hasattr(uni, "time") else __import__("time").monotonic()
+    older = _leaf(TAG["chat"], 10, ts=now - 100.0)
+    newer = _leaf(TAG["chat"], 10, ts=now - 1.0)
+    victim, source = qs.pick_victim(
+        strategy=st, leaves=[newer, older], capacity=1000, page_size=1,
+        overrides=st.victim_overrides, session_registry=st.session_registry)
+    check(victim is older, "global victim_key must pick the lower reuse score")
+    check(source == "global", f"source must stay 'global', got {source}")
+
+
 def test_disabled_params_rejected():
     """未启用配额时数学层直接报错：接线错误不该静默返回 0。"""
     print("[12] disabled params are rejected, not silently zeroed")
@@ -372,6 +472,10 @@ def main():
         test_accounting_cascade_decrements_each_node,
         test_snapshot_heals_drift,
         test_quota_gap_gate,
+        test_stage0_one_shot_preempts_quota,
+        test_stage1_quota_labels_and_skip,
+        test_stage1_fallback_is_seeded_random,
+        test_stage2_unchanged_without_quota,
         test_disabled_params_rejected,
     ]
     for t in tests:

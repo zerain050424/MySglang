@@ -135,6 +135,52 @@ def resolve_chunk(page_size: int, params: QuotaParams) -> int:
     return max(int(page_size or 1), int(params.chunk_tokens))
 
 
+def pick_victim(
+    *,
+    strategy,
+    leaves,
+    capacity: float,
+    page_size: int,
+    overrides,
+    session_registry,
+):
+    """三级淘汰的候选选择：返回 (victim, source)；无可淘汰对象时 (None, None)。
+
+    阶段 0  one-shot 带永远先清空（带内 LRU），不计配额。
+    阶段 1  配额启用：按点名声次逐个尝试，队内无候选就跳下一个；全部无候选才
+            用策略私有 RNG 兜底（同 seed 可复现）。
+    阶段 2  未配置配额时保留原路径：全局 victim_key 竞争 + 改写器链。
+
+    这里是纯决策，不释放 KV、不改树；副作用留在缓存层。
+    """
+    one_shot = [n for n in leaves if strategy.is_one_shot(n)]
+    if one_shot:
+        return min(one_shot, key=strategy.one_shot_key), "one_shot"
+    if not leaves:
+        return None, None
+
+    if strategy.quota.enabled:
+        for queue in strategy.quota_ranking(capacity, page_size):
+            victim = strategy.quota_victim(queue, leaves, capacity)
+            if victim is not None:
+                return victim, f"quota:{queue}"
+        return strategy.quota_fallback(leaves), "quota:fallback"
+
+    victim = min(leaves, key=strategy.victim_key)
+    source = "global"
+    for override in overrides:
+        if override.applies_to(victim):
+            alt = override.pick(leaves, session_registry)
+            if alt is not None:
+                victim = alt
+                source = (
+                    override.queue.value
+                    if override.queue is not None
+                    else override.name
+                )
+    return victim, source
+
+
 def struct_tier(node, share_of, share_min: int) -> Tuple[int, float]:
     """STRUCT 队列的减持顺序键（Q1=b）：先"刚好够保护"，再"高出阈值"，同档 LRU。
 

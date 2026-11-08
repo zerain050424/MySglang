@@ -10,6 +10,7 @@
 import logging
 import time
 
+from sglang.srt.mem_cache import quota_selector
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams, EvictResult
 from sglang.srt.mem_cache.evict_policy import SimpleHybridStrategy
 from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -53,33 +54,8 @@ class SimpleHybridRadixCache(RadixCache):
         #   阶段1 配额启用时：点名队列 -> 队内挑选（SLRU 分档 / RR / MT）-> 兜底
         #   否则保留原路径：全局 victim_key 竞争 + 改写器链
         while num_evicted < num_tokens:
-            # 每个分支必定给出 victim 或 break；victim 绝不跨轮复用（会二次释放）
-            leaves = self.evictable_leaves
-            one_shot = [n for n in leaves if strategy.is_one_shot(n)]
-            source = "global"
-            if one_shot:
-                victim = min(one_shot, key=strategy.one_shot_key)
-                source = "one_shot"
-            elif leaves and strategy.quota.enabled:
-                victim, source = self._quota_victim(leaves, capacity)
-                if victim is None:
-                    break
-            elif leaves:
-                victim = min(leaves, key=strategy.victim_key)
-                # 依次询问已注册的改写器（注册顺序即优先级，后者覆盖前者）。
-                # 返回 None 表示不接管 -> 保留当前候选，绝不阻塞淘汰推进。
-                for override in self.victim_overrides:
-                    if override.applies_to(victim):
-                        alt = override.pick(leaves, self.session_registry)
-                        if alt is not None:
-                            victim = alt
-                            # queue用来profile本次淘汰由哪个队列的策略决定。
-                            source = (
-                                override.queue.value
-                                if override.queue is not None
-                                else override.name
-                            )
-            else:
+            victim, source = self._pick_victim(self.evictable_leaves, capacity)
+            if victim is None:
                 break
             released = self._evict_one(victim)
             if released <= 0:
@@ -95,19 +71,16 @@ class SimpleHybridRadixCache(RadixCache):
         self.update_eviction_metrics(num_evicted, start_time)
         return EvictResult(num_tokens_evicted=num_evicted)
 
-    def _quota_victim(self, leaves, capacity: float):
-        """阶段 1a/1b：按点名声次依次尝试，全部无候选才进兜底。
-
-        `leaves` 是当前可淘汰叶子（已排除锁定节点）。点名队列里可能一个叶子
-        都没有（全部 locked / 全是 one-shot / 标签全场集中到另一队列），此时
-        跳到下一个队列——否则配额会把淘汰卡死在“该削的削不了”上。
-        """
-        strategy = self.eviction_strategy
-        for queue in strategy.quota_ranking(capacity, self.page_size):
-            victim = strategy.quota_victim(queue, leaves, capacity)
-            if victim is not None:
-                return victim, f"quota:{queue}"
-        return strategy.quota_fallback(leaves), "quota:fallback"
+    def _pick_victim(self, leaves, capacity: float):
+        """三级淘汰的候选选择；决策本身在 quota_selector.pick_victim。"""
+        return quota_selector.pick_victim(
+            strategy=self.eviction_strategy,
+            leaves=leaves,
+            capacity=capacity,
+            page_size=self.page_size,
+            overrides=self.victim_overrides,
+            session_registry=self.session_registry,
+        )
 
     def _evict_one(self, node) -> int:
         """
