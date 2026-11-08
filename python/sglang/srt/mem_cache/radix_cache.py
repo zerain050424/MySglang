@@ -375,9 +375,10 @@ class RadixCache(BasePrefixCache):
             for ov in self.victim_overrides
             if hasattr(ov, "on_node_inserted")
         )
-        _record_insert = getattr(self.eviction_strategy, "record_insert", None)
-        if _record_insert is not None:
-            self._insert_observers = self._insert_observers + (_record_insert,)
+        # 配额的节点入账只挂“新建节点”一条路径（插入点里显式调用）。
+        # 不能挂 _insert_observers：分裂也会触发它，而分裂时 child.key 同步
+        # 变短、队列归属不变，占用净变化为 0，再记一次就是双计。
+        self._record_insert = getattr(self.eviction_strategy, "record_insert", None)
         # 需要命中期记录的插件（目前是 SLRU 的共享会话数账本）。
         # 不经过任何标签策略：`force_agentic` 等实验开关下账本同样要维护，
         # 否则 SLRU 的准入条件会退化成恒真/恒假。
@@ -1177,6 +1178,9 @@ class RadixCache(BasePrefixCache):
             # T-LRU：新节点记下 root->self 的累计长度，并把高水位沿祖先链上抬。
             for observe in self._insert_observers:
                 observe(new_node)
+            # 配额账本：只记“新出现的 token”，分裂路径不走这里（净变化为 0）。
+            if self._record_insert is not None:
+                self._record_insert(new_node)
             if (
                 not self.force_agentic
                 and node is not self.root_node

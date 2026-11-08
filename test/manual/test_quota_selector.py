@@ -38,6 +38,9 @@ for _pkg in ("sglang", "sglang.srt", "sglang.srt.mem_cache"):
 
 uni = _load("sglang.srt.mem_cache.uni_utils", os.path.join(_CACHE_DIR, "uni_utils.py"))
 qs = _load("sglang.srt.mem_cache.quota_selector", os.path.join(_CACHE_DIR, "quota_selector.py"))
+vo = _load("sglang.srt.mem_cache.victim_override", os.path.join(_CACHE_DIR, "victim_override.py"))
+_load("sglang.srt.mem_cache.heter_logging", os.path.join(_CACHE_DIR, "heter_logging.py"))
+ep = _load("sglang.srt.mem_cache.evict_policy", os.path.join(_CACHE_DIR, "evict_policy.py"))
 
 QuotaParams = uni.QuotaParams
 C = 1000.0
@@ -230,6 +233,117 @@ def test_resolve_chunk():
     check(qs.resolve_chunk(64, chunked) == 64, "page_size wins when larger")
 
 
+class _Leaf:
+    """极简叶子替身：只带配额计量用到的字段。
+
+    必须是普通类而不是 SimpleNamespace —— SLRU 的共享数账本是
+    WeakKeyDictionary，需要节点可弱引用。
+    """
+
+    def __init__(self, tag, tokens, ts=0.0, session_id=None):
+        self.queue_tag = tag
+        self.value = [0] * tokens
+        self.key = [0] * tokens
+        self.last_access_time = ts
+        self.session_id = session_id
+
+
+def _leaf(tag, tokens, ts=0.0, session_id=None):
+    return _Leaf(tag, tokens, ts, session_id)
+
+
+TAG = {
+    "struct": uni.SimpleHybridQueueTag.QSTRUCT,
+    "agentic": uni.SimpleHybridQueueTag.QAGENT,
+    "chat": uni.SimpleHybridQueueTag.QCHAT,
+}
+
+
+def _strategy(**kw):
+    return ep.SimpleHybridStrategy(
+        quota={"caps": {"struct": 0.2, "agentic": 0.5, "chat": 0.3}, **kw}
+    )
+
+
+def test_accounting_insert_and_evict():
+    """记账：插入累加、淘汰扣减；one-shot 两侧都不进账。"""
+    print("[13] accounting: insert adds, evict subtracts, one-shot is excluded")
+    st = _strategy()
+    st.record_insert(_leaf(TAG["agentic"], 100))
+    st.record_insert(_leaf(TAG["struct"], 40))
+    check(st._occ["agentic"] == 100, f"agentic={st._occ['agentic']}, want 100")
+    check(st._occ["struct"] == 40, f"struct={st._occ['struct']}, want 40")
+
+    st.record_evict(_leaf(TAG["agentic"], 30))
+    check(st._occ["agentic"] == 70, f"after evict agentic={st._occ['agentic']}, want 70")
+
+    # TRANS 会话 + share < share_min -> one-shot，插入与淘汰两侧都不进账
+    trans = _leaf(TAG["struct"], 50, session_id="t1")
+    st.session_registry.touch("t1", "r1", prompt_len=50)
+    st.session_registry.get("t1").session_type = uni.SessionType.TRANS
+    check(st.is_one_shot(trans), "precondition: a TRANS node with share 0 is one-shot")
+    before = st._occ["struct"]
+    st.record_insert(trans)
+    check(st._occ["struct"] == before,
+          f"one-shot insert must not be counted, {before} -> {st._occ['struct']}")
+    st.record_evict(trans)
+    check(st._occ["struct"] == before,
+          f"one-shot evict must not be counted, {before} -> {st._occ['struct']}")
+
+
+def test_accounting_cascade_decrements_each_node():
+    """级联删除：_evict_one 逐节点调 record_evict，祖先也要各扣一次。"""
+    print("[14] accounting: cascade eviction decrements every deleted node")
+    st = _strategy()
+    for n in (40, 60, 100):
+        st.record_insert(_leaf(TAG["chat"], n))
+    check(st._occ["chat"] == 200, f"chat={st._occ['chat']}, want 200")
+    # 模拟一次 victim + 两个祖先的级联删除
+    for n in (100, 60):
+        st.record_evict(_leaf(TAG["chat"], n))
+    check(st._occ["chat"] == 40, f"chat={st._occ['chat']}, want 40")
+    # 扣不穿地板
+    st.record_evict(_leaf(TAG["chat"], 999))
+    check(st._occ["chat"] == 0.0, f"occ must clamp at 0, got {st._occ['chat']}")
+
+
+def test_snapshot_heals_drift():
+    """快照对齐：改标签 / one-shot 迁移 / 分裂双计导致的漂移都能被拉回真值。"""
+    print("[15] reconcile restores ground truth after tag moves and splits")
+    st = _strategy()
+    st.record_insert(_leaf(TAG["agentic"], 500))
+    # 人为打偏（等价于改标签 + 漏记）
+    st._occ["agentic"] += 300
+    st._occ["struct"] -= 120
+    truth = {
+        "struct": {"total": 400, "one_shot": 100},
+        "agentic": {"total": 600, "one_shot": 0},
+        "chat": {"total": 200, "one_shot": 200},
+        "random": {"total": 90, "one_shot": 90},
+    }
+    st.reconcile_occupancy(truth, capacity=1000)
+    check(st._occ["struct"] == 300, f"struct={st._occ['struct']}, want 300 (total-one_shot)")
+    check(st._occ["agentic"] == 600, f"agentic={st._occ['agentic']}, want 600")
+    check(st._occ["chat"] == 0, f"chat={st._occ['chat']}, want 0 (整行 one-shot)")
+    check(st._capacity == 1000, f"capacity={st._capacity}, want 1000")
+
+
+def test_quota_gap_gate():
+    """配额缺口：超配额才给 RR 上限，弹性区不限制。"""
+    print("[16] quota gap is only defined when the queue is over its target")
+    st = _strategy()
+    st.reconcile_occupancy({"struct": {"total": 0, "one_shot": 0},
+                            "agentic": {"total": 600, "one_shot": 0},
+                            "chat": {"total": 0, "one_shot": 0}}, capacity=1000)
+    check(abs(st._quota_gap("agentic", 1000) - 100) < 1e-6,
+          f"gap={st._quota_gap('agentic', 1000)}, want 100 (600-500)")
+    st.reconcile_occupancy({"struct": {"total": 0, "one_shot": 0},
+                            "agentic": {"total": 300, "one_shot": 0},
+                            "chat": {"total": 0, "one_shot": 0}}, capacity=1000)
+    check(st._quota_gap("agentic", 1000) is None,
+          "under-target queue must not constrain RR")
+
+
 def test_disabled_params_rejected():
     """未启用配额时数学层直接报错：接线错误不该静默返回 0。"""
     print("[12] disabled params are rejected, not silently zeroed")
@@ -254,6 +368,10 @@ def main():
         test_elastic_picks_max_excess_over_floor,
         test_struct_tier,
         test_resolve_chunk,
+        test_accounting_insert_and_evict,
+        test_accounting_cascade_decrements_each_node,
+        test_snapshot_heals_drift,
+        test_quota_gap_gate,
         test_disabled_params_rejected,
     ]
     for t in tests:
