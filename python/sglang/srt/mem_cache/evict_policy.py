@@ -331,7 +331,10 @@ class SimpleHybridStrategy(EvictionStrategy):
         tokens = _node_num_tokens(node)
         wkey = self.workload_of(node)
         one_shot = self.is_one_shot(node)
-        if self.quota.enabled and not one_shot:
+        # random 不参与配额：它整行 one-shot；但缺席会话证据的节点
+        # （客户端未带 session_id）is_one_shot 判 False，wkey 会是 "random"，
+        # 必须用 QUOTA_QUEUES 白名单挡掉，否则扣减会打到不存在的键上。
+        if self.quota.enabled and not one_shot and wkey in QUOTA_QUEUES:
             self._occ[wkey] = max(0.0, self._occ[wkey] - tokens)
         self.profiler.record_evict(wkey, tokens, one_shot=one_shot)
         # 策略事件流：节点级驱逐事件（供 Uni-Bench 结果矩阵分析）
@@ -414,7 +417,10 @@ class SimpleHybridStrategy(EvictionStrategy):
         """
         if not self.quota.enabled or self.is_one_shot(node):
             return
-        self._occ[self.workload_of(node)] += _node_num_tokens(node)
+        wkey = self.workload_of(node)
+        if wkey not in QUOTA_QUEUES:
+            return  # random 不参与配额
+        self._occ[wkey] += _node_num_tokens(node)
 
     def observe_occupancy(
         self,
