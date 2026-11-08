@@ -349,8 +349,13 @@ class RadixCache(BasePrefixCache):
         # that implement them, so other policies pay nothing.
         ## 可选钩子
         self._hit_recorder = getattr(self.eviction_strategy, "record_hit", None)
-        self._profile_printer = getattr(
-            self.eviction_strategy, "maybe_print_profile", None
+        self._occupancy_observer = getattr(
+            self.eviction_strategy, "observe_occupancy", None
+        )
+        # 配额启用时，策略需要 allocator 的可用量/容量来判断是否承压；
+        # 未启用就不碰 allocator，测试用的极简替身也能跑。
+        self._needs_capacity = bool(
+            getattr(self.eviction_strategy, "needs_capacity", False)
         )
         # 实验开关（SimpleHybridStrategy.force_agentic）：把所有节点直接标成 QAGENT，
         # 让 QAGENT-only 的插件（RR / T-LRU）拿到 100% 的流量。只改 queue_tag，
@@ -363,13 +368,16 @@ class RadixCache(BasePrefixCache):
         self.victim_overrides = tuple(
             getattr(self.eviction_strategy, "victim_overrides", ()) or ()
         )
-        # 需要「插入期记账」的插件（目前是 SLRU 的分裂继承）。
+        # 需要「插入期记账」的插件（目前是 SLRU 的分裂继承）与配额的节点入账。
         # 在这里解析成函数元组：无插件时是空元组，插入/分裂路径只多一次空循环。
         self._insert_observers = tuple(
             ov.on_node_inserted
             for ov in self.victim_overrides
             if hasattr(ov, "on_node_inserted")
         )
+        _record_insert = getattr(self.eviction_strategy, "record_insert", None)
+        if _record_insert is not None:
+            self._insert_observers = self._insert_observers + (_record_insert,)
         # 需要命中期记录的插件（目前是 SLRU 的共享会话数账本）。
         # 不经过任何标签策略：`force_agentic` 等实验开关下账本同样要维护，
         # 否则 SLRU 的准入条件会退化成恒真/恒假。
@@ -722,11 +730,21 @@ class RadixCache(BasePrefixCache):
 
         start_time = time.perf_counter()
         num_tokens = params.num_tokens
-        if self._profile_printer is not None:
-            _profile_due = getattr(self.eviction_strategy, "profile_due", None)
-            if _profile_due is None or _profile_due():
-                self._profile_printer(
-                    self._per_workload_token_count(), self.session_registry.summary()
+        if self._occupancy_observer is not None:
+            # 承压判据要 allocator 的 O(1) 指标；只有配额启用时才取
+            if self._needs_capacity:
+                available = self.token_to_kv_pool_allocator.available_size()
+                capacity = float(self.token_to_kv_pool_allocator.size)
+            else:
+                available = capacity = 0.0
+            if self._occupancy_observer.wants_occupancy(
+                available, capacity, has_capacity=self._needs_capacity
+            ):
+                self._occupancy_observer.observe_occupancy(
+                    self._per_workload_token_count(),
+                    self.session_registry.summary(),
+                    available=available,
+                    capacity=capacity,
                 )
         leaves = list(self.evictable_leaves)
         eviction_heap = [

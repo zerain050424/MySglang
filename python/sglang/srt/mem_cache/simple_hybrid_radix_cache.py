@@ -22,7 +22,7 @@ class SimpleHybridRadixCache(RadixCache):
     """RadixCache + 多级队列淘汰"""
 
     def evict(self, params: EvictParams) -> EvictResult:
-        # 禁用 radix cache 时无操作
+        # 禁用 radixcache 时无操作
         if self.disable:
             return EvictResult()
         if not isinstance(self.eviction_strategy, SimpleHybridStrategy):
@@ -30,13 +30,21 @@ class SimpleHybridRadixCache(RadixCache):
 
         start_time = time.perf_counter()
         num_tokens = params.num_tokens
-        # 每 PROFILE_INTERVAL 秒按 workload 打印一次 profile
-        # 门禁：仅当打印到期才做全树遍历（否则节流窗口内白发全线）
-        if self._profile_printer is not None:
-            _profile_due = getattr(self.eviction_strategy, "profile_due", None)
-            if _profile_due is None or _profile_due():
-                self._profile_printer(
-                    self._per_workload_token_count(), self.session_registry.summary()
+        # profile 打印与配额账本校准共用一次全树遍历（两个时钟分开）
+        if self._occupancy_observer is not None:
+            if self._needs_capacity:
+                available = self.token_to_kv_pool_allocator.available_size()
+                capacity = float(self.token_to_kv_pool_allocator.size)
+            else:
+                available = capacity = 0.0
+            if self._occupancy_observer.wants_occupancy(
+                available, capacity, has_capacity=self._needs_capacity
+            ):
+                self._occupancy_observer.observe_occupancy(
+                    self._per_workload_token_count(),
+                    self.session_registry.summary(),
+                    available=available,
+                    capacity=capacity,
                 )
 
         strategy = self.eviction_strategy
@@ -95,26 +103,19 @@ class SimpleHybridRadixCache(RadixCache):
         """
         total = 0
         cur = node
-        # 当祖先自己是一次性内容（未被跨会话共享）时级联删除，否则会
-        # 连带删掉刚进 protected 的共享前缀。
         strategy = self.eviction_strategy
         one_shot = strategy.is_one_shot(node)
         while True:
             parent = cur.parent
-            # 累计该队列的淘汰 token（供 profile）
             self.eviction_strategy.record_evict(cur)
-            # 归还 KV slot
             self.token_to_kv_pool_allocator.free_segment(cur.value, start_pos=0)
-            # 记录 KV 事件
             self.kv_events.record_remove(cur)
             total += len(cur.value)
-            # 从树中删除；_delete_leaf 会顺带维护 evictable_leaves 与父节点晋升
             self._delete_leaf(cur)
             if (one_shot and parent is not None and parent is not self.root_node
                     and parent.lock_ref == 0 and not parent.children
-                    # 同源闸：祖先必须也是 one-shot（共享数未达保护阈值）。
                     and strategy.is_one_shot(parent)):
-                cur = parent  # 死链：随 one-shot 一并删除
+                cur = parent
                 continue
             break
         return total
