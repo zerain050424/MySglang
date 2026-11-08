@@ -76,8 +76,9 @@ def session_type_to_queue_tag(session_type: SessionType) -> SimpleHybridQueueTag
 #   RrParams        : Agentic 会话级轮询配额（跨会话公平）
 #   SlruParams      : SLRU 的共享会话数阈值（决定 one-shot 分界与保护范围）
 #   MultiTurnParams : 多轮对话（QCHAT）带内权重
+#   QuotaParams     : 跨队列配额（下限 + 上限，分母为池容量）
 # 用 dataclass 而不是裸 kwargs，是为了让 `eviction_policy_config` 有层级、能校验、能整体
-# 配置只接受 {"rr":{...},"slru":{...},"mt":{...}} 分组形式。
+# 配置只接受 {"rr":{...},"slru":{...},"mt":{...},"quota":{...}} 分组形式。
 # ---------------------------------------------------------------------------
 
 
@@ -195,6 +196,112 @@ class MultiTurnParams:
     @classmethod
     def from_any(cls, value=None) -> "MultiTurnParams":
         return _coerce_params(cls, value, name="multi-turn")
+
+    def as_dict(self) -> dict:
+        return dataclasses.asdict(self)
+
+
+# 配额覆盖的三级队列。`random` 不在此列：它整行都是 one-shot，
+# 在阶段 0 就被清掉，因此永远不会计入配额账本。
+QUOTA_QUEUES = ("struct", "agentic", "chat")
+
+
+@dataclasses.dataclass
+class QuotaParams:
+    """跨队列配额：下限 rho（保留）+ 上限 k（封顶），中间是弹性区。
+
+    配置形式：
+        --radix-eviction-policy-config '{"quota": {
+            "caps": {"struct": 0.2, "agentic": 0.5, "chat": 0.3},
+            "reservations": {"struct": 0.05, "agentic": 0.2, "chat": 0.1}}}'
+
+    两个字典都是**容量比例**，分母恒为池容量 C（allocator.size），
+    不随淘汰变化——用当前占用之和作分母会让目标同步塔陷，把淘汰量放大 1/(1-k) 倍。
+
+    caps 必须三个队列全给（漏填等于默认永不封顶，是个静默失效），且 sum(k) <= 1；
+    reservations 缺省 0，只需给想保底的队列。chunk_tokens 与 page_size 取大作为
+    单次最小减持量；deadzone 与它共同防止在边界上来回点名。
+    """
+
+    caps: Dict[str, float] = dataclasses.field(default_factory=dict)
+    reservations: Dict[str, float] = dataclasses.field(default_factory=dict)
+    deadzone: float = 0.05
+    chunk_tokens: int = 0
+    pressure_window_s: float = 3.0
+    seed: int = 0
+
+    def __post_init__(self):
+        if not self.caps:
+            # 空 caps = 关闭配额（默认）。只校验标量，不要求三个队列。
+            self._validate_scalars()
+            if self.reservations:
+                raise ValueError(
+                    "quota.reservations requires quota.caps; got "
+                    f"{sorted(self.reservations)}."
+                )
+            return
+
+        unknown = set(self.caps) - set(QUOTA_QUEUES)
+        if unknown:
+            raise ValueError(
+                f"quota.caps has unknown queues {sorted(unknown)}; "
+                f"expected exactly {list(QUOTA_QUEUES)}."
+            )
+        missing = set(QUOTA_QUEUES) - set(self.caps)
+        if missing:
+            raise ValueError(
+                f"quota.caps is missing {sorted(missing)}; give all of "
+                f"{list(QUOTA_QUEUES)} (a missing cap silently never binds)."
+            )
+        unknown = set(self.reservations) - set(QUOTA_QUEUES)
+        if unknown:
+            raise ValueError(
+                f"quota.reservations has unknown queues {sorted(unknown)}; "
+                f"expected a subset of {list(QUOTA_QUEUES)}."
+            )
+
+        for q, cap in self.caps.items():
+            if not 0.0 < cap <= 1.0:
+                raise ValueError(f"quota.caps[{q!r}] must be in (0, 1], got {cap}")
+        total_cap = sum(self.caps.values())
+        if total_cap > 1.0 + 1e-9:
+            raise ValueError(
+                f"quota caps must sum to <= 1, got {total_cap:.4f}; "
+                "caps are fractions of the pool capacity."
+            )
+
+        for q, res in self.reservations.items():
+            if not 0.0 <= res <= self.caps[q]:
+                raise ValueError(
+                    f"quota.reservations[{q!r}] must be in [0, caps[{q!r}]={self.caps[q]}], "
+                    f"got {res}"
+                )
+        total_res = sum(self.reservations.values())
+        if total_res > 1.0 + 1e-9:
+            raise ValueError(f"quota reservations must sum to <= 1, got {total_res:.4f}")
+
+        self._validate_scalars()
+
+    def _validate_scalars(self) -> None:
+        if not 0.0 <= self.deadzone < 1.0:
+            raise ValueError(f"quota.deadzone must be in [0, 1), got {self.deadzone}")
+        if self.chunk_tokens < 0:
+            raise ValueError(f"quota.chunk_tokens must be >= 0, got {self.chunk_tokens}")
+        if self.pressure_window_s <= 0:
+            raise ValueError(
+                f"quota.pressure_window_s must be > 0, got {self.pressure_window_s}"
+            )
+        if not isinstance(self.seed, int) or isinstance(self.seed, bool):
+            raise ValueError(f"quota.seed must be int, got {self.seed!r}")
+
+    @property
+    def enabled(self) -> bool:
+        """未配置 caps 即关闭：此时淘汰行为与引入配额前完全一致。"""
+        return bool(self.caps)
+
+    @classmethod
+    def from_any(cls, value=None) -> "QuotaParams":
+        return _coerce_params(cls, value, name="quota")
 
     def as_dict(self) -> dict:
         return dataclasses.asdict(self)
