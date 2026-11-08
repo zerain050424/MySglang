@@ -13,7 +13,6 @@ from sglang.srt.mem_cache.uni_utils import (
     SessionRegistry,
     SessionType,
     SlruParams,
-    TlruParams,
     TASK_CONFIG,
     workload_label_of,
     SimpleHybridTaskType,
@@ -22,10 +21,8 @@ from sglang.srt.mem_cache.uni_utils import (
 )
 from sglang.srt.mem_cache.victim_override import (
     RrEvictPolicy,
-    TlruEvictPolicy,
     SlruEvictPolicy,
     MultiTurnEvictPolicy,
-    tlru_lens,
 )
 from sglang.srt.mem_cache.heter_logging import heterlog, HeterProfiler
 
@@ -100,17 +97,16 @@ class TLRUStrategy(EvictionStrategy):
         self.next_prompt_estimate = next_prompt_estimate
 
     def get_priority(self, node: TreeNode) -> Tuple[int, float]:
-        # tlru_lens(node)[1] (history) is the branch's high-water depth, i.e. the
+        # node._tlru_history_len is the branch's high-water depth, i.e. the
         # paper's L, and deliberately does not shrink when the tail is trimmed.
         # Deriving L from what is still resident instead would leave the
         # shortened conversation over budget on the next pass too, and T-LRU
         # would walk it down to nothing rather than stopping after
         # (threshold - Q_hat) tokens.
-        _cached_prefix_len, _history_len = tlru_lens(node)
         budget = max(
-            _history_len + self.next_prompt_estimate - self.threshold, 0
+            node._tlru_history_len + self.next_prompt_estimate - self.threshold, 0
         )
-        cached_without_this_node = _cached_prefix_len - len(node.key)
+        cached_without_this_node = node._tlru_cached_prefix_len - len(node.key)
         tel_safe = cached_without_this_node >= budget
         return (-1 if tel_safe else 0, node.last_access_time)
 
@@ -150,13 +146,12 @@ class SimpleHybridStrategy(EvictionStrategy):
         force_agentic: bool = False,
         rr: Union[RrParams, dict, None] = None,
         slru: Union[SlruParams, dict, None] = None,
-        tlru: Union[TlruParams, dict, None] = None,
         mt: Union[MultiTurnParams, dict, None] = None,
     ):
         """
-        参数组由 RrParams / SlruParams / TlruParams / MultiTurnParams 承载（uni_utils）。
+        参数组由 RrParams / SlruParams / MultiTurnParams 承载（uni_utils）。
         配置只接受分组形式：
-            {"rr": {...}, "slru": {...}, "tlru": {...}, "mt": {...}}
+            {"rr": {...}, "slru": {...}, "mt": {...}}
         未知键在参数组构造处直接报错。
 
         max_offset 不属于任何一组：它是 struct 复用分数里的位置项上界。
@@ -168,7 +163,6 @@ class SimpleHybridStrategy(EvictionStrategy):
         """
         self.rr = RrParams.from_any(rr)
         self.slru = SlruParams.from_any(slru)
-        self.tlru = TlruParams.from_any(tlru)
         self.mt = MultiTurnParams.from_any(mt)
         self.force_agentic = bool(force_agentic)
         self.max_offset = max_offset or 2048
@@ -192,13 +186,10 @@ class SimpleHybridStrategy(EvictionStrategy):
         self.slru_evict = SlruEvictPolicy(
             self.session_registry, self.slru.share_min
         )
-        # T-LRU 尾巴优先：只修 QAGENT 的候选，并在插入期维护 _tlru_* 历史最长会话长度。
-        self.tlru_evict = TlruEvictPolicy(self.tlru) if self.tlru.enabled else None
         # 多轮对话（QCHAT）带内改写器：1-prob(e) 排序（默认启用，见 MultiTurnParams）
         self.mt_evict = MultiTurnEvictPolicy(self.mt, self.session_registry) if self.mt.enabled else None
-        self._validate_scope()
         self.victim_overrides = tuple(
-            p for p in (self.rr_evict, self.tlru_evict, self.slru_evict, self.mt_evict) if p is not None
+            p for p in (self.rr_evict, self.slru_evict, self.mt_evict) if p is not None
         )
 
     def reset_bookkeeping(self) -> None:
@@ -211,21 +202,6 @@ class SimpleHybridStrategy(EvictionStrategy):
         self.profiler.reset()
         self._seen_rids.clear()
         self._rid_order.clear()
-
-
-    def _validate_scope(self) -> None:
-        """拦住会静默失效的插件组合。
-
-        `victim_overrides` 是覆盖链（后者覆盖前者），而 RR 只要挑得出会话就会
-        返回非 None，所以 fair_rr + tlru 同时开会把 TLRU 完全遮蔽。SLRU 只认
-        STRUCT 叶子，与这两者的作用域不相交，不需要互斥检查。
-        """
-        if self.rr_evict is not None and self.tlru_evict is not None:
-            raise ValueError(
-                "rr.fair_rr and tlru.enabled are mutually exclusive: both rewrite "
-                "the QAGENT candidate and the later override wins, so T-LRU would "
-                "never be consulted. Enable only one of them."
-            )
 
 
     def _task_type_of(self, node) -> SimpleHybridTaskType:
@@ -374,7 +350,6 @@ class SimpleHybridStrategy(EvictionStrategy):
             workload_occ,
             session_summary,
             slru_policy=self.slru_evict,
-            tlru_policy=self.tlru_evict,
             mt_policy=self.mt_evict,
         )
         heterlog.info("Profile", f"[SimpleHybrid profile]\n{_profile}")

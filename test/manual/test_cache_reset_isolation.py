@@ -6,8 +6,7 @@ reset 必须把「上一次 run 的状态」全部清掉，否则会串味：
 
   SessionRegistry 的 d/L/gaps  ->  RR 的 loss_cap 直接读它们
   策略的窗口/累计/来源计数     ->  [SimpleHybrid profile] 会打印混合值
-  插件的计数器                 ->  tel_safe/lru 比例失真
-  树上节点的 _tlru_* 高水位    -> 随树一起丢弃
+  插件的计数器                 ->  SLRU 的 share 账本失真
 
 Run: /root/sl_old/bin/python test/manual/test_cache_reset_isolation.py
 """
@@ -52,7 +51,7 @@ class Alloc:
 
 CFG = {
     "force_agentic": True,
-    "tlru": {"enabled": True, "threshold": 943, "next_prompt_estimate": 71},
+    "slru": {"share_min": 2},
 }
 
 
@@ -115,9 +114,6 @@ def dirty(cache):
     strategy._victim_sources["qagent"] = 777.0
     strategy._seen_rids.add("rid-1")
     strategy._rid_order.append("rid-1")
-    if strategy.tlru_evict is not None:
-        strategy.tlru_evict.tel_safe_picks = 5
-        strategy.tlru_evict.history_raises = 42
 
     # 会话账本：touch 会写 d/L
     cache.session_registry.touch("sessA", "rid-1", prompt_len=200)
@@ -145,10 +141,6 @@ def test_reset_clears_everything():
     check(not strategy._seen_rids and not strategy._rid_order,
           "request dedup set must be cleared")
     check(not all_nodes(cache), "tree must be empty after reset")
-    if strategy.tlru_evict is not None:
-        s = strategy.tlru_evict.stats()
-        check(all(v == 0 for v in s.values()),
-              f"plugin counters must be zeroed, got {s}")
 
 
 def test_second_run_equals_fresh_run():
@@ -168,8 +160,6 @@ def test_second_run_equals_fresh_run():
     def fingerprint(cache):
         return sorted(
             (
-                n._tlru_cached_prefix_len,
-                n._tlru_history_len,
                 n.share_sessions,
                 getattr(n.queue_tag, "value", str(n.queue_tag)),
                 0 if n.value is None else len(n.value),
@@ -179,9 +169,6 @@ def test_second_run_equals_fresh_run():
 
     check(fingerprint(reused) == fingerprint(fresh),
           "tree fingerprint differs: reuse is contaminated")
-    check(reused.root_node._tlru_history_len == fresh.root_node._tlru_history_len,
-          f"root high-water {reused.root_node._tlru_history_len} != "
-          f"fresh {fresh.root_node._tlru_history_len}")
 
     st_reused = reused.session_registry.get("sessB")
     st_fresh = fresh.session_registry.get("sessB")

@@ -9,7 +9,7 @@ T-LRU 的两个参数都是 token 数（论文里是 block，需乘 page_size）
 - Q_hat  = 下一轮 prompt 相对本轮的增量中位数（"下一轮会新增多少 token"）
 - threshold = 允许放弃的尾部预算：越大越激进（保留 L 个以外的尾巴越少）
 
-约束（TlruParams 会在启动时校验）：threshold 必须 > Q_hat，否则没有任何节点
+约束（CLI 启动校验见 kv_cache_hook）：threshold 必须 > Q_hat，否则没有任何节点
 会 tel-safe，TLRU 退化成纯 LRU。
 
 用法：
@@ -122,11 +122,10 @@ def main() -> int:
             "frac_of_L": frac,
             "threshold": threshold,
             "next_prompt_estimate": q_hat,
-            "config": {"tlru": {
-                "enabled": True,
+            "config": {
                 "threshold": threshold,
                 "next_prompt_estimate": q_hat,
-            }},
+            },
         })
 
     report = {

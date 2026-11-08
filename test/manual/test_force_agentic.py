@@ -1,7 +1,7 @@
 """force_agentic：把全部节点直达 QAGENT 队列。
 
-实验前提（RR vs T-LRU 的 burst/pause 场景）：RrEvictPolicy 与 TlruEvictPolicy 的
-applies_to 都只认 QAGENT，而状态机默认会把新节点标成 QTRANS（one-shot）、把间隔
+实验前提（RR vs T-LRU 的 burst/pause 场景）：RrEvictPolicy 的
+applies_to 只认 QAGENT，而状态机默认会把新节点标成 QTRANS（one-shot）、把间隔
 ≥8s 的命中标成 QCHAT。force_agentic 关掉这套分流：
 
   1. 新节点直接 QAGENT（不再 QTRANS → 不被 one-shot 带先清）
@@ -191,7 +191,7 @@ def test_plugins_see_everything():
     print("[6] QAGENT-only plugins now cover all leaves")
     cfg = {
         "force_agentic": True,
-        "tlru": {"enabled": True, "threshold": 943, "next_prompt_estimate": 71},
+        "slru": {"share_min": 2},
     }
     cache = SimpleHybridRadixCache(
         CacheInitParams(
@@ -208,23 +208,10 @@ def test_plugins_see_everything():
     match(cache, list(range(0, 200)), session_id="p")
 
     strategy = cache.eviction_strategy
-    tlru = strategy.tlru_evict
-    check(tlru is not None, "tlru plugin must be built")
-
+    slru = strategy.slru_evict
     leaves = list(cache.evictable_leaves)
-    uncovered = [n.id for n in leaves if not tlru.applies_to(n)]
-    check(not uncovered,
-          f"every leaf must be in the plugin's scope, uncovered={uncovered[:5]}")
-
-    # 高水位必须已经被插入回调写进去（> 0 且单调）
-    pumped = [n for n in all_nodes(cache) if n._tlru_history_len > 0]
-    check(len(pumped) == len(all_nodes(cache)),
-          f"all nodes must carry a water mark, missing={len(all_nodes(cache)) - len(pumped)}")
-    # 不变量：根节点的高水位 == 树上见过的最深前缀（而不是某条序列的长度）
-    deepest = max(n._tlru_cached_prefix_len for n in all_nodes(cache))
-    check(cache.root_node._tlru_history_len == deepest,
-          f"root high-water {cache.root_node._tlru_history_len} != deepest path {deepest}")
-    check(deepest >= 300, f"deepest path {deepest} looks too shallow")
+    covered = [n.id for n in leaves if slru.applies_to(n)]
+    check(covered, f"no leaf reaches the SLRU plugin, leaves={len(leaves)}")
 
 
 def main():

@@ -129,7 +129,6 @@ def install(
                         cache._per_workload_token_count(),
                         cache.session_registry.summary(),
                         slru_policy=strategy.slru_evict,
-                        tlru_policy=strategy.tlru_evict,
                         mt_policy=strategy.mt_evict,
                     )
                 except Exception:

@@ -75,10 +75,9 @@ def session_type_to_queue_tag(session_type: SessionType) -> SimpleHybridQueueTag
 #
 #   RrParams        : Agentic 会话级轮询配额（跨会话公平）
 #   SlruParams      : SLRU 的共享会话数阈值（决定 one-shot 分界与保护范围）
-#   TlruParams      : T-LRU 的尾部预算（QAGENT 候选修正）
 #   MultiTurnParams : 多轮对话（QCHAT）带内权重
 # 用 dataclass 而不是裸 kwargs，是为了让 `eviction_policy_config` 有层级、能校验、能整体
-# 配置只接受 {"rr":{...},"slru":{...},"tlru":{...},"mt":{...}} 分组形式。
+# 配置只接受 {"rr":{...},"slru":{...},"mt":{...}} 分组形式。
 # ---------------------------------------------------------------------------
 
 
@@ -174,53 +173,12 @@ class SlruParams:
 
 
 @dataclasses.dataclass
-class TlruParams:
-    """T-LRU 的尾部预算（SimpleHybrid 的 QAGENT 候选修正用）。
-
-    threshold 与 next_prompt_estimate 都是 **token** 数；论文里以 block 为单位，
-    移植时需乘 page_size。语义：
-
-        budget = max(L + Q_hat - threshold, 0)
-
-    起点已越过 budget 的片段对下一轮 prefill 的尾部延迟再无贡献（tel-safe），
-    可以优先淘汰。threshold 必须 **大于** next_prompt_estimate，否则预算永远
-    不小于 L，没有任何节点会 tel-safe，T-LRU 退化成纯 LRU。
-    """
-
-    enabled: bool = False
-    threshold: int = 0
-    next_prompt_estimate: int = 0
-
-    def __post_init__(self):
-        if self.threshold < 0:
-            raise ValueError(f"tlru.threshold must be >= 0, got {self.threshold}")
-        if self.next_prompt_estimate < 0:
-            raise ValueError(
-                "tlru.next_prompt_estimate must be >= 0, "
-                f"got {self.next_prompt_estimate}"
-            )
-        if self.enabled and self.threshold <= self.next_prompt_estimate:
-            raise ValueError(
-                "tlru.threshold must be > tlru.next_prompt_estimate, got "
-                f"{self.threshold} <= {self.next_prompt_estimate}; otherwise no "
-                "tokens are ever TEL-safe and T-LRU is exactly LRU."
-            )
-
-    @classmethod
-    def from_any(cls, value=None) -> "TlruParams":
-        return _coerce_params(cls, value, name="tlru")
-
-    def as_dict(self) -> dict:
-        return dataclasses.asdict(self)
-
-
-@dataclasses.dataclass
 class MultiTurnParams:
     """多轮对话（QCHAT）带内改写器的参数。
 
     配置形式：``--radix-eviction-policy-config '{"mt": {"enabled": true}}'``。
 
-    带内权重 1 − prob(e) = CDF(elapsed; μ, σ)，μ/σ 取
+    带内权重 1 - prob(e) = CDF(elapsed; μ, σ)，μ/σ 取
     ``TASK_CONFIG[MULTI_TURN_CHAT]``（UniCache 原机制，μ=4.77 / σ=1.279）；
     带内排序不乘其他队列的权重——QCHAT 带内语义等价于全局 victim_key。
     enabled 默认 True：mt 改写器只在 victim 落入 QCHAT 带时接管

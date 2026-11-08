@@ -284,8 +284,8 @@ class TreeNode: ## TreeNode 是基数树（RadixTree）的节点，每个节点�
         TreeNode.counter += 1
 
         # ---- HeterCache（SimpleHYBRID / T-LRU / SLRU）相关状态 ----
-        # 注意：插件私有记账（SLRU 共享账 / TLRU 高水位）已改为外挂侧表
-        # （见 victim_override._SLRU_META / _TLRU_META，WeakKeyDictionary，
+        # 注意：插件私有记账（SLRU 共享账）已改为外挂侧表
+        # （见 victim_override._SLRU_META，WeakKeyDictionary，
         # 节点回收时条目自动消失），不再内嵌在 TreeNode 上。
 
         self.abs_start = abs_start
@@ -363,7 +363,7 @@ class RadixCache(BasePrefixCache):
         self.victim_overrides = tuple(
             getattr(self.eviction_strategy, "victim_overrides", ()) or ()
         )
-        # 需要「插入期记账」的插件（目前只有 TLRU 的 _tlru_* 高水位）。
+        # 需要「插入期记账」的插件（目前是 SLRU 的分裂继承）。
         # 在这里解析成函数元组：无插件时是空元组，插入/分裂路径只多一次空循环。
         self._insert_observers = tuple(
             ov.on_node_inserted

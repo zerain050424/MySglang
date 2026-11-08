@@ -34,7 +34,7 @@ class HeterProfiler:
       record_hit / record_evict / record_victim_source —— 三个记账收口由
       策略调用，本类只做累加，不做任何判定；
       summary(workload_occ, session_summary, slru_policy,
-      tlru_policy) —— 纯渲染，参数为只读引用。
+      mt_policy) —— 纯渲染，参数为只读引用。
     """
 
     def __init__(self):
@@ -86,7 +86,6 @@ class HeterProfiler:
                 workload_occ,
                 session_summary=None,
                 slru_policy=None,
-                tlru_policy=None,
                 mt_policy=None) -> str:
         """返回各 workload 的 profile 摘要，打印形态不变。
 
@@ -135,15 +134,6 @@ class HeterProfiler:
                 f"{k}={v:.0f}" for k, v in self._victim_sources.items()
             )
             lines.append(f"  victim_src: {src}")
-        if tlru_policy is not None:
-            # phase1/phase2 的混合比：tel_safe 为 0 说明尾部预算没起作用。
-            s = tlru_policy.stats()
-            lines.append(
-                f"  tlru: tel_safe={s['tlru_tel_safe_picks']:.0f} "
-                f"lru={s['tlru_lru_picks']:.0f} "
-                f"fallback={s['tlru_fallbacks']:.0f} "
-                f"hist_raises={s['tlru_history_raises']:.0f}"
-            )
         if mt_policy is not None:
             # 多轮带内改写器（1-prob(e)）：picks=0 说明窗口内没有 QCHAT victim。
             s = mt_policy.stats()

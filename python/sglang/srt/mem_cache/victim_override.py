@@ -25,8 +25,6 @@
 【内置策略实现清单】
 - RrEvictPolicy:
     实现会话级轮询公平性（Round-Robin），内部维护独立的会话轮询序号及配额违约计数。
-- TlruEvictPolicy:
-    实现 T-LRU 尾部优先淘汰修正；除选点外，还会通过 `on_node_inserted` 钩子在节点插入与分裂时维护其 `_tlru_*` 高水位状态。
 - SlruEvictPolicy:
     分段式 LRU（Probation → Protected，段内按 recency 排序）。同时独占维护节点共享会话数账本（通过 `on_node_hit` 触发）。
     配合 `scope="non_one_shot"` 可组装为带 One-shot 隔离带的 SLRU模式。
@@ -47,7 +45,6 @@ from sglang.srt.mem_cache.uni_utils import (
     SessionType,
     SimpleHybridQueueTag,
     SimpleHybridTaskType,
-    TlruParams,
     MultiTurnParams,
     TASK_CONFIG,
     _cached_lognorm_cdf,
@@ -65,19 +62,8 @@ if TYPE_CHECKING:  # pragma: no cover
 # 设计：策略插件私有状态不再内嵌 TreeNode 字段，改由本模块持侧表。
 # WeakKeyDictionary 以节点为弱键：节点被 GC（分裂清理/驱逐/reset）时
 # 条目自动消失，与旧内嵌字段生命周期等价，无需显式清理钩子。
-# 键为 TreeNode，读侧缺省为 0，与旧节点字段初始值语义一致。
-_TLRU_META = weakref.WeakKeyDictionary()  # node -> [cached_prefix_len, history_len]
+# 键为 TreeNode，读侧缺省为 0。
 _SLRU_META = weakref.WeakKeyDictionary()  # node -> [share_sessions, session_bloom]
-
-
-def tlru_lens(node) -> Tuple[int, int]:
-    """读取 T-LRU 侧表；节点无条目按 (0, 0)，与旧节点字段初始值等价。
-
-    读方：TlruEvictPolicy.pick / TLRUStrategy.get_priority（独立策略）。
-    写方：TlruEvictPolicy.on_node_inserted（插入/分裂期唯一写者）。
-    """
-    _e = _TLRU_META.get(node)
-    return (_e[0], _e[1]) if _e else (0, 0)
 
 
 class VictimOverride(ABC):
@@ -204,109 +190,6 @@ class RrEvictPolicy(VictimOverride):
         self._rr_last.clear()
         self._rr_seq = 0
         self.quota_breach = 0
-
-
-class TlruEvictPolicy(VictimOverride):
-
-    name = "tlru"
-    queue = SimpleHybridQueueTag.QAGENT
-
-    def __init__(self, params: TlruParams):
-        self.params = params
-        # ---- 观测 ----
-        self.tel_safe_picks = 0     # 选中的候选里有多少是 tel-safe（phase 1）
-        self.lru_picks = 0          # tel-safe 用尽后按 recency 退化的次数（phase 2）
-        self.fallbacks = 0          # 队内无 QAGENT 叶子，交回全局候选
-        self.history_raises = 0     # 高水位上抬的次数（插入期开销的代理指标）
-
-    # ------------------------------------------------------------ 插入期记账
-
-    def on_node_inserted(self, node) -> None:
-        """维护 T-LRU 的两个结构化字段（存于 _TLRU_META 侧表）；由缓存层在节点创建/分裂后回调。
-
-        等价于 unified 的 `_set_tlru_lens_and_raise_history`，但用「自深 vs
-        子树高水位取 max」统一覆盖 split：分裂出的新父节点只有 child 一个子树，
-        max(自深, child.history) 恰好等于 child.history（分裂不增加分支深度）。
-        分裂时 child 的字段值不变（新 cached = 旧 base + 新前缀，数学上与旧
-        公式一致），故只需回调新父节点。
-        """
-        parent = getattr(node, "parent", None)
-        base = tlru_lens(parent)[0] if parent is not None else 0
-        entry = _TLRU_META.setdefault(node, [0, 0])
-        entry[0] = base + len(node.key or ())
-
-        hi = entry[0]
-        for child in (node.children or {}).values():
-            child_hi = tlru_lens(child)[1]
-            if child_hi > hi:
-                hi = child_hi
-        if entry[1] < hi:
-            entry[1] = hi
-
-        # 沿祖先链上抬（截断在已达标处，最常见情形是一次就停）。
-        cur = parent
-        while cur is not None:
-            ce = _TLRU_META.setdefault(cur, [0, 0])
-            if ce[1] >= hi:
-                break
-            ce[1] = hi
-            self.history_raises += 1
-            cur = cur.parent
-
-    # ------------------------------------------------------------ 插件接口
-
-    def applies_to(self, node) -> bool:
-        if node is None:
-            return False
-        return (
-            task_type_of_tag(getattr(node, "queue_tag", None))
-            == SimpleHybridTaskType.MULTI_TURN_AGENTIC
-        )
-
-    def pick(self, leaves=None, registry=None) -> Optional["TreeNode"]:
-        """tel-safe 的尾巴先走；同为 tel-safe 时取最久未访问（LRU 阶段）。"""
-        if leaves is None:
-            return None
-        threshold = self.params.threshold
-        next_prompt = self.params.next_prompt_estimate
-
-        best = None
-        for node in leaves:
-            if not self.applies_to(node):
-                continue
-            cached, history = tlru_lens(node)
-            budget = max(history + next_prompt - threshold, 0)
-            cached_without = cached - len(node.key or ())
-            tel_safe = cached_without >= budget
-            key = (0 if tel_safe else 1, node.last_access_time)
-            if best is None or key < best[0]:
-                best = (key, node, tel_safe)
-
-        if best is None:
-            self.fallbacks += 1
-            return None
-        if best[2]:
-            self.tel_safe_picks += 1
-        else:
-            self.lru_picks += 1
-        return best[1]
-
-    # ------------------------------------------------------------ 观测
-
-    def stats(self) -> Dict[str, float]:
-        return {
-            "tlru_tel_safe_picks": self.tel_safe_picks,
-            "tlru_lru_picks": self.lru_picks,
-            "tlru_fallbacks": self.fallbacks,
-            "tlru_history_raises": self.history_raises,
-        }
-
-    def reset(self) -> None:
-        """只清计数器；高水位在 _TLRU_META 侧表，随节点 GC 一起丢弃。"""
-        self.tel_safe_picks = 0
-        self.lru_picks = 0
-        self.fallbacks = 0
-        self.history_raises = 0
 
 
 class SlruEvictPolicy(VictimOverride):
