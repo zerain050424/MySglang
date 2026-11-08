@@ -460,7 +460,7 @@ class SimpleHybridStrategy(EvictionStrategy):
             return {}
         return effective_targets(self._occ, capacity, self.quota)
 
-    def quota_victim(self, queue: str, leaves):
+    def quota_victim(self, queue: str, leaves, capacity: float):
         """在指定队列内挑一个受害者；该队列无候选时返回 None（由调用方跳队）。"""
         pool = [n for n in leaves if self.workload_of(n) == queue]
         if not pool:
@@ -474,7 +474,10 @@ class SimpleHybridStrategy(EvictionStrategy):
                 pool, key=lambda n: struct_tier(n, share_of, share_min)
             )
         if queue == "agentic" and self.rr_evict is not None:
-            picked = self.rr_evict.pick(pool, self.session_registry)
+            # 配额缺口作为 RR loss_cap 的上界：超配额时单次不得把一条会话削穿。
+            picked = self.rr_evict.pick(
+                pool, self.session_registry, max_deficit=self._quota_gap("agentic", capacity)
+            )
             if picked is not None:
                 return picked
         if queue == "chat" and self.mt_evict is not None:
@@ -482,6 +485,14 @@ class SimpleHybridStrategy(EvictionStrategy):
             if picked is not None:
                 return picked
         return min(pool, key=self.victim_key)
+
+    def _quota_gap(self, queue: str, capacity: float):
+        """该队列超出有效目标多少 token；未超出时返回 None（不限制队内策略）。"""
+        if not self.quota.enabled or capacity <= 0:
+            return None
+        target = effective_targets(self._occ, capacity, self.quota)[queue]
+        gap = self._occ[queue] - target
+        return gap if gap > 0 else None
 
     def quota_fallback(self, leaves):
         """兜底：策略私有 RNG 均匀抽一个可淘汰叶子（Q4=b）。

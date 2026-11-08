@@ -58,7 +58,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from sglang.srt.mem_cache.uni_utils import SessionState
 
 
-# ---- HeterCache 插件侧表：替代 TreeNode 上的内嵌插件状态（方案 B 解耦）----
+# ---- HeterCache 插件侧表：替代 TreeNode 上的内嵌插件状态----
 # 设计：策略插件私有状态不再内嵌 TreeNode 字段，改由本模块持侧表。
 # WeakKeyDictionary 以节点为弱键：节点被 GC（分裂清理/驱逐/reset）时
 # 条目自动消失，与旧内嵌字段生命周期等价，无需显式清理钩子。
@@ -134,21 +134,25 @@ class RrEvictPolicy(VictimOverride):
             == SimpleHybridTaskType.MULTI_TURN_AGENTIC
         )
 
-    def pick(self, leaves, registry) -> Optional["TreeNode"]:
+    def pick(self, leaves, registry, *, max_deficit=None) -> Optional["TreeNode"]:
         if not self.params.fair_rr:
             return None
         agentic = [node for node in leaves if self.applies_to(node)]
         if not agentic:
             return None
-        victim = self._pick_round_robin(agentic, registry)
+        victim = self._pick_round_robin(agentic, registry, max_deficit=max_deficit)
         if victim is None:
             self.quota_breach += 1
         return victim
 
     # ---- 内部 ----
 
-    def _pick_round_robin(self, leaves, registry) -> Optional["TreeNode"]:
-        """挑最久未被删除的 Agentic 会话的最深叶子。"""
+    def _pick_round_robin(self, leaves, registry, max_deficit=None) -> Optional["TreeNode"]:
+        """挑最久未被删除的 Agentic 会话的最深叶子。
+
+        `max_deficit` 是外部（跨队列配额）给的上限：本轮允许把单会话缺口再推高
+        到多少 token。与 `loss_cap(L)` 取 min，即“配额缺口不得把单个会话削穿”。
+        """
         tails: Dict[str, Tuple["TreeNode", "SessionState"]] = {}
         for node in leaves:
             sid = getattr(node, "session_id", None)
@@ -164,8 +168,11 @@ class RrEvictPolicy(VictimOverride):
 
         best = None
         for sid, (node, state) in tails.items():  # 跨会话轮询
-            if state.d >= self.loss_cap(state.L):
-                # 本会话缺口已经够大，本轮不再动它
+            limit = self.loss_cap(state.L)
+            if max_deficit is not None:
+                limit = min(limit, max_deficit)
+            if state.d >= limit:
+                # 本会话缺口已经够大（loss_cap 或配额缺口），本轮不再动它
                 continue
             last = self._rr_last.get(sid, -1)  # -1 = 从未被选中
             if best is None or last < best[0]:

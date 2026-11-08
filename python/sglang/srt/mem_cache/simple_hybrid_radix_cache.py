@@ -104,7 +104,7 @@ class SimpleHybridRadixCache(RadixCache):
         """
         strategy = self.eviction_strategy
         for queue in strategy.quota_ranking(capacity, self.page_size):
-            victim = strategy.quota_victim(queue, leaves)
+            victim = strategy.quota_victim(queue, leaves, capacity)
             if victim is not None:
                 return victim, f"quota:{queue}"
         return strategy.quota_fallback(leaves), "quota:fallback"
