@@ -53,10 +53,9 @@ arm_policy() {
   case "$1" in
     A0) echo "lru|" ;;
     A1) echo 'slru|{"protected_threshold":2}' ;;
-    A2) echo 'simple_hybrid|{"tiny_lru":{"policy":"off"}}' ;;
-    A3) echo 'simple_hybrid|{"tiny_lru":{"policy":"tag_lru"}}' ;;
-    A4) echo 'simple_hybrid|{"tiny_lru":{"policy":"tag_lru","local_hot":"one_shot"}}' ;;
-    A5) echo 'simple_hybrid|{"tiny_lru":{"policy":"tag_lru","struct_share_min":3}}' ;;
+    A2) echo 'simple_hybrid|{"slru":{"share_min":1000000}}' ;;
+    A3) echo 'simple_hybrid|{"slru":{"share_min":2}}' ;;
+    A4) echo 'simple_hybrid|{"slru":{"share_min":3}}' ;;
     *) echo "??|" ;;
   esac
 }

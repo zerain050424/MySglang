@@ -37,12 +37,15 @@ from wtl.trace import schedule_single_workload  # noqa: E402
 
 
 def test_arms_select():
-    assert [a.id for a in select("A0,A3-A5")] == ["A0", "A3", "A4", "A5"]
+    assert [a.id for a in select("A0,A2-A4")] == ["A0", "A2", "A3", "A4"]
     assert [a.id for a in select("all")] == list(ARMS)
     assert select(None)[0].id == "A0"
-    assert ARMS["A3"].tiny_lru["policy"] == "tag_lru"
-    assert ARMS["A3"].tiny_lru.get("local_hot", "chat") == "chat"
-    assert ARMS["A2"].tiny_lru["policy"] == "off"
+    # A3 是主对象（两带 SLRU），A2 只有 one-shot 带（share_min 不可达）
+    assert ARMS["A3"].share_min == 2
+    assert ARMS["A4"].share_min == 3
+    assert ARMS["A2"].share_min >= 10 ** 6
+    assert ARMS["A3"].slru == {"share_min": 2}
+    assert ARMS["A0"].slru == {}
 
 
 def _tiny_trace(tmp: Path, sessions: int = 30):
@@ -224,10 +227,9 @@ def test_analyze_offline_table():
 
 
 def test_arm_configs_match_framework():
-    """A0–A5 的 tiny_lru 配置必须能被框架的 TinyLRUParams / TagLruPolicy 接受。
+    """A2–A4 的 slru 配置必须能被框架的 SlruParams 接受。
 
-    这条是**配置漂移保险**：如果框架改了参数名（如 struct_share_min / local_hot），
-    这里第一时间红。
+    这条是**配置漂移保险**：如果框架改了参数名（如 share_min），这里第一时间红。
     没有 torch 时用「stub 顶层包 + 真实源码路径」的方式只导入纯 Python 模块。
     """
     import types
@@ -246,32 +248,18 @@ def test_arm_configs_match_framework():
             sys.modules[f"sglang.{sub}"] = m
 
     try:
-        from sglang.srt.mem_cache.tag_lru import TagLruPolicy
-        from sglang.srt.mem_cache.uni_utils import TinyLRUParams
+        from sglang.srt.mem_cache.uni_utils import SlruParams
     except ImportError as exc:
         # 本地仓库可能停在旧版本（分支仓库在实验机上）：按 SKIP 处理，不判失败。
         print(f"  SKIP  {exc}（分支仓库上会跑）")
         return
 
     for arm in ARMS.values():
-        cfg = (arm.config or {}).get("tiny_lru")
+        cfg = (arm.config or {}).get("slru")
         if cfg is None:
             continue
-        try:
-            p = TinyLRUParams.from_any(cfg)
-        except (ValueError, ImportError) as exc:
-            if "Unknown tiny_lru.policy" in str(exc) or isinstance(exc, ImportError):
-                # 本地仓库可能还停在旧版本（实验机才是分支所在）：
-                # 这种"本机框架不认识该 policy / 没有该模块"的情况按 SKIP 处理。
-                print(f"  SKIP  {arm.id}: 本地框架不支持 {cfg.get('policy')!r}（在分支仓库上会跑）")
-                return
-            raise
-        if p.policy == "tag_lru":
-            TagLruPolicy(
-                struct_share_min=p.struct_share_min,
-                share_metric=p.share_metric,
-                local_hot=p.local_hot,
-            )
+        p = SlruParams.from_any(cfg)
+        assert p.share_min == cfg["share_min"]
 
 
 def _main() -> int:

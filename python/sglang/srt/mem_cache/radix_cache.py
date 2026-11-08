@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.heter_logging import heterlog
 
 """
 Copyright 2023-2024 SGLang Team
@@ -49,9 +50,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.events import KVCacheEventRecorder
-from sglang.srt.mem_cache.uni_utils import (   
+from sglang.srt.mem_cache.uni_utils import (
     SessionRegistry,
+    SessionType,
     SimpleHybridQueueTag,
+    session_type_to_queue_tag,
 )
 from sglang.srt.mem_cache.utils import (
     get_eviction_strategy,
@@ -262,44 +265,34 @@ class TreeNode: ## TreeNode 是基数树（RadixTree）的节点，每个节点�
     def __init__(
         self, id: Optional[int] = None, priority: int = 0, abs_start: int = 0
     ):
+        # ---- 基础基数树元信息（与策略无关）----
         self.children = defaultdict(TreeNode)
         self.parent: TreeNode = None
         self.key: RadixKey = None
         self.value: Optional[torch.Tensor] = None ##挂在在节点上的缓存值，通常是KV缓存的索引或数据片段
-        ## 本节点片段第一个 token 在整条序列中的绝对偏移（从根算起）。
-        ## abs_start + len(value) 即 HeterCache/vLLM 的 num_hashed_tokens（片段结束偏移）。
-        self.abs_start = abs_start
         self.lock_ref = 0 ## 节点的锁引用计数，表示有多少请求正在使用该节点及其子树，防止被驱逐。
         self.last_access_time = time.monotonic() ## 节点的最后访问时间，用于LRU等驱逐策略。
         self.creation_time = time.monotonic() ## 节点的创建时间，用于统计和调试。
-
         self.hit_count = 0
         # store hash values of each pages
         self.hash_value: Optional[List[str]] = None 
         # Namespace-aware hashes used only for external KV events.
         self.event_hash_value: Optional[List[str]] = None
         # priority for priority-aware eviction
-        # SimpleHYBRID (HeterCache) workload metadata.
-
-        # is_decode: generated-output (decode) portion, never reused, evict first.
         self.priority = priority
-        self.queue_tag = SimpleHybridQueueTag.QTRANS ## 负载类型
-        self.is_decode = False
-        # SimpleHYBRID：节点归属的会话（用于会话级缺口记账，见 uni_utils.SessionRegistry）
-        self.session_id: Optional[str] = None
-        # Q_struct 队内 W-TinyLRU：不同 rid 数 + rid 布隆 + 区归属（0=非成员）
-        self.share_count = 0
-        self.rid_bloom = 0
-        self.struct_region = 0
-        # T-LRU（单例 tlru.enabled）：tokens root->self 与分支高水位。
-        # 只在开启时由 TlruEvictPolicy.on_node_inserted() 写入，其余策略恒 0。
-        self._tlru_cached_prefix_len = 0
-        self._tlru_history_len = 0
-        # 曾经/正在分叉（结构证据的黏性标记）：节点失去所有子节点后仍然是成员，
-        # 直到 aging 判定它没有共享证据才退队。
-        self.struct_ever_branch = False
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
+
+        # ---- HeterCache（SimpleHYBRID / T-LRU / SLRU）相关状态 ----
+        # 注意：插件私有记账（SLRU 共享账 / TLRU 高水位）已改为外挂侧表
+        # （见 victim_override._SLRU_META / _TLRU_META，WeakKeyDictionary，
+        # 节点回收时条目自动消失），不再内嵌在 TreeNode 上。
+
+        self.abs_start = abs_start
+        self.queue_tag = SimpleHybridQueueTag.QTRANS ## 负载类型
+        self.is_decode = False
+        # SimpleHYBRID：节点归属的会话
+        self.session_id: Optional[str] = None
 
     @property
     def evicted(self): ## 节点是否已经被驱逐，判断依据是节点的值是否为None。
@@ -359,10 +352,13 @@ class RadixCache(BasePrefixCache):
         self._alpha_updater = getattr(
             self.eviction_strategy, "maybe_update_alpha", None
         )
-        # Q_struct 队内 W-TinyLRU（SimpleHybridStrategy.structState；其他策略为 None）。
-        # 只在策略开启时挂钩子，关闭时所有调用点都是 `is not None` 的一次判空。
-        self.struct_policy = getattr(self.eviction_strategy, "structState", None)
-        # 可插拔的「淘汰候选改写器」：RR 会话公平 / struct 队内顺序等。
+        # 实验开关（SimpleHybridStrategy.force_agentic）：把所有节点直接标成 QAGENT，
+        # 让 QAGENT-only 的插件（RR / T-LRU）拿到 100% 的流量。只改 queue_tag，
+        # 不动 session_type —— 分类器自身的统计仍然可测。
+        self.force_agentic = bool(
+            getattr(self.eviction_strategy, "force_agentic", False)
+        )
+        # 可插拔的淘汰候选改写器：RR 会话公平 / struct 队内顺序等。
         # 空元组表示没有任何插件，淘汰走原来的全局 victim_key。
         self.victim_overrides = tuple(
             getattr(self.eviction_strategy, "victim_overrides", ()) or ()
@@ -374,10 +370,21 @@ class RadixCache(BasePrefixCache):
             for ov in self.victim_overrides
             if hasattr(ov, "on_node_inserted")
         )
+        # 需要命中期记录的插件（目前是 SLRU 的共享会话数账本）。
+        # 不经过任何标签策略：`force_agentic` 等实验开关下账本同样要维护，
+        # 否则 SLRU 的准入条件会退化成恒真/恒假。
+        self._hit_observers = tuple(
+            ov.on_node_hit
+            for ov in self.victim_overrides
+            if hasattr(ov, "on_node_hit")
+        )
 
         self.evictable_leaves = set()
-        # SimpleHYBRID：会话级 KV 账本（每会话 d/L/gaps），供公平淘汰使用
-        self.session_registry = SessionRegistry()
+        # SimpleHYBRID：会话级 KV 账本（每会话 d/L/gaps），供公平淘汰使用。
+        # 进程级单例：同进程内多个缓存实例共享同一本账（见 SessionRegistry 文档）。
+        # 需要隔离时（单测 / 并行对照）构造后覆盖本属性：
+        #     cache.session_registry = SessionRegistry()
+        self.session_registry = SessionRegistry.global_instance()
         self.reset()
 
         # ---- 策略无关的「按工作负载占用」采样器（env 门控，默认关）----
@@ -386,9 +393,9 @@ class RadixCache(BasePrefixCache):
         # 周期性调 _per_workload_token_count()（基类方法，树上节点带 queue_tag，
         # 任何策略都可用）。默认关闭：无 env 时这里只做一次 os.environ.get 判空。
         _occ_env = os.environ.get("SGLANG_WORKLOAD_OCC_LOG", "0")
-        logger.info(
-            "[occ-sampler] env=%s pid=%s policy=%s",
-            _occ_env, os.getpid(), self.eviction_policy,
+        heterlog.info(
+            "OccSampler",
+            f"env={_occ_env} pid={os.getpid()} policy={self.eviction_policy}",
         )
         if _occ_env == "1":
             interval = int(os.environ.get("SGLANG_WORKLOAD_OCC_INTERVAL", "30"))
@@ -399,11 +406,11 @@ class RadixCache(BasePrefixCache):
                 name="workload-occ-sampler",
             )
             t.start()
-            logger.info("[occ-sampler] thread started, alive=%s", t.is_alive())
+            heterlog.info("OccSampler", f"thread started, alive={t.is_alive()}")
 
         # ---- 节点级标签快照（env 门控，默认关）----
-        # 用途：把「状态机给每个 radix 节点打的队列标签」与「节点真实归属
-        # (session_id)」一起落盘，用于节点级标注准确率统计，见
+        # 用途：把状态机给每个 radix 节点打的队列标签 与 节点真实归属
+        # (session_id)一起落盘，用于节点级标注准确率统计，见
         # Uni-Bench/evaluate_node_labels.py。只读遍历，不改变任何淘汰状态。
         _dump_path = os.environ.get("SGLANG_NODE_LABEL_DUMP", "")
         if _dump_path:
@@ -415,9 +422,10 @@ class RadixCache(BasePrefixCache):
                 name="node-label-dumper",
             )
             t.start()
-            logger.info(
-                "[node-label] dump -> %s every %.0fs (pid=%s policy=%s)",
-                _dump_path, _dump_interval, os.getpid(), self.eviction_policy,
+            heterlog.info(
+                "NodeLabel",
+                f"dump -> {_dump_path} every {_dump_interval:.0f}s "
+                f"(pid={os.getpid()} policy={self.eviction_policy})",
             )
 
     @classmethod
@@ -444,6 +452,15 @@ class RadixCache(BasePrefixCache):
         # 插件可能持有节点引用（Q_struct 的索引）/ 计数器，必须先于树一起清空
         for override in getattr(self, "victim_overrides", ()):
             override.reset()
+        # 会话账本与策略计数器同样属于「上一次 run 的状态」。`/flush_cache` 会走到
+        # 这里，因此复用同一个 server 跑多个 seed 时不会串味（RR 的 loss_cap 直接
+        # 读 SessionRegistry 的 d/L）。
+        registry = getattr(self, "session_registry", None)
+        if registry is not None:
+            registry.clear()
+        reset_bookkeeping = getattr(self.eviction_strategy, "reset_bookkeeping", None)
+        if reset_bookkeeping is not None:
+            reset_bookkeeping()
         # Initialize root with minimum priority so any real priority overrides it
         self.root_node = TreeNode(priority=-sys.maxsize)
         self.root_node.key = RadixKey(token_ids=array("q"), extra_key=None)
@@ -513,10 +530,21 @@ class RadixCache(BasePrefixCache):
         if len(key) == 0:
             return self._empty_match_result
 
-        # Q_struct 频数是不同请求数：rid 从这里透传到命中路径。
-        # 没有 req 的调用（如 chunked 自查）rid 为 None，只刷新顺序、不计数。
-        rid = getattr(params.req, "rid", None) if params.req is not None else None
-        value, last_node = self._match_prefix_helper(self.root_node, key, rid)
+        # Q_struct 频数按不同请求计；会话类型另按 session 生命周期累计。
+        req = params.req
+        rid = getattr(req, "rid", None) if req is not None else None
+        session_id = getattr(req, "session_id", None) if req is not None else None
+        if self._hit_recorder is not None and session_id:
+            prompt_ids = getattr(req, "origin_input_ids", None)
+            self.session_registry.observe_request(
+                session_id,
+                rid or "",
+                len(prompt_ids) if prompt_ids is not None else len(key),
+                tool_call=getattr(req, "tool_call", None),
+            )
+        value, last_node = self._match_prefix_helper(
+            self.root_node, key, rid, session_id
+        )
         if value:
             value = torch.cat(value)
         else:
@@ -694,12 +722,12 @@ class RadixCache(BasePrefixCache):
 
         start_time = time.perf_counter()
         num_tokens = params.num_tokens
-        # Phase 3: refresh per-type alphas from recent hit efficiency.
-        # 同时传两份口径：alpha 用可调度容量，profile 用 workload 占用。
         if self._alpha_updater is not None:
-            self._alpha_updater(
-                *self._profile_token_counts(), self.session_registry.summary()
-            )
+            _alpha_due = getattr(self.eviction_strategy, "alpha_update_due", None)
+            if _alpha_due is None or _alpha_due():
+                self._alpha_updater(
+                    *self._profile_token_counts(), self.session_registry.summary()
+                )
         leaves = list(self.evictable_leaves)
         eviction_heap = [
             (self.eviction_strategy.get_priority(node), node) for node in leaves
@@ -748,21 +776,21 @@ class RadixCache(BasePrefixCache):
             i += 1
             try:
                 counts = self._per_workload_token_count()
-                logger.info(
-                    "[occ-sampler] tick=%s counts=%s", i,
-                    {k: int(v['total']) for k, v in sorted(counts.items())} if counts else {},
-                )
+                _snapshot = {
+                    k: int(v['total']) for k, v in sorted(counts.items())
+                } if counts else {}
+                heterlog.info("OccSampler", f"tick={i} counts={_snapshot}")
                 if counts:
                     msg = " ".join(
                         f"{k}={int(v['total'])}" for k, v in sorted(counts.items())
                     )
-                    logger.info("[workload occ] %s", msg)
+                    heterlog.info("WorkloadOcc", msg)
                 tag_counts = self._per_queue_tag_token_count()
                 if tag_counts:
                     msg = " ".join(
                         f"{k}={v}" for k, v in sorted(tag_counts.items())
                     )
-                    logger.info("[queue occ] %s", msg)
+                    heterlog.info("QueueOcc", msg)
             except Exception:  # 采样失败不能影响主流程
                 logger.exception("workload occ sampler failed")
 
@@ -809,7 +837,7 @@ class RadixCache(BasePrefixCache):
             i += 1
             try:
                 n = self._dump_node_labels(path, i)
-                logger.info("[node-label] tick=%s dumped %s nodes", i, n)
+                heterlog.info("NodeLabel", f"tick={i} dumped {n} nodes")
             except Exception:  # 采样失败不能影响主流程
                 logger.exception("node label dump failed")
 
@@ -824,9 +852,15 @@ class RadixCache(BasePrefixCache):
                 if child.evicted:
                     continue
                 stack.append(child)
+                session_state = self.session_registry.get(child.session_id)
                 rows.append({
-                    # 状态机的判定结果（qtrans/qstruct/qagent/qchat）
+                    # 队列标签和会话分类分别记录，避免把分叉角色当成会话真值。
                     "tag": getattr(child.queue_tag, "value", str(child.queue_tag)),
+                    "stype": (
+                        session_state.session_type.value
+                        if session_state is not None
+                        else SessionType.TRANS.value
+                    ),
                     # 真实归属：由插入该片段的请求携带，前缀即负载类别
                     "sid": child.session_id,
                     "tok": len(child.key),
@@ -943,7 +977,7 @@ class RadixCache(BasePrefixCache):
     ##### Internal Helper Functions #####
 
     def _match_prefix_helper(
-        self, node: TreeNode, key: RadixKey, rid=None
+        self, node: TreeNode, key: RadixKey, rid=None, session_id=None
     ): ## node：当前节点，key：要匹配的RadixKey
         access_time = time.monotonic()
         node.last_access_time = access_time
@@ -956,13 +990,15 @@ class RadixCache(BasePrefixCache):
             prefix_len = child.key.match(key, page_size=self.page_size) ##计算当前节点的key与子节点的key的匹配长度，返回匹配的逻辑单位数量，向下取整为page_size的整数倍
             if prefix_len < len(child.key): ## 如果匹配长度小于子节点的key长度，说明匹配结束在子节点的中间，需要将子节点拆分为两个节点，一个表示匹配的前缀，一个表示剩余的后缀
                 new_node = self._split_node(child.key, child, prefix_len)
-                self._record_node_hit(new_node, access_time, rid)
+                self._record_cross_session_hit(session_id, new_node)
+                self._record_node_hit(new_node, access_time, rid, session_id)
                 value.append(new_node.value) ## 追加KV张量
                 node = new_node ## 将当前节点更新为新创建的节点
                 break
             else:
                 value.append(child.value) ## 完全匹配追加全量张量
-                self._record_node_hit(child, access_time, rid)
+                self._record_cross_session_hit(session_id, child)
+                self._record_node_hit(child, access_time, rid, session_id)
                 node = child ## 将当前节点更新为子节点
                 key = key[prefix_len:] ## 将key截断为剩余未匹配的部分
 
@@ -971,22 +1007,48 @@ class RadixCache(BasePrefixCache):
 
         return value, node
 
+    def _record_cross_session_hit(self, session_id, node: TreeNode) -> None:
+        if self._hit_recorder is None or not session_id:
+            return
+        self.session_registry.record_cross_session_hit(
+            session_id, getattr(node, "session_id", None)
+        )
+
     def _record_node_hit(
-        self, node: TreeNode, access_time: float, rid=None
+        self, node: TreeNode, access_time: float, rid=None, session_id=None
     ) -> None:
-        """根据命中间隔更新节点状态。"""
+        """Apply the session's type to owned nodes; keep fork/shared tags sticky."""
         delta = access_time - node.last_access_time
         node.hit_count += 1
-        if node.queue_tag != SimpleHybridQueueTag.QSTRUCT:
-            node.queue_tag = (
-                SimpleHybridQueueTag.QAGENT
-                if delta < 8.0
-                else SimpleHybridQueueTag.QCHAT
-            )
+        # 共享会话数账本（SlruEvictPolicy）：必须早于 queue_tag 更新，
+        # 也必须早于 force_agentic 短路，否则该实验开关会让账本永远停在 0。
+        for observe in self._hit_observers:
+            observe(node, session_id)
+        state = (
+            self.session_registry.get(session_id)
+            if self._hit_recorder is not None
+            else None
+        )
+        if self.force_agentic:
+            # 直达 agentic 队列：跳过 8s 间隔判定与 QSTRUCT 黏性。
+            node.queue_tag = SimpleHybridQueueTag.QAGENT
+        elif node.queue_tag != SimpleHybridQueueTag.QSTRUCT:
+            if state is not None and state.session_type == SessionType.STRUCT:
+                node.queue_tag = SimpleHybridQueueTag.QSTRUCT
+            elif (
+                state is not None
+                and node.session_id == session_id
+                and state.session_type in (SessionType.AGENTIC, SessionType.CHAT)
+            ):
+                node.queue_tag = session_type_to_queue_tag(state.session_type)
+            elif state is None or session_id is None or node.session_id is None:
+                # Preserve legacy behavior outside the session classifier.
+                node.queue_tag = (
+                    SimpleHybridQueueTag.QAGENT
+                    if delta < 8.0
+                    else SimpleHybridQueueTag.QCHAT
+                )
         node.last_access_time = access_time
-        if self.struct_policy is not None:
-            # 注意：这里用 rid 去重，chunked 复查（rid=None）不会把分块自引用刷成高频
-            self.struct_policy.on_hit(node, rid)
 
     def _split_node(
            self,
@@ -1027,12 +1089,10 @@ class RadixCache(BasePrefixCache):
            new_node.event_hash_value, child.event_hash_value = split_node_hash_value(
             child.event_hash_value, split_len, self.page_size
            )
-           # Q_struct：分裂不改变「哪些请求经过这段前缀」，两半都继承频数。
-           new_node.share_count = child.share_count
-           new_node.rid_bloom = child.rid_bloom
-           if self.struct_policy is not None:
-               self.struct_policy.on_split(new_node, child)
            # T-LRU：分裂不增加分支深度，新父节点继承 child 的高水位。
+           # SLRU：共享账本的新父节点继承由 SlruEvictPolicy.on_node_inserted
+           # 在下方观察者回调里完成（分裂不改变「哪些请求经过这段前缀」，
+           # 两半都继承），不再新增占位字段。
            for observe in self._insert_observers:
                observe(new_node)
 
@@ -1094,7 +1154,18 @@ class RadixCache(BasePrefixCache):
             new_node.parent = node
             new_node.key = key
             new_node.value = value.clone()
-            new_node.queue_tag = SimpleHybridQueueTag.QTRANS
+            state = self.session_registry.get(session_id)
+            if self.force_agentic:
+                # 直达 agentic 队列：新节点不再落 QTRANS（否则会被 one-shot 带先清）
+                new_node.queue_tag = SimpleHybridQueueTag.QAGENT
+            else:
+                # 出生标签只看「谁创建了这段」；跨会话共享的事实由
+                # SlruEvictPolicy 的共享数账本记录，与标签无关。
+                new_node.queue_tag = (
+                    session_type_to_queue_tag(state.session_type)
+                    if state is not None
+                    else SimpleHybridQueueTag.QTRANS
+                )
             new_node.is_decode = (
                 decode_start is not None and total_prefix_length >= decode_start
             )
@@ -1104,11 +1175,13 @@ class RadixCache(BasePrefixCache):
             # T-LRU：新节点记下 root->self 的累计长度，并把高水位沿祖先链上抬。
             for observe in self._insert_observers:
                 observe(new_node)
-            if node is not self.root_node and len(node.children) >= 2:
+            if (
+                not self.force_agentic
+                and node is not self.root_node
+                and len(node.children) >= 2
+            ):
+                # 分叉点即「多请求共用前缀」的结构证据，直接标 QSTRUCT。
                 node.queue_tag = SimpleHybridQueueTag.QSTRUCT
-            if self.struct_policy is not None:
-                # 刚分叉的父节点可能是新成员（M3 第一项）
-                self.struct_policy.on_children_added(node)
             self.evictable_size_ += len(key)
             self._update_leaf_status(node)
             self._update_leaf_status(new_node)
@@ -1145,31 +1218,22 @@ class RadixCache(BasePrefixCache):
         self.evictable_size_ -= len(node.key)
         if node in self.evictable_leaves:
             self.evictable_leaves.remove(node)
-        if self.struct_policy is not None:
-            self.struct_policy.on_delete(node)
         self._update_leaf_status(node.parent)
 
     def _update_leaf_status(self, node: TreeNode):
         if node.evicted or node.lock_ref > 0: ## 节点已被驱逐且被锁
             if node in self.evictable_leaves:
                 self.evictable_leaves.remove(node) ## 从可驱逐叶子节点集合中移除该节点
-            if self.struct_policy is not None:
-                self.struct_policy.on_no_longer_leaf(node)
             return
 
         for child in node.children.values():
             if not child.evicted: ## 如果子节点没有被驱逐，说明当前节点不是叶子节点
                 if node in self.evictable_leaves:
                     self.evictable_leaves.remove(node)
-                if self.struct_policy is not None:
-                    self.struct_policy.on_no_longer_leaf(node)
                 return
 
         if node not in self.evictable_leaves: ## 节点没有被驱逐且没有被锁，且所有子节点都已被驱逐，说明当前节点是可驱逐叶子节点，将其添加到可驱逐叶子节点集合中
             self.evictable_leaves.add(node)
-            if self.struct_policy is not None:
-                # 新降级的叶子：按继承表落区（热点模板前缀在这里被保住）
-                self.struct_policy.on_became_leaf(node)
 
     def _total_size_helper(self):
         total_size = 0

@@ -5,14 +5,15 @@ import logging
 import time
 from collections import deque
 from typing import TYPE_CHECKING, Dict, Optional, Tuple, Union
-
-from sglang.srt.mem_cache.struct_queue_policy import StructQueueState
 from sglang.srt.mem_cache.uni_utils import (
     AlphaParams,
     node_end_offset,
     node_num_tokens,
     RrParams,
-    TinyLRUParams,
+    MultiTurnParams,
+    SessionRegistry,
+    SessionType,
+    SlruParams,
     TlruParams,
     TASK_CONFIG,
     WORKLOAD_LABELS,
@@ -24,9 +25,12 @@ from sglang.srt.mem_cache.uni_utils import (
 )
 from sglang.srt.mem_cache.victim_override import (
     RrEvictPolicy,
-    StructTinyLruPolicy,
     TlruEvictPolicy,
+    SlruEvictPolicy,
+    MultiTurnEvictPolicy,
+    tlru_lens,
 )
+from sglang.srt.mem_cache.heter_logging import heterlog, HeterProfiler
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.radix_cache import TreeNode
@@ -99,16 +103,17 @@ class TLRUStrategy(EvictionStrategy):
         self.next_prompt_estimate = next_prompt_estimate
 
     def get_priority(self, node: TreeNode) -> Tuple[int, float]:
-        # node._tlru_history_len is the branch's high-water depth, i.e. the
+        # tlru_lens(node)[1] (history) is the branch's high-water depth, i.e. the
         # paper's L, and deliberately does not shrink when the tail is trimmed.
         # Deriving L from what is still resident instead would leave the
         # shortened conversation over budget on the next pass too, and T-LRU
         # would walk it down to nothing rather than stopping after
         # (threshold - Q_hat) tokens.
+        _cached_prefix_len, _history_len = tlru_lens(node)
         budget = max(
-            node._tlru_history_len + self.next_prompt_estimate - self.threshold, 0
+            _history_len + self.next_prompt_estimate - self.threshold, 0
         )
-        cached_without_this_node = node._tlru_cached_prefix_len - len(node.key)
+        cached_without_this_node = _cached_prefix_len - len(node.key)
         tel_safe = cached_without_this_node >= budget
         return (-1 if tel_safe else 0, node.last_access_time)
 
@@ -145,24 +150,32 @@ class SimpleHybridStrategy(EvictionStrategy):
         self,
         max_offset: int = 2048,
         *,
+        force_agentic: bool = False,
         alpha: Union[AlphaParams, dict, None] = None,
         rr: Union[RrParams, dict, None] = None,
-        tiny_lru: Union[TinyLRUParams, dict, None] = None,
+        slru: Union[SlruParams, dict, None] = None,
         tlru: Union[TlruParams, dict, None] = None,
+        mt: Union[MultiTurnParams, dict, None] = None,
     ):
-        """三组参数分别由 AlphaParams / RrParams / TinyLRUParams 承载（uni_utils）。
-
+        """
+        参数组由 AlphaParams / RrParams / SlruParams 承载（uni_utils）。
         配置只接受分组形式：
-            {"alpha": {...}, "rr": {...}, "tiny_lru": {...}}
-        未知键在参数组构造处直接报错（拼错不再静默失效）。
+            {"alpha": {...}, "rr": {...}, "slru": {...}}
+        未知键在参数组构造处直接报错。
 
-        max_offset 不属于任何一组：它是 Q_struct 复用分数里的位置项上界
-        （HeterCache 的 offset 语义），与 TinyLRU 的频数准入无关。
+        max_offset 不属于任何一组：它是 struct 复用分数里的位置项上界。
+
+        force_agentic 是实验开关：打开后所有节点都按 agentic 语义
+        解释（评分、one-shot、插件作用域一致），并把 queue_tag 直接标成 QAGENT。
+        用途是让 QAGENT-only 的插件拿到 100% 流量；它不修改 session_type，因此
+        分类器自身的统计仍然可测。
         """
         self.alpha = AlphaParams.from_any(alpha)
         self.rr = RrParams.from_any(rr)
-        self.tiny_lru = TinyLRUParams.from_any(tiny_lru)
+        self.slru = SlruParams.from_any(slru)
         self.tlru = TlruParams.from_any(tlru)
+        self.mt = MultiTurnParams.from_any(mt)
+        self.force_agentic = bool(force_agentic)
         self.max_offset = max_offset or 2048
 
         # 在线更新α状态
@@ -170,58 +183,48 @@ class SimpleHybridStrategy(EvictionStrategy):
         self._hit_tokens: Dict[str, float] = {}
         self._seen_rids: set = set()
         self._rid_order: deque = deque()
-        # 累计计数器（不清空，供 profile 使用）
-        #   - self._hit_tokens : 策略用的窗口命中量，键是alpha_key
-        #   - self._total_hit_tokens / _total_evicted_tokens : profile用的累计量，键是 workload 标签（"random" 单列），与alpha无关。
-        #   - self._total_evicted_one_shot : 一次性内容（random + 单轮 response 段）
-        #     的累计淘汰量；单轮 response 段口径 = 该标量 − evicted["random"]。
-        self._total_hit_tokens: Dict[str, float] = {}
-        self._total_evicted_tokens: Dict[str, float] = {}
-        self._total_evicted_one_shot = 0.0
-        # 淘汰来源记账：one_shot 带 / 全局 victim_key / 各插件（queue 名），
-        # 供 profile 打印「本次淘汰由哪个队列的策略决定」。
-        self._victim_sources: Dict[str, float] = {}
+        #   观测账本（累计命中/淘汰/one_shot/淘汰来源）已外挂至
+        #   Uni-Bench/profile 的 HeterProfiler（方案 B）：记账/渲染同口径，
+        #   reset 随 reset_bookkeeping 委托清空；树采集与 alpha 更新仍在策略内。
+        self.profiler = HeterProfiler()
 
 
-        #   self.structState    = 状态机（缓存层持有：8 个钩子 + owns 死链闸）
-        #   self.TinyLru_evict  = 淘汰面适配器（只进 victim_overrides）
-        # 若让 self.structState 直接指向适配器，radix_cache 的 8 处钩子调用会静默
-        # 变成 no-op（getattr 判空不报错），struct 策略会整体失效而日志无异常。
         self.rr_evict = RrEvictPolicy(self.rr) if self.rr.fair_rr else None
-        self.structState = (
-            StructQueueState(
-                enabled=True,
-                k=self.tiny_lru.k,
-                window_entries=self.tiny_lru.window_entries,
-                epoch_events=self.tiny_lru.epoch_events,
-                admission_tie=self.tiny_lru.admission_tie,
-                admission_metric=self.tiny_lru.admission_metric,
-                inherit_share=self.tiny_lru.inherit_share,
-            )
-            if self.tiny_lru.policy == "wtinylru"
-            else None
+        # 会话账本：SLRU 的共享数账本与 one-shot 判定共用它。
+        self.session_registry = SessionRegistry.global_instance()
+        # 共享数阈值只有一处配置：SlruParams.share_min。
+        # 它同时喂给 SLRU 的准入判定与 one-shot 的分界。
+        self.slru_evict = SlruEvictPolicy(
+            self.session_registry, self.slru.share_min
         )
-        self.TinyLru_evict = (
-            StructTinyLruPolicy(self.structState)
-            if self.structState is not None
-            else None
-        )
-        # T-LRU 尾巴优先：只修 QAGENT 的候选，并在插入期维护 _tlru_* 高水位。
-        # 与 struct 分属不同队列可共存；与 fair_rr 互斥（两者都修 QAGENT，
-        # 链上后注册者会把前者完全遮蔽），由 _validate_scope() 拦住。
+        # T-LRU 尾巴优先：只修 QAGENT 的候选，并在插入期维护 _tlru_* 历史最长会话长度。
         self.tlru_evict = TlruEvictPolicy(self.tlru) if self.tlru.enabled else None
+        # 多轮对话（QCHAT）带内改写器：1-prob(e) 排序（默认启用，见 MultiTurnParams）
+        self.mt_evict = MultiTurnEvictPolicy(self.mt, self.session_registry) if self.mt.enabled else None
         self._validate_scope()
         self.victim_overrides = tuple(
-            p
-            for p in (self.rr_evict, self.TinyLru_evict, self.tlru_evict)
-            if p is not None
+            p for p in (self.rr_evict, self.tlru_evict, self.slru_evict, self.mt_evict) if p is not None
         )
+
+    def reset_bookkeeping(self) -> None:
+        """清空窗口/累计/来源计数（缓存 flush 与 reset 同源）。
+
+        不复位参数，也不动 `_last_update`：它只影响计时节流。
+        跨 run 复用 server 时，若不清理，`[SimpleHybrid profile]` 打印的是
+        上一轮与这一轮的混合值。
+        """
+        self._hit_tokens.clear()
+        self.profiler.reset()
+        self._seen_rids.clear()
+        self._rid_order.clear()
+
 
     def _validate_scope(self) -> None:
         """拦住会静默失效的插件组合。
 
         `victim_overrides` 是覆盖链（后者覆盖前者），而 RR 只要挑得出会话就会
-        返回非 None，所以 fair_rr + tlru 同时开会把 TLRU 完全遮蔽。
+        返回非 None，所以 fair_rr + tlru 同时开会把 TLRU 完全遮蔽。SLRU 只认
+        STRUCT 叶子，与这两者的作用域不相交，不需要互斥检查。
         """
         if self.rr_evict is not None and self.tlru_evict is not None:
             raise ValueError(
@@ -230,9 +233,15 @@ class SimpleHybridStrategy(EvictionStrategy):
                 "never be consulted. Enable only one of them."
             )
 
-    @staticmethod
-    def _task_type_of(node) -> SimpleHybridTaskType:
+
+    def _task_type_of(self, node) -> SimpleHybridTaskType:
         # 队列标签由缓存状态机维护。映射表在 uni_utils，策略与改写器共用。
+        # force_agentic 时短路：即使某个节点残留 QTRANS/QCHAT/QSTRUCT 标签，
+        # 评分与队列归属也统一按 agentic 走（缓存层会同步把标签强制成 QAGENT）。
+        # 注意：one-shot 判定不走这里 —— 它只看会话类型 + 跨会话共享数。
+        if self.force_agentic:
+            return SimpleHybridTaskType.MULTI_TURN_AGENTIC
+        
         return task_type_of_tag(getattr(node, "queue_tag", None))
 
     def _reuse_score(self, node) -> float:
@@ -260,7 +269,7 @@ class SimpleHybridStrategy(EvictionStrategy):
     def get_priority(self, node: TreeNode) -> Tuple[int, float, float]:
         """
         全序优先级：带 0 = 一次性内容（random / 单轮 response 段）先淘汰，
-        带内按树上结束偏移降序（与 one_shot_key 同口径）；带 1 = 可调度内容
+        带内按 last_access 升序（与 one_shot_key 同口径）；带 1 = 可调度内容
         按 reuse_score 竞争。
         """
         if self.is_one_shot(node):
@@ -270,35 +279,47 @@ class SimpleHybridStrategy(EvictionStrategy):
     # 暴露给淘汰器的键语义
 
     def victim_key(self, node) -> tuple:
-        """
-            统一淘汰键：复用分数低者先走，同分时 token 多者先走。
+        """全局基础候选键：复用分数最低者先走，同分时 token 多者先走。
+
+        队列内部顺序由插件接管（SLRU 对受保护的 struct 叶子改写成段内 LRU），
+        因此这里不再编码「类间 rank」。
         """
         return (self._reuse_score(node), -_node_num_tokens(node))
 
     def is_one_shot(self, node) -> bool:
+        """一次性内容（one-shot）：淘汰顺序永远先于可调度内容。
+
+        判定只看会话类型与跨会话共享数
+
+        one_shot = 会话类型 ∈ {TRANS, STRUCT} 且 share_sessions < share_min
+
+        为什么不能看标签：`queue_tag` 是谁创建了这段的粗粒度标记，而
+        共享数才是还会不会被复用的证据。典型反例：TRANS 会话插入的
+        文档段后来被别的会话反复命中——标签仍挂着 QTRANS，但它是热前缀。
+
+        `share_sessions >= share_min` = 已被 >=2 个不同会话命中过（创建者
+        自己的首次重读计 1，首次外部命中即达 2），属于跨会话模板，
+        不进一次性带——即使它的创建者当初被判成 TRANS。阈值取自
+        `SlruParams.share_min`，与 `SlruEvictPolicy.applies_to` 是同一个值。
         """
-        一次性内容（one-shot）：淘汰顺序永远先于可调度内容。
-          - RANDOM_SINGLE_TURN：随机单轮，跨会话几乎不复用；
-          - STRUCT_SINGLE_TURN 的生成段：会话发完即弃，response 不会再被任何请求当作前缀。
-        多轮负载的 response 段不在此列：下一轮会复用，与其 prompt 段同队列参与调度。
-        """
-        task_type = self._task_type_of(node)
-        if task_type == SimpleHybridTaskType.RANDOM_SINGLE_TURN:
-            return True
-        return node.is_decode and (
-            task_type == SimpleHybridTaskType.STRUCT_SINGLE_TURN
-        )
+        st = self.session_registry.get(getattr(node, "session_id", None))
+        if st is None:
+            # 无会话证据（客户端未带 session_id，或账本已被 sweep）：不判 one-shot。
+            return False
+        if self.slru_evict.share_of(node) >= self.slru_evict.share_min:
+            # 已被足够多会话复用：即便创建者是 TRANS 也不再是一次性内容。
+            return False
+        return st.session_type in (SessionType.TRANS, SessionType.STRUCT)
 
     def workload_of(self, node) -> str:
         """节点所属的工作负载。"""
         return workload_label_of(self._task_type_of(node))
 
     def one_shot_key(self, node) -> tuple:
-        """one-shot 带内排序：树上结束偏移最深的块先淘汰。
-
-        口径对齐 HeterCache 的 evict_first 堆键（-num_hashed_tokens，
-        即块的绝对结束位置）：序列里越靠后的生成段越先走。"""
-        return (-_node_end_offset(node), node.last_access_time)
+        """
+        one-shot 带内排序：最久未访问者先走（LRU）。
+        """
+        return (node.last_access_time,)
 
     # ---- online alpha balancing ----
 
@@ -319,103 +340,66 @@ class SimpleHybridStrategy(EvictionStrategy):
             if q != key:
                 self._hit_tokens[q] *= self.HIT_DECAY ## 命中期间其他队列的窗口衰减
         self._hit_tokens[key] = self._hit_tokens.get(key, 0.0) + hit_tokens
-        # 累计命中。
-        wkey = workload_label_of(task_type)
-        self._total_hit_tokens[wkey] = self._total_hit_tokens.get(wkey, 0.0) + hit_tokens
+# 累计命中（账本外挂：HeterProfiler）。
+        self.profiler.record_hit(wkey, hit_tokens)
+        # 策略事件流：高频路径，DEBUG 级别短路
+        if heterlog.enabled:
+            heterlog.hit(workload=wkey,
+                         task_type=task_type,
+                         hit_tokens=hit_tokens,
+                         req=rid)
 
     def record_evict(self, node) -> None:
-        """累计被淘汰的 token 数，按 workload 记账（与 hit 同口径，可比较）。
+        """累计被淘汰的 token 数，按 workload 记账。
         one-shot 淘汰量单记一个标量；random 的淘汰量直接读 workload 行，
-        单轮 response 段的淘汰量 = 标量 − evicted["random"]。"""
+        单轮 response 段的淘汰量 = 标量 - evicted["random"]。"""
         tokens = _node_num_tokens(node)
         wkey = self.workload_of(node)
-        self._total_evicted_tokens[wkey] = (
-            self._total_evicted_tokens.get(wkey, 0.0) + tokens
-        )
-        if self.is_one_shot(node):
-            self._total_evicted_one_shot += tokens
+        self.profiler.record_evict(wkey, tokens, one_shot=self.is_one_shot(node))
+        # 策略事件流：节点级驱逐事件（供 Uni-Bench 结果矩阵分析）
+        heterlog.evict(node_id=id(node),
+                       workload=wkey,
+                       tokens=tokens,
+                       one_shot=self.is_one_shot(node))
 
     def record_victim_source(self, source: str, tokens: float) -> None:
         """
         记录本次淘汰由谁决定，按来源累计 token 数。
-        source 取值："one_shot"（硬优先带）/ "global"（全局 victim_key 竞争）/
-        插件的 queue 名（如 "qagent"、"qstruct"）。只做观测，不参与仲裁。
+        source 取值："one_shot"/ "global"（全局 victim_key 竞争）/
+        插件的 queue 名（如 "qagent"、"qstruct"）。
         """
-        self._victim_sources[source] = self._victim_sources.get(source, 0.0) + tokens
+        self.profiler.record_victim_source(source, tokens)
+        # 策略事件流：淘汰裁决来源
+        heterlog.victim_source(source, tokens)
 
-    def profile_summary(self, workload_occ, session_summary=None) -> str:
-        """返回各 workload 的 profile 摘要，供日志打印。
 
-        字段含义：
-          hit / evicted : 累计命中 / 淘汰 token，按 workload（与 occ 同口径，可比较）
-          occ           : 该 workload 的全部驻留 token（含 response 段）；
-                          `occ(-N)` 后缀 = 其中 one-shot 部分（random 整行、
-                          struct 的 response 段），alpha 调度不了
-          alpha         : 在线权重（random 不参与 alpha，恒为 "-"）
+    def alpha_update_due(self) -> bool:
+        """调用点门禁：到 update_interval 才值得做一次全树口径计算。
 
-        Σocc == schedulable + Σone_shot（schedulable 即 alpha 分母）。
-        多轮负载的 one_shot 恒为 0，不打印后缀；random 整行 one-shot。
+        evict() 热路径先问这个，再做 _profile_token_counts() 的全树遍历，
+        避免在节流窗口内白白遍历整棵树（口径只在 alpha 真正更新时才被
+        消费）。maybe_update_alpha 内部保留同一判定，双保险且不改对外
+        语义；其他策略没有此方法，调用点 getattr 判空回退原路径。
         """
-        lines = ["  workload           hit     evicted             occ   alpha"]
-        pool = 0
-        schedulable = 0
-        for q in WORKLOAD_LABELS:
-            c = workload_occ.get(q)
-            if not c:
-                continue
-            pool += c["total"]
-            schedulable += c["total"] - c["one_shot"]
-            hit = self._total_hit_tokens.get(q, 0.0)
-            evicted = self._total_evicted_tokens.get(q, 0.0)
-            alpha = self.alpha.balance.get(q)
-            alpha_s = f"{alpha:>6.3f}" if alpha is not None else "     -"
-            occ_s = f"{c['total']:>10.0f}"
-            if c["one_shot"]:
-                occ_s += f"(-{c['one_shot']:.0f})"
-            lines.append(
-                f"  {q:8s} {hit:>12.0f} {evicted:>12.0f} {occ_s:>16s} {alpha_s}"
-            )
-        lines.append(
-            f"  pool={pool:.0f} schedulable={schedulable:.0f} "
-            f"one_shot_evicted={self._total_evicted_one_shot:.0f}"
-        )
-        if self._victim_sources:
-            src = " ".join(
-                f"{k}={v:.0f}" for k, v in self._victim_sources.items()
-            )
-            lines.append(f"  victim_src: {src}")
-        if self.tlru_evict is not None:
-            # phase1/phase2 的混合比：tel_safe 为 0 说明尾部预算没起作用。
-            s = self.tlru_evict.stats()
-            lines.append(
-                f"  tlru: tel_safe={s['tlru_tel_safe_picks']:.0f} "
-                f"lru={s['tlru_lru_picks']:.0f} "
-                f"fallback={s['tlru_fallbacks']:.0f} "
-                f"hist_raises={s['tlru_history_raises']:.0f}"
-            )
-        if session_summary:
-            # 会话级缺口：d_sum 与淘汰总量同量纲，可互相校验
-            lines.append(
-                f"  sessions={int(session_summary['sessions'])} "
-                f"d_sum={session_summary['d_sum']:.0f} "
-                f"d_p50={session_summary['d_p50']:.0f} "
-                f"d_max={session_summary['d_max']:.0f} "
-                f"d_nonzero={int(session_summary['d_nonzero'])}"
-            )
-        return "\n".join(lines)
+        return time.monotonic() - self._last_update >= self.alpha.update_interval
 
     def maybe_update_alpha(self, sched, workload_occ, session_summary=None) -> None:
         # Time-guarded trigger for alpha rebalancing (called from evict()).
         now = time.monotonic()
         if now - self._last_update < self.alpha.update_interval:
-            return ## 每经过一个时间间隔interval才进行更新
+            return ## 每经过一个时间间隔interval才进行更新（调用点已由 alpha_update_due 门禁预筛，这里双保险）
         self._last_update = now
         self.update_alpha_balance(sched)
-        # 每个 update_interval 秒打印一次各 workload profile 摘要
-        logger.info(
-            "[SimpleHybrid profile]\n%s",
-            self.profile_summary(workload_occ, session_summary),
+        # 每个 update_interval 秒打印一次各 workload profile 摘要（直接进 Profiler，无薄委托层）
+        _profile = self.profiler.summary(
+            workload_occ,
+            session_summary,
+            alpha_balance=self.alpha.balance,
+            slru_policy=self.slru_evict,
+            tlru_policy=self.tlru_evict,
+            mt_policy=self.mt_evict,
         )
+        heterlog.info("AlphaBalance", f"[SimpleHybrid profile]\n{_profile}")
 
     def update_alpha_balance(
         self,

@@ -1,4 +1,5 @@
 import math
+import zlib
 import dataclasses
 import enum
 import logging
@@ -21,10 +22,17 @@ class SimpleHybridTaskType(str, enum.Enum):
     RANDOM_SINGLE_TURN = "random_single_turn"
 
 
+class SessionType(str, enum.Enum):
+    TRANS = "trans"
+    STRUCT = "struct"
+    CHAT = "chat"
+    AGENTIC = "agentic"
+
+
 class SimpleHybridQueueTag(str, enum.Enum):
     """HeterCache 节点状态标签。
 
-    标签由缓存状态机根据插入、命中间隔和分支拓扑自动维护。
+    标签由会话分类器与 radix 结构证据共同维护；非会话请求保留旧命中间隔规则。
     """
 
     QTRANS = "qtrans"
@@ -33,15 +41,43 @@ class SimpleHybridQueueTag(str, enum.Enum):
     QCHAT = "qchat"
 
 
+def session_bloom_bits(session_id) -> int:
+    """session_id -> 64 bit bloom（4 函数），饱和在 ~8 个会话后误判率上升。
+
+    位布局归共享会话数账本的所有者（SlruEvictPolicy）使用；
+    节点上的 ``session_bloom`` 语义因此与任何标签策略无关。
+    """
+    text = "sid:" + (session_id if isinstance(session_id, str) else str(session_id))
+    h = zlib.crc32(text.encode("utf-8", "replace")) & 0xFFFFFFFF
+    h = (h * 0x9E3779B1) & 0xFFFFFFFF
+    bits = 0
+    for i in range(4):
+        bits |= 1 << ((h >> (i * 6)) & 63)
+    return bits
+
+
+# 节点共享会话数的饱和上界（8 bit，够用且能塞进诊断快照）。
+SESSION_SHARE_MAX = 255
+
+
+def session_type_to_queue_tag(session_type: SessionType) -> SimpleHybridQueueTag:
+    """Map a session classifier result to the queue used for newly owned KV."""
+    return {
+        SessionType.TRANS: SimpleHybridQueueTag.QTRANS,
+        SessionType.STRUCT: SimpleHybridQueueTag.QSTRUCT,
+        SessionType.AGENTIC: SimpleHybridQueueTag.QAGENT,
+        SessionType.CHAT: SimpleHybridQueueTag.QCHAT,
+    }[session_type]
+
+
 # ---------------------------------------------------------------------------
 # SimpleHybrid 的三组可调参数
 #
 #   AlphaParams   : alpha 在线权重的反馈控制（全局、每 update_interval 跑一次）
 #   RrParams      : Agentic 会话级轮询配额（跨会话公平）
-#   TinyLRUParams : Q_struct 队列内部的 W-TinyLRU（队内驻留/准入，见 STRUCT_QUEUE_WTINYLRU.md）
+#   SlruParams    : SLRU 的共享会话数阈值（决定 one-shot 分界与保护范围）
 # 用 dataclass 而不是裸 kwargs，是为了让 `eviction_policy_config` 有层级、能校验、能整体
-# 复制/日志/消融；旧的扁平键（alpha_smooth / fair_rr / struct_k ...）已删除，
-# 配置只接受 {"alpha":{...},"rr":{...},"tiny_lru":{...}} 分组形式。
+# 配置只接受 {"alpha":{...},"rr":{...},"slru":{...}} 分组形式。
 # ---------------------------------------------------------------------------
 
 
@@ -147,50 +183,40 @@ class RrParams:
         return dataclasses.asdict(self)
 
 
-@dataclasses.dataclass
-class TinyLRUParams:
-    """Q_struct 队列内部的 W-TinyLRU（队内淘汰，不做跨队列仲裁）。
+# 跨会话模板的共享会话数阈值。
+#
+# 语义：除创建者外还有 >= N 个会话命中过同一节点（即共 >= N+1 个会话用过）。
+# 它同时决定两件事，两处必须同源，所以只允许配置一处：
+#   * SlruEvictPolicy.applies_to       : 是否受 SLRU 保护（进候选池）
+#   * SimpleHybridStrategy.is_one_shot : 是否退出 one-shot 带
+DEFAULT_SHARE_MIN = 2
 
-    policy="off" 时策略完全不构造，所有钩子判空跳过（零开销）。
-    完整语义见 python/sglang/srt/mem_cache/STRUCT_QUEUE_WTINYLRU.md。
+
+@dataclasses.dataclass
+class SlruParams:
+    """SLRU 的共享会话数阈值。
+
+    配置形式：``--radix-eviction-policy-config '{"slru": {"share_min": 2}}'``。
+
+    共享数由 `SlruEvictPolicy` 记账（见 victim_override）：每个不同会话 +1，
+    创建者在节点插入那一刻就计入，同一会话由`session_bloom` 去重。
+    因此 `share_min = 2` 意味着共 2 个会话用过
+    ＝创建者 + 1 次外部命中，才算跨会话模板、才开始受保护；
+    低于该值的节点（以及 TRANS 会话的节点）进 one-shot 带优先淘汰。
     """
 
-    policy: str = "off"  # "off" | "wtinylru"
-    k: int = 3  # protected 的 share_count 门限
-    window_entries: int = 64  # 观察窗条目配额（无队列预算，按条目而非 token）
-    epoch_events: int = 8192  # aging 纪元的请求数
-    admission_tie: str = "reject"  # 频数相同时 "reject" | "admit"
-    admission_metric: str = "share"  # "share" | "share_per_token"
-    inherit_share: bool = True  # 降级叶子是否继承父节点频数
+    share_min: int = DEFAULT_SHARE_MIN
 
     def __post_init__(self):
-        if self.policy not in ("off", "wtinylru"):
+        if self.share_min < 2:
             raise ValueError(
-                f"Unknown tiny_lru.policy: {self.policy}. Supported: 'off', 'wtinylru'."
-            )
-        if self.k < 2:
-            raise ValueError(f"tiny_lru.k must be >= 2, got {self.k}")
-        if self.window_entries < 1:
-            raise ValueError(
-                f"tiny_lru.window_entries must be >= 1, got {self.window_entries}"
-            )
-        if self.epoch_events < 1:
-            raise ValueError(
-                f"tiny_lru.epoch_events must be >= 1, got {self.epoch_events}"
-            )
-        if self.admission_tie not in ("reject", "admit"):
-            raise ValueError(
-                f"tiny_lru.admission_tie must be 'reject' or 'admit', got {self.admission_tie}"
-            )
-        if self.admission_metric not in ("share", "share_per_token"):
-            raise ValueError(
-                "tiny_lru.admission_metric must be 'share' or 'share_per_token', "
-                f"got {self.admission_metric}"
+                "slru.share_min must be >= 2 (>1 个外部会话才算共享), "
+                f"got {self.share_min}"
             )
 
     @classmethod
-    def from_any(cls, value=None) -> "TinyLRUParams":
-        return _coerce_params(cls, value, name="tiny_lru")
+    def from_any(cls, value=None) -> "SlruParams":
+        return _coerce_params(cls, value, name="slru")
 
     def as_dict(self) -> dict:
         return dataclasses.asdict(self)
@@ -232,6 +258,34 @@ class TlruParams:
     @classmethod
     def from_any(cls, value=None) -> "TlruParams":
         return _coerce_params(cls, value, name="tlru")
+
+    def as_dict(self) -> dict:
+        return dataclasses.asdict(self)
+
+
+@dataclasses.dataclass
+class MultiTurnParams:
+    """多轮对话（QCHAT）带内改写器的参数。
+
+    配置形式：``--radix-eviction-policy-config '{"mt": {"enabled": true}}'``。
+
+    带内权重 1 − prob(e) = CDF(elapsed; μ, σ)，μ/σ 取
+    ``TASK_CONFIG[MULTI_TURN_CHAT]``（UniCache 原机制，μ=4.77 / σ=1.279）；
+    带内排序不乘 alpha——QCHAT 带内 alpha 恒同，乘不乘排序结果一致。
+    enabled 默认 True：mt 改写器只在 victim 落入 QCHAT 带时接管
+    （调用链 applies_to 门禁），带内语义与全局 victim_key 等价，
+    差异仅在 tie-break=LRU，默认不改变淘汰分布。
+    """
+
+    enabled: bool = True
+
+    def __post_init__(self):
+        if not isinstance(self.enabled, bool):
+            raise ValueError(f"mt.enabled must be bool, got {self.enabled!r}")
+
+    @classmethod
+    def from_any(cls, value=None) -> "MultiTurnParams":
+        return _coerce_params(cls, value, name="multi-turn")
 
     def as_dict(self) -> dict:
         return dataclasses.asdict(self)
@@ -333,7 +387,8 @@ class SessionState:
     """一条会话的 KV记账。
 
     `d` 只在两处变化：会话自己的请求写入时归零、其片段被删时累加。
-    `gaps` 记轮间隔样本（本次请求到达 - 上次请求到达），供后续权重使用。
+    `classifier_gaps`、tool-call 与跨会话命中证据只用于更新会话类型；
+    原 `gaps` / `L` 仍服务于 KV 账本，避免分类器改变其记账语义。
     """
 
     session_id: str
@@ -345,6 +400,15 @@ class SessionState:
     gaps: List[float] = dataclasses.field(default_factory=list)
     attached: int = 0           # 累计挂到该会话名下的 token 数（调试用）
     charged: int = 0            # 累计被删的 token 数（调试用）
+    turn_count: int = 0
+    tool_call_count: int = 0
+    cross_session_shared: bool = False
+    session_type: SessionType = SessionType.TRANS
+    first_context_len: int = 0
+    latest_context_len: int = 0
+    classifier_gaps: List[float] = dataclasses.field(default_factory=list)
+    classifier_last_rid: str = ""
+    classifier_last_request_start: Optional[float] = None
 
 
 logger = logging.getLogger(__name__)
@@ -357,13 +421,52 @@ _TRACE_SID = os.environ.get("SGLANG_SESSION_TRACE_SID", "")
 
 class SessionRegistry:
     """
-    会话表,记录每个会话的状态
-    只做记账：`touch` 由插入路径调用，`charge`/`attach` 由节点新增与删除调用。
-    不依赖 radix tree，节点按鸭子类型读取 `session_id` 与 `value`。
+    会话表：独立维护 KV 记账与逐步升级的会话类型。
+    `observe_request` / `record_cross_session_hit` 更新分类证据；`touch`、`charge`、
+    `attach` 保持 KV 记账职责。节点按鸭子类型读取 `session_id` 与 `value`。
+
+    进程级共享
+    ----------
+    缓存层通过 `global_instance()` 取用**同一个**账本，因此：
+
+      * 同一进程内所有 radix cache 实例（device/host、重复构造）看到同一份
+        `d`/`L`/`gaps`，RR 的 `loss_cap` 与分类器不会各算一套；
+      * `clear()` 是全局的 —— `/flush_cache` 清的是整本账（这正是想要的语义）；
+      * 需要隔离（单测、对照实验并行）时用 `reset_global()` 丢弃单例，或直接
+        `SessionRegistry()` 造私有实例并在构造缓存后覆盖 `cache.session_registry`。
+
+    访问方全部在调度线程（match / insert / evict）里，`sweep()` 由 `touch()` 顺带
+    触发，因此这里不加锁。
     """
+
+    # 进程级单例。用基类名访问，避免子类各持一份。
+    _global: Optional["SessionRegistry"] = None
+
+    @classmethod
+    def global_instance(cls) -> "SessionRegistry":
+        """返回进程级共享账本（首次调用时用默认 TTL 创建）。"""
+        inst = SessionRegistry._global
+        if inst is None:
+            inst = SessionRegistry()
+            SessionRegistry._global = inst
+        return inst
+
+    @classmethod
+    def reset_global(cls) -> Optional["SessionRegistry"]:
+        """丢弃单例并返回旧实例；下一次 `global_instance()` 会新建。
+
+        用于测试隔离与「换参数重建」：单例一旦创建就固定了 `idle_ttl` /
+        `empty_grace`，想换参数必须先 reset。
+        """
+        old = SessionRegistry._global
+        SessionRegistry._global = None
+        return old
 
     GAP_WINDOW = 8          # 只保留最近 8 个轮间隔样本
     SWEEP_EVERY = 256       # 每 N 次 touch 顺带回收一次
+    MULTI_TURN_MIN = 5
+    GAP_SPLIT_S = 15.0
+    AGENTIC_CONTEXT_GROWTH_TOKENS = 1500
 
     def __init__(self, idle_ttl: float = 3600.0, empty_grace: float = 60.0):
         self._sessions: Dict[str, SessionState] = {}
@@ -377,6 +480,78 @@ class SessionRegistry:
 
     def __len__(self) -> int:
         return len(self._sessions)
+
+    # ---- 会话分类证据 ----
+    def observe_request(
+        self,
+        session_id: Optional[str],
+        rid: str = "",
+        prompt_len: int = 0,
+        *,
+        tool_call=None,
+        now: Optional[float] = None,
+    ) -> Optional[SessionState]:
+        """用当前请求可见的会话证据更新分类；同一 rid（如 chunked 重入）只计一次。"""
+        if not session_id:
+            return None
+        now = time.monotonic() if now is None else now
+        st = self._sessions.get(session_id)
+        if st is None:
+            st = self._sessions[session_id] = SessionState(session_id=session_id) #获取session状态
+        if rid and rid == st.classifier_last_rid:
+            return st
+
+        if st.classifier_last_request_start is None:
+            st.first_context_len = prompt_len ## 首次请求时记录初始上下文长度
+        else:
+            st.classifier_gaps.append(max(0.0, now - st.classifier_last_request_start)) ## 记录这个会话的轮间间隔
+            if len(st.classifier_gaps) > self.GAP_WINDOW: ## 截断
+                del st.classifier_gaps[0]
+        st.turn_count += 1
+        st.tool_call_count += int(bool(tool_call))
+        st.latest_context_len = prompt_len
+        st.classifier_last_request_start = now
+        st.classifier_last_rid = rid
+        st.session_type = self._classify(st)
+        return st
+
+    def record_cross_session_hit(
+        self, session_id: Optional[str], owner_session_id: Optional[str]
+    ) -> Optional[SessionState]:
+        """Record that this session reused a radix segment first inserted by another session."""
+        if not session_id or not owner_session_id or session_id == owner_session_id:
+            return self.get(session_id)
+        st = self._sessions.get(session_id)
+        if st is None:
+            st = self._sessions[session_id] = SessionState(session_id=session_id)
+        st.cross_session_shared = True # 检测是否存在跨会话复用
+        st.session_type = self._classify(st)
+        return st
+
+    @classmethod
+    def _classify(cls, state: SessionState) -> SessionType:
+        if state.turn_count < cls.MULTI_TURN_MIN: # 小于阈值轮数, 认为是单轮 workload，按跨会话共享证据区分结构化与非结构化
+            return SessionType.STRUCT if state.cross_session_shared else SessionType.TRANS
+        if state.tool_call_count: # 存在Tool_call, 认为是 agentic workload
+            return SessionType.AGENTIC
+        if state.classifier_gaps:
+            ordered = sorted(state.classifier_gaps)
+            middle = len(ordered) // 2
+            median_gap = (
+                ordered[middle]
+                if len(ordered) % 2
+                else (ordered[middle - 1] + ordered[middle]) / 2
+            )
+            if median_gap < cls.GAP_SPLIT_S: # 轮间间隔小于阈值, 认为是Agentic
+                return SessionType.AGENTIC
+            if median_gap > cls.GAP_SPLIT_S: # 轮间间隔大于阈值, 认为是Chat
+                return SessionType.CHAT
+        growth = state.latest_context_len - state.first_context_len
+        return (
+            SessionType.AGENTIC
+            if growth >= cls.AGENTIC_CONTEXT_GROWTH_TOKENS #上下文长度增长超过阈值, 认为是Agentic
+            else SessionType.CHAT
+        )
 
     # ---- 记账 ----
     def touch(
@@ -453,6 +628,14 @@ class SessionRegistry:
             st.d = st.L
 
     # ---- 回收 ----
+    def clear(self) -> None:
+        """清空全部会话记账。
+
+        缓存 flush / reset 必须调用：跨 run 复用同一个 server 时，`d`/`L`/`gaps`
+        如果残留，RR 的 loss_cap 会读到上一轮的缺口，实验之间互相污染。
+        """
+        self._sessions.clear()
+
     def sweep(self, now: Optional[float] = None) -> int:
         now = time.monotonic() if now is None else now
         dead = [

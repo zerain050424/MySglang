@@ -199,11 +199,12 @@ class RealBackend:
                 return super()._delete_leaf(node)
 
         self._clock = radix.time  # 已被 SimClock 替换；缓存引用省掉逐次 import
-        self._tag_mode = False  # 建好 cache 后再判定（见下）
+        self._slru_mode = False  # 建好 cache 后再判定（见下）
         self._cache_cls = _Instrumented
         self.cache = _Instrumented(init_params)
-        self._tag_mode = (
-            getattr(self.cache.eviction_strategy, "tagState", None) is not None
+        # simple_hybrid 才带 SLRU 插件；lru/slru 臂没有，region 恒 0。
+        self._slru_mode = (
+            getattr(self.cache.eviction_strategy, "slru_evict", None) is not None
         )
         self._req_seq = 0
         self.pool_tokens = int(pool_tokens)
@@ -280,10 +281,12 @@ class RealBackend:
             return
         depth, ph = _node_path_info(node, root)
         tokens = int(len(node.value)) if node.value is not None else 0
-        if self._tag_mode:
-            # QSTRUCT 就是「受保护前缀」的等价物：G5（级联删除）按标签统计。
-            tag = getattr(node, "queue_tag", None)
-            region = 3 if getattr(tag, "value", tag) == "qstruct" else 0
+        if self._slru_mode:
+            # region 3 = 「受保护段」= 非一次性内容。判定与淘汰路径同源
+            # （strategy.is_one_shot），而不是看 queue_tag —— 标签与共享数
+            # 已经解耦，拿标签统计会把 M4 的 protected_waste_rate 算歪。
+            strategy = self.cache.eviction_strategy
+            region = 0 if strategy.is_one_shot(node) else 3
         else:
             region = 0
         self._on_evict(
@@ -305,15 +308,13 @@ class RealBackend:
         snap = None
         victim_src = dict(getattr(strategy, "_victim_sources", {}) or {})
         alpha = dict(getattr(getattr(strategy, "alpha", None), "balance", {}) or {})
+        slru = getattr(strategy, "slru_evict", None)
         return {
             "available": self._available(),
             "evictable_size": int(getattr(self.cache, "evictable_size_", 0) or 0),
-            "tag": (
-                strategy.tag_snapshot()
-                if hasattr(strategy, "tag_snapshot")
-                else None
-            ),
-            "evicted_by_tag": dict(getattr(strategy, "_evicted_by_tag", {}) or {}),
+            # 共享数账本 + 本改写器实际给出的候选数（机制证据）
+            "slru": slru.stats() if slru is not None else None,
+            "slru_share_min": getattr(slru, "share_min", None),
             "victim_src": victim_src,
             "alpha": alpha,
         }

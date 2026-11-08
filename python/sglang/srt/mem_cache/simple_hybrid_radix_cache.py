@@ -1,4 +1,5 @@
-"""SimpleHYBRID 的 radix cache：RadixCache + 两带淘汰。
+"""
+  SimpleHYBRID 的 radix cache：RadixCache + 两带淘汰。
   one-shot 带（random 整个请求 / 单轮 response 段）永远先清空；
   可调度内容（各 workload 的 prompt 段 + 多轮 response 段）按复用分数
   全局竞争，分数最低者先走。
@@ -24,27 +25,29 @@ class SimpleHybridRadixCache(RadixCache):
         # 禁用 radix cache 时无操作
         if self.disable:
             return EvictResult()
-        # 若策略不是 SimpleHybridStrategy，
-        # 退回父类单堆淘汰，避免 AttributeError
         if not isinstance(self.eviction_strategy, SimpleHybridStrategy):
             return super().evict(params)
 
         start_time = time.perf_counter()
         num_tokens = params.num_tokens
         # 每隔 update_interval 秒按命中效率刷新各类型 α 权重
+        # 门禁：仅当 alpha 更新到期才做全树遍历（否则节流窗口内白发全线）
         if self._alpha_updater is not None:
-            # 传三份口径：alpha 用可调度容量，profile 用 workload 占用与会话缺口
-            self._alpha_updater(
-                *self._profile_token_counts(), self.session_registry.summary()
-            )
+            _alpha_due = getattr(self.eviction_strategy, "alpha_update_due", None)
+            if _alpha_due is None or _alpha_due():
+                # 传三份口径：alpha 用可调度容量，profile 用 workload 占用与会话缺口
+                self._alpha_updater(
+                    *self._profile_token_counts(), self.session_registry.summary()
+                )
 
         strategy = self.eviction_strategy
         num_evicted = 0
-
-        # one-shot 永远先清空（one_shot_key 首项 -树上结束偏移：位置最深的块先走，
-        # 对齐 HeterCache evict_first 的 -num_hashed_tokens 口径）；
+        # one-shot 永远先清空（淘汰策略为带内LRU）；
         # 清空后可调度内容按 victim_key 全局竞争（分数最低，同分 token 多者先走）。
         while num_evicted < num_tokens:
+            # 下面两个分支必定会给victim赋值（one-shot 带 / victim_key基础候选）
+            # 第三分支直接 break。因此 victim 绝不跨轮复用、也绝不为None
+            # 复用上一轮已删除的 victim 会二次释放同一段 KV。
             leaves = self.evictable_leaves
             one_shot = [n for n in leaves if strategy.is_one_shot(n)]
             source = "global"
@@ -53,14 +56,14 @@ class SimpleHybridRadixCache(RadixCache):
                 source = "one_shot"
             elif leaves:
                 victim = min(leaves, key=strategy.victim_key)
-                # 依次询问已注册的改写器（注册顺序 = 优先级，后者覆盖前者）。
-                # 返回 None 表示不接管 -> 保留当前候选，绝不阻塞推进（INV-4）。
+                # 依次询问已注册的改写器（注册顺序即优先级，后者覆盖前者）。
+                # 返回 None 表示不接管 -> 保留当前候选，绝不阻塞淘汰推进。
                 for override in self.victim_overrides:
                     if override.applies_to(victim):
                         alt = override.pick(leaves, self.session_registry)
                         if alt is not None:
                             victim = alt
-                            # queue 仅观测：profile 打「本次淘汰由哪个队列的策略决定」。
+                            # queue用来profile本次淘汰由哪个队列的策略决定。
                             source = (
                                 override.queue.value
                                 if override.queue is not None
@@ -85,32 +88,33 @@ class SimpleHybridRadixCache(RadixCache):
     def _evict_one(self, node) -> int:
         """
         淘汰一个叶子并释放其 KV，返回释放的 token 数。
-        one-shot 节点向上追溯：把因本次删除而变得「无其他子树、未上锁」的
-        祖先链一次删净 —— 单轮会话的 response 走后，其上方的 prompt 链
+        one-shot 节点向上追溯：把因本次删除而变得无其他子树、未上锁的
+        祖先链一次删净 —— 单轮会话的response走后，其上方的prompt链
         不会再产生任何复用，逐叶淘汰只会让死链反复以新叶子的身份暴露，
         驱逐循环为此多跑若干轮。遇到根、分支点（还有其他子树）或上锁
         节点即停，它们仍可能是共享前缀。
         """
         total = 0
         cur = node
-        struct_state = getattr(self.eviction_strategy, "structState", None)
-        one_shot = self.eviction_strategy.is_one_shot(node)
+        # 当祖先自己是一次性内容（未被跨会话共享）时级联删除，否则会
+        # 连带删掉刚进 protected 的共享前缀。
+        strategy = self.eviction_strategy
+        one_shot = strategy.is_one_shot(node)
         while True:
             parent = cur.parent
             # 累计该队列的淘汰 token（供 profile）
             self.eviction_strategy.record_evict(cur)
-            # 归还 KV slot（page 对齐的段）
+            # 归还 KV slot
             self.token_to_kv_pool_allocator.free_segment(cur.value, start_pos=0)
-            # 记录 KV 事件（供指标/回放使用）
+            # 记录 KV 事件
             self.kv_events.record_remove(cur)
             total += len(cur.value)
             # 从树中删除；_delete_leaf 会顺带维护 evictable_leaves 与父节点晋升
             self._delete_leaf(cur)
             if (one_shot and parent is not None and parent is not self.root_node
                     and parent.lock_ref == 0 and not parent.children
-                    # Q_struct 闸：模板前缀不参与 one-shot 死链级联，
-                    # 否则「降级后的文档段被收割」会连带删掉刚进 protected 的前缀。
-                    and not (struct_state is not None and struct_state.owns(parent))):
+                    # 同源闸：祖先必须也是 one-shot（共享数未达保护阈值）。
+                    and strategy.is_one_shot(parent)):
                 cur = parent  # 死链：随 one-shot 一并删除
                 continue
             break

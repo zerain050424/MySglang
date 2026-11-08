@@ -14,6 +14,17 @@
 
 另外附一条 ``meta.json``，记录共享前缀的实际长度与变体表，
 使 M1 指标不必再跑 prefix_stats。
+
+``--scenario dslru``（D-SLRU，本轮"两带 SLRU vs LRU vs 上游 SLRU"的主负载）
+三条成分各自对准一条机制弱点：
+
+    模板层   跨块长间隔复发      → LRU 按 recency 会把模板挤掉
+    私有层   只有本会话反复读    → 上游 SLRU 按 hit_count 把它晋升进 protected
+    burst    单轮唯一 token      → 制造真实容量压力
+
+调度是决定性的：模板 v 在 ``v % blocks`` 块出生（放两个会话，先把
+``share_sessions`` 顶到 >= share_min），之后每 ``+2`` 块复发一个会话，
+因此相邻两次使用之间总隔着一整个 burst 块。
 """
 
 from __future__ import annotations
@@ -139,6 +150,142 @@ def build(
     return {"sessions": sessions, "meta": meta}
 
 
+def build_dslru(
+    *,
+    prefix_depth: int = 2048,
+    variants: int = 16,
+    sessions_per_template: int = 5,
+    turns: int = 3,
+    private_mu: float = 7.6,
+    private_sigma: float = 0.4,
+    user_len: int = 128,
+    output_len: int = 256,
+    blocks: int = 8,
+    burst_sessions: int = 384,
+    doc_len: int = 1024,
+    seed: int = 42,
+    max_sessions: int = -1,
+) -> Dict[str, object]:
+    """生成 D-SLRU trace：跨块复发的模板 × 会话内私有热点 × 单轮 burst。
+
+    单请求结构（顺序不能变）::
+
+        [模板 prefix_depth + variant][私有上下文][历史输出][本轮用户 token]
+        → 生成 output_len
+
+    * 私有上下文是**唯一** token，且每轮都完整出现在 prompt 里 —— 它会被
+      同一条会话反复命中（``hit_count`` 涨到 >=2，上游 SLRU 会晋升它），
+      但 ``share_sessions`` 停在 1（bloom 对同一会话去重），所以两带 SLRU
+      永远把它留在 one-shot 带里先清。
+    * ``turns`` 必须 < 5（分类器 ``MULTI_TURN_MIN``），否则会话被判成
+      AGENTIC/CHAT，节点就不再进一次性带，本负载的靶子失效。
+    """
+    rng = random.Random(seed)
+    shared = _rand_tokens(rng, prefix_depth)
+    variant_tokens = [
+        _rand_tokens(random.Random(seed * 7919 + i), _VARIANT_LEN)
+        for i in range(variants)
+    ]
+    turns = max(1, int(turns))
+    blocks = max(1, int(blocks))
+    sessions_per_template = max(3, int(sessions_per_template))
+
+    # 模板 v 的会话落在哪些块：出生块 2 个 + 之后均匀铺到后面的块。
+    # 注意：**不能取模**——(birth + 2k) % blocks 会把复发会话绕回出生块之前，
+    # 于是该会话到达时模板还没被创建，测出来的"模板未命中的"其实是"还没插过"，
+    # 会把 A3 的成绩系统性压低（实测约 49% 的模板请求踩到这个假阴性）。
+    per_block: Dict[int, List[Dict[str, object]]] = {b: [] for b in range(blocks)}
+    private_lens: List[int] = []
+    template_uses: Dict[int, int] = {}
+    tail_slots = max(1, sessions_per_template - 2)
+    for v in range(variants):
+        birth = v % blocks
+        span = max(0, blocks - 1 - birth)
+        schedule = [birth, birth] + [
+            birth + (j * span) // tail_slots for j in range(1, tail_slots + 1)
+        ]
+        for j, blk in enumerate(schedule):
+            sid = f"dslru-t{v}-s{j}-seed{seed}"
+            s_rng = random.Random(hash((seed, "dslru", v, j)) & 0xFFFFFFFF)
+            body_len = max(64, int(s_rng.lognormvariate(private_mu, private_sigma)))
+            private_lens.append(body_len)
+            body = _rand_tokens(s_rng, body_len)
+            prompt = shared + variant_tokens[v] + body
+            acc_out: List[int] = []
+            session: Dict[str, object] = {"id": sid, "num_turns": turns}
+            for t in range(1, turns + 1):
+                prompt = prompt + acc_out + _rand_tokens(s_rng, user_len)
+                out = _rand_tokens(s_rng, output_len)
+                session[f"turn_{t}"] = {
+                    "input_ids": list(prompt),
+                    "response_ids": list(out),
+                    "prompt_tokens": len(prompt),
+                }
+                acc_out = out
+            per_block[blk].append(session)
+            template_uses[v] = template_uses.get(v, 0) + turns
+
+    # burst：单轮唯一文档，按块均分，紧跟在同块的模板会话之后
+    burst_per_block = max(0, int(burst_sessions) // blocks)
+    noise_n = 0
+    for b in range(blocks):
+        for k in range(burst_per_block):
+            idx = b * burst_per_block + k
+            n_rng = random.Random(hash((seed, "dslru-noise", idx)) & 0xFFFFFFFF)
+            doc = _rand_tokens(n_rng, doc_len)
+            per_block[b].append(
+                {
+                    "id": f"dslru-noise-{idx}-seed{seed}",
+                    "num_turns": 1,
+                    "turn_1": {
+                        "input_ids": doc,
+                        "response_ids": _rand_tokens(n_rng, max(32, output_len // 2)),
+                        "prompt_tokens": len(doc),
+                    },
+                }
+            )
+            noise_n += 1
+
+    sessions = [sess for b in range(blocks) for sess in per_block[b]]
+    if max_sessions and max_sessions > 0:
+        sessions = sessions[:max_sessions]
+
+    template_len = prefix_depth + _VARIANT_LEN
+    layers = sorted({
+        x for x in (256, 512, 1024, 2048, 4096, 8192, template_len)
+        if x <= template_len
+    })
+    meta = {
+        "kind": "synth-dslru",
+        "seed": seed,
+        "prefix_depth": prefix_depth,
+        "shared_prefix_tokens": prefix_depth,
+        "variant_len": _VARIANT_LEN,
+        "template_len": template_len,
+        # 注意：per_block 以「块」为键，与变体下标无关（variants 常常 > blocks）。
+        "variants": [
+            {"variant": v, "sessions": sessions_per_template} for v in range(variants)
+        ],
+        "breadth": sessions_per_template,
+        "turns": turns,
+        "blocks": blocks,
+        "burst_per_block": burst_per_block,
+        "noise_sessions": noise_n,
+        "noise_frac": round(noise_n / max(len(sessions) - noise_n, 1), 3),
+        "doc_len": doc_len,
+        "private_mu": private_mu,
+        "private_sigma": private_sigma,
+        "private_tokens_mean": round(sum(private_lens) / max(len(private_lens), 1)),
+        "user_len": user_len,
+        "output_len": output_len,
+        "template_uses": template_uses,
+        "num_sessions": len(sessions),
+        # M1 分层：模板整段（prefix_depth + variant）也在里面
+        "layers": layers,
+    }
+    return {"sessions": sessions, "meta": meta}
+
+
 def write(out_dir: str | Path, built: Dict[str, object]) -> Path:
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -164,20 +311,45 @@ def main(argv=None) -> None:
     p.add_argument("--doc-len", type=int, default=2000)
     p.add_argument("--max-sessions", type=int, default=-1)
     p.add_argument("--phased", action="store_true",
-                   help="按变体分块并在块间插入冲刷文档（门控 G2 需要）")
+                   help="[ladder] 按变体分块并在块间插入冲刷文档（门控 G2 需要）")
+    p.add_argument("--scenario", default="ladder", choices=["ladder", "dslru"],
+                   help="ladder=共享前缀阶梯（旧场景）；dslru=两带 SLRU 主负载")
+    # ---- dslru 专用 ----
+    p.add_argument("--blocks", type=int, default=8,
+                   help="[dslru] 调度块数：块=模板会话 -> burst -> 下一块")
+    p.add_argument("--sessions-per-template", type=int, default=5,
+                   help="[dslru] 每模板会话数（>=3：出生块 2 个 + 复发）")
+    p.add_argument("--private-mu", type=float, default=7.6,
+                   help="[dslru] 会话私有上下文长度 lognormal mu（7.6≈2000 token）")
+    p.add_argument("--private-sigma", type=float, default=0.4)
+    p.add_argument("--user-len", type=int, default=128, help="[dslru] 每轮新增用户 token")
+    p.add_argument("--output-len", type=int, default=256, help="[dslru] 每轮生成 token")
+    p.add_argument("--burst-sessions", type=int, default=384,
+                   help="[dslru] burst 会话总数（按块均分）")
     p.add_argument("--seed", type=int, default=42)
     a = p.parse_args(argv)
-    built = build(
-        prefix_depth=a.prefix_depth, breadth=a.breadth, variants=a.variants,
-        turns=a.turns, body_mu=a.body_mu, body_sigma=a.body_sigma,
-        noise_frac=a.noise_frac, doc_len=a.doc_len, seed=a.seed,
-        max_sessions=a.max_sessions, phased=a.phased,
-    )
+    if a.scenario == "dslru":
+        built = build_dslru(
+            prefix_depth=a.prefix_depth, variants=a.variants,
+            sessions_per_template=a.sessions_per_template, turns=a.turns,
+            private_mu=a.private_mu, private_sigma=a.private_sigma,
+            user_len=a.user_len, output_len=a.output_len,
+            blocks=a.blocks, burst_sessions=a.burst_sessions,
+            doc_len=a.doc_len, seed=a.seed, max_sessions=a.max_sessions,
+        )
+    else:
+        built = build(
+            prefix_depth=a.prefix_depth, breadth=a.breadth, variants=a.variants,
+            turns=a.turns, body_mu=a.body_mu, body_sigma=a.body_sigma,
+            noise_frac=a.noise_frac, doc_len=a.doc_len, seed=a.seed,
+            max_sessions=a.max_sessions, phased=a.phased,
+        )
     path = write(a.out_dir, built)
     meta = built["meta"]
-    print(f"[synth] {path}  sessions={meta['num_sessions']} "
+    print(f"[synth] {path}  kind={meta['kind']} sessions={meta['num_sessions']} "
           f"prefix={meta['prefix_depth']} breadth={meta['breadth']} "
-          f"variants={a.variants} noise={meta['noise_sessions']}")
+          f"variants={a.variants} noise={meta['noise_sessions']}"
+          + (f" blocks={meta['blocks']}" if a.scenario == "dslru" else ""))
 
 
 if __name__ == "__main__":

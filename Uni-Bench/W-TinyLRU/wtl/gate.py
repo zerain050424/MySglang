@@ -5,10 +5,10 @@
 检查项
 ------
 G1 可复现         同配置跑两遍，逐请求明细必须完全一致（含 SimClock，无 wall-clock 依赖）
-G2 机制被行使     标签版：晋升发生过（tag.promote>0）且 QSTRUCT 真的被淘汰过
+G2 机制被行使     共享数被记账过（slru.share_counted>0）且 SLRU 给出过候选（slru_picks>0）
 G3 无压力不变性   pool/工作集 = 2.0 时 A0/A1/A2/A3 的 hit% 差 < 0.5pp（对照必须是平的）
 G4 后端忠实度     真 LRU 与镜像 LRU 在同一小 trace 上的 cached_len 一致率 ≥ 99.5%
-G5 上溯闸         A3 下 protected 区被「级联删除」的 token == 0（§7.4 的最大正确性风险）
+G5 上溯闸         A3 下受保护段（region 3）被「级联删除」的 token == 0（最大正确性风险）
 
     python -m wtl.gate --backend auto
     python -m wtl.gate --backend fake        # 无 sglang 的机器上只验链路（G2/G4 记 N/A）
@@ -113,23 +113,27 @@ def main(argv=None) -> int:
         # ---------------- G2 / G5 ----------------
         if r1 is not None and r1["backend"] == "real":
             s = r1["summary"]
-            tag = s.get("tag") or {}
-            by_tag = s.get("evicted_by_tag") or {}
-            prompt = int(tag.get("promote") or 0)
-            q_evicted = float(by_tag.get("tag:qstruct", 0.0) or 0.0)
-            exercised = prompt > 0 and q_evicted > 0
+            slru = s.get("slru") or {}
+            vsrc = s.get("victim_src") or {}
+            counted = int(slru.get("share_counted") or 0)
+            picks = int(slru.get("slru_picks") or 0)
+            q_evicted = float(vsrc.get("qstruct", 0.0) or 0.0)
+            os_evicted = float(vsrc.get("one_shot", 0.0) or 0.0)
+            # 机制被行使 = 共享数真的被记账过 + SLRU 真的给出过候选
+            exercised = counted > 0 and picks > 0
             results.append(
                 ("G2", "机制被行使", "PASS" if exercised else "FAIL",
-                 f"tag_lru promote={prompt} counted={tag.get('counted')} "
-                 f"dedup={tag.get('dedup')} qstruct_evicted={q_evicted:.0f}")
+                 f"share_counted={counted} share_dedup={slru.get('share_dedup')} "
+                 f"slru_picks={picks} share_min={s.get('slru_share_min')} "
+                 f"one_shot_evicted={os_evicted:.0f} qstruct_evicted={q_evicted:.0f}")
             )
             cascade = (s.get("regret") or {}).get("protected_cascade_deleted_tokens", 0)
             results.append(
                 ("G5", "上溯闸", "PASS" if cascade == 0 else "FAIL",
                  f"受保护前缀被级联删除 {cascade} tokens")
             )
-            payload["checks"].append({"id": "G2", "pass": exercised, "tag": tag,
-                                      "evicted_by_tag": by_tag})
+            payload["checks"].append({"id": "G2", "pass": exercised, "slru": slru,
+                                      "victim_src": vsrc})
             payload["checks"].append({"id": "G5", "pass": cascade == 0,
                                       "protected_cascade_tokens": cascade})
 

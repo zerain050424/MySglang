@@ -173,7 +173,7 @@ def test_second_run_equals_fresh_run():
             (
                 n._tlru_cached_prefix_len,
                 n._tlru_history_len,
-                n.struct_region,
+                n.share_sessions,
                 getattr(n.queue_tag, "value", str(n.queue_tag)),
                 0 if n.value is None else len(n.value),
             )
