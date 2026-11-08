@@ -2,12 +2,11 @@
 
 为什么需要它
 ------------
-``SimpleHybridStrategy`` 的复用分数（``_reuse_score``）与 alpha 更新
-（``maybe_update_alpha``）都用 ``time.monotonic()``。离线回放若用真实时钟，
+``SimpleHybridStrategy`` 的复用分数（``_reuse_score``）用
+``time.monotonic()``。离线回放若用真实时钟，
 整条 trace 会在几秒内跑完，所有 ``elapsed`` 都≈0：
 
-* ``reuse_prob = 1 - lognorm_cdf(elapsed)`` 全部≈1，队列间不再有区分度；
-* alpha 的 30s 更新闸永远不触发。
+* ``reuse_prob = 1 - lognorm_cdf(elapsed)`` 全部≈1，队列间不再有区分度。
 
 于是回放退化成「按 token 数量比大小」，与真机行为无关。
 本模块把 sglang 这几个模块内的 ``time`` 换成一个由 trace 时间戳驱动的替身，

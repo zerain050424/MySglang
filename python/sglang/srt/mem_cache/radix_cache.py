@@ -349,8 +349,8 @@ class RadixCache(BasePrefixCache):
         # that implement them, so other policies pay nothing.
         ## 可选钩子
         self._hit_recorder = getattr(self.eviction_strategy, "record_hit", None)
-        self._alpha_updater = getattr(
-            self.eviction_strategy, "maybe_update_alpha", None
+        self._profile_printer = getattr(
+            self.eviction_strategy, "maybe_print_profile", None
         )
         # 实验开关（SimpleHybridStrategy.force_agentic）：把所有节点直接标成 QAGENT，
         # 让 QAGENT-only 的插件（RR / T-LRU）拿到 100% 的流量。只改 queue_tag，
@@ -722,11 +722,11 @@ class RadixCache(BasePrefixCache):
 
         start_time = time.perf_counter()
         num_tokens = params.num_tokens
-        if self._alpha_updater is not None:
-            _alpha_due = getattr(self.eviction_strategy, "alpha_update_due", None)
-            if _alpha_due is None or _alpha_due():
-                self._alpha_updater(
-                    *self._profile_token_counts(), self.session_registry.summary()
+        if self._profile_printer is not None:
+            _profile_due = getattr(self.eviction_strategy, "profile_due", None)
+            if _profile_due is None or _profile_due():
+                self._profile_printer(
+                    self._per_workload_token_count(), self.session_registry.summary()
                 )
         leaves = list(self.evictable_leaves)
         eviction_heap = [
@@ -756,7 +756,7 @@ class RadixCache(BasePrefixCache):
         """一次性内容判定：优先用策略口径（SimpleHybrid 有多轮/单轮之分）。
 
         非 SimpleHybrid 策略没有 is_one_shot，退回旧规则（is_decode 或随机单轮）。
-        计数与淘汰必须用同一判定，否则 alpha 的分母口径与实际淘汰会互相打架。
+        计数与淘汰必须用同一判定，否则 profile 的分母口径与实际淘汰会互相打架。
         """
         fn = getattr(self.eviction_strategy, "is_one_shot", None)
         if fn is not None:
@@ -802,7 +802,7 @@ class RadixCache(BasePrefixCache):
         返回 {label: {"total": t, "one_shot": o}}；
         one_shot = 该 workload 中一次性内容的 token（random 整行、
         struct 的 response 段；多轮恒为 0）。
-        Σ(total − one_shot) 即 alpha 的可调度分母，见 _schedulable_per_alpha_key。
+        Σ(total − one_shot) 即 profile 里的可调度占用。
         """
         out: dict = {}
         stack = [self.root_node]
@@ -903,22 +903,6 @@ class RadixCache(BasePrefixCache):
                 out[tag] = out.get(tag, 0) + len(child.key)
                 stack.append(child)
         return out
-
-    def _schedulable_per_alpha_key(self, counts: dict) -> dict:
-        """alpha 分母：可调度容量 = total − one_shot，按 alpha_key 聚合。
-        workload label 与 alpha_key 只在 random 上不同，而 random 整行
-        one-shot（total − one_shot == 0）自然落空——分母纯度由构造保证。"""
-        sched: dict = {}
-        for label, rec in counts.items():
-            s = rec["total"] - rec["one_shot"]
-            if s > 0:
-                sched[label] = sched.get(label, 0.0) + s
-        return sched
-
-    def _profile_token_counts(self):
-        """一次遍历给出两份口径：(alpha 可调度容量, workload 占用)。"""
-        counts = self._per_workload_token_count()
-        return self._schedulable_per_alpha_key(counts), counts
 
     def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:
         if self.disable:

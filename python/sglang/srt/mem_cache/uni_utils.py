@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 # SPDX-License-Identifier: Apache-2.0
 from enum import Enum
 
-# 单轮 workload 没有「下一轮」，其队列级权重由 alpha（实测命中效率）承担。
+# 单轮 workload 没有「下一轮」，节点级只保留位置项。
 
 
 class SimpleHybridTaskType(str, enum.Enum):
@@ -71,13 +71,14 @@ def session_type_to_queue_tag(session_type: SessionType) -> SimpleHybridQueueTag
 
 
 # ---------------------------------------------------------------------------
-# SimpleHybrid 的三组可调参数
+# SimpleHybrid 的可调参数组
 #
-#   AlphaParams   : alpha 在线权重的反馈控制（全局、每 update_interval 跑一次）
-#   RrParams      : Agentic 会话级轮询配额（跨会话公平）
-#   SlruParams    : SLRU 的共享会话数阈值（决定 one-shot 分界与保护范围）
+#   RrParams        : Agentic 会话级轮询配额（跨会话公平）
+#   SlruParams      : SLRU 的共享会话数阈值（决定 one-shot 分界与保护范围）
+#   TlruParams      : T-LRU 的尾部预算（QAGENT 候选修正）
+#   MultiTurnParams : 多轮对话（QCHAT）带内权重
 # 用 dataclass 而不是裸 kwargs，是为了让 `eviction_policy_config` 有层级、能校验、能整体
-# 配置只接受 {"alpha":{...},"rr":{...},"slru":{...}} 分组形式。
+# 配置只接受 {"rr":{...},"slru":{...},"tlru":{...},"mt":{...}} 分组形式。
 # ---------------------------------------------------------------------------
 
 
@@ -98,56 +99,6 @@ def _coerce_params(cls, value, *, name: str):
     raise TypeError(
         f"{name} must be {cls.__name__}, dict or None, got {type(value).__name__}."
     )
-
-
-DEFAULT_ALPHA_BALANCE = {
-    "chat": 1.0,
-    "agentic": 1.0,
-    "struct": 1.0,
-    "random": 1.0,
-}
-
-
-@dataclasses.dataclass
-class AlphaParams:
-    """alpha 在线权重的反馈控制参数。
-
-    `balance` 是各队列的初始权重；运行时由 update_alpha_balance() 按命中效率改写，
-    三个稳定性约束（容量份额下限 / 单步限速 / 温度+EMA）都在这里配置。
-    """
-
-    update_interval: float = 30.0  # 秒；alpha 重算与 profile 打印的间隔
-    min_cap_share: float = 0.02  # eff 分母下限，避免份额趋零时爆炸
-    max_alpha_step: float = 3.0  # 单次更新允许的最大倍数变化
-    smooth: float = 0.7  # EMA 中旧值保留权重
-    temperature: float = 0.5  # (1/temperature) 次幂放大
-    balance: Dict[str, float] = dataclasses.field(
-        default_factory=lambda: dict(DEFAULT_ALPHA_BALANCE)
-    )
-
-    def __post_init__(self):
-        # 浅拷贝 + 补齐缺省键：外部传入的字典不与自己共享引用（内部会就地改 balance），
-        # 只给部分队列（如 {"chat": 2.0}）时其余队列仍回落到 1.0。
-        merged = dict(DEFAULT_ALPHA_BALANCE)
-        merged.update(self.balance)
-        self.balance = merged
-        if self.update_interval <= 0:
-            raise ValueError(f"update_interval must be > 0, got {self.update_interval}")
-        if self.min_cap_share <= 0:
-            raise ValueError(f"min_cap_share must be > 0, got {self.min_cap_share}")
-        if self.max_alpha_step < 1.0:
-            raise ValueError(f"max_alpha_step must be >= 1, got {self.max_alpha_step}")
-        if not 0.0 <= self.smooth <= 1.0:
-            raise ValueError(f"smooth must be in [0, 1], got {self.smooth}")
-        if self.temperature <= 0:
-            raise ValueError(f"temperature must be > 0, got {self.temperature}")
-
-    @classmethod
-    def from_any(cls, value=None) -> "AlphaParams":
-        return _coerce_params(cls, value, name="alpha")
-
-    def as_dict(self) -> dict:
-        return dataclasses.asdict(self)
 
 
 @dataclasses.dataclass
@@ -271,7 +222,7 @@ class MultiTurnParams:
 
     带内权重 1 − prob(e) = CDF(elapsed; μ, σ)，μ/σ 取
     ``TASK_CONFIG[MULTI_TURN_CHAT]``（UniCache 原机制，μ=4.77 / σ=1.279）；
-    带内排序不乘 alpha——QCHAT 带内 alpha 恒同，乘不乘排序结果一致。
+    带内排序不乘其他队列的权重——QCHAT 带内语义等价于全局 victim_key。
     enabled 默认 True：mt 改写器只在 victim 落入 QCHAT 带时接管
     （调用链 applies_to 门禁），带内语义与全局 victim_key 等价，
     差异仅在 tie-break=LRU，默认不改变淘汰分布。
@@ -324,10 +275,10 @@ def _cached_lognorm_cdf(x: float, mu: float, sigma: float) -> float:
     return 0.5 * (1.0 + math.erf(z))
 
 
-   # (mu, sigma, alpha_key) per multi-turn workload type
+   # (mu, sigma) per multi-turn workload type
 TASK_CONFIG = {
-    SimpleHybridTaskType.MULTI_TURN_CHAT: (4.77, 1.279, "chat"),
-    SimpleHybridTaskType.MULTI_TURN_AGENTIC: (1.81, 1.092, "agentic"),
+    SimpleHybridTaskType.MULTI_TURN_CHAT: (4.77, 1.279),
+    SimpleHybridTaskType.MULTI_TURN_AGENTIC: (1.81, 1.092),
 }
 
 # profile/记账用的四类工作负载标签（顺序即打印顺序）。
@@ -336,15 +287,9 @@ WORKLOAD_LABELS = ("chat", "agentic", "struct", "random")
 
 def workload_label_of(task_type) -> str:
     """把任务类型映射到四类工作负载标签。"""
-    return alpha_key_of(task_type)
-
-
-def alpha_key_of(task_type) -> str:
-    """Map a task type to one of the four workload keys."""
-    cfg = TASK_CONFIG.get(task_type)
-    if cfg is not None:
-        return cfg[2]
     return {
+        SimpleHybridTaskType.MULTI_TURN_CHAT: "chat",
+        SimpleHybridTaskType.MULTI_TURN_AGENTIC: "agentic",
         SimpleHybridTaskType.STRUCT_SINGLE_TURN: "struct",
         SimpleHybridTaskType.RANDOM_SINGLE_TURN: "random",
     }.get(task_type, "chat")

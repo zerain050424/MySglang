@@ -307,7 +307,6 @@ class RealBackend:
         strategy = self.cache.eviction_strategy
         snap = None
         victim_src = dict(getattr(strategy, "_victim_sources", {}) or {})
-        alpha = dict(getattr(getattr(strategy, "alpha", None), "balance", {}) or {})
         slru = getattr(strategy, "slru_evict", None)
         return {
             "available": self._available(),
@@ -316,7 +315,6 @@ class RealBackend:
             "slru": slru.stats() if slru is not None else None,
             "slru_share_min": getattr(slru, "share_min", None),
             "victim_src": victim_src,
-            "alpha": alpha,
         }
 
     def close(self) -> None:
@@ -495,7 +493,6 @@ class FakeBackend:
             "available": self.pool - self.used,
             "evictable_size": self.used,
             "victim_src": {},
-            "alpha": {},
         }
 
     def close(self) -> None:

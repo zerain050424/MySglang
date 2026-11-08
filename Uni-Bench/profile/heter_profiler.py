@@ -2,15 +2,14 @@
 #
 # 定位：SimpleHybridStrategy 的「记账 + 渲染」从策略类中剥离出的独立观测对象
 #   1. 独占四本累计账：total_hit / total_evicted / total_evicted_one_shot /
-#      victim_sources（键为 workload 标签，"random" 单列，与 alpha 无关）；
+#      victim_sources（键为 workload 标签，"random" 单列）；
 #   2. summary() 渲染 [SimpleHybrid profile] 文本 —— 与旧 profile_summary
 #      逐字节等价（验收基线：diff == 0）；
 #   3. 输出口仅走 HeterLogger（heterlog 双写），本类不持文件句柄。
 #
 # 红线（本类绝不承载）：
 #   - 树遍历（_per_workload_token_count 等仍在 RadixCache —— 它们的输出
-#     是 alpha 更新的输入，属于策略数据面）；
-#   - alpha 在线更新（update_alpha_balance 仍在策略内）；
+#     是 profile 渲染的输入，属于策略数据面）；
 #   - 背景采样线程（occ-sampler / node-label dump 留在 RadixCache）。
 # 树状态由外部以参传入（workload_occ / session_summary），插件观测接口
 # duck-typed（stats() / share_min），本类对策略零反向引用。
@@ -34,7 +33,7 @@ class HeterProfiler:
     与 strategy 的契约：
       record_hit / record_evict / record_victim_source —— 三个记账收口由
       策略调用，本类只做累加，不做任何判定；
-      summary(workload_occ, session_summary, alpha_balance, slru_policy,
+      summary(workload_occ, session_summary, slru_policy,
       tlru_policy) —— 纯渲染，参数为只读引用。
     """
 
@@ -86,7 +85,6 @@ class HeterProfiler:
     def summary(self,
                 workload_occ,
                 session_summary=None,
-                alpha_balance=None,
                 slru_policy=None,
                 tlru_policy=None,
                 mt_policy=None) -> str:
@@ -96,14 +94,13 @@ class HeterProfiler:
           hit / evicted : 累计命中 / 淘汰 token，按 workload（与 occ 同口径，可比较）
           occ           : 该 workload 的全部驻留 token（含 response 段）；
                           `occ(-N)` 后缀 = 其中 one-shot 部分（random 整行、
-                          struct 的 response 段），alpha 调度不了
-          alpha         : 在线权重（random 不参与 alpha，恒为 "-"）
+                          struct 的 response 段）
 
-        Σocc == schedulable + Σone_shot（schedulable 即 alpha 分母）。
+        Σocc == schedulable + Σone_shot。
         多轮负载的 one_shot 恒为 0，不打印后缀；random 整行 one-shot。
         """
         from sglang.srt.mem_cache.uni_utils import WORKLOAD_LABELS
-        lines = ["  workload           hit     evicted             occ   alpha"]
+        lines = ["  workload           hit     evicted             occ"]
         pool = 0
         schedulable = 0
         for q in WORKLOAD_LABELS:
@@ -114,13 +111,11 @@ class HeterProfiler:
             schedulable += c["total"] - c["one_shot"]
             hit = self._total_hit_tokens.get(q, 0.0)
             evicted = self._total_evicted_tokens.get(q, 0.0)
-            alpha = alpha_balance.get(q)
-            alpha_s = f"{alpha:>6.3f}" if alpha is not None else "     -"
             occ_s = f"{c['total']:>10.0f}"
             if c["one_shot"]:
                 occ_s += f"(-{c['one_shot']:.0f})"
             lines.append(
-                f"  {q:8s} {hit:>12.0f} {evicted:>12.0f} {occ_s:>16s} {alpha_s}"
+                f"  {q:8s} {hit:>12.0f} {evicted:>12.0f} {occ_s:>16s}"
             )
         lines.append(
             f"  pool={pool:.0f} schedulable={schedulable:.0f} "

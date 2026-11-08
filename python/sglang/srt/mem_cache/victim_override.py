@@ -469,8 +469,7 @@ class MultiTurnEvictPolicy(VictimOverride):
 
     其中 reuse_prob = 1 - CDF 是 UniCache calculate_priority 对多轮任务
     的原有口径（lognormal，μ/σ 来自 TASK_CONFIG）；**越大越先淘汰**。
-    带内不乘 alpha：QCHAT 带内 alpha 恒同，排序结果不受影响（口径见
-    MultiTurnParams）。同权重时退化为段内 LRU（最久未访问先走）。
+    同权重时退化为段内 LRU（最久未访问先走）。
 
     【接管语义】
     带内归属按 **SessionType ∈ {CHAT, AGENTIC}** 判定（多轮两类负载），
@@ -525,7 +524,7 @@ class MultiTurnEvictPolicy(VictimOverride):
                 if stype == SessionType.AGENTIC
                 else SimpleHybridTaskType.MULTI_TURN_CHAT
             )
-            mu, sigma, _alpha_key = TASK_CONFIG[cfg_key]
+            mu, sigma = TASK_CONFIG[cfg_key]
             elapsed = time.monotonic() - node.last_access_time
             weight = _cached_lognorm_cdf(int(elapsed), mu, sigma)  # 1-prob(e)
             # 权重大者先走；同分退化为 LRU（更久未访问 = 更小的 last_access）

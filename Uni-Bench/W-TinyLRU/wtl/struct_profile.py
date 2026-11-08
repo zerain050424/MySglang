@@ -18,7 +18,7 @@ SLRU 的共享数账本（``SlruEvictPolicy.stats()``）、它实际给出的候
      "available":.., "evictable_size":.., "protected_size":..,
      "slru":{"slru_picks":..,"share_counted":..,"share_dedup":..},
      "slru_share_min":2,
-     "victim_src":{"one_shot":..,"qstruct":..,"global":..}, "alpha":{...},
+     "victim_src":{"one_shot":..,"qstruct":..,"global":..},
      "profile":"..."}
 
 分析侧（``wtl.analyze``）用它画两件事：
@@ -55,7 +55,6 @@ def _record(cache, tag: str, samples: list, calls: int) -> dict:
     slru = getattr(strategy, "slru_evict", None)
     snap = slru.stats() if slru is not None else None
     victim_src = dict(getattr(strategy, "_victim_sources", {}) or {})
-    alpha = dict(getattr(getattr(strategy, "alpha", None), "balance", {}) or {})
     rec = {
         "ts": round(time.time(), 3),
         "tag": tag,
@@ -69,7 +68,6 @@ def _record(cache, tag: str, samples: list, calls: int) -> dict:
         "slru": snap,
         "slru_share_min": getattr(slru, "share_min", None),
         "victim_src": victim_src,
-        "alpha": alpha,
     }
     return rec
 
@@ -127,9 +125,12 @@ def install(
             if with_profile_lines:
                 strategy = cache.eviction_strategy
                 try:
-                    sched, occ = cache._profile_token_counts()
-                    rec["profile"] = strategy.profile_summary(
-                        occ, cache.session_registry.summary()
+                    rec["profile"] = strategy.profiler.summary(
+                        cache._per_workload_token_count(),
+                        cache.session_registry.summary(),
+                        slru_policy=strategy.slru_evict,
+                        tlru_policy=strategy.tlru_evict,
+                        mt_policy=strategy.mt_evict,
                     )
                 except Exception:
                     rec["profile"] = None

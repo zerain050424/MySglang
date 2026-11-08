@@ -569,70 +569,7 @@ def test_one_shot_chain_stops_at_branch_and_lock():
           f"锁下的树不可淘汰, evictable={len(cache.evictable_leaves)}")
 
 
-def test_alpha_symmetry_stays_neutral():
-    """#4: 三队列效率/容量完全对称时，alpha 必须保持 1.0。
 
-    旧实现恒等于下界 0.001：eff = (h/Σh)/(cap+1e-3) 的量级是 1e-5，被绝对量
-    eps=1e-3 主导 -> r ~1e-2 -> temperature=0.2 即 5 次幂 -> ~1e-10 ->
-    lower(=0.001) > upper(~1e-10) -> max(lower, min(upper, x)) 退化成常数。
-    """
-    print("[11] alpha symmetry: identical efficiency must keep alpha == 1.0")
-    strategy = SimpleHybridStrategy()
-    hits = {"struct": 1000.0, "chat": 1000.0, "agentic": 1000.0}
-    cap = {"struct": 30000.0, "chat": 30000.0, "agentic": 30000.0}
-    for _ in range(6):
-        strategy._hit_tokens.clear()
-        strategy._hit_tokens.update(hits)
-        strategy.update_alpha_balance(cap)
-    got = {q: round(strategy.alpha.balance[q], 6) for q in hits}
-    print(f"      alpha={got}")
-    for q in hits:
-        a = strategy.alpha.balance[q]
-        check(abs(a - 1.0) < 1e-6, f"{q} alpha={a}, expected 1.0 (neutral)")
-
-
-def test_alpha_rewards_productive_queue():
-    """#4: 单位容量命中产出更高的队列 alpha 更高，且差异由数据驱动。"""
-    print("[12] alpha rewards the productive queue")
-    strategy = SimpleHybridStrategy()
-    hits = {"struct": 500.0, "chat": 2000.0, "agentic": 120000.0}
-    cap = {"struct": 38104.0, "chat": 18759.0, "agentic": 26982.0}
-    for _ in range(6):
-        strategy._hit_tokens.clear()
-        strategy._hit_tokens.update(hits)
-        strategy.update_alpha_balance(cap)
-    a = strategy.alpha.balance
-    print(f"      alpha={ {q: round(a[q], 6) for q in hits} }")
-    check(a["agentic"] > 1.0, f"agentic alpha={a['agentic']:.6f}, expected > 1")
-    check(a["struct"] < 1.0, f"struct alpha={a['struct']:.6f}, expected < 1")
-    check(a["agentic"] > a["struct"] * 10.0,
-          f"agentic({a['agentic']:.4f}) must exceed struct({a['struct']:.4f}) by 10x")
-    for q in hits:
-        check(0.001 <= a[q] <= 10.0, f"{q} alpha={a[q]} out of bounds")
-
-
-def test_alpha_punishes_zero_hit_capacity():
-    """#4: 占着容量但零命中的队列必须被降权。
-
-    旧实现 `if h > 0 and cap > 0` 直接把「有容量、无命中」的队列排除在统计外，
-    于是它的 alpha 原地不动 —— single 堆到 38% 容量却只贡献 0.48% 命中时，
-    恰恰拿不到任何惩罚。
-    """
-    print("[13] alpha punishes a queue that holds capacity with zero hits")
-    strategy = SimpleHybridStrategy()
-    hits = {"chat": 10000.0}          # struct 有容量，本窗口零命中
-    cap = {"struct": 30000.0, "chat": 30000.0}
-    # smooth=0.7 + 单步限速后收敛更慢，给足迭代次数
-    for _ in range(20):
-        strategy._hit_tokens.clear()
-        strategy._hit_tokens.update(hits)
-        strategy.update_alpha_balance(cap)
-    a = strategy.alpha.balance
-    print(f"      alpha={ {q: round(a[q], 6) for q in cap} }")
-    check(a["struct"] < 0.1,
-          f"zero-hit struct alpha={a['struct']:.6f}, expected pushed below 0.1")
-    check(a["chat"] > a["struct"] * 10.0,
-          f"chat({a['chat']:.4f}) must exceed struct({a['struct']:.4f}) by 10x")
 
 
 def test_single_score_is_time_invariant():
@@ -640,7 +577,7 @@ def test_single_score_is_time_invariant():
 
     bench 里每个 session 只发一次（build_hybrid_arrival_schedule 一 session
     一到达），单轮没有「下一轮」，600s 这个常数没有对应的生成过程。
-    单轮的队列级权重交给 alpha（由实测命中效率驱动），节点级只保留位置项。
+    单轮的节点级分数只保留位置项。
     """
     print("[14] single-turn score must not depend on idle time")
     strategy = SimpleHybridStrategy(max_offset=2048)
@@ -662,61 +599,7 @@ def test_single_score_is_time_invariant():
     )
 
 
-def test_starved_queue_does_not_explode():
-    """容量被压到极小的队列，效率不能因为分母趋零而爆炸。
 
-    实测到的锯齿：single 容量掉到 786/100000（0.8%）时，eff = 命中占比/容量占比
-    的分母趋零 -> r**5 顶到上界 10 -> 下一窗口它没有容量自然没命中 -> EMA 以
-    ×0.1 衰减回 0.001，形成 ~2.5 分钟周期的极限环（62 分钟内 alpha 跨度 10000×）。
-    对策：容量份额加下限（min_cap_share），使 eff 有界。
-    """
-    print("[15] starved queue must not explode to the upper bound")
-    strat = SimpleHybridStrategy()
-    hits = {"struct": 300.0, "agentic": 100000.0}   # struct 极少命中
-    cap = {"struct": 50.0, "agentic": 100000.0}     # struct 容量 0.05%
-    for _ in range(20):
-        strat._hit_tokens.clear()
-        strat._hit_tokens.update(hits)
-        strat.update_alpha_balance(cap)
-    a = strat.alpha.balance["struct"]
-    print(f"      alpha(struct) after 20 windows = {a:.4f}")
-    check(a < 0.1, f"starved struct alpha={a:.4f}, expected < 0.1 (no explosion)")
-
-
-def test_alpha_step_is_rate_limited():
-    """单次更新不得把 alpha 变化超过 max_alpha_step 倍，避免 Bang-Bang 跳变。"""
-    print("[16] per-update alpha change is rate limited")
-    strat = SimpleHybridStrategy()
-    strat.alpha.balance["struct"] = 0.001
-    strat._hit_tokens.update({"struct": 100000.0, "agentic": 1.0})
-    strat.update_alpha_balance({"struct": 50000.0, "agentic": 50000.0})
-    a = strat.alpha.balance["struct"]
-    limit = 0.001 * strat.alpha.max_alpha_step * 1.0001
-    print(f"      0.001 -> {a:.6f}  (limit {limit:.6f})")
-    check(a <= limit, f"alpha jumped 0.001 -> {a:.6f}, expected <= {limit:.6f}")
-
-
-def test_alpha_converges_under_steady_load():
-    """稳态负载下 alpha 必须收敛（尾部窗口不再变化），而不是持续极限环。"""
-    print("[17] alpha converges under a steady workload")
-    strat = SimpleHybridStrategy()
-    hits = {"struct": 500.0, "chat": 2000.0, "agentic": 120000.0}
-    cap = {"struct": 38104.0, "chat": 18759.0, "agentic": 26982.0}
-    hist = []
-    for _ in range(80):
-        strat._hit_tokens.clear()
-        strat._hit_tokens.update(hits)
-        strat.update_alpha_balance(cap)
-        hist.append(dict(strat.alpha.balance))
-    tail = hist[-5:]
-    got = {q: round(tail[-1][q], 6) for q in hits}
-    print(f"      converged alpha={got}")
-    for q in hits:
-        vals = [h[q] for h in tail]
-        check(
-            max(vals) - min(vals) < 1e-6,
-            f"{q} still oscillating in last 5 windows: {[round(v,6) for v in vals]}",
-        )
 
 
 def _sh_cache():
@@ -793,7 +676,7 @@ def test_workload_and_band_are_orthogonal():
 
 
 def test_workload_occ_accounting_adds_up():
-    """占用统计：Σ(total−one_shot) 必须等于 alpha 可调度分母（同一遍历推导）。"""
+    """占用统计：每个 workload 的 total/one_shot 必须与插入量对得上。"""
     print("[19] workload occupancy accounting must add up")
     cache = _sh_cache()
 
@@ -830,8 +713,6 @@ def test_workload_occ_accounting_adds_up():
     shared.share_sessions = cache.eviction_strategy.slru_evict.share_min
 
     wl = cache._per_workload_token_count()
-    cap = cache._schedulable_per_alpha_key(wl)
-    print(f"      capacity={ {k:int(v) for k,v in cap.items()} }")
     print(f"      workload={ {k:{kk:int(vv) for kk,vv in v.items()} for k,v in wl.items()} }")
 
     ag = wl.get("agentic", {})
@@ -851,23 +732,22 @@ def test_workload_occ_accounting_adds_up():
 
     tot_total = sum(v["total"] for v in wl.values())
     tot_os = sum(v["one_shot"] for v in wl.values())
-    check(abs((tot_total - tot_os) - sum(cap.values())) < 1e-9,
-          f"schedulable({tot_total - tot_os}) != alpha capacity({sum(cap.values())})")
     check(tot_total == 2200, f"total={tot_total}, expected 2200")
-    check("random" not in cap, "random 整行一次性，不得进入 alpha 分母")
+    check(tot_os == 100, f"one_shot={tot_os}, expected 100 (只有 random 整行)")
 
 
 def test_record_hit_uses_workload_label():
-    """命中记账按 workload；策略维度 _hit_tokens 仍按 alpha_key（行为不变）。"""
-    print("[20] record_hit: profile 按 workload 记账，策略仍按 alpha_key")
+    """命中记账按 workload 归因到 HeterProfiler，且每请求只记一次。"""
+    print("[20] record_hit: profile 按 workload 记账")
     st = SimpleHybridStrategy()
     req = SimpleNamespace(rid="r1", session_id="apps_123", extra_key=None)
     node = _mk_node(32, 0, task_type=SimpleHybridTaskType.RANDOM_SINGLE_TURN)
     st.record_hit(req, node, 500)
-    check(st._total_hit_tokens.get("random") == 500,
-          f"profile 记到 {list(st._total_hit_tokens)}, expected random=500")
-    check(st._hit_tokens.get("random") == 500,
-          f"策略维度应使用 random alpha_key, got {st._hit_tokens}")
+    check(st.profiler._total_hit_tokens.get("random") == 500,
+          f"profile 记到 {list(st.profiler._total_hit_tokens)}, expected random=500")
+    st.record_hit(req, node, 500)
+    check(st.profiler._total_hit_tokens.get("random") == 500,
+          "同一 rid 重复上报不得重复记账")
 
 
 def test_record_evict_one_shot_scalar():
@@ -988,13 +868,7 @@ def main():
         test_one_shot_still_drained_first,
         test_one_shot_order_by_tree_offset,
         test_one_shot_chain_stops_at_branch_and_lock,
-        test_alpha_symmetry_stays_neutral,
-        test_alpha_rewards_productive_queue,
-        test_alpha_punishes_zero_hit_capacity,
         test_single_score_is_time_invariant,
-        test_starved_queue_does_not_explode,
-        test_alpha_step_is_rate_limited,
-        test_alpha_converges_under_steady_load,
         test_workload_and_band_are_orthogonal,
         test_workload_occ_accounting_adds_up,
         test_record_hit_uses_workload_label,

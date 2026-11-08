@@ -109,7 +109,6 @@ def dirty(cache):
 
     strategy = cache.eviction_strategy
     # 人为把记账/计数打脏（等价于一轮真实 run 之后的状态）
-    strategy._hit_tokens["agentic"] = 1234.0
     strategy._total_hit_tokens["agentic"] = 5678.0
     strategy._total_evicted_tokens["agentic"] = 4321.0
     strategy._total_evicted_one_shot = 99.0
@@ -134,13 +133,11 @@ def test_reset_clears_everything():
     strategy = dirty(cache)
 
     check(len(cache.session_registry) > 0, "precondition: registry has sessions")
-    check(strategy._hit_tokens, "precondition: hit window non-empty")
 
     cache.reset()
 
     check(len(cache.session_registry) == 0,
           f"SessionRegistry must be empty after reset, got {len(cache.session_registry)}")
-    check(not strategy._hit_tokens, "hit window must be cleared")
     check(not strategy._total_hit_tokens, "total hit tokens must be cleared")
     check(not strategy._total_evicted_tokens, "total evicted tokens must be cleared")
     check(strategy._total_evicted_one_shot == 0.0, "one-shot scalar must be zeroed")

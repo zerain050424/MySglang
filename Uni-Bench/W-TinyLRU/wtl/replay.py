@@ -283,7 +283,6 @@ def run_replay(
         "slru": stats.get("slru") or {},
         "slru_share_min": stats.get("slru_share_min"),
         "victim_src": stats.get("victim_src") or {},
-        "alpha": stats.get("alpha") or {},
         "wall_s": round(time.perf_counter() - t0, 3),
     }
 

@@ -152,7 +152,6 @@ def make_cache(cache_cls, strategy, nodes):
     cache.eviction_strategy = strategy
     cache.session_registry = strategy.session_registry
     cache.victim_overrides = tuple(strategy.victim_overrides)
-    cache._alpha_updater = None
     cache.token_to_kv_pool_allocator = FakeAllocator()
     cache.kv_events = FakeEvents()
     cache.deleted = []
@@ -184,8 +183,8 @@ def _update_eviction_metrics(self, num_evicted, start_time):
     self.metrics.append(num_evicted)
 
 
-def _profile_token_counts(self):
-    return {}, {}
+def _per_workload_token_count(self):
+    return {}
 
 
 # --------------------------------------------------------------------------
@@ -205,7 +204,7 @@ def _bootstrap():
     cls = shc.SimpleHybridRadixCache
     cls._delete_leaf = _delete_leaf
     cls.update_eviction_metrics = _update_eviction_metrics
-    cls._profile_token_counts = _profile_token_counts
+    cls._per_workload_token_count = _per_workload_token_count
     return ep, shc, sys.modules["sglang.srt.mem_cache.base_prefix_cache"]
 
 

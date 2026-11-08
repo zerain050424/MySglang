@@ -4,9 +4,8 @@ from abc import ABC, abstractmethod
 import logging
 import time
 from collections import deque
-from typing import TYPE_CHECKING, Dict, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Tuple, Union
 from sglang.srt.mem_cache.uni_utils import (
-    AlphaParams,
     node_end_offset,
     node_num_tokens,
     RrParams,
@@ -16,9 +15,7 @@ from sglang.srt.mem_cache.uni_utils import (
     SlruParams,
     TlruParams,
     TASK_CONFIG,
-    WORKLOAD_LABELS,
     workload_label_of,
-    alpha_key_of,
     SimpleHybridTaskType,
     _cached_lognorm_cdf,
     task_type_of_tag,
@@ -141,8 +138,8 @@ class SimpleHybridStrategy(EvictionStrategy):
     """
       多级别队列进行淘汰
     """
-    # 衰减
-    HIT_DECAY = 0.95
+    # profile 打印的节流窗口（秒）
+    PROFILE_INTERVAL = 30.0
     # Cap on the once-per-request dedup set (bounds memory in long runs).
     MAX_SEEN_RIDS = 100_000
 
@@ -151,16 +148,15 @@ class SimpleHybridStrategy(EvictionStrategy):
         max_offset: int = 2048,
         *,
         force_agentic: bool = False,
-        alpha: Union[AlphaParams, dict, None] = None,
         rr: Union[RrParams, dict, None] = None,
         slru: Union[SlruParams, dict, None] = None,
         tlru: Union[TlruParams, dict, None] = None,
         mt: Union[MultiTurnParams, dict, None] = None,
     ):
         """
-        参数组由 AlphaParams / RrParams / SlruParams 承载（uni_utils）。
+        参数组由 RrParams / SlruParams / TlruParams / MultiTurnParams 承载（uni_utils）。
         配置只接受分组形式：
-            {"alpha": {...}, "rr": {...}, "slru": {...}}
+            {"rr": {...}, "slru": {...}, "tlru": {...}, "mt": {...}}
         未知键在参数组构造处直接报错。
 
         max_offset 不属于任何一组：它是 struct 复用分数里的位置项上界。
@@ -170,7 +166,6 @@ class SimpleHybridStrategy(EvictionStrategy):
         用途是让 QAGENT-only 的插件拿到 100% 流量；它不修改 session_type，因此
         分类器自身的统计仍然可测。
         """
-        self.alpha = AlphaParams.from_any(alpha)
         self.rr = RrParams.from_any(rr)
         self.slru = SlruParams.from_any(slru)
         self.tlru = TlruParams.from_any(tlru)
@@ -178,14 +173,14 @@ class SimpleHybridStrategy(EvictionStrategy):
         self.force_agentic = bool(force_agentic)
         self.max_offset = max_offset or 2048
 
-        # 在线更新α状态
-        self._last_update = time.monotonic()
-        self._hit_tokens: Dict[str, float] = {}
+        # profile 打印的节流窗口
+        self._last_profile = time.monotonic()
+        # 每请求只归因一次命中的去重账本
         self._seen_rids: set = set()
         self._rid_order: deque = deque()
         #   观测账本（累计命中/淘汰/one_shot/淘汰来源）已外挂至
         #   Uni-Bench/profile 的 HeterProfiler（方案 B）：记账/渲染同口径，
-        #   reset 随 reset_bookkeeping 委托清空；树采集与 alpha 更新仍在策略内。
+        #   reset 随 reset_bookkeeping 委托清空；树采集仍在策略内。
         self.profiler = HeterProfiler()
 
 
@@ -209,11 +204,10 @@ class SimpleHybridStrategy(EvictionStrategy):
     def reset_bookkeeping(self) -> None:
         """清空窗口/累计/来源计数（缓存 flush 与 reset 同源）。
 
-        不复位参数，也不动 `_last_update`：它只影响计时节流。
+        不复位参数，也不动 `_last_profile`：它只影响打印节流。
         跨 run 复用 server 时，若不清理，`[SimpleHybrid profile]` 打印的是
         上一轮与这一轮的混合值。
         """
-        self._hit_tokens.clear()
         self.profiler.reset()
         self._seen_rids.clear()
         self._rid_order.clear()
@@ -247,22 +241,16 @@ class SimpleHybridStrategy(EvictionStrategy):
     def _reuse_score(self, node) -> float:
         """calculate_priority() from HeterCache, with time.monotonic() as now."""
         task_type = self._task_type_of(node)
-        num_tokens = len(node.value) if node.value is not None else 0
         elapsed = time.monotonic() - node.last_access_time
         e = int(elapsed)
         cfg = TASK_CONFIG.get(task_type)
-        if cfg is not None: ## 多轮任务
-            mu, sigma, alpha_key = cfg
-            alpha = self.alpha.balance.get(alpha_key, 1.0) # 在线更新α
-            reuse_prob = 1.0 - _cached_lognorm_cdf(e, mu, sigma)
-            return alpha * reuse_prob
+        if cfg is not None:  # 多轮任务
+            mu, sigma = cfg
+            return 1.0 - _cached_lognorm_cdf(e, mu, sigma)
         if task_type == SimpleHybridTaskType.STRUCT_SINGLE_TURN:
-            alpha = self.alpha.balance.get("struct", 1.0)
             # HeterCache 的 offset 是块在序列中的绝对结束位置，不是 radix 片段长度。
             offset_factor = 1.0 - _node_end_offset(node) / (self.max_offset or 1)
-            offset_factor = max(0.0, min(1.0, offset_factor))
-            #  单轮分数 = alpha * 位置项。
-            return alpha * offset_factor
+            return max(0.0, min(1.0, offset_factor))
         return 0.0
 
 
@@ -321,11 +309,11 @@ class SimpleHybridStrategy(EvictionStrategy):
         """
         return (node.last_access_time,)
 
-    # ---- online alpha balancing ----
+    # ---- 命中/淘汰记账 ----
 
     def record_hit(self, req, node, hit_tokens: int) -> None:
         # Attribute a request's prefix-cache hit to its workload type, once
-        # per request; decay other types to keep the window recent.
+        # per request.
         rid = getattr(req, "rid", None)
         if rid is None or rid in self._seen_rids:
             return
@@ -335,12 +323,8 @@ class SimpleHybridStrategy(EvictionStrategy):
             self._seen_rids.discard(self._rid_order.popleft())
 
         task_type = self._task_type_of(node)
-        key = alpha_key_of(task_type)
-        for q in self._hit_tokens:
-            if q != key:
-                self._hit_tokens[q] *= self.HIT_DECAY ## 命中期间其他队列的窗口衰减
-        self._hit_tokens[key] = self._hit_tokens.get(key, 0.0) + hit_tokens
-# 累计命中（账本外挂：HeterProfiler）。
+        wkey = self.workload_of(node)
+        # 累计命中（账本外挂：HeterProfiler）。
         self.profiler.record_hit(wkey, hit_tokens)
         # 策略事件流：高频路径，DEBUG 级别短路
         if heterlog.enabled:
@@ -373,110 +357,24 @@ class SimpleHybridStrategy(EvictionStrategy):
         heterlog.victim_source(source, tokens)
 
 
-    def alpha_update_due(self) -> bool:
-        """调用点门禁：到 update_interval 才值得做一次全树口径计算。
+    def profile_due(self) -> bool:
+        """调用点门禁：到 PROFILE_INTERVAL 才值得做一次全树口径计算。
 
-        evict() 热路径先问这个，再做 _profile_token_counts() 的全树遍历，
-        避免在节流窗口内白白遍历整棵树（口径只在 alpha 真正更新时才被
-        消费）。maybe_update_alpha 内部保留同一判定，双保险且不改对外
-        语义；其他策略没有此方法，调用点 getattr 判空回退原路径。
+        evict() 热路径先问这个，再做 _per_workload_token_count() 的全树遍历，
+        避免在节流窗口内白白遍历整棵树。
         """
-        return time.monotonic() - self._last_update >= self.alpha.update_interval
+        return time.monotonic() - self._last_profile >= self.PROFILE_INTERVAL
 
-    def maybe_update_alpha(self, sched, workload_occ, session_summary=None) -> None:
-        # Time-guarded trigger for alpha rebalancing (called from evict()).
+    def maybe_print_profile(self, workload_occ, session_summary=None) -> None:
         now = time.monotonic()
-        if now - self._last_update < self.alpha.update_interval:
-            return ## 每经过一个时间间隔interval才进行更新（调用点已由 alpha_update_due 门禁预筛，这里双保险）
-        self._last_update = now
-        self.update_alpha_balance(sched)
-        # 每个 update_interval 秒打印一次各 workload profile 摘要（直接进 Profiler，无薄委托层）
+        if now - self._last_profile < self.PROFILE_INTERVAL:
+            return
+        self._last_profile = now
         _profile = self.profiler.summary(
             workload_occ,
             session_summary,
-            alpha_balance=self.alpha.balance,
             slru_policy=self.slru_evict,
             tlru_policy=self.tlru_evict,
             mt_policy=self.mt_evict,
         )
-        heterlog.info("AlphaBalance", f"[SimpleHybrid profile]\n{_profile}")
-
-    def update_alpha_balance(
-        self,
-        sched,
-        smooth: Optional[float] = None,
-        temperature: Optional[float] = None,
-    ) -> None:
-        """按「单位容量的命中产出」重算各队列 alpha（带稳定性约束）。
-        效率定义
-        --------
-            eff(q) = 命中占比(q) / max(容量占比(q), min_cap_share)
-                   = (hits_q/Σhits) / max(cap_q/Σcap, min_cap_share)
-
-        无量纲、量级 O(1)：>1 表示这一级用给定容量换到了超额命中。
-
-        为什么需要三个稳定性约束（实测 62 分钟的教训）
-        -------------------------------------------------
-        1. 容量份额下限：分母趋零时 eff 爆炸。struct 被压到 786/100000
-           (0.8%) 时，一个窗口里少量命中就让 eff 冲高 -> r**5 顶到上界 10；
-           下一窗口它没有容量自然没命中 -> EMA 逐窗 ×0.1 衰减回 0.001。
-           实测形成 ~2.5 分钟周期的锯齿，alpha 跨度 10000×。
-        2. 单步限速：即使信号极端，单次更新也不超过 max_alpha_step 倍，
-           避免 Bang-Bang 式跳变。
-        3. 升温 + 加重平滑：temperature 0.2 -> 0.5（5 次幂改平方），
-           smooth 0.1 -> 0.7（90% 新值改为 70% 保留旧值）。
-
-        参与规则
-        --------
-        只让「当前占着容量」的队列参与配额分配；但**不按命中过滤** ——
-        占着容量却零命中的队列必须参与（eff=0），否则它永远拿不到惩罚。
-        """
-        if smooth is None:
-            smooth = self.alpha.smooth
-        if temperature is None:
-            temperature = self.alpha.temperature
-
-        hits = dict(self._hit_tokens)
-        self._hit_tokens.clear()
-        if not hits:
-            return
-
-        caps = {q: c for q, c in sched.items() if c > 0}
-        if not caps:
-            return
-
-        total_hits = sum(hits.get(q, 0.0) for q in caps)
-        if total_hits <= 0:
-            return  # 本窗口没有任何命中，无反馈信号，保持现状
-        total_cap = sum(caps.values())
-        if total_cap <= 0:
-            return
-
-        # 容量份额加下限：使 eff 在 cap_share→0 时有界（约束 1）
-        cap_share = {
-            q: max(c / total_cap, self.alpha.min_cap_share) for q, c in caps.items()
-        }
-        eff = {q: (hits.get(q, 0.0) / total_hits) / cap_share[q] for q in caps}
-
-        keys = list(eff.keys())
-        vals = [eff[k] for k in keys]
-        mean_eff = sum(vals) / len(vals)
-        if mean_eff <= 0:
-            return
-
-        # 温度缩放 + 2σ 截断（抑制离群）
-        scaled = [(v / mean_eff) ** (1.0 / temperature) for v in vals]
-        mean_s = sum(scaled) / len(scaled)
-        std_s = (sum((x - mean_s) ** 2 for x in scaled) / len(scaled)) ** 0.5
-        lower = max(0.001, mean_s - 2 * std_s)
-        # upper 必须 >= lower，否则 max(lower, min(upper, x)) 会退化成常数
-        upper = max(lower, min(10.0, mean_s + 2 * std_s))
-
-        for q, val in zip(keys, scaled):
-            prev = self.alpha.balance.get(q, 1.0)
-            updated = smooth * prev + (1 - smooth) * val          # EMA
-            # 约束 2：单步限速，避免从下界一步跳到上界
-            lo, hi = prev / self.alpha.max_alpha_step, prev * self.alpha.max_alpha_step
-            updated = max(lo, min(hi, updated))
-            self.alpha.balance[q] = max(lower, min(upper, updated))
-    
+        heterlog.info("Profile", f"[SimpleHybrid profile]\n{_profile}")
