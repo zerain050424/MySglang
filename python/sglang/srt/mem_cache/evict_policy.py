@@ -354,14 +354,6 @@ class SimpleHybridStrategy(EvictionStrategy):
         heterlog.victim_source(source, tokens)
 
 
-    def profile_due(self) -> bool:
-        """调用点门禁：到 PROFILE_INTERVAL 才值得做一次全树口径计算。
-
-        evict() 热路径先问这个，再做 _per_workload_token_count() 的全树遍历，
-        避免在节流窗口内白白遍历整棵树。
-        """
-        return time.monotonic() - self._last_profile >= self.PROFILE_INTERVAL
-
     def _reconcile_interval(self, available: float, capacity: float) -> float:
         """配额账本的校准窗口：承压时缩短到 pressure_window_s，否则 30s。
 
