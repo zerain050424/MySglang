@@ -722,9 +722,6 @@ class RadixCache(BasePrefixCache):
 
         start_time = time.perf_counter()
         num_tokens = params.num_tokens
-        # Phase 3: refresh per-type alphas from recent hit efficiency.
-        # 同时传两份口径：alpha 用可调度容量，profile 用 workload 占用。
-        # 门禁：仅当 alpha 更新到期才做全树遍历（否则节流窗口内白发全线）。
         if self._alpha_updater is not None:
             _alpha_due = getattr(self.eviction_strategy, "alpha_update_due", None)
             if _alpha_due is None or _alpha_due():
