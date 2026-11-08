@@ -30,37 +30,40 @@ class SimpleHybridRadixCache(RadixCache):
 
         start_time = time.perf_counter()
         num_tokens = params.num_tokens
+        # 配额仲裁需要池容量与可用量（O(1)，不遍历树）；只在配额启用时读 allocator
+        available = capacity = 0.0
+        if self._needs_capacity:
+            available = self.token_to_kv_pool_allocator.available_size()
+            capacity = float(self.token_to_kv_pool_allocator.size)
         # profile 打印与配额账本校准共用一次全树遍历（两个时钟分开）
-        if self._occupancy_observer is not None:
-            if self._needs_capacity:
-                available = self.token_to_kv_pool_allocator.available_size()
-                capacity = float(self.token_to_kv_pool_allocator.size)
-            else:
-                available = capacity = 0.0
-            if self._occupancy_observer.wants_occupancy(
-                available, capacity, has_capacity=self._needs_capacity
-            ):
-                self._occupancy_observer.observe_occupancy(
-                    self._per_workload_token_count(),
-                    self.session_registry.summary(),
-                    available=available,
-                    capacity=capacity,
-                )
+        if self._occupancy_observer is not None and self._occupancy_observer.wants_occupancy(
+            available, capacity, has_capacity=self._needs_capacity
+        ):
+            self._occupancy_observer.observe_occupancy(
+                self._per_workload_token_count(),
+                self.session_registry.summary(),
+                available=available,
+                capacity=capacity,
+            )
 
         strategy = self.eviction_strategy
         num_evicted = 0
-        # one-shot 永远先清空（淘汰策略为带内LRU）；
-        # 清空后可调度内容按 victim_key 全局竞争（分数最低，同分 token 多者先走）。
+        # 三级淘汰：
+        #   阶段0 one-shot 带永远先清空（带内 LRU），不计配额
+        #   阶段1 配额启用时：点名队列 -> 队内挑选（SLRU 分档 / RR / MT）-> 兜底
+        #   否则保留原路径：全局 victim_key 竞争 + 改写器链
         while num_evicted < num_tokens:
-            # 下面两个分支必定会给victim赋值（one-shot 带 / victim_key基础候选）
-            # 第三分支直接 break。因此 victim 绝不跨轮复用、也绝不为None
-            # 复用上一轮已删除的 victim 会二次释放同一段 KV。
+            # 每个分支必定给出 victim 或 break；victim 绝不跨轮复用（会二次释放）
             leaves = self.evictable_leaves
             one_shot = [n for n in leaves if strategy.is_one_shot(n)]
             source = "global"
             if one_shot:
                 victim = min(one_shot, key=strategy.one_shot_key)
                 source = "one_shot"
+            elif leaves and strategy.quota.enabled:
+                victim, source = self._quota_victim(leaves, capacity)
+                if victim is None:
+                    break
             elif leaves:
                 victim = min(leaves, key=strategy.victim_key)
                 # 依次询问已注册的改写器（注册顺序即优先级，后者覆盖前者）。
@@ -91,6 +94,20 @@ class SimpleHybridRadixCache(RadixCache):
 
         self.update_eviction_metrics(num_evicted, start_time)
         return EvictResult(num_tokens_evicted=num_evicted)
+
+    def _quota_victim(self, leaves, capacity: float):
+        """阶段 1a/1b：按点名声次依次尝试，全部无候选才进兜底。
+
+        `leaves` 是当前可淘汰叶子（已排除锁定节点）。点名队列里可能一个叶子
+        都没有（全部 locked / 全是 one-shot / 标签全场集中到另一队列），此时
+        跳到下一个队列——否则配额会把淘汰卡死在“该削的削不了”上。
+        """
+        strategy = self.eviction_strategy
+        for queue in strategy.quota_ranking(capacity, self.page_size):
+            victim = strategy.quota_victim(queue, leaves)
+            if victim is not None:
+                return victim, f"quota:{queue}"
+        return strategy.quota_fallback(leaves), "quota:fallback"
 
     def _evict_one(self, node) -> int:
         """
