@@ -27,9 +27,12 @@ victim 与搅拌流**都**被强制标成 QAGENT（`force_agentic`），所以�
 
 | 臂 | 配置 | 说明 |
 |---|---|---|
-| `a0_control` | `{"force_agentic": true}` | 纯全局 `victim_key`（alpha × lognormal） |
+| `a0_control` | `{"force_agentic": true}` | 纯全局 `victim_key`（`_reuse_score` = lognormal 复用概率） |
 | `a1_rr` | `+ rr.fair_rr=true, kappa=0.5` | 会话级轮询，单会话最多削 `loss_cap(L)` |
-| `a2_tlru` | `+ tlru.enabled=true, threshold=943, Q=71` | tel-safe 尾巴先走 |
+
+插件形态的 T-LRU 臂（原 `a2_tlru`，`{"tlru": {...}}` 分组）已从主干移除，
+归档在分支 `exp/tlru-plugin-arm`（对应 tag `pre-alpha-removal`）。
+原生 T-LRU 臂见下节 `a3_native_tlru` / `a4_tlru_t90` / `a5_tlru_t200`。
 
 三臂共用同一棵 tree、同一套评分、同一个 one-shot 带（空）。差值可归因到插件。
 
@@ -82,14 +85,14 @@ victim 与搅拌流**都**被强制标成 QAGENT（`force_agentic`），所以�
 
 | 场景 | 运行数 | server 启动 | 预估 |
 |---|---|---|---|
-| 试点（`ARMS="a1_rr a2_tlru" RESUME_MODES=simultaneous BUDGETS=30000 SEEDS="42"`） | 2 | 2 | **~7 min** |
+| 试点（`ARMS="a1_rr a3_native_tlru" RESUME_MODES=simultaneous BUDGETS=30000 SEEDS="42"`） | 2 | 2 | **~7 min** |
 | 快跑（默认：3 臂 × 2 模式 × 2 预算 × 2 seed） | 24 | **6** | **~1 h** |
 | 全量（3 seed） | 36 | 6 | ~1.4 h |
 | 不复用（`GROUP_BY_SERVER=0`，24 次启动） | 24 | 24 | ~1.5 h |
 
 ```bash
 # 试点（7 分钟，先确认脚本/相位都对）
-ARMS="a1_rr a2_tlru" RESUME_MODES=simultaneous BUDGETS=30000 SEEDS="42" bash run_matrix.sh
+ARMS="a1_rr a3_native_tlru" RESUME_MODES=simultaneous BUDGETS=30000 SEEDS="42" bash run_matrix.sh
 
 # 快跑（默认）
 bash run_matrix.sh

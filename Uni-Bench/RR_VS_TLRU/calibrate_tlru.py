@@ -15,7 +15,7 @@ T-LRU 的两个参数都是 token 数（论文里是 block，需乘 page_size）
 用法：
     python calibrate_tlru.py \
         --data-path ../TaskData/AgentBankData/Qwen2.5-7B-Instruct/AgentBank_alfred_scale_5000_session_data.jsonl \
-        [--out configs/a2_tlru.json] [--fracs 0.10,0.25,0.50]
+        [--out configs/arm_a3_native_tlru.json] [--fracs 0.10,0.25,0.50]
 """
 
 from __future__ import annotations

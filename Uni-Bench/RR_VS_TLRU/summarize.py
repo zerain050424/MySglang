@@ -23,9 +23,9 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-ARM_ORDER = ["a0_control", "a1_rr", "a2_tlru", "a3_native_tlru",
+ARM_ORDER = ["a0_control", "a1_rr", "a3_native_tlru",
              "a4_tlru_t90", "a5_tlru_t200"]
-ARM_LABEL = {"a0_control": "A0 对照", "a1_rr": "A1 RR", "a2_tlru": "A2 T-LRU(插件)",
+ARM_LABEL = {"a0_control": "A0 对照", "a1_rr": "A1 RR",
              "a3_native_tlru": "A3 TLRU 原生 t=320",
              "a4_tlru_t90": "A4 TLRU 原生 t=90",
              "a5_tlru_t200": "A5 TLRU 原生 t=200"}

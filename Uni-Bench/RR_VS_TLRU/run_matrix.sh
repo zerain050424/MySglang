@@ -23,7 +23,7 @@ cd "$(dirname "$0")"
 BENCH_DIR="$(cd .. && pwd)"
 source "$BENCH_DIR/env.sh"
 
-ARMS=${ARMS:-"a0_control a1_rr a2_tlru"}
+ARMS=${ARMS:-"a0_control a1_rr"}
 RESUME_MODES=${RESUME_MODES:-"simultaneous batched"}
 BUDGETS=${BUDGETS:-"22000 30000"}
 SEEDS=${SEEDS:-"42 43"}
