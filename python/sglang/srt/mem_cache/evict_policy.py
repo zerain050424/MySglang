@@ -434,11 +434,19 @@ class SimpleHybridStrategy(EvictionStrategy):
         if now - self._last_profile < self.PROFILE_INTERVAL:
             return
         self._last_profile = now
+        quota_on = self.quota.enabled
         _profile = self.profiler.summary(
             workload_occ,
             session_summary,
             slru_policy=self.slru_evict,
             mt_policy=self.mt_evict,
+            quota_occ=self._occ if quota_on else None,
+            quota_targets=(
+                self.quota_targets(self._capacity) if quota_on else None
+            ),
+            quota_caps=(
+                queue_capacities(self.quota, self._capacity) if quota_on else None
+            ),
         )
         heterlog.info("Profile", f"[SimpleHybrid profile]\n{_profile}")
 

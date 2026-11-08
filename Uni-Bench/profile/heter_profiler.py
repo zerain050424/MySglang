@@ -86,20 +86,30 @@ class HeterProfiler:
                 workload_occ,
                 session_summary=None,
                 slru_policy=None,
-                mt_policy=None) -> str:
-        """返回各 workload 的 profile 摘要，打印形态不变。
+                mt_policy=None,
+                quota_occ=None,
+                quota_targets=None,
+                quota_caps=None) -> str:
+        """返回各 workload 的 profile 摘要。
 
         字段含义：
           hit / evicted : 累计命中 / 淘汰 token，按 workload（与 occ 同口径，可比较）
           occ           : 该 workload 的全部驻留 token（含 response 段）；
                           `occ(-N)` 后缀 = 其中 one-shot 部分（random 整行、
                           struct 的 response 段）
+          q_occ / target / cap : 只在启用跨队列配额时出现。q_occ 是配额口径的
+                          占用（排除 one-shot，含 locked）；target 是水填充后的
+                          有效目标；cap 是该队列的硬上限（k*C）。
 
         Σocc == schedulable + Σone_shot。
         多轮负载的 one_shot 恒为 0，不打印后缀；random 整行 one-shot。
         """
         from sglang.srt.mem_cache.uni_utils import WORKLOAD_LABELS
-        lines = ["  workload           hit     evicted             occ"]
+        quota_on = quota_caps is not None
+        header = "  workload           hit     evicted             occ"
+        if quota_on:
+            header += "       q_occ    target       cap"
+        lines = [header]
         pool = 0
         schedulable = 0
         for q in WORKLOAD_LABELS:
@@ -113,9 +123,18 @@ class HeterProfiler:
             occ_s = f"{c['total']:>10.0f}"
             if c["one_shot"]:
                 occ_s += f"(-{c['one_shot']:.0f})"
-            lines.append(
-                f"  {q:8s} {hit:>12.0f} {evicted:>12.0f} {occ_s:>16s}"
-            )
+            row = f"  {q:8s} {hit:>12.0f} {evicted:>12.0f} {occ_s:>16s}"
+            if quota_on:
+                if q in quota_caps:
+                    row += (
+                        f" {(quota_occ or {}).get(q, 0.0):>11.0f}"
+                        f" {(quota_targets or {}).get(q, 0.0):>9.0f}"
+                        f" {quota_caps[q]:>9.0f}"
+                    )
+                else:
+                    # random 不参与配额（整行 one-shot）
+                    row += f" {'-':>11s} {'-':>9s} {'-':>9s}"
+            lines.append(row)
         lines.append(
             f"  pool={pool:.0f} schedulable={schedulable:.0f} "
             f"one_shot_evicted={self._total_evicted_one_shot:.0f}"
