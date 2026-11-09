@@ -163,11 +163,10 @@ def make_cache(cache_cls, strategy, nodes):
     # 批次 C 之后账本与遥测归驱动层持有：假缓存要把引用接上
     cache.occupancy = strategy.occupancy
     cache.telemetry = strategy.telemetry
-    cache._needs_capacity = strategy.needs_capacity
+    # 配额仲裁恒需容量；观测编排归驱动层，本测试不采样占用
+    cache._needs_capacity = True
     cache.page_size = 1
     cache.evictable_size_ = 0
-    # 观测钩子：本测试只关心淘汰控制流，不采样占用
-    cache._occupancy_observer = None
     cache._hit_recorder = None
     cache._record_insert = None
     cache.force_agentic = False
@@ -208,7 +207,12 @@ def _update_eviction_metrics(self, num_evicted, start_time):
 
 
 def _per_queue_token_count(self):
-    return {}
+    """假树没法遍历：直接回显账本，让 reconcile 成为幂等操作。
+
+    否则驱动层新增的观测编排会用空快照把测试种下的 _occ 清零，
+    配额排名随之变空、只能走兜底。
+    """
+    return {q: {"total": v, "one_shot": 0.0} for q, v in self.occupancy.occ.items()}
 
 
 # --------------------------------------------------------------------------

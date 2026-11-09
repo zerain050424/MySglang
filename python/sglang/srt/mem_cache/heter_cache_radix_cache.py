@@ -10,6 +10,7 @@ import logging
 import time
 
 from sglang.srt.mem_cache import quota_selector
+from sglang.srt.mem_cache.quota_selector import queue_capacities
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams, EvictResult
 from sglang.srt.mem_cache.evict_policy import HeterCacheStrategy
 from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -44,15 +45,7 @@ class HeterCacheRadixCache(RadixCache):
             capacity = float(self.token_to_kv_pool_allocator.size)
 
         # 淘汰前同步全树占用，防止配额仲裁基于过期水位做出错误倾斜
-        if self._occupancy_observer is not None and self._occupancy_observer.wants_occupancy(
-            available, capacity, has_capacity=self._needs_capacity
-        ):
-            self._occupancy_observer.observe_occupancy(
-                self._per_queue_token_count(),
-                self.session_registry.summary(),
-                available=available,
-                capacity=capacity,
-            )
+        self._observe_occupancy(available, capacity)
 
         strategy = self.eviction_strategy
         num_evicted = 0
@@ -73,6 +66,45 @@ class HeterCacheRadixCache(RadixCache):
 
         self.update_eviction_metrics(num_evicted, start_time)
         return EvictResult(num_tokens_evicted=num_evicted)
+
+    def _observe_occupancy(self, available: float, capacity: float) -> None:
+        """时钟到期时做一次全树快照，同一份快照先校准账本、再渲染 profile。
+
+        编排留在驱动层：只有这里同时知道 allocator 水位、树与会话账本。
+        两个时钟分属两个协作者——校准（tracker）服务账本正确性，打印
+        （telemetry）服务观测；任一到期只遍历一次树。
+
+        Args:
+            available: allocator 当前可用 token。
+            capacity: 池容量；0 表示没拿到，此时校准走常规窗口。
+        """
+        tracker, telemetry = self.occupancy, self.telemetry
+        strategy = self.eviction_strategy
+        want_render = telemetry.wants_profile()
+        want_reconcile = tracker.wants_reconcile(
+            available,
+            capacity,
+            normal_window_s=telemetry.PROFILE_INTERVAL,
+            pressure_window_s=strategy.quota.pressure_window_s,
+            has_capacity=capacity > 0,
+        )
+        if not (want_render or want_reconcile):
+            return
+
+        snapshot = self._per_queue_token_count()
+        if want_reconcile:
+            tracker.reconcile(snapshot, capacity)
+        if not want_render:
+            return
+        telemetry.observe_profile(
+            snapshot,
+            self.session_registry.summary(),
+            slru_policy=strategy.slru_evict,
+            mt_policy=strategy.mt_evict,
+            quota_occ=tracker.occ,
+            quota_targets=strategy.quota_targets(tracker.occ, tracker.capacity),
+            quota_caps=queue_capacities(strategy.quota, tracker.capacity),
+        )
 
     def _pick_victim(self, leaves, capacity: float):
         """转发至 quota_selector 纯策略决策器。"""

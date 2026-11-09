@@ -19,7 +19,6 @@ import random
 from typing import TYPE_CHECKING, Tuple, Union
 from sglang.srt.mem_cache.quota_selector import (
     effective_targets,
-    queue_capacities,
     queue_ranking,
     resolve_chunk,
     struct_tier,
@@ -218,15 +217,8 @@ class HeterCacheStrategy(EvictionStrategy):
             self.session_registry, self.slru.share_min
         )
         self.mt_evict = MultiTurnEvictPolicy(self.mt, self.session_registry) if self.mt.enabled else None
-        # 节点生命周期观测器：命中记账与分裂继承。与队内选点分开登记——RR / MT
-        # 只在配额裁决里被调用，不参与节点生命周期；SLRU 两头都要（它的共享数
-        # 账本既喂 is_one_shot，也喂 struct 分级）。
-        self.node_observers = (self.slru_evict,)
 
-    def reset_bookkeeping(self) -> None:
-        """重置统计指标、去重状态与配额账本（缓存 flush / reset 时调用）。"""
-        self.telemetry.reset()
-        self.occupancy.reset()
+        self.node_observers = (self.slru_evict,)
 
     def _node_tag(self, node) -> HeterCacheNodeTag:
         """节点的生效标签（已收敛枚举）。force_agentic 开启时统一按 agentic 算。"""
@@ -235,17 +227,6 @@ class HeterCacheStrategy(EvictionStrategy):
         return HeterCacheNodeTag.coerce(getattr(node, "queue_tag", None))
 
     def get_priority(self, node: TreeNode) -> Tuple[int, float, float]:
-        """HeterCache 没有单节点全局排序，调用方应走配额裁决。
-
-        ``EvictionStrategy`` 把它定为抽象方法，必须有实现才能实例化；但配额
-        仲裁按队列与目标占用做水填充分配，不是按节点打分。这里直接报错，
-        避免调用方拿它当优先级堆用。
-
-        Raises:
-            NotImplementedError: 总是抛出。HeterCache 必须搭配
-                HeterCacheRadixCache 使用（它走 ``quota_selector.pick_victim``）；
-                挂到其它树上时 registry 的守卫会在启动期拦住。
-        """
         raise NotImplementedError(
             "HeterCacheStrategy has no single-node ordering; "
             "use quota arbitration (quota_selector.pick_victim) instead"
@@ -295,75 +276,11 @@ class HeterCacheStrategy(EvictionStrategy):
         """记录淘汰决策来源。"""
         self.telemetry.on_victim_source(source, tokens)
 
-    def wants_occupancy(self, available: float, capacity: float, *, has_capacity: bool) -> bool:
-        """是否需要做一次全树快照：校准时钟或打印时钟任一到期。
-
-        两个时钟分属两个协作者：校准（tracker）服务账本正确性，打印（telemetry）
-        服务观测。调用方拿到 True 后只遍历一次，快照同时喂两边。
-        """
-        if self.telemetry.wants_profile():
-            return True
-        return self.occupancy.wants_reconcile(
-            available,
-            capacity,
-            normal_window_s=self.telemetry.PROFILE_INTERVAL,
-            pressure_window_s=self.quota.pressure_window_s,
-            has_capacity=has_capacity,
-        )
-
-
     def record_insert(self, node) -> None:
         """新节点挂载时增量计入配额（仅在节点创建时调用，节点分裂时不触发）。"""
         if self.is_one_shot(node):
             return
         self.occupancy.insert(self._node_tag(node).queue_name, _node_num_tokens(node))
-
-    @property
-    def needs_capacity(self) -> bool:
-        """告诉缓存层：每次淘汰都必须注入 allocator 容量。
-
-        这不是开关，是驱动层的探测信号：``RadixCache`` 用
-        ``getattr(strategy, "needs_capacity", False)`` 决定要不要读
-        ``available_size()/size``。没有这个属性，capacity 恒为 0，
-        ``effective_targets`` 会把所有 target 算成 0，配额退化成
-        “每个队列都超上限”。
-        """
-        return True
-
-    def observe_occupancy(
-        self,
-        queue_occ: dict,
-        session_summary=None,
-        *,
-        available: float,
-        capacity: float,
-    ) -> None:
-        """全树快照的单一消费入口：同一份快照同时喂校准与渲染。
-
-        调用方（``RadioCache.evict``）已按 ``wants_occupancy`` 判过时钟，
-        这里再判一次是为了让该方法自身幂等——重复调用不会重复校准或刷屏。
-        """
-        if self.occupancy.wants_reconcile(
-            available,
-            capacity,
-            normal_window_s=self.telemetry.PROFILE_INTERVAL,
-            pressure_window_s=self.quota.pressure_window_s,
-            has_capacity=capacity > 0,
-        ):
-            self.occupancy.reconcile(queue_occ, capacity)
-        if not self.telemetry.wants_profile():
-            return
-        self.telemetry.observe_profile(
-            queue_occ,
-            session_summary,
-            slru_policy=self.slru_evict,
-            mt_policy=self.mt_evict,
-            quota_occ=self.occupancy.occ,
-            quota_targets=self.quota_targets(
-                self.occupancy.occ, self.occupancy.capacity
-            ),
-            quota_caps=queue_capacities(self.quota, self.occupancy.capacity),
-        )
 
     # ---- 跨队列配额 ----
 

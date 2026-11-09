@@ -270,10 +270,10 @@ class TreeNode: ## TreeNode 是基数树（RadixTree）的节点，每个节点�
         self.children = defaultdict(TreeNode)
         self.parent: TreeNode = None
         self.key: RadixKey = None
-        self.value: Optional[torch.Tensor] = None ##挂在在节点上的缓存值，通常是KV缓存的索引或数据片段
-        self.lock_ref = 0 ## 节点的锁引用计数，表示有多少请求正在使用该节点及其子树，防止被驱逐。
-        self.last_access_time = time.monotonic() ## 节点的最后访问时间，用于LRU等驱逐策略。
-        self.creation_time = time.monotonic() ## 节点的创建时间，用于统计和调试。
+        self.value: Optional[torch.Tensor] = None
+        self.lock_ref = 0 
+        self.last_access_time = time.monotonic()
+        self.creation_time = time.monotonic()
         self.hit_count = 0
         # store hash values of each pages
         self.hash_value: Optional[List[str]] = None 
@@ -284,11 +284,7 @@ class TreeNode: ## TreeNode 是基数树（RadixTree）的节点，每个节点�
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
 
-        # ---- HeterCache（多队列 / T-LRU / SLRU）相关状态 ----
-        # 注意：插件私有记账（SLRU 共享账）已改为外挂侧表
-        # （见 victim_override._SLRU_META，WeakKeyDictionary，
-        # 节点回收时条目自动消失），不再内嵌在 TreeNode 上。
-
+        # ---- HeterCache相关状态 ----
         self.abs_start = abs_start
         self.queue_tag = HeterCacheNodeTag.QTRANS ## 负载类型
         self.is_decode = False
@@ -362,12 +358,9 @@ class RadixCache(BasePrefixCache):
             self.occupancy = heter.occupancy
             self.telemetry = heter.telemetry
             self._hit_recorder = heter.record_hit
-            self._occupancy_observer = heter
             # 配额仲裁要 allocator 的可用量/容量判断承压；其它策略不碰 allocator，
             # 测试里的极简替身因此仍能跑。
             self._needs_capacity = True
-            # 实验开关：把节点直接标成 QAGENT，只改 queue_tag，不动 session_type，
-            # 分类器自身的统计仍然可测。
             self.force_agentic = heter.force_agentic
             # 节点生命周期观测器：命中记账与分裂继承（当前只有 SLRU 的共享数账本）。
             # 队内选点（RR / MT）不在这里——它们只由配额裁决调用。
@@ -379,7 +372,6 @@ class RadixCache(BasePrefixCache):
             self.occupancy = None
             self.telemetry = None
             self._hit_recorder = None
-            self._occupancy_observer = None
             self._needs_capacity = False
             self.force_agentic = False
             self.node_observers = ()
@@ -478,9 +470,11 @@ class RadixCache(BasePrefixCache):
         registry = getattr(self, "session_registry", None)
         if registry is not None:
             registry.clear()
-        reset_bookkeeping = getattr(self.eviction_strategy, "reset_bookkeeping", None)
-        if reset_bookkeeping is not None:
-            reset_bookkeeping()
+        # 观测协作者的状态同样属于「上一次 run」：账本与累计量一起清。
+        if self.occupancy is not None:
+            self.occupancy.reset()
+        if self.telemetry is not None:
+            self.telemetry.reset()
         # Initialize root with minimum priority so any real priority overrides it
         self.root_node = TreeNode(priority=-sys.maxsize)
         self.root_node.key = RadixKey(token_ids=array("q"), extra_key=None)
@@ -742,22 +736,7 @@ class RadixCache(BasePrefixCache):
 
         start_time = time.perf_counter()
         num_tokens = params.num_tokens
-        if self._occupancy_observer is not None:
-            # 承压判据要 allocator 的 O(1) 指标；只有配额启用时才取
-            if self._needs_capacity:
-                available = self.token_to_kv_pool_allocator.available_size()
-                capacity = float(self.token_to_kv_pool_allocator.size)
-            else:
-                available = capacity = 0.0
-            if self._occupancy_observer.wants_occupancy(
-                available, capacity, has_capacity=self._needs_capacity
-            ):
-                self._occupancy_observer.observe_occupancy(
-                    self._per_queue_token_count(),
-                    self.session_registry.summary(),
-                    available=available,
-                    capacity=capacity,
-                )
+        # 观测编排归 HeterCacheRadixCache.evict（它是唯一会挂观测协作者的缓存）。
         leaves = list(self.evictable_leaves)
         eviction_heap = [
             (self.eviction_strategy.get_priority(node), node) for node in leaves
