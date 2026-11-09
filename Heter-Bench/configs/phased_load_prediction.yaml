@@ -1,3 +1,4 @@
+# data_path 相对 Heter-Bench 根目录解析（不是本文件所在目录）。
 # Four consecutive workload phases for the automatic-label accuracy experiment.
 # Each phase consumes fresh sessions from the task data pool.
 tasks:

@@ -55,6 +55,11 @@ from typing import Any, Dict, List, Optional
 import aiohttp
 import yaml
 
+# 配置里的 data_path 一律相对本目录（Heter-Bench 根）解析。
+# 配置自身住在 configs/ 下，若按"配置文件所在目录"解析会得到
+# configs/TaskData/... —— 与实际布局差一层。
+HETER_BENCH_ROOT = Path(__file__).resolve().parent.parent
+
 
 # --------------------------------------------------------------------------
 # 数据加载
@@ -245,7 +250,7 @@ def build_hybrid_arrival_schedule(tasks_config: Dict[str, Any],
     for task in tasks_config.get("tasks", []):
         name = task["name"]
         data_path = task["data_path"]
-        # data_path 相对 tasks_config 所在目录解析（而非 CWD），更稳健
+        # data_path 相对 Heter-Bench 根目录解析（而非 CWD），与 wtl 的 UNIBENCH_ROOT 一致
         if base_dir and not os.path.isabs(data_path):
             data_path = os.path.join(base_dir, data_path)
 
@@ -677,7 +682,7 @@ async def main_async(args: argparse.Namespace) -> Dict[str, Any]:
         if args.phases_config:
             with open(args.phases_config, encoding="utf-8") as f:
                 phases_config = yaml.safe_load(f)
-            base_dir = str(Path(args.phases_config).resolve().parent)
+            base_dir = str(HETER_BENCH_ROOT)
             schedule = build_phased_arrival_schedule(phases_config, base_dir)
             print(f"[Heter-Bench] phased mode: {len(schedule)} sessions")
             tasks = [
@@ -695,7 +700,7 @@ async def main_async(args: argparse.Namespace) -> Dict[str, Any]:
             # ============================================================
             with open(args.tasks_config, encoding="utf-8") as f:
                 tasks_config = yaml.safe_load(f)
-            base_dir = str(Path(args.tasks_config).resolve().parent)
+            base_dir = str(HETER_BENCH_ROOT)
             schedule = build_hybrid_arrival_schedule(tasks_config, base_dir)
 
             print(f"[Heter-Bench] 混合负载模式：{len(tasks_config['tasks'])} 个 task，"

@@ -11,8 +11,7 @@
 # mu/sigma 取值来源：
 #   text / agentic / single / random —— 对齐 HeterCache 对应 tasks_config.yaml 的
 #     到达间隔实测拟合值；
-#   file / image / search —— HeterCache 未开源其到达间隔实测值，此处沿用其复用概率
-#     的 lognormal 拟合参数（vllm/core/evictor.py calculate_priority）作近似。
+
 tasks:
   - name: text            # ShareGPT-multi-turn-* / text_ShareGPT-multi-turn-*
     task_id: 0
