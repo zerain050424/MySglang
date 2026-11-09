@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Uni-Bench：对 sglang SimpleHybridRadixCache 做前缀缓存 benchmark。
+"""Heter-Bench：对 sglang HeterCacheRadixCache 做前缀缓存 benchmark。
 
 支持两种负载模式：
   1) 单负载模式（--data-path）：单个 session_data.jsonl 压测（向后兼容）。
@@ -26,13 +26,13 @@
   - 「比例」= 各 task 的 lambda_rate 之比（session 到达速率之比）。
 
 用法（单负载）：
-  python bench_unicache.py \
+  python bench_hetercache.py \
       --data-path /path/ShareGPT_..._session_data.jsonl \
       --base-url http://127.0.0.1:30000 \
       --concurrency 32 --output result/bench.json
 
 用法（混合负载，模仿 HeterCache Hybrid/tasks_config.yaml）：
-  python bench_unicache.py \
+  python bench_hetercache.py \
       --tasks-config hybrid_tasks_config.yaml \
       --base-url http://127.0.0.1:30000 \
       --concurrency 32 --arrival-scale 1 --wait-scale 1 --output result/hybrid.json
@@ -96,7 +96,7 @@ def load_sessions(path: str, num_sessions: int, seed: Optional[int] = None,
 def load_arrival_config(path: Optional[str]) -> Dict[str, Dict[str, Any]]:
     """读取到达间隔 YAML，返回 {task_name: {task_id, lambda_rate, mu, sigma, seed}}。
 
-    结构对齐 HeterCache 的 tasks_config.yaml（见 Uni-Bench/arrival_config.yaml）。
+    结构对齐 HeterCache 的 tasks_config.yaml（见 Heter-Bench/arrival_config.yaml）。
     仅单负载模式使用：根据 session_id 前缀查该负载类型的轮间 mu/sigma。
     """
     if not path:
@@ -679,7 +679,7 @@ async def main_async(args: argparse.Namespace) -> Dict[str, Any]:
                 phases_config = yaml.safe_load(f)
             base_dir = str(Path(args.phases_config).resolve().parent)
             schedule = build_phased_arrival_schedule(phases_config, base_dir)
-            print(f"[Uni-Bench] phased mode: {len(schedule)} sessions")
+            print(f"[Heter-Bench] phased mode: {len(schedule)} sessions")
             tasks = [
                 asyncio.create_task(run_session(
                     http, sem, ev.session, args, stats, url,
@@ -698,7 +698,7 @@ async def main_async(args: argparse.Namespace) -> Dict[str, Any]:
             base_dir = str(Path(args.tasks_config).resolve().parent)
             schedule = build_hybrid_arrival_schedule(tasks_config, base_dir)
 
-            print(f"[Uni-Bench] 混合负载模式：{len(tasks_config['tasks'])} 个 task，"
+            print(f"[Heter-Bench] 混合负载模式：{len(tasks_config['tasks'])} 个 task，"
                   f"共 {len(schedule)} 个 session（按 lambda_rate 比例混合）")
             for t in tasks_config["tasks"]:
                 print(f"    - {t['name']:16s} lambda_rate={t.get('lambda_rate', 1):>4} "
@@ -708,7 +708,7 @@ async def main_async(args: argparse.Namespace) -> Dict[str, Any]:
             # 屏障参与方 = 带 pause_after_turn 的 victim 会话数
             gate = BurstGate(
                 sum(1 for ev in schedule if ev.task_cfg.get("pause_after_turn")))
-            print(f"[Uni-Bench] base_url={args.base_url} concurrency={args.concurrency} "
+            print(f"[Heter-Bench] base_url={args.base_url} concurrency={args.concurrency} "
                   f"arrival_scale={args.arrival_scale} wait_scale={args.wait_scale} "
                   f"burst_gate={gate.expect}")
 
@@ -729,7 +729,7 @@ async def main_async(args: argparse.Namespace) -> Dict[str, Any]:
                         await asyncio.wait_for(
                             gate.event.wait(), timeout=args.burst_gate_timeout_s)
                     except asyncio.TimeoutError:
-                        print("[Uni-Bench] WARN: 等待 victim 全部 pause 超时，"
+                        print("[Heter-Bench] WARN: 等待 victim 全部 pause 超时，"
                               "提前开始 burst 窗口")
                     phase_marks["burst_start"] = time.perf_counter()
                     await asyncio.sleep(args.burst_duration_s)
@@ -737,7 +737,7 @@ async def main_async(args: argparse.Namespace) -> Dict[str, Any]:
                     phase_marks["burst_end"] = resume_gate.opened_at
 
                 burst_task = asyncio.create_task(_burst_window())
-                print(f"[Uni-Bench] burst/pause 启用：victims={gate.expect} "
+                print(f"[Heter-Bench] burst/pause 启用：victims={gate.expect} "
                       f"burst={args.burst_duration_s}s resume_mode={args.resume_mode} "
                       f"wave_size={args.resume_wave_size} "
                       f"wave_interval={args.resume_wave_interval_s}s")
@@ -771,10 +771,10 @@ async def main_async(args: argparse.Namespace) -> Dict[str, Any]:
             args.arrival_config = load_arrival_config(args.arrival_config)
             sessions = load_sessions(args.data_path, args.num_sessions, args.seed,
                                      shuffle=not args.no_shuffle)
-            print(f"[Uni-Bench] Loaded {len(sessions)} sessions from {args.data_path}")
-            print(f"[Uni-Bench] base_url={args.base_url} concurrency={args.concurrency} "
+            print(f"[Heter-Bench] Loaded {len(sessions)} sessions from {args.data_path}")
+            print(f"[Heter-Bench] base_url={args.base_url} concurrency={args.concurrency} "
                   f"wait_scale={args.wait_scale}")
-            print(f"[Uni-Bench] arrival tasks: {sorted(args.arrival_config)}")
+            print(f"[Heter-Bench] arrival tasks: {sorted(args.arrival_config)}")
 
             tasks = [
                 asyncio.create_task(run_session(http, sem, s, args, stats, url))
@@ -823,7 +823,7 @@ async def main_async(args: argparse.Namespace) -> Dict[str, Any]:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Uni-Bench: 前缀缓存 benchmark（单负载 / 混合负载）")
+    p = argparse.ArgumentParser(description="Heter-Bench: 前缀缓存 benchmark（单负载 / 混合负载）")
     # ---- 单负载模式 ----
     p.add_argument(
         "--data-path",
@@ -901,7 +901,7 @@ def main() -> None:
         )
 
     summary, stats = asyncio.run(main_async(args))
-    print("\n================ Uni-Bench 结果 ================")
+    print("\n================ Heter-Bench 结果 ================")
     for k, v in summary.items():
         print(f"  {k:24s}: {v}")
     print("================================================")
@@ -909,7 +909,7 @@ def main() -> None:
         Path(args.output).parent.mkdir(parents=True, exist_ok=True)
         with open(args.output, "w", encoding="utf-8") as f:
             json.dump(summary, f, ensure_ascii=False, indent=2)
-        print(f"[Uni-Bench] 结果已写入 {args.output}")
+        print(f"[Heter-Bench] 结果已写入 {args.output}")
         csv_path = str(args.output).rsplit(".json", 1)[0] + ".csv"
         if stats.rows:
             import csv as _csv
@@ -917,7 +917,7 @@ def main() -> None:
                 w = _csv.DictWriter(f, fieldnames=list(stats.rows[0].keys()))
                 w.writeheader()
                 w.writerows(stats.rows)
-            print(f"[Uni-Bench] 逐请求明细已写入 {csv_path} ({len(stats.rows)} rows)")
+            print(f"[Heter-Bench] 逐请求明细已写入 {csv_path} ({len(stats.rows)} rows)")
 
 
 if __name__ == "__main__":

@@ -32,7 +32,7 @@ from .synth import build as build_synth
 from .synth import write as write_synth
 from .trace import WORKLOADS
 
-HERE = Path(__file__).resolve().parents[1]  # Uni-Bench/W-TinyLRU
+HERE = Path(__file__).resolve().parents[1]  # Heter-Bench/W-TinyLRU
 
 
 @dataclass

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# 真机（L2）：逐臂起服务 → 跑 Uni-Bench 客户端 → 收 TTFT / 命中率 / struct 埋点。
+# 真机（L2）：逐臂起服务 → 跑 Heter-Bench 客户端 → 收 TTFT / 命中率 / struct 埋点。
 #
 #   ARMS="A0 A2 A3" MODES="hybrid sharegpt" TOKENS_LIST="100000" SEEDS="42" \
 #     bash scripts/run_online.sh
 #
 # 关键点
-#   * --enable-simple-hybrid 选 backend，--radix-eviction-policy 选策略，两者缺一不可；
+#   * --enable-heter-cache 选 backend，--radix-eviction-policy 选策略，两者缺一不可；
 #   * 每臂独立的 SGLANG_STRUCT_PROFILE，便于 analyze 分组；
 #   * 结果命名 bench_<arm>_<mode>_<tokens>k_s<seed>.json，analyze 从文件名解析元数据。
 #
@@ -33,7 +33,7 @@ SEEDS="${SEEDS:-42}"
 TOKENS_LIST="${TOKENS_LIST:-100000}"
 ARMS="${ARMS:-A0 A2 A3}"
 MODES="${MODES:-hybrid sharegpt}"
-CLIENT="${CLIENT:-$HERE/../bench_unicache.py}"
+CLIENT="${CLIENT:-$HERE/../bench_hetercache.py}"
 OUTDIR="${OUTDIR:-$HERE/result/online}"
 mkdir -p "$OUTDIR"
 
@@ -53,9 +53,9 @@ arm_policy() {
   case "$1" in
     A0) echo "lru|" ;;
     A1) echo 'slru|{"protected_threshold":2}' ;;
-    A2) echo 'simple_hybrid|{"slru":{"share_min":1000000}}' ;;
-    A3) echo 'simple_hybrid|{"slru":{"share_min":2}}' ;;
-    A4) echo 'simple_hybrid|{"slru":{"share_min":3}}' ;;
+    A2) echo 'heter_cache|{"slru":{"share_min":1000000}}' ;;
+    A3) echo 'heter_cache|{"slru":{"share_min":2}}' ;;
+    A4) echo 'heter_cache|{"slru":{"share_min":3}}' ;;
     *) echo "??|" ;;
   esac
 }
@@ -85,8 +85,8 @@ run_one() {
   [ -f "$out" ] && { echo "== skip $tag（已有结果）"; return 0; }
 
   local extra=()   # bash 4.3 兼容：展开时用 ${extra[@]+...}
-  if [ "$policy" = "simple_hybrid" ]; then
-    extra+=(--enable-simple-hybrid)
+  if [ "$policy" = "heter_cache" ]; then
+    extra+=(--enable-heter-cache)
     extra+=(--radix-eviction-policy-config "$cfg")
   fi
 

@@ -6,7 +6,7 @@
   本地 HeterCache 用 vllm 的 vllm.simulator.data_parser.prepare_simulator_data_streaming_jsonl
   把"多轮对话原始数据"转成逐 session、逐 turn 的 token 序列。服务器上没有 vllm，
   这里用纯 transformers 复刻同样的逻辑（输出格式逐字节一致），方便后续
-  bench_unicache.py 直接复用。
+  bench_hetercache.py 直接复用。
 
 【输出格式】（与 HeterCache 完全一致，一行一个 session）
   {"<session_id>": {

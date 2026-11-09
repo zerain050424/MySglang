@@ -2,7 +2,7 @@
 
 为什么需要它
 ------------
-``SimpleHybridStrategy`` 的复用分数（``_reuse_score``）用
+``HeterCacheStrategy`` 的复用分数（``_reuse_score``）用
 ``time.monotonic()``。离线回放若用真实时钟，
 整条 trace 会在几秒内跑完，所有 ``elapsed`` 都≈0：
 
@@ -17,7 +17,7 @@
     sglang.srt.mem_cache.radix_cache
     sglang.srt.mem_cache.base_prefix_cache
     sglang.srt.mem_cache.evict_policy
-    sglang.srt.mem_cache.simple_hybrid_radix_cache
+    sglang.srt.mem_cache.heter_cache_radix_cache
     sglang.srt.mem_cache.victim_override
     sglang.srt.mem_cache.uni_utils
 
@@ -34,7 +34,7 @@ _PATCHED_MODULES = (
     "sglang.srt.mem_cache.radix_cache",
     "sglang.srt.mem_cache.base_prefix_cache",
     "sglang.srt.mem_cache.evict_policy",
-    "sglang.srt.mem_cache.simple_hybrid_radix_cache",
+    "sglang.srt.mem_cache.heter_cache_radix_cache",
     "sglang.srt.mem_cache.victim_override",
     "sglang.srt.mem_cache.uni_utils",
 )

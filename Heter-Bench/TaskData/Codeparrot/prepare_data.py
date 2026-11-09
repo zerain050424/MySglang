@@ -16,8 +16,8 @@
      每个 solution 生成一条单轮对话 {id: "<prefix>-<uuid>-<idx>", conversations: [user, assistant]}。
 
 【会话标识】
-  id 仅用于关联同一会话的请求，不承载 SimpleHybrid 的 task_type。
-  发送时 bench_unicache.py 会把 id 原样作为 session_id，但前缀不再影响策略。
+  id 仅用于关联同一会话的请求，不承载 HeterCache 的 task_type。
+  发送时 bench_hetercache.py 会把 id 原样作为 session_id，但前缀不再影响策略。
 
 【用法】
   /root/sl_old/bin/python prepare_data.py \

@@ -1,15 +1,15 @@
 """``python -m wtl.serve`` —— 带 struct 埋点的 sglang 服务启动器。
 
 等价于 ``python -m sglang.launch_server``，但先安装 ``wtl.struct_profile``。
-**不修改框架代码**：埋点只是把 ``SimpleHybridRadixCache.evict`` 包了一层。
+**不修改框架代码**：埋点只是把 ``HeterCacheRadixCache.evict`` 包了一层。
 
-用法（在 Uni-Bench/W-TinyLRU 下）：
+用法（在 Heter-Bench/W-TinyLRU 下）：
 
     PY=/root/sl_old/bin/python
     SGLANG_STRUCT_PROFILE=result/struct_A3.jsonl \\
     SGLANG_STRUCT_PROFILE_TAG=A3_hybrid_100k \\
     $PY -m wtl.serve --model-path $MODEL \\
-        --enable-simple-hybrid --radix-eviction-policy simple_hybrid \\
+        --enable-heter-cache --radix-eviction-policy heter_cache \\
         --radix-eviction-policy-config '{"slru":{"share_min":2}}' \\
         --max-total-tokens 100000 --enable-metrics --port 30000
 

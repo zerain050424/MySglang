@@ -1,9 +1,9 @@
 # HeterProfiler —— HeterCache 策略级观测账本 + profile 渲染器（方案 B 解耦）
 #
-# 定位：SimpleHybridStrategy 的「记账 + 渲染」从策略类中剥离出的独立观测对象
+# 定位：HeterCacheStrategy 的「记账 + 渲染」从策略类中剥离出的独立观测对象
 #   1. 独占四本累计账：total_hit / total_evicted / total_evicted_one_shot /
 #      victim_sources（键为 workload 标签，"random" 单列）；
-#   2. summary() 渲染 [SimpleHybrid profile] 文本 —— 与旧 profile_summary
+#   2. summary() 渲染 [HeterCache profile] 文本 —— 与旧 profile_summary
 #      逐字节等价（验收基线：diff == 0）；
 #   3. 输出口仅走 HeterLogger（heterlog 双写），本类不持文件句柄。
 #
@@ -14,7 +14,7 @@
 # 树状态由外部以参传入（workload_occ / session_summary），插件观测接口
 # duck-typed（stats() / share_min），本类对策略零反向引用。
 #
-# 相对路径：本文件位于 Uni-Bench/profile/，向上一级到 Uni-Bench 再进 log。
+# 相对路径：本文件位于 Heter-Bench/profile/，向上一级到 Heter-Bench 再进 log。
 # 级别门槛：渲染入口走 heterlog.info，级别语义由 HeterLogger 统一控制。
 import os
 import sys

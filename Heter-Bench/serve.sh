@@ -2,11 +2,11 @@
 # 启动一个 sglang server。服务器环境修正见 env.sh。
 #
 # 用法：
-#   POLICY=simple_hybrid MAX_TOTAL_TOKENS=100000 bash serve.sh
+#   POLICY=heter_cache MAX_TOTAL_TOKENS=100000 bash serve.sh
 #   POLICY=lru          MAX_TOTAL_TOKENS=100000 bash serve.sh
 #
-# 注意：simple_hybrid 需要同时加 --enable-simple-hybrid（选择 SimpleHybridRadixCache）
-#      和 --radix-eviction-policy=simple_hybrid（选择 SimpleHybridStrategy），缺一不可。
+# 注意：heter_cache 需要同时加 --enable-heter-cache（选择 HeterCacheRadixCache）
+#      和 --radix-eviction-policy=heter_cache（选择 HeterCacheStrategy），缺一不可。
 set -eu
 BENCH_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=env.sh
@@ -22,10 +22,10 @@ LOG=${LOG:-$BENCH_DIR/result/log/server_${POLICY}_${MAX_TOTAL_TOKENS}.log}
 
 mkdir -p "$(dirname "$LOG")"
 
-# simple_hybrid 需要额外的 --enable-simple-hybrid
+# heter_cache 需要额外的 --enable-heter-cache
 EXTRA=""
-if [ "$POLICY" = "simple_hybrid" ]; then
-  EXTRA="--enable-simple-hybrid"
+if [ "$POLICY" = "heter_cache" ]; then
+  EXTRA="--enable-heter-cache"
 fi
 # 可选附加参数（如 --radix-cache-backend=classic），用 EXTRA_ARGS 传入
 EXTRA_ARGS=${EXTRA_ARGS:-}

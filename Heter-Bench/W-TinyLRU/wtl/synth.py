@@ -1,7 +1,7 @@
 """合成「共享前缀强度阶梯」trace（设计文档 §5.1，场景 A）。
 
-生成的是与 ``Uni-Bench/TaskData`` 同格式的 session_data.jsonl，
-因此可以直接喂给 ``wtl.replay`` / ``bench_unicache.py``：
+生成的是与 ``Heter-Bench/TaskData`` 同格式的 session_data.jsonl，
+因此可以直接喂给 ``wtl.replay`` / ``bench_hetercache.py``：
 
     {"<id>": {"id": ..., "num_turns": N, "turn_1": {...}, ...}}
 

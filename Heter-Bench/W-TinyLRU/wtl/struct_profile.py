@@ -2,7 +2,7 @@
 
 SLRU 的共享数账本（``SlruEvictPolicy.stats()``）、它实际给出的候选数
 （``slru_picks``）与 ``victim_src`` 需要落盘，但框架里没有 dump 点，
-而本实验约定「不改主体框架代码」。因此这里在 ``SimpleHybridRadixCache.evict``
+而本实验约定「不改主体框架代码」。因此这里在 ``HeterCacheRadixCache.evict``
 外面包一层：**只在 evict 返回之后再读状态**，不改变任何淘汰语义。
 
 开关（env）
@@ -92,18 +92,18 @@ def install(
     ) in ("1", "true", "True")
 
     try:
-        from sglang.srt.mem_cache.simple_hybrid_radix_cache import (
-            SimpleHybridRadixCache,
+        from sglang.srt.mem_cache.heter_cache_radix_cache import (
+            HeterCacheRadixCache,
         )
     except Exception as exc:  # pragma: no cover
-        logger.warning("[struct-profile] 无法导入 SimpleHybridRadixCache: %s", exc)
+        logger.warning("[struct-profile] 无法导入 HeterCacheRadixCache: %s", exc)
         return False
 
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
     fh = open(out, "a", encoding="utf-8", buffering=1)
 
-    orig_evict = SimpleHybridRadixCache.evict
+    orig_evict = HeterCacheRadixCache.evict
     st = {
         "last": 0.0,
         "calls": 0,
@@ -150,7 +150,7 @@ def install(
         _flush()
         return res
 
-    SimpleHybridRadixCache.evict = evict
+    HeterCacheRadixCache.evict = evict
 
     def _close() -> None:
         try:

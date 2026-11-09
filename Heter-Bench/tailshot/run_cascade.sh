@@ -17,7 +17,7 @@ mkdir -p "$OUT"
 run_one () {
   local CFG=$1 TAG=$2
   echo "=== [$TAG] server up $(date +%T) ==="
-  POLICY=simple_hybrid MAX_TOTAL_TOKENS=100000 PORT=$PORT \
+  POLICY=heter_cache MAX_TOTAL_TOKENS=100000 PORT=$PORT \
     LOG=$OUT/server_${TAG}.log EXTRA_ARGS="--attention-backend triton" \
     nohup bash "$BENCH/serve.sh" > /dev/null 2>&1 &
   for _ in $(seq 1 120); do
@@ -30,13 +30,13 @@ run_one () {
   fi
   echo "=== [$TAG] server healthy $(date +%T)，池=$(grep -o 'max_total_num_tokens=[0-9]*' "$OUT/server_${TAG}.log" | tail -1) ==="
 
-  if [ ! -f "$OUT/calib_simple_hybrid.json" ]; then
+  if [ ! -f "$OUT/calib_heter_cache.json" ]; then
     /root/sl_old/bin/python "$BENCH/calibrate.py" \
-      --base-url "http://127.0.0.1:$PORT" --output "$OUT/calib_simple_hybrid.json"
+      --base-url "http://127.0.0.1:$PORT" --output "$OUT/calib_heter_cache.json"
   fi
 
   echo "=== [$TAG] bench start $(date +%T) ==="
-  /root/sl_old/bin/python "$BENCH/bench_unicache.py" \
+  /root/sl_old/bin/python "$BENCH/bench_hetercache.py" \
     --tasks-config "$BENCH/tailshot/cascade_${CFG}.yaml" \
     --concurrency 32 --arrival-scale 1 --wait-scale 1 --seed "$SEED" \
     --base-url "http://127.0.0.1:$PORT" \

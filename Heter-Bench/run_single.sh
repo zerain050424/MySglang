@@ -5,7 +5,7 @@
 #
 # 用法（server 需已用同一 policy 启动，见 serve.sh）：
 #   bash run_single.sh lru             # → result/LRU/
-#   bash run_single.sh simple_hybrid   # → result/HeterCache/
+#   bash run_single.sh heter_cache   # → result/HeterCache/
 #   POLICY=lfu bash run_single.sh      # → result/LFU/
 #
 # 可调环境变量：
@@ -35,7 +35,7 @@ WAIT_SCALE=${WAIT_SCALE:-1}
 # policy → 输出目录名（LRU / HeterCache / ...）
 case "$POLICY" in
   lru)           DIR="LRU" ;;
-  simple_hybrid) DIR="HeterCache" ;;
+  heter_cache) DIR="HeterCache" ;;
   lfu)           DIR="LFU" ;;
   slru)          DIR="SLRU" ;;
   *)             DIR="$(echo "$POLICY" | tr 'a-z' 'A-Z')" ;;
@@ -55,12 +55,12 @@ echo ">>> 单一负载 benchmark | policy=$POLICY → $OUTDIR"
 echo ">>> num_sessions=$NUM_SESSIONS concurrency=$CONC wait_scale=$WAIT_SCALE"
 echo "=================================================="
 
-# run <name> <data_path> [bench_unicache.py 额外参数...]
+# run <name> <data_path> [bench_hetercache.py 额外参数...]
 run() {
   local name="$1" data="$2"; shift 2
   echo "--------------------------------------------------"
   echo ">>> [$DIR] $name"
-  "$PY" "$BENCH_DIR/bench_unicache.py" \
+  "$PY" "$BENCH_DIR/bench_hetercache.py" \
     --data-path "$data" \
     --base-url "$BASE_URL" \
     --output "$OUTDIR/bench_${name}.json" \

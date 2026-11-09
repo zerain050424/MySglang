@@ -8,7 +8,7 @@
 * ``policy`` 直接对应 ``--radix-eviction-policy``；
 * ``config`` 直接对应 ``--radix-eviction-policy-config``（即策略构造 kwargs）；
 * ``A0/A1`` 是上游能力边界（lru / slru）；
-* ``A2`` 是「只有 one-shot 带」的基线（simple_hybrid + share_min 调到不可达），
+* ``A2`` 是「只有 one-shot 带」的基线（heter_cache + share_min 调到不可达），
   ``A3`` 是主对象（两带 SLRU：one-shot 带 + 跨会话保护），``A4`` 是阈值消融。
 
 共享数阈值只有一个旋钮 ``slru.share_min``（框架侧 ``SlruParams``）：
@@ -68,16 +68,16 @@ ARMS: Dict[str, Arm] = {
         "上游分段 LRU：能力上限参照（无准入/无 aging）", False,
     ),
     "A2": Arm(
-        "A2", "hybrid_band_only", "simple_hybrid",
+        "A2", "hybrid_band_only", "heter_cache",
         {"slru": {"share_min": BAND_ONLY_SHARE_MIN}},
         "只有 one-shot 带：保护段不可达（隔离「保护机制」的贡献）", False,
     ),
     "A3": Arm(
-        "A3", "slru_two_band", "simple_hybrid", {"slru": {"share_min": 2}},
+        "A3", "slru_two_band", "heter_cache", {"slru": {"share_min": 2}},
         "主对象：两带 SLRU（one-shot 带 + 跨会话共享保护段 · 段内 LRU）", True,
     ),
     "A4": Arm(
-        "A4", "slru_min3", "simple_hybrid", {"slru": {"share_min": 3}},
+        "A4", "slru_min3", "heter_cache", {"slru": {"share_min": 3}},
         "消融：要 3 个会话命中过才进保护段（阈值敏感性）", True,
     ),
 }

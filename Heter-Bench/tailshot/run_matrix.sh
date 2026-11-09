@@ -32,7 +32,7 @@ run_one () {
   fi
 
   echo "=== [$TAG] bench start $(date +%T) ==="
-  /root/sl_old/bin/python "$BENCH/bench_unicache.py" \
+  /root/sl_old/bin/python "$BENCH/bench_hetercache.py" \
     --tasks-config "$CFG" --concurrency 32 \
     --arrival-scale 1 --wait-scale 1 \
     --base-url "http://127.0.0.1:$PORT" \
@@ -43,7 +43,7 @@ run_one () {
   sleep 15  # 等 GPU 释放
 }
 
-for POLICY in lru simple_hybrid; do
+for POLICY in lru heter_cache; do
   run_one $POLICY "$BENCH/tailshot/tailshot_control.yaml"      "${POLICY}_control"
   run_one $POLICY "$BENCH/tailshot/tailshot_F150.yaml"         "${POLICY}_F150"
   run_one $POLICY "$BENCH/tailshot/tailshot_F400.yaml"         "${POLICY}_F400"

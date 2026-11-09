@@ -1,5 +1,5 @@
 # =============================================================================
-# Uni-Bench 配置（被 run_all.sh source；也可手动 export 覆盖）
+# Heter-Bench 配置（被 run_all.sh source；也可手动 export 覆盖）
 # 用法：source config.sh 后运行 run_all.sh
 # =============================================================================
 
@@ -15,19 +15,21 @@ export PORT=${PORT:-30000}
 #   - AgentBank agentic:  TaskData/AgentBankData/Qwen2.5-7B-Instruct/AgentBank_alfred_scale_5000_session_data.jsonl
 #   - AgentBank 单轮 API: TaskData/AgentBankData/Qwen2.5-7B-Instruct/AgentBank_single_api_session_data.jsonl
 # 与 Qwen2.5 模型不匹配，仅用于验证链路，勿用于正式对比）
+# 远端路径：本目录已改名 Heter-Bench，但实验机上的 checkout 仍是
+# /root/sg-unicache/Uni-Bench。这条绝对路径故意保留，等服务端目录真正迁移时再改。
 export DATA=${DATA:-/root/sg-unicache/Uni-Bench/TaskData/SharedGPT-multi-turn/Qwen2.5-7B-Instruct/ShareGPT_cleaned_valid_deduplicated_session_data.jsonl}
 
 # 并发会话数（会话间并发，会话内串行）
 export CONC=${CONC:-32}
 
 # 混合负载配置（模仿 HeterCache TaskData/Hybrid/*/tasks_config.yaml）。
-# 用 bench_unicache.py --tasks-config 时生效；每个 task 的 lambda_rate 之比即混合比例。
+# 用 bench_hetercache.py --tasks-config 时生效；每个 task 的 lambda_rate 之比即混合比例。
 export HYBRID_TASKS_CONFIG=${HYBRID_TASKS_CONFIG:-$BENCH_DIR/hybrid_tasks_config.yaml}
 # 会话到达节奏缩放：1=HeterCache 真实 Poisson 到达；0=全部立即到达（等同单负载并发）。
 export ARRIVAL_SCALE=${ARRIVAL_SCALE:-1.0}
 
 # 实验矩阵
-export POLICIES=${POLICIES:-"lru simple_hybrid"}
+export POLICIES=${POLICIES:-"lru heter_cache"}
 export TOKENS_LIST=${TOKENS_LIST:-"50000 100000 200000"}   # KV pool token 上限（制造淘汰压力）
 
 # 轮间等待缩放（inter-turn 到达间隔）：

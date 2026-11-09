@@ -1,6 +1,7 @@
 """Tailshot 矩阵快照：完成的 run 逐个出受害者画像 + 当前运行状态。"""
 import csv, json, glob, os, statistics as S, re, time
 
+# 远端路径：实验机上仍为 /root/sg-unicache/Uni-Bench（本地目录已改名 Heter-Bench）。
 BASE = "/root/sg-unicache/Uni-Bench/result/tailshot"
 MATRIX = f"{BASE}/matrix.log"
 

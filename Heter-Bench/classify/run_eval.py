@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """会话级分类准确率主实验。
 
-用法（在 Uni-Bench/classify 下）：
+用法（在 Heter-Bench/classify 下）：
     /root/sl_old/bin/python run_eval.py --source trace
     /root/sl_old/bin/python run_eval.py --source task --max-per-workload 2000 \
         --gap-model per_workload

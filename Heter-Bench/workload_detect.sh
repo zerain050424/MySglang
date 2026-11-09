@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-UNI_BENCH_DIR="/root/sg-unicache/Uni-Bench"
+# 远端路径：实验机上的 checkout 仍叫 /root/sg-unicache/Uni-Bench，
+# 本地目录已改名 Heter-Bench。迁移时连同这里、config.sh、tailshot/ 下的同名路径一起改。
+HETER_BENCH_DIR="/root/sg-unicache/Uni-Bench"
 SRV_SESSION="unicache_srv"
 BENCH_SESSION="unicache_bench"
 SERVER_URL="http://127.0.0.1:30000"
 
-cd "${UNI_BENCH_DIR}"
+cd "${HETER_BENCH_DIR}"
 
 # ── 0) 清场 ────────────────────────────────────────────────
 rm -f result/node_labels_phased.jsonl result/phased_load_prediction_C.*
@@ -16,11 +18,11 @@ tmux has-session -t "${SRV_SESSION}" 2>/dev/null && tmux kill-session -t "${SRV_
 tmux has-session -t "${BENCH_SESSION}" 2>/dev/null && tmux kill-session -t "${BENCH_SESSION}" || true
 
 # ── 1) 起 server（tmux；约 40s 就绪）─────────────────────────
-tmux new -d -s "${SRV_SESSION}" "cd ${UNI_BENCH_DIR} \
+tmux new -d -s "${SRV_SESSION}" "cd ${HETER_BENCH_DIR} \
  && SGLANG_WORKLOAD_OCC_LOG=1 SGLANG_WORKLOAD_OCC_INTERVAL=30 \
-    SGLANG_NODE_LABEL_DUMP=${UNI_BENCH_DIR}/result/node_labels_phased.jsonl \
+    SGLANG_NODE_LABEL_DUMP=${HETER_BENCH_DIR}/result/node_labels_phased.jsonl \
     SGLANG_NODE_LABEL_INTERVAL=30 \
-    POLICY=simple_hybrid MAX_TOTAL_TOKENS=100000 \
+    POLICY=heter_cache MAX_TOTAL_TOKENS=100000 \
     bash serve.sh"
 
 echo "Waiting for server at ${SERVER_URL} ..."
@@ -37,9 +39,9 @@ done
 echo SERVER_READY
 
 # ── 2) 起 bench（另一 tmux；~15–18 min）─────────────────────
-tmux new -d -s "${BENCH_SESSION}" "cd ${UNI_BENCH_DIR} \
+tmux new -d -s "${BENCH_SESSION}" "cd ${HETER_BENCH_DIR} \
  && source env.sh \
- && \"\$PY\" bench_unicache.py --phases-config phased_load_prediction.yaml \
+ && \"\$PY\" bench_hetercache.py --phases-config phased_load_prediction.yaml \
       --base-url ${SERVER_URL} --concurrency 32 \
       --arrival-scale 1 --wait-scale 1 \
       --output result/phased_load_prediction_C.json \

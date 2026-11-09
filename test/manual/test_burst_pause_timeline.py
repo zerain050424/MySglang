@@ -24,12 +24,12 @@ import yaml
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BENCH_DIR = os.path.abspath(os.path.join(HERE, "..", "..", "Heter-Bench"))
-BENCH = os.path.join(BENCH_DIR, "bench_unicache.py")
+BENCH = os.path.join(BENCH_DIR, "bench_hetercache.py")
 BASE_YAML = os.path.join(BENCH_DIR, "RR_VS_TLRU", "configs", "burst_pause.yaml")
 
-spec = importlib.util.spec_from_file_location("bench_unicache", BENCH)
+spec = importlib.util.spec_from_file_location("bench_hetercache", BENCH)
 bench = importlib.util.module_from_spec(spec)
-sys.modules["bench_unicache"] = bench
+sys.modules["bench_hetercache"] = bench
 spec.loader.exec_module(bench)
 
 FAILS = []
@@ -98,7 +98,7 @@ def run_case(tasks_config: str, resume_mode: str):
         "--burst-gate-timeout-s", "60",
     ]
     old = sys.argv
-    sys.argv = ["bench_unicache"] + argv
+    sys.argv = ["bench_hetercache"] + argv
     try:
         args = bench.parse_args()
     finally:

@@ -1,6 +1,6 @@
 """评测脚本的自检：口径映射、trace 回填、重放语义、指标计算。
 
-    /root/sl_old/bin/python -m pytest Uni-Bench/classify/tests/test_session_accuracy.py -q
+    /root/sl_old/bin/python -m pytest Heter-Bench/classify/tests/test_session_accuracy.py -q
 """
 
 import os

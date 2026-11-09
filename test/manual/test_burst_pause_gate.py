@@ -11,12 +11,12 @@ import sys
 import time
 
 BENCH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "..", "..", "Heter-Bench", "bench_unicache.py"
+    os.path.dirname(os.path.abspath(__file__)), "..", "..", "Heter-Bench", "bench_hetercache.py"
 )
-spec = importlib.util.spec_from_file_location("bench_unicache", BENCH)
+spec = importlib.util.spec_from_file_location("bench_hetercache", BENCH)
 bench = importlib.util.module_from_spec(spec)
 # dataclass 需要在 exec 期间能通过 sys.modules[cls.__module__] 找到模块
-sys.modules["bench_unicache"] = bench
+sys.modules["bench_hetercache"] = bench
 spec.loader.exec_module(bench)
 ResumeGate = bench.ResumeGate
 

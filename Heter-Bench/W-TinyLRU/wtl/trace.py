@@ -1,8 +1,8 @@
-"""trace 读取与到达调度（与 ``Uni-Bench/bench_unicache.py`` 同语义）。
+"""trace 读取与到达调度（与 ``Heter-Bench/bench_hetercache.py`` 同语义）。
 
 为什么要自己重写而不是 import
 -----------------------------
-``bench_unicache.py`` 依赖 aiohttp / yaml，而离线回放只需 jsonl。
+``bench_hetercache.py`` 依赖 aiohttp / yaml，而离线回放只需 jsonl。
 这里复刻它三个可直接对齐的行为，**随机数与排序公式完全一致**：
 
 * ``load_sessions``：``{"<id>": {id, num_turns, turn_1..N}}`` 逐行读；
@@ -30,10 +30,10 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 # --------------------------------------------------------------------------
 # 路径
 # --------------------------------------------------------------------------
-PKG_ROOT = Path(__file__).resolve().parents[1]          # Uni-Bench/W-TinyLRU
+PKG_ROOT = Path(__file__).resolve().parents[1]          # Heter-Bench/W-TinyLRU
 UNIBENCH_ROOT = Path(os.environ.get("UNIBENCH_ROOT", PKG_ROOT.parent))
 
-# 负载注册表：name -> (相对 Uni-Bench 的 jsonl 路径, mu, sigma, 说明)
+# 负载注册表：name -> (相对 Heter-Bench 的 jsonl 路径, mu, sigma, 说明)
 WORKLOADS: Dict[str, Dict[str, Any]] = {
     "alfred": {
         "path": "TaskData/AgentBankData/Qwen2.5-7B-Instruct/AgentBank_alfred_scale_5000_session_data.jsonl",
@@ -58,7 +58,7 @@ WORKLOADS: Dict[str, Dict[str, Any]] = {
     "hybrid": {
         "path": "hybrid_tasks_config.yaml",  # 走 --tasks-config
         "mu": 0.0, "sigma": 0.0, "task": "hybrid",
-        "note": "四负载混合（1:1:1:1），与 Uni-Bench 在线实验同构",
+        "note": "四负载混合（1:1:1:1），与 Heter-Bench 在线实验同构",
     },
 }
 
@@ -95,7 +95,7 @@ class Request:
 
     @property
     def rid(self) -> str:
-        # 与 bench_unicache.py 完全一致，便于离线/在线逐请求对齐
+        # 与 bench_hetercache.py 完全一致，便于离线/在线逐请求对齐
         return f"{self.sid}_turn_{self.turn}"
 
 
@@ -109,10 +109,10 @@ class SessionArrival:
 
 
 # --------------------------------------------------------------------------
-# 与 bench_unicache.py 逐行对齐的两个小工具
+# 与 bench_hetercache.py 逐行对齐的两个小工具
 # --------------------------------------------------------------------------
 def stable_seed_from_str(s: str, base_seed: int = 0) -> int:
-    """字符串 -> 稳定 32-bit seed（sha256，与 bench_unicache 相同）。"""
+    """字符串 -> 稳定 32-bit seed（sha256，与 bench_hetercache 相同）。"""
     h = hashlib.sha256(s.encode()).hexdigest()
     return (int(h, 16) + base_seed) % (2**32 - 1)
 
@@ -137,7 +137,7 @@ def load_sessions(
     shuffle: bool = True,
     read_limit: int = 0,
 ) -> List[Dict[str, Any]]:
-    """读 session_data.jsonl；语义与 ``bench_unicache.load_sessions`` 相同。
+    """读 session_data.jsonl；语义与 ``bench_hetercache.load_sessions`` 相同。
 
     ``read_limit``：只读文件前 N 行再做 shuffle/截取。大文件（2~3GB 的
     AgentBank/ShareGPT）全量读入要几十 GB Python 对象，离线矩阵没必要；
@@ -252,7 +252,7 @@ def schedule_single_workload(
 ) -> List[Request]:
     cfg = WORKLOADS.get(workload, {})
     path = Path(data_path).resolve() if data_path else workload_path(workload)
-    # 与 bench_unicache 单负载模式一致：用同一个 seed 打乱再截取（否则跨进程不可复现）
+    # 与 bench_hetercache 单负载模式一致：用同一个 seed 打乱再截取（否则跨进程不可复现）
     sessions = load_sessions(
         path, num_sessions, seed=seed, shuffle=shuffle, read_limit=read_limit
     )
@@ -295,7 +295,7 @@ def schedule_hybrid(
     service_ms_per_1k: float = 0.0,
     num_sessions_override: int = -1,
 ) -> List[Request]:
-    """多负载混合（对齐 bench_unicache.build_hybrid_arrival_schedule）。"""
+    """多负载混合（对齐 bench_hetercache.build_hybrid_arrival_schedule）。"""
     config_path = Path(tasks_config).resolve()
     cfg = load_tasks_config(config_path)
     base_dir = config_path.parent

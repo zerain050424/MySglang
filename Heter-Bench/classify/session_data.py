@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence
 
-# 真值前缀表（与 Uni-Bench/evaluate_node_labels.py 一致）
+# 真值前缀表（与 Heter-Bench/evaluate_node_labels.py 一致）
 GT_PREFIXES = (
     ("apps_", "random"),
     ("alfred_", "agentic"),
@@ -220,7 +220,7 @@ def default_task_paths(sg_root: Path) -> List[Path]:
 
 
 # ---------------------------------------------------------------------------
-# 真实 trace（bench_unicache.py 输出的 CSV）
+# 真实 trace（bench_hetercache.py 输出的 CSV）
 # ---------------------------------------------------------------------------
 
 

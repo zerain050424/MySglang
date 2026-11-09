@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate window-level workload prediction from Uni-Bench outputs."""
+"""Evaluate window-level workload prediction from Heter-Bench outputs."""
 
 from __future__ import annotations
 

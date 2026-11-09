@@ -10,7 +10,7 @@ simclock.py     事件驱动仿真时钟（替换 sglang 模块内的 time）
 trace.py        session_data.jsonl 读取与到达调度生成
 synth.py        合成 trace：前缀阶梯（副）/ D-SLRU（主）
 prefix_stats.py 共享前缀 LCP 统计（M1 指标的基准）
-backends.py     回放后端：RealBackend（真 SimpleHybridRadixCache）/ FakeBackend（smoke）
+backends.py     回放后端：RealBackend（真 HeterCacheRadixCache）/ FakeBackend（smoke）
 metrics.py      保留度 / 后悔率 / 保护浪费率
 replay.py       离线回放驱动（L1）
 run_matrix.py   离线矩阵并发执行器

@@ -7,10 +7,10 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE))          # 让 import bench_unicache 可用
+sys.path.insert(0, str(HERE))          # 让 import bench_hetercache 可用
 
 import aiohttp
-import bench_unicache as bu            # 复用 Stats / run_session / one_request
+import bench_hetercache as bu            # 复用 Stats / run_session / one_request
 
 DATA = (
     HERE / "TaskData/SharedGPT-multi-turn/Qwen2.5-7B-Instruct"

@@ -6,7 +6,7 @@
 # 说明: tokenizer 用服务器的 Qwen2.5-7B-Instruct（与 sglang server 一致）
 # =============================================================================
 set -eu
-UB="$(cd "$(dirname "$0")/../.." && pwd)"          # Uni-Bench 根目录
+UB="$(cd "$(dirname "$0")/../.." && pwd)"          # Heter-Bench 根目录
 TOKENIZER="/root/autodl-tmp/model/Qwen2.5-7B-Instruct"  # 服务器模型（可改）
 PY="/root/sl_old/bin/python"                        # HeterCache 部署环境 python
 RAW="/root/autodl-tmp/TaskData/SharedGPT-multi-turn/ShareGPT_V3_unfiltered_cleaned_split.json"

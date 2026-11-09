@@ -1,4 +1,4 @@
-# Uni-Bench 到达间隔配置
+# Heter-Bench 到达间隔配置
 #
 # 每个 task 的 mu/sigma 是 inter-turn（轮间）到达间隔的 lognormal 参数（秒），
 # lambda_rate 是 session 到达率（Poisson，session/s）。

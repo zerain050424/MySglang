@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Uni-Bench 服务器环境（被 serve.sh / run_all.sh source）
+# Heter-Bench 服务器环境（被 serve.sh / run_all.sh source）
 # 1. 定义变量 PY，指向 HeterCache 部署的 venv 里的 python：/root/sl_old/bin/python。
 # 2. 优先从虚拟环境里加载ninja等
 # 3. 修改默认库的查找路径

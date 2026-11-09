@@ -13,7 +13,7 @@
   mathqa/mbpp/mbpp_before/mind2web/rearrange/strategyqa/triviaqa/webarena/webshop/alfred
 
 【会话标识】
-  session_id 仅用于关联同一会话的多轮请求，不承载 SimpleHybrid 的 task_type。
+  session_id 仅用于关联同一会话的多轮请求，不承载 HeterCache 的 task_type。
   data.sh 仍可挑选不同数据集构建混合负载，但负载类型由 benchmark 配置决定。
 
 【用法】

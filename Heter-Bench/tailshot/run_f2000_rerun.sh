@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -u
+# 远端路径：实验机上仍为 /root/sg-unicache/Uni-Bench（本地目录已改名 Heter-Bench）。
 BENCH=/root/sg-unicache/Uni-Bench
 OUT=$BENCH/result/tailshot_bigv
 cd /root/sg-unicache/Uni-Bench
@@ -18,7 +19,7 @@ run_one () {
     echo "=== [$TAG] server FAILED ==="; return 1
   fi
   echo "=== [$TAG] bench start $(date +%T) ==="
-  /root/sl_old/bin/python "$BENCH/bench_unicache.py" \
+  /root/sl_old/bin/python "$BENCH/bench_hetercache.py" \
     --tasks-config "$CFG" --concurrency 32 \
     --arrival-scale 1 --wait-scale 1 \
     --base-url "http://127.0.0.1:$PORT" \
@@ -28,5 +29,5 @@ run_one () {
   sleep 15
 }
 run_one lru "$BENCH/tailshot/tailshot_F2000.yaml" "lru_F2000"
-run_one simple_hybrid "$BENCH/tailshot/tailshot_F2000.yaml" "simple_hybrid_F2000"
+run_one heter_cache "$BENCH/tailshot/tailshot_F2000.yaml" "heter_cache_F2000"
 echo "=== F2000 RERUN DONE $(date +%T) ==="

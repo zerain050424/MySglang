@@ -7,7 +7,7 @@
     close()
 
 ``RealBackend``
-    在 CPU 上用真实 ``SimpleHybridRadixCache`` 跑（不加载模型），
+    在 CPU 上用真实 ``HeterCacheRadixCache`` 跑（不加载模型），
     参照 ``test/registered/unit/mem_cache/test_radix_cache_slru_accuracy.py`` 的
     极小 ``MHATokenToKVPool`` 构造法。只做两处**运行时插桩**（不改框架代码）：
 
@@ -91,7 +91,7 @@ def _node_path_info(node, root) -> tuple:
 # Real backend
 # ---------------------------------------------------------------------------
 class RealBackend:
-    """真实 ``SimpleHybridRadixCache`` 的离线回放后端（CPU，无需模型）。"""
+    """真实 ``HeterCacheRadixCache`` 的离线回放后端（CPU，无需模型）。"""
 
     supports_struct = False
 
@@ -109,7 +109,7 @@ class RealBackend:
             import torch  # noqa: F401
             radix = importlib.import_module("sglang.srt.mem_cache.radix_cache")
             cache_mod = importlib.import_module(
-                "sglang.srt.mem_cache.simple_hybrid_radix_cache"
+                "sglang.srt.mem_cache.heter_cache_radix_cache"
             )
             params_mod = importlib.import_module("sglang.srt.mem_cache.cache_init_params")
             base_mod = importlib.import_module("sglang.srt.mem_cache.base_prefix_cache")
@@ -168,13 +168,13 @@ class RealBackend:
             enable_kv_cache_events=False,
         )
 
-        base_cls = cache_mod.SimpleHybridRadixCache
+        base_cls = cache_mod.HeterCacheRadixCache
         hooks = self
 
         class _Instrumented(base_cls):  # type: ignore[misc, valid-type]
             """只读插桩：记录淘汰事件，不改变任何淘汰/释放行为。
 
-            ``_evict_one`` 只存在于 SimpleHybridRadixCache；当策略是 lru/slru 时
+            ``_evict_one`` 只存在于 HeterCacheRadixCache；当策略是 lru/slru 时
             （``--radix-eviction-policy lru`` 仍用同一个缓存类），淘汰走基类
             ``RadixCache.evict``，没有 "victim" 概念，此时把每次删除都记为 victim。
             """
@@ -183,7 +183,7 @@ class RealBackend:
                 self._wtl_victim = None
                 return super().evict(params)
 
-            def _evict_one(self, node):  # 仅 SimpleHybridRadixCache 有
+            def _evict_one(self, node):  # 仅 HeterCacheRadixCache 有
                 self._wtl_victim = node
                 return super()._evict_one(node)
 
@@ -202,7 +202,7 @@ class RealBackend:
         self._slru_mode = False  # 建好 cache 后再判定（见下）
         self._cache_cls = _Instrumented
         self.cache = _Instrumented(init_params)
-        # simple_hybrid 才带 SLRU 插件；lru/slru 臂没有，region 恒 0。
+        # heter_cache 才带 SLRU 插件；lru/slru 臂没有，region 恒 0。
         self._slru_mode = (
             getattr(self.cache.eviction_strategy, "slru_evict", None) is not None
         )

@@ -296,7 +296,7 @@ def test_bench_passes_only_completed_tool_calls(monkeypatch):
 
     bench_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "Heter-Bench"))
     sys.path.insert(0, bench_path)
-    import bench_unicache
+    import bench_hetercache
 
     sent_tool_calls = []
 
@@ -312,7 +312,7 @@ def test_bench_passes_only_completed_tool_calls(monkeypatch):
             "prefill_ms": 0.0,
         }
 
-    monkeypatch.setattr(bench_unicache, "one_request", fake_one_request)
+    monkeypatch.setattr(bench_hetercache, "one_request", fake_one_request)
     first_call = {"action": "move_ahead"}
     session = {
         "id": "alfred_test_session",
@@ -320,9 +320,9 @@ def test_bench_passes_only_completed_tool_calls(monkeypatch):
         "turn_1": {"input_ids": [1], "response_ids": [2], "tool_call": first_call},
         "turn_2": {"input_ids": [1, 2], "response_ids": [3], "tool_call": None},
     }
-    stats = bench_unicache.Stats()
+    stats = bench_hetercache.Stats()
     asyncio.run(
-        bench_unicache.run_session(
+        bench_hetercache.run_session(
             http=None,
             sem=asyncio.Semaphore(1),
             sess=session,

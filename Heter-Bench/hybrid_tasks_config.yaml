@@ -10,7 +10,7 @@
 #   - seed/task_id: 确定性打乱与 RNG（stable_seed = seed + task_id*1000）。
 #   - shuffle     : 是否打乱该负载自身 session 顺序（mashqa 同文档问题相邻可设 false）。
 #
-# data_path 相对本文件所在目录（Uni-Bench/）解析。
+# data_path 相对本文件所在目录（Heter-Bench/）解析。
 #
 # 本配置按 HeterCache 混合实验的默认比例：各负载 lambda_rate=1（1:1:1:1），
 # 覆盖四类异构负载：

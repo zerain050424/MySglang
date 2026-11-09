@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Uni-Bench 实验矩阵：policy × max_total_tokens，自动启停 server 并汇总命中率。
+# Heter-Bench 实验矩阵：policy × max_total_tokens，自动启停 server 并汇总命中率。
 #
 # 用法：
 #   bash run_all.sh
-#   POLICIES="lru simple_hybrid" TOKENS_LIST="50000 200000" bash run_all.sh
+#   POLICIES="lru heter_cache" TOKENS_LIST="50000 200000" bash run_all.sh
 #
-# 输出：Uni-Bench/result/bench_<policy>_<tokens>.json + 终端汇总表
+# 输出：Heter-Bench/result/bench_<policy>_<tokens>.json + 终端汇总表
 set -u
 
 BENCH_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -36,7 +36,7 @@ wait_health() {
 run_one() {
   local policy="$1" tokens="$2"
   local extra=""
-  [ "$policy" = "simple_hybrid" ] && extra="--enable-simple-hybrid"
+  [ "$policy" = "heter_cache" ] && extra="--enable-heter-cache"
 
   echo "=================================================="
   echo ">>> policy=$policy  max_total_tokens=$tokens"
@@ -58,7 +58,7 @@ run_one() {
     return 1
   fi
 
-  "$PY" "$BENCH_DIR/bench_unicache.py" \
+  "$PY" "$BENCH_DIR/bench_hetercache.py" \
     --data-path "$DATA" \
     --base-url "http://127.0.0.1:${PORT}" \
     --concurrency "$CONC" \
@@ -95,10 +95,10 @@ for p in sorted(glob.glob(os.path.join(outdir, "bench_*.json"))):
         d.get("num_errors"),
     ))
 
-print("\n=================== Uni-Bench 汇总 ===================")
+print("\n=================== Heter-Bench 汇总 ===================")
 print(f"{'file':38s} {'hit%':>7s} {'ttft_p50':>9s} {'ttft_p99':>9s} {'reqs':>7s} {'err':>5s}")
 for r in rows:
     print(f"{r[0]:38s} {str(r[1]):>7s} {str(r[2]):>9s} {str(r[3]):>9s} {str(r[4]):>7s} {str(r[5]):>5s}")
 print("=====================================================")
-print("提示：对比 simple_hybrid 与基线的 hit% 与 ttft；cache 越小差异应越明显。")
+print("提示：对比 heter_cache 与基线的 hit% 与 ttft；cache 越小差异应越明显。")
 PYEOF
