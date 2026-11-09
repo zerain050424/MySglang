@@ -170,13 +170,13 @@ class SLRUStrategy(EvictionStrategy):
         return (is_protected, node.last_access_time)
 
 
-class HeterCacheStrategy:
+class HeterCacheStrategy(EvictionStrategy):
     """HeterCache 多队列缓存淘汰策略。
 
-    不继承 ``EvictionStrategy``：基类只规定 ``get_priority``（单节点排序键），
-    而 HeterCache 的裁决来自配额仲裁（按队列与目标占用的水填充），根本不存在
-    一个跨队列可比的节点分数。硬实现一个只为满足抽象方法的 ``get_priority``
-    反而会误导调用方以为可以拿它当优先级堆用。
+    继承 ``EvictionStrategy`` 只为满足策略注册表与类型契约；基类唯一的抽象
+    方法 ``get_priority`` 在这里是显式拒绝——HeterCache 的裁决来自配额仲裁
+    （按队列与目标占用的水填充），不存在一个跨队列可比的节点分数，退回任何
+    默认序都是假语义。
 
     两层决策：
     1. 分带过滤：One-shot 节点（无跨轮复用价值）优先清理，不计入配额账本。
@@ -234,6 +234,22 @@ class HeterCacheStrategy:
             return HeterCacheNodeTag.QAGENT
         return HeterCacheNodeTag.coerce(getattr(node, "queue_tag", None))
 
+    def get_priority(self, node: TreeNode) -> Tuple[int, float, float]:
+        """HeterCache 没有单节点全局排序，调用方应走配额裁决。
+
+        ``EvictionStrategy`` 把它定为抽象方法，必须有实现才能实例化；但配额
+        仲裁按队列与目标占用做水填充分配，不是按节点打分。这里直接报错，
+        避免调用方拿它当优先级堆用。
+
+        Raises:
+            NotImplementedError: 总是抛出。HeterCache 必须搭配
+                HeterCacheRadixCache 使用（它走 ``quota_selector.pick_victim``）；
+                挂到其它树上时 registry 的守卫会在启动期拦住。
+        """
+        raise NotImplementedError(
+            "HeterCacheStrategy has no single-node ordering; "
+            "use quota arbitration (quota_selector.pick_victim) instead"
+        )
 
     def is_one_shot(self, node) -> bool:
         """判定节点是否属于 One-shot 带。
