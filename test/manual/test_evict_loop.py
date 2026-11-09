@@ -224,10 +224,10 @@ def _bootstrap():
     _install_stubs()
     _load("sglang.srt.mem_cache.heter_utils", "sglang/srt/mem_cache/heter_utils.py")
     _load("sglang.srt.mem_cache.queue_occupancy", "sglang/srt/mem_cache/queue_occupancy.py")
-    # evict_policy 现在直接依赖 quota_selector 与 heter_logging（观测门面）：
+    # evict_policy 现在直接依赖 quota_selector 与 heter_bench_bridge（观测装配）：
     # 这两者必须先于它装载，否则包路径被 stub 掉后无法按名解析。
     _load("sglang.srt.mem_cache.quota_selector", "sglang/srt/mem_cache/quota_selector.py")
-    _load("sglang.srt.mem_cache.heter_logging", "sglang/srt/mem_cache/heter_logging.py")
+    _load("sglang.srt.mem_cache.heter_bench_bridge", "sglang/srt/mem_cache/heter_bench_bridge.py")
     _load("sglang.srt.mem_cache.victim_override", "sglang/srt/mem_cache/victim_override.py")
     ep = _load("sglang.srt.mem_cache.evict_policy", "sglang/srt/mem_cache/evict_policy.py")
     shc = _load(

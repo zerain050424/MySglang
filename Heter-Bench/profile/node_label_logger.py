@@ -12,7 +12,7 @@
 统计（``evaluate_node_labels.py`` / ``evaluate_node_count.py``）。
 
 本模块属于实验脚手架，**不随 sglang 安装分发**：由
-``sglang/srt/mem_cache/heter_logging.py`` 按仓库根定位后加载；Heter-Bench
+``sglang/srt/mem_cache/heter_bench_bridge.py`` 按仓库根定位后加载；Heter-Bench
 不在场时该桥退化为空实现。
 
 环境变量：

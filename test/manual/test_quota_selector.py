@@ -41,7 +41,7 @@ hu = _load("sglang.srt.mem_cache.heter_utils", os.path.join(_CACHE_DIR, "heter_u
 _load("sglang.srt.mem_cache.queue_occupancy", os.path.join(_CACHE_DIR, "queue_occupancy.py"))
 qs = _load("sglang.srt.mem_cache.quota_selector", os.path.join(_CACHE_DIR, "quota_selector.py"))
 vo = _load("sglang.srt.mem_cache.victim_override", os.path.join(_CACHE_DIR, "victim_override.py"))
-_load("sglang.srt.mem_cache.heter_logging", os.path.join(_CACHE_DIR, "heter_logging.py"))
+_load("sglang.srt.mem_cache.heter_bench_bridge", os.path.join(_CACHE_DIR, "heter_bench_bridge.py"))
 ep = _load("sglang.srt.mem_cache.evict_policy", os.path.join(_CACHE_DIR, "evict_policy.py"))
 
 QuotaParams = hu.QuotaParams

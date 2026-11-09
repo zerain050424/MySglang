@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.heter_logging import start_node_label_logger
+from sglang.srt.mem_cache.heter_bench_bridge import start_node_label_logger
 
 """
 Copyright 2023-2024 SGLang Team

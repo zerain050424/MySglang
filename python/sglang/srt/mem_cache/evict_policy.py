@@ -40,7 +40,7 @@ from sglang.srt.mem_cache.victim_override import (
     SlruEvictPolicy,
     MultiTurnEvictPolicy,
 )
-from sglang.srt.mem_cache.heter_logging import (
+from sglang.srt.mem_cache.heter_bench_bridge import (
     CacheTelemetry,
     HeterProfiler,
 )

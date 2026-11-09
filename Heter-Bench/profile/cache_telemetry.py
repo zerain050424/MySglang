@@ -4,8 +4,8 @@
 profiler、要不要判开关、参数怎么拼；上层的三个 ``record_*`` 因此各剩一行调用。
 
 **属于实验脚手架**，不随 sglang 安装分发：由
-``sglang/srt/mem_cache/heter_logging.py`` 按仓库根定位后加载。Heter-Bench 不在场
-时，该桥提供一个同签名的空实现，调用点因此不需要判空。
+``sglang/srt/mem_cache/heter_bench_bridge.py`` 按仓库根定位后加载；Heter-Bench 不在场
+时该桥直接报错，不留空实现。
 
 开关判据是 ``capturing or enabled``，两者对应不同出口：
 

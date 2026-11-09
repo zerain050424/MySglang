@@ -104,7 +104,7 @@ sys.modules["sglang.srt.mem_cache"] = m
 ```
 
 **新增模块必须同步加进装载列表**，否则报 `No module named ...`。本轮为此改过两次：
-`queue_occupancy`、`heter_logging`。
+`queue_occupancy`、`heter_bench_bridge`。
 
 纯逻辑验证（不建真缓存）也能做：`HeterCacheRadixCache.__new__(cls)` 加假协作者，
 即可测 `_release_node` 的调用序列、`_observe_occupancy` 的时钟调度。
@@ -159,7 +159,7 @@ Heter-Bench 文档里的历史数字与旧口径说明保留原文，只在需�
   驱动层 `_observe_occupancy`（编排）。策略只做判据与裁决。
 - 策略无关的队列占用日志（`OccSampler` / `QueueOcc` / `TagOcc`）已删除，
   `[HeterCache profile]` 是队列占用的唯一出口。
-- 观测实现全部在 `Heter-Bench/`，sglang 侧只留 `heter_logging.py` 这一个桥
-  （定位目录、导入、缺失时降级为空实现）：
+- 观测实现全部在 `Heter-Bench/`，sglang 侧只留 `heter_bench_bridge.py` 这一个桥
+  （只做定位与导入；Heter-Bench 缺席时启动即报错，不留空实现）：
   `Heter-Bench/log/heter_logger.py`、`profile/{heter_profiler,cache_telemetry,node_label_logger}.py`。
   新增观测代码请放这里，不要放进 `python/sglang/srt/mem_cache/`。
