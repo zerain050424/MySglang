@@ -52,6 +52,8 @@ class Alloc:
 CFG = {
     "force_agentic": True,
     "slru": {"share_min": 2},
+    # 配额必填：HeterCache 只走配额仲裁
+    "quota": {"caps": {"struct": 0.3, "agentic": 0.4, "chat": 0.3}},
 }
 
 

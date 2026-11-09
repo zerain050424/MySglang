@@ -1,7 +1,7 @@
 """force_agentic：把全部节点直达 QAGENT 队列。
 
 实验前提（RR vs T-LRU 的 burst/pause 场景）：RrEvictPolicy 的
-applies_to 只认 QAGENT，而状态机默认会把新节点标成 QTRANS（one-shot）、把间隔
+队内策略只认 QAGENT，而状态机默认会把新节点标成 QTRANS（one-shot）、把间隔
 ≥8s 的命中标成 QCHAT。force_agentic 关掉这套分流：
 
   1. 新节点直接 QAGENT（不再 QTRANS → 不被 one-shot 带先清）
@@ -56,7 +56,10 @@ class Alloc:
 
 
 def build(force_agentic):
-    cfg = {"force_agentic": True} if force_agentic else None
+    # 配额必填：HeterCache 只走配额仲裁
+    cfg = {"quota": {"caps": {"struct": 0.3, "agentic": 0.4, "chat": 0.3}}}
+    if force_agentic:
+        cfg["force_agentic"] = True
     return HeterCacheRadixCache(
         CacheInitParams(
             disable=False,
@@ -212,7 +215,7 @@ def test_plugins_see_everything():
     strategy = cache.eviction_strategy
     slru = strategy.slru_evict
     leaves = list(cache.evictable_leaves)
-    covered = [n.id for n in leaves if slru.applies_to(n)]
+    covered = [n.id for n in leaves if slru.pick([n]) is n]
     check(covered, f"no leaf reaches the SLRU plugin, leaves={len(leaves)}")
 
 

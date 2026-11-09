@@ -377,8 +377,7 @@ def test_stage0_one_shot_preempts_quota():
     st.session_registry.get("s1").session_type = hu.SessionType.TRANS
     check(st.is_one_shot(one), "precondition: TRANS node is one-shot")
     victim, source = qs.pick_victim(
-        strategy=st, leaves=[struct_node, one], capacity=1000, page_size=1,
-        overrides=st.victim_overrides, session_registry=st.session_registry)
+        strategy=st, leaves=[struct_node, one], capacity=1000, page_size=1)
     check(victim is one and source == "one_shot",
           f"one-shot must win, got source={source}")
     check("struct" in st.quota_ranking(1000, 1), "precondition: struct is over cap")
@@ -397,15 +396,13 @@ def test_stage1_quota_labels_and_skip():
     # 第一名 struct 无候选（一个 struct 叶子都没给）-> 应跳到 agentic
     agentic_node = _leaf(TAG["agentic"], 100, ts=1.0)
     victim, source = qs.pick_victim(
-        strategy=st, leaves=[agentic_node], capacity=1000, page_size=1,
-        overrides=st.victim_overrides, session_registry=st.session_registry)
+        strategy=st, leaves=[agentic_node], capacity=1000, page_size=1)
     check(victim is agentic_node and source == "quota:agentic",
           f"must skip the empty struct queue, got {source}")
 
     # 所有队列都没候选 -> 兜底，不 busy-loop
     victim, source = qs.pick_victim(
-        strategy=st, leaves=[], capacity=1000, page_size=1,
-        overrides=st.victim_overrides, session_registry=st.session_registry)
+        strategy=st, leaves=[], capacity=1000, page_size=1)
     check(victim is None and source is None,
           f"empty leaves must yield (None, None), got {(victim, source)}")
 
@@ -432,8 +429,7 @@ def test_stage1_fallback_is_seeded_random():
         picks = []
         for _ in range(6):
             victim, source = qs.pick_victim(
-                strategy=st, leaves=leaves, capacity=1000, page_size=1,
-                overrides=st.victim_overrides, session_registry=st.session_registry)
+                strategy=st, leaves=leaves, capacity=1000, page_size=1)
             picks.append((index[id(victim)], source))
         return picks
 
@@ -447,31 +443,29 @@ def test_stage1_fallback_is_seeded_random():
     check(_random.getstate() == state_before, "fallback must not touch global random")
 
 
-def test_stage2_unchanged_without_quota():
-    """未配置配额：走原路径（全局 victim_key + 改写器链），标签回到 global。"""
-    print("[20] stage 2: no quota config keeps the original path")
-    st = ep.HeterCacheStrategy()
-    check(st.quota.enabled is False, "precondition: quota off")
-    # 时间必须是相对 now 的：绝对值会让 elapsed 大到 reuse_prob 全部归零
-    now = hu.time.monotonic() if hasattr(hu, "time") else __import__("time").monotonic()
-    older = _leaf(TAG["chat"], 10, ts=now - 100.0)
-    newer = _leaf(TAG["chat"], 10, ts=now - 1.0)
-    victim, source = qs.pick_victim(
-        strategy=st, leaves=[newer, older], capacity=1000, page_size=1,
-        overrides=st.victim_overrides, session_registry=st.session_registry)
-    check(victim is older, "global victim_key must pick the lower reuse score")
-    check(source == "global", f"source must stay 'global', got {source}")
-
-
-def test_disabled_params_rejected():
-    """未启用配额时数学层直接报错：接线错误不该静默返回 0。"""
-    print("[12] disabled params are rejected, not silently zeroed")
+def test_quota_is_mandatory():
+    """配额必填：不给 caps 直接报错，不会静默退回另一套淘汰语义。"""
+    print("[20] quota is mandatory: missing caps raises, never degrades")
     try:
-        qs.effective_targets({"struct": 1, "agentic": 1, "chat": 1}, C, QuotaParams())
+        ep.HeterCacheStrategy()
     except ValueError as exc:
-        print(f"      rejected: {str(exc)[:60]}")
+        print(f"      rejected: {str(exc)[:70]}")
     else:
-        check(False, "effective_targets accepted disabled params")
+        check(False, "HeterCacheStrategy accepted empty quota.caps")
+
+    try:
+        QuotaParams()
+    except ValueError:
+        pass
+    else:
+        check(False, "QuotaParams accepted empty caps")
+
+    # 数学层不再自带“未启用”守卫：配额必然有值，targets 恒可算
+    caps = {"caps": {"struct": 0.2, "agentic": 0.5, "chat": 0.3}}
+    targets = qs.effective_targets(
+        {"struct": 1, "agentic": 1, "chat": 1}, C, QuotaParams(**caps)
+    )
+    check(set(targets) == set(hu.QUOTA_QUEUES), f"targets keys={sorted(targets)}")
 
 
 def main():
@@ -495,8 +489,7 @@ def main():
         test_stage0_one_shot_preempts_quota,
         test_stage1_quota_labels_and_skip,
         test_stage1_fallback_is_seeded_random,
-        test_stage2_unchanged_without_quota,
-        test_disabled_params_rejected,
+        test_quota_is_mandatory,
     ]
     for t in tests:
         try:

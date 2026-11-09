@@ -4,7 +4,7 @@
 torch 的依赖，只加载 `heter_cache_radix_cache.py` 本体，再挂一棵假树。
 钉住四件事：
 
-1. **没有 one-shot 叶子时不会崩**：基础候选走 `victim_key`，绝不退化成 None
+1. **没有 one-shot 叶子时不会崩**：配额仲裁或随机兜底必须给出候选
    （历史 bug：`victim` 初始化在循环外 + 基础候选被注释掉 → `_evict_one(None)`）。
 2. **候选不跨轮复用**：每轮重新计算，已删除的节点不会被二次删除
    （历史 bug：复用上一轮 victim → 二次 `free_segment` + `_delete_leaf` 断言失败）。
@@ -124,11 +124,18 @@ class FakeNode:
 
 
 class FakeAllocator:
+    """容量恒为「已满 20% 空闲」的假分配器：配额需要 size/available_size。"""
+
+    size = 1000
+
     def __init__(self):
         self.freed = []
 
     def free_segment(self, value, *, start_pos=0):
         self.freed.append((tuple(value), start_pos))
+
+    def available_size(self):
+        return 800
 
 
 class FakeEvents:
@@ -151,7 +158,16 @@ def make_cache(cache_cls, strategy, nodes):
     cache.disable = False
     cache.eviction_strategy = strategy
     cache.session_registry = strategy.session_registry
-    cache.victim_overrides = tuple(strategy.victim_overrides)
+    cache.node_observers = tuple(strategy.node_observers)
+    # evict() 依赖这三个由 __init__ 派生的字段；假缓存需要手工接上
+    cache._needs_capacity = strategy.needs_capacity
+    cache.page_size = 1
+    cache.evictable_size_ = 0
+    # 观测钩子：本测试只关心淘汰控制流，不采样占用
+    cache._occupancy_observer = None
+    cache._hit_recorder = None
+    cache._record_insert = None
+    cache.force_agentic = False
     cache.token_to_kv_pool_allocator = FakeAllocator()
     cache.kv_events = FakeEvents()
     cache.deleted = []
@@ -166,6 +182,11 @@ def make_cache(cache_cls, strategy, nodes):
         cache.evictable_leaves.add(n)
         # _delete_leaf 会用 node.key.child_key(page_size)；假树里用轻量替身
         n.key = FakeRadixKey(n)
+    # 真实缓存在建节点时会调 record_insert；假缓存手工补这一步，
+    # 否则 _occ 恒 0，配额排名永远为空。
+    for n in nodes:
+        if not strategy.is_one_shot(n):
+            strategy.record_insert(n)
     return cache
 
 
@@ -195,6 +216,10 @@ def _per_queue_token_count(self):
 def _bootstrap():
     _install_stubs()
     _load("sglang.srt.mem_cache.heter_utils", "sglang/srt/mem_cache/heter_utils.py")
+    # evict_policy 现在直接依赖 quota_selector 与 heter_logging（观测门面）：
+    # 这两者必须先于它装载，否则包路径被 stub 掉后无法按名解析。
+    _load("sglang.srt.mem_cache.quota_selector", "sglang/srt/mem_cache/quota_selector.py")
+    _load("sglang.srt.mem_cache.heter_logging", "sglang/srt/mem_cache/heter_logging.py")
     _load("sglang.srt.mem_cache.victim_override", "sglang/srt/mem_cache/victim_override.py")
     ep = _load("sglang.srt.mem_cache.evict_policy", "sglang/srt/mem_cache/evict_policy.py")
     shc = _load(
@@ -208,8 +233,11 @@ def _bootstrap():
     return ep, shc, sys.modules["sglang.srt.mem_cache.base_prefix_cache"]
 
 
+CAPS = {"caps": {"struct": 0.3, "agentic": 0.4, "chat": 0.3}}
+
+
 def _strategy(ep, sessions, **slru):
-    st = ep.HeterCacheStrategy(slru=slru or None)
+    st = ep.HeterCacheStrategy(slru=slru or None, quota=dict(CAPS))
     reg = sys.modules["sglang.srt.mem_cache.heter_utils"].SessionRegistry()
     hu = sys.modules["sglang.srt.mem_cache.heter_utils"]
     for sid, stype in sessions.items():
@@ -219,9 +247,15 @@ def _strategy(ep, sessions, **slru):
     return st
 
 
+def _seed_share(st, node, n):
+    """把节点的跨会话共享数直接记进 SLRU 账本（share_of 只认这本账）。"""
+    for i in range(n):
+        st.slru_evict.on_node_hit(node, f"seed-{id(node)}-{i}")
+
+
 def test_no_one_shot_leaves_does_not_crash(ep, shc, base):
     """历史 P0：没有 one-shot 叶子时 victim 曾是 None / 陈旧节点。"""
-    print("[1] no one-shot leaves: base candidate via victim_key, no crash")
+    print("[1] no one-shot leaves: quota path still yields a victim")
     hu = sys.modules["sglang.srt.mem_cache.heter_utils"]
     st = _strategy(ep, {"a1": hu.SessionType.AGENTIC})
     nodes = [
@@ -239,9 +273,10 @@ def test_no_one_shot_leaves_does_not_crash(ep, shc, base):
     check(len(cache.deleted) == 3, f"all leaves evicted, got {len(cache.deleted)}")
     check(result.num_tokens_evicted == 96,
           f"released tokens, got {result.num_tokens_evicted}")
-    check(st._victim_sources.get("global") == 96,
-          f"source must be 'global', got {st._victim_sources}")
-    check(not st._victim_sources.get("one_shot"),
+    quota_srcs = {k: v for k, v in st.profiler._victim_sources.items() if k.startswith("quota:")}
+    check(quota_srcs.get("quota:agentic", 0) + quota_srcs.get("quota:fallback", 0) == 96,
+          f"all 96 tokens must come from the quota path, got {st.profiler._victim_sources}")
+    check(not st.profiler._victim_sources.get("one_shot"),
           "no one-shot band should have been used")
 
 
@@ -270,87 +305,56 @@ def test_victim_not_reused_across_rounds(ep, shc, base):
 
 
 def test_one_shot_band_first(ep, shc, base):
-    """one-shot 叶子先走，且按结束偏移最深优先。"""
-    print("[3] one-shot leaves are drained first (deepest end offset wins)")
+    """one-shot 叶子先走：不管位置深浅，一律先于受保护节点被清。"""
+    print("[3] one-shot leaves are drained before protected ones")
     hu = sys.modules["sglang.srt.mem_cache.heter_utils"]
     st = _strategy(
         ep,
         {"t1": hu.SessionType.TRANS, "s1": hu.SessionType.STRUCT},
     )
     # 一个未共享的 TRANS 节点（one-shot） + 一个共享的 STRUCT 节点（受保护）
-    shallow = FakeNode("t1", hu.HeterCacheNodeTag.QTRANS, tokens=16, abs_start=0)
-    deep = FakeNode("t1", hu.HeterCacheNodeTag.QTRANS, tokens=16, abs_start=256)
-    shared = FakeNode(
-        "s1", hu.HeterCacheNodeTag.QSTRUCT, tokens=16, abs_start=0,
-        share_sessions=st.slru_evict.share_min,
+    shallow = FakeNode(
+        "t1", hu.HeterCacheNodeTag.QTRANS, tokens=16, abs_start=0, last_access=1.0
     )
+    deep = FakeNode(
+        "t1", hu.HeterCacheNodeTag.QTRANS, tokens=16, abs_start=256, last_access=2.0
+    )
+    shared = FakeNode("s1", hu.HeterCacheNodeTag.QSTRUCT, tokens=16, abs_start=0)
+    _seed_share(st, shared, st.slru_evict.share_min)
     check(st.is_one_shot(deep) is True, "sanity: trans node is one-shot")
     check(st.is_one_shot(shared) is False, "sanity: shared struct is protected")
 
     cache = make_cache(shc.HeterCacheRadixCache, st, [shallow, deep, shared])
     cache.evict(base.EvictParams(num_tokens=16))
 
-    check(cache.deleted == [deep],
-          f"deepest one-shot node must go first, got {cache.deleted}")
-    check(st._victim_sources.get("one_shot") == 16,
-          f"source must be 'one_shot', got {st._victim_sources}")
+    # 带内排序是 one_shot_key（LRU）：shallow 的 last_access 更早，先走
+    check(cache.deleted == [shallow],
+          f"LRU-oldest one-shot node must go first, got {cache.deleted}")
+    check(st.profiler._victim_sources.get("one_shot") == 16,
+          f"source must be 'one_shot', got {st.profiler._victim_sources}")
 
 
 def test_slru_rewrites_struct_candidate(ep, shc, base):
-    """只有受保护的 struct 叶子时，来源应是 SLRU，且挑最久未访问的那片。"""
-    print("[4] SLRU rewrites the candidate among protected struct leaves")
+    """只有受保护的 struct 叶子时，配额点名 struct 队，队内按段内 LRU 挑最久未访问的那片。"""
+    print("[4] struct queue: quota names it, struct_tier picks the LRU-oldest")
     hu = sys.modules["sglang.srt.mem_cache.heter_utils"]
     st = _strategy(ep, {"s1": hu.SessionType.STRUCT})
     thr = st.slru_evict.share_min
-    old = FakeNode(
-        "s1", hu.HeterCacheNodeTag.QSTRUCT, tokens=16,
-        last_access=1_000.0, share_sessions=thr,
-    )
+    old = FakeNode("s1", hu.HeterCacheNodeTag.QSTRUCT, tokens=16, last_access=1_000.0)
     new = FakeNode(
-        "s1", hu.HeterCacheNodeTag.QSTRUCT, tokens=16,
-        last_access=9_999_999.0, share_sessions=thr,
+        "s1", hu.HeterCacheNodeTag.QSTRUCT, tokens=16, last_access=9_999_999.0
     )
+    _seed_share(st, old, thr)
+    _seed_share(st, new, thr)
     cache = make_cache(shc.HeterCacheRadixCache, st, [old, new])
 
     cache.evict(base.EvictParams(num_tokens=16))
 
     check(cache.deleted == [old], f"LRU-oldest must be picked, got {cache.deleted}")
-    check(st._victim_sources.get("qstruct") == 16,
-          f"source must be the SLRU queue, got {st._victim_sources}")
-    check(st.slru_evict.stats()["slru_picks"] >= 1, "SLRU must have been consulted")
-
-
-def test_slru_actually_rewrites_with_tag_off(ep, shc, base):
-    """基础候选按位置打分，SLRU 把它改写成最久未访问的那个。
-
-    这条证明 SLRU 不是只改个 source 标签：victim_key 对 struct 用的是
-    `1 - end_offset/max_offset` 位置打分（长前缀会被判 0 分），与 SLRU 的
-    LRU 口径不同，二者会挑出不同节点。
-    """
-    print("[4b] SLRU rewrites the position-scored base candidate")
-    hu = sys.modules["sglang.srt.mem_cache.heter_utils"]
-    st = _strategy(ep, {"s1": hu.SessionType.STRUCT})
-    thr = st.slru_evict.share_min
-    # 位置打分偏向「结束偏移小」的节点 -> 基础候选会挑 deep（offset 越界被截成 0 分）
-    old_lru = FakeNode(
-        "s1", hu.HeterCacheNodeTag.QSTRUCT, tokens=16,
-        abs_start=0, last_access=1_000.0, share_sessions=thr,
-    )
-    deep_recent = FakeNode(
-        "s1", hu.HeterCacheNodeTag.QSTRUCT, tokens=16,
-        abs_start=8000, last_access=9_999_999.0, share_sessions=thr,
-    )
-    cache = make_cache(shc.HeterCacheRadixCache, st, [old_lru, deep_recent])
-
-    base_pick = min(cache.evictable_leaves, key=st.victim_key)
-    check(base_pick is deep_recent,
-          f"sanity: base candidate should be the deep node, got {base_pick}")
-
-    cache.evict(base.EvictParams(num_tokens=16))
-    check(cache.deleted == [old_lru],
-          f"SLRU must override the base candidate, got {cache.deleted}")
-    check(st._victim_sources.get("qstruct") == 16,
-          f"source must be the SLRU queue, got {st._victim_sources}")
+    check(st.profiler._victim_sources.get("quota:struct") == 16,
+          f"source must be the struct queue, got {st.profiler._victim_sources}")
+    # struct 队的选点由 struct_tier 直接完成（share 分级 + 段内 LRU），
+    # 不再经过 SlruEvictPolicy.pick，所以这里不校验 slru_picks。
 
 
 def test_empty_tree_is_noop(ep, shc, base):
@@ -371,7 +375,6 @@ def main():
         test_victim_not_reused_across_rounds,
         test_one_shot_band_first,
         test_slru_rewrites_struct_candidate,
-        test_slru_actually_rewrites_with_tag_off,
         test_empty_tree_is_noop,
     ]
     for t in tests:

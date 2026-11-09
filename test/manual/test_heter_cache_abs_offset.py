@@ -9,7 +9,7 @@ not of position in the sequence. These tests pin down the intended semantics:
   node.abs_start + len(node.value)   == absolute end offset ("num_hashed_tokens")
   child.abs_start == parent.abs_start + len(parent.value)
 
-and that HeterCacheStrategy._reuse_score() ranks by that absolute end offset.
+以及节点标签 / 配额裁决不再依赖任何“全局价值分”。
 
 Run:  /root/sl_old/bin/python test/manual/test_heter_cache_abs_offset.py
 """
@@ -41,6 +41,9 @@ from sglang.srt.mem_cache.heter_utils import (  # noqa: E402
     SessionType,
     HeterCacheNodeTag,
 )
+
+# 配额必填：HeterCache 只走配额仲裁，测试统一用一组均衡上限。
+QUOTA_CFG = {"caps": {"struct": 0.3, "agentic": 0.4, "chat": 0.3}}
 
 FAILS = []
 
@@ -166,38 +169,6 @@ def _mk_node(
     )
 
 
-def test_reuse_score_uses_absolute_offset():
-    print("[5] _reuse_score: same segment length, shallower offset scores higher")
-    strategy = HeterCacheStrategy(max_offset=2048)
-    shallow = _mk_node(32, abs_start=0)
-    deep = _mk_node(32, abs_start=3000)
-    s_shallow = strategy._reuse_score(shallow)
-    s_deep = strategy._reuse_score(deep)
-    check(s_shallow > 0.9, f"shallow(0..32) score={s_shallow:.4f}, expected ~0.98")
-    check(s_deep == 0.0, f"deep(3000..3032) score={s_deep:.4f}, expected 0.0")
-    check(s_shallow > s_deep, "shallower offset must score strictly higher")
-    # Segment-length-only scoring gave BOTH nodes 1 - 32/2048; the deep node
-    # must now differ sharply from that value.
-    old_segment_only = 1.0 - 32 / 2048
-    check(
-        abs(s_deep - old_segment_only) > 0.5,
-        f"deep score={s_deep:.4f} must differ from segment-length-only "
-        f"{old_segment_only:.4f}",
-    )
-
-
-def test_no_abs_start_fallback():
-    print("[6] node without abs_start falls back to segment length (no crash)")
-    strategy = HeterCacheStrategy(max_offset=2048)
-    node = _mk_node(32, abs_start=0)
-    del node.abs_start
-    s = strategy._reuse_score(node)
-    check(
-        abs(s - (1.0 - 32 / 2048)) < 1e-9,
-        f"fallback score={s:.6f}, expected {1.0 - 32 / 2048:.6f}",
-    )
-
-
 def test_randomized_invariants():
     print("[7] randomized inserts (heavy sharing/splitting) keep invariants")
     import random
@@ -222,146 +193,6 @@ def test_randomized_invariants():
         check(max_end <= 300 * 40, f"max end offset {max_end} exploded")
 
 
-def test_eviction_prefers_deep_single_turn_node():
-    """End-to-end: cross-queue eviction must spend KV on the shallow prefix.
-
-    Deep   : single-turn node, abs_start=2000, 32 tokens  (end offset 2032)
-             -> new score 0.000 ; old (segment-length) score 0.984
-    Rival  : agentic node, 32 tokens, idle ~10s -> score ~0.33
-
-    Old code kept the deep single-turn node and evicted the agentic one;
-    correct code evicts the deep single-turn node instead.
-    """
-    print("[8] cross-queue evict: deep single-turn node goes before a mid-score agentic node")
-
-    class Alloc:
-        device = torch.device("cpu")
-
-        def free_segment(self, indices=None, start_pos=0):
-            return None
-
-    cache = HeterCacheRadixCache(
-        CacheInitParams(
-            disable=False,
-            req_to_token_pool=None,
-            token_to_kv_pool_allocator=Alloc(),
-            page_size=1,
-            eviction_policy="heter_cache",
-        )
-    )
-
-    def insert(tokens, tag):
-        result = cache.insert(
-            InsertParams(
-                key=RadixKey(array("q", tokens)),
-                value=torch.tensor(tokens, dtype=torch.int64),
-            )
-        )
-        result.last_device_node.queue_tag = tag
-
-    # deep: [0..1999] then extend to [0..2031] -> 32-token child at abs_start=2000
-    insert(list(range(0, 2000)), HeterCacheNodeTag.QSTRUCT)
-    insert(list(range(0, 2032)), HeterCacheNodeTag.QSTRUCT)
-    # rival: separate 32-token agentic node hanging off the root
-    insert(list(range(5000, 5032)), HeterCacheNodeTag.QAGENT)
-
-    deep = rival = None
-    for node in cache.evictable_leaves:
-        if len(node.value) != 32:
-            continue
-        if node.queue_tag == HeterCacheNodeTag.QSTRUCT:
-            deep = node
-        elif node.queue_tag == HeterCacheNodeTag.QAGENT:
-            rival = node
-    check(deep is not None, "expected a 32-token single-turn node")
-    check(rival is not None, "expected a 32-token agentic node")
-    if deep is None or rival is None:
-        return
-
-    check(deep.abs_start == 2000, f"deep.abs_start={deep.abs_start}, expected 2000")
-    check(rival.abs_start == 0, f"rival.abs_start={rival.abs_start}, expected 0")
-
-    # make the rival idle ~10s so its lognormal reuse score sits mid-range
-    rival.last_access_time = time.monotonic() - 10.0
-
-    s_deep = cache.eviction_strategy._reuse_score(deep)
-    s_rival = cache.eviction_strategy._reuse_score(rival)
-    print(f"      score(deep single-turn, end=2032)={s_deep:.4f}")
-    print(f"      score(rival agentic, idle 10s)    ={s_rival:.4f}")
-    check(s_deep < s_rival,
-          f"deep single-turn score {s_deep:.4f} must be below agentic {s_rival:.4f}")
-
-    result = cache.evict(EvictParams(num_tokens=32))
-    check(result.num_tokens_evicted == 32,
-          f"expected 32 tokens evicted, got {result.num_tokens_evicted}")
-    still_there = {n for p in cache.evictable_leaves for n in [p]}
-    check(rival in still_there, "agentic rival should survive")
-    check(deep not in still_there, "deep single-turn node should be evicted")
-
-
-def test_same_queue_picks_lowest_score():
-    """#2: intra-queue candidacy must use the same key as the cross-queue compare.
-
-    Same queue (single), so the old per-queue heap_key (largest segment first)
-    and the score-based key disagree:
-
-      A = deep   : abs_start=2000, len=32   -> score(0.008), heap_key(-32)
-      B = shallow: abs_start=0,    len=2000 -> score(0.023), heap_key(-2000)
-
-    Old: heap_key 推举 B -> 淘汰 B（2000 token）
-    New: score     推举 A -> 淘汰 A（32 token）
-    """
-    print("[9] same-queue evict: lowest score wins, not largest segment")
-
-    class Alloc:
-        device = torch.device("cpu")
-
-        def free_segment(self, indices=None, start_pos=0):
-            return None
-
-    cache = HeterCacheRadixCache(
-        CacheInitParams(
-            disable=False,
-            req_to_token_pool=None,
-            token_to_kv_pool_allocator=Alloc(),
-            page_size=1,
-            eviction_policy="heter_cache",
-        )
-    )
-
-    def insert(tokens, tag=HeterCacheNodeTag.QSTRUCT):
-        result = cache.insert(
-            InsertParams(
-                key=RadixKey(array("q", tokens)),
-                value=torch.tensor(tokens, dtype=torch.int64),
-            )
-        )
-        result.last_device_node.queue_tag = tag
-
-    insert(list(range(0, 2000)))          # shallow 2000-token single node
-    insert(list(range(0, 2032)))          # splits it: 32-token child at abs_start=2000
-    insert(list(range(5000, 7000)))       # second 2000-token single node (shallow)
-
-    deep = shallow_short = None
-    for node in cache.evictable_leaves:
-        if node.abs_start == 2000 and len(node.value) == 32:
-            deep = node
-    check(deep is not None, "expected a 32-token node at abs_start=2000")
-    if deep is None:
-        return
-
-    s_deep = cache.eviction_strategy._reuse_score(deep)
-    check(0.0 < s_deep < 0.02, f"deep score={s_deep:.4f}, expected ~0.008")
-
-    result = cache.evict(EvictParams(num_tokens=32))
-    print(f"      evicted {result.num_tokens_evicted} tokens")
-    check(
-        result.num_tokens_evicted == 32,
-        f"expected the 32-token deep node to be evicted, got "
-        f"{result.num_tokens_evicted} tokens (largest-segment-first behaviour)",
-    )
-
-
 def test_one_shot_still_drained_first():
     """#2 regression guard: one-shot content must still go before everything."""
     print("[10] one-shot band still drained first")
@@ -379,6 +210,9 @@ def test_one_shot_still_drained_first():
             token_to_kv_pool_allocator=Alloc(),
             page_size=1,
             eviction_policy="heter_cache",
+            eviction_policy_config={
+                "quota": {"caps": {"struct": 0.3, "agentic": 0.4, "chat": 0.3}}
+            },
         )
     )
 
@@ -433,6 +267,9 @@ def test_one_shot_order_by_tree_offset():
             token_to_kv_pool_allocator=Alloc(),
             page_size=1,
             eviction_policy="heter_cache",
+            eviction_policy_config={
+                "quota": {"caps": {"struct": 0.3, "agentic": 0.4, "chat": 0.3}}
+            },
         )
     )
 
@@ -505,6 +342,9 @@ def test_one_shot_chain_stops_at_branch_and_lock():
                 token_to_kv_pool_allocator=Alloc(),
                 page_size=1,
                 eviction_policy="heter_cache",
+                eviction_policy_config={
+                    "quota": {"caps": {"struct": 0.3, "agentic": 0.4, "chat": 0.3}}
+                },
             )
         )
 
@@ -562,36 +402,6 @@ def test_one_shot_chain_stops_at_branch_and_lock():
 
 
 
-def test_single_score_is_time_invariant():
-    """#3: 单轮分数不再含杜撰的时间项 exp(-t/600)。
-
-    bench 里每个 session 只发一次（build_hybrid_arrival_schedule 一 session
-    一到达），单轮没有「下一轮」，600s 这个常数没有对应的生成过程。
-    单轮的节点级分数只保留位置项。
-    """
-    print("[14] single-turn score must not depend on idle time")
-    strategy = HeterCacheStrategy(max_offset=2048)
-    fresh = _mk_node(32, abs_start=0)
-    fresh.last_access_time = time.monotonic()
-    idle = _mk_node(32, abs_start=0)
-    idle.last_access_time = time.monotonic() - 600.0
-    s_fresh = strategy._reuse_score(fresh)
-    s_idle = strategy._reuse_score(idle)
-    print(f"      score(idle 0s)={s_fresh:.4f}  score(idle 600s)={s_idle:.4f}")
-    check(
-        abs(s_fresh - s_idle) < 1e-12,
-        f"score must not depend on idle time: {s_fresh:.6f} vs {s_idle:.6f}",
-    )
-    check(
-        abs(s_idle - (1.0 - 32 / 2048)) < 1e-9,
-        f"idle-600s score={s_idle:.6f}, expected {1.0 - 32 / 2048:.6f} "
-        f"(no fabricated exp decay)",
-    )
-
-
-
-
-
 def _sh_cache():
     class Alloc:
         device = torch.device("cpu")
@@ -606,6 +416,9 @@ def _sh_cache():
             token_to_kv_pool_allocator=Alloc(),
             page_size=1,
             eviction_policy="heter_cache",
+            eviction_policy_config={
+                "quota": {"caps": {"struct": 0.3, "agentic": 0.4, "chat": 0.3}}
+            },
         )
     )
 
@@ -621,7 +434,7 @@ def test_queue_and_band_are_orthogonal():
     只有单轮负载的生成段才是一次性的。
     """
     print("[18] queue attribution vs eviction band must be orthogonal")
-    st = HeterCacheStrategy()
+    st = HeterCacheStrategy(quota=QUOTA_CFG)
     # one-shot 判定看「会话类型 + 跨会话共享数」，因此节点需要会话证据。
     reg = SessionRegistry()
     st.session_registry = reg
@@ -729,7 +542,7 @@ def test_queue_occ_accounting_adds_up():
 def test_record_hit_uses_queue_name():
     """命中记账按队列归因到 HeterProfiler，且每请求只记一次。"""
     print("[20] record_hit: profile 按队列记账")
-    st = HeterCacheStrategy()
+    st = HeterCacheStrategy(quota=QUOTA_CFG)
     req = SimpleNamespace(rid="r1", session_id="apps_123", extra_key=None)
     node = _mk_node(32, 0, tag=HeterCacheNodeTag.QTRANS)
     st.record_hit(req, node, 500)
@@ -743,7 +556,7 @@ def test_record_hit_uses_queue_name():
 def test_record_evict_one_shot_scalar():
     """淘汰记账：队列一本账 + one-shot 一个标量（decode 带可推导）。"""
     print("[21] record_evict: 队列账本 + one-shot 标量")
-    st = HeterCacheStrategy()
+    st = HeterCacheStrategy(quota=QUOTA_CFG)
     resp = _mk_node(64, 32, tag=HeterCacheNodeTag.QAGENT)
     resp.is_decode = True
     st.record_evict(resp)
@@ -769,7 +582,7 @@ def test_multiturn_decode_is_not_one_shot():
     只有单轮负载的生成段（以及随机单轮）才是一次性内容。
     """
     print("[22] multi-turn decode stays in its queue")
-    strat = HeterCacheStrategy()
+    strat = HeterCacheStrategy(quota=QUOTA_CFG)
 
     def node(tt, dec):
         return SimpleNamespace(
@@ -801,6 +614,9 @@ def test_decode_band_end_to_end():
                 disable=False, req_to_token_pool=None,
                 token_to_kv_pool_allocator=None, page_size=1,
                 eviction_policy="heter_cache",
+                eviction_policy_config={
+                    "quota": {"caps": {"struct": 0.3, "agentic": 0.4, "chat": 0.3}}
+                },
             )
         )
         # 先有 [0,50) 前缀，再以 decode_start=50 扩展到 100 -> 后段 is_decode=True
@@ -850,15 +666,10 @@ def main():
         test_split_via_insert,
         test_split_via_match,
         test_deep_tree_offsets,
-        test_reuse_score_uses_absolute_offset,
-        test_no_abs_start_fallback,
         test_randomized_invariants,
-        test_eviction_prefers_deep_single_turn_node,
-        test_same_queue_picks_lowest_score,
         test_one_shot_still_drained_first,
         test_one_shot_order_by_tree_offset,
         test_one_shot_chain_stops_at_branch_and_lock,
-        test_single_score_is_time_invariant,
         test_queue_and_band_are_orthogonal,
         test_queue_occ_accounting_adds_up,
         test_record_hit_uses_queue_name,

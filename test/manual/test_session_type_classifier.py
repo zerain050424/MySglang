@@ -130,6 +130,9 @@ def test_radix_cross_session_hit_promotes_short_session_to_struct():
             token_to_kv_pool_allocator=None,
             page_size=1,
             eviction_policy="heter_cache",
+            eviction_policy_config={
+                "quota": {"caps": {"struct": 0.3, "agentic": 0.4, "chat": 0.3}}
+            },
         )
     )
     cache.insert(
@@ -170,6 +173,9 @@ def test_classified_agentic_session_tags_new_nodes(tmp_path):
             token_to_kv_pool_allocator=None,
             page_size=1,
             eviction_policy="heter_cache",
+            eviction_policy_config={
+                "quota": {"caps": {"struct": 0.3, "agentic": 0.4, "chat": 0.3}}
+            },
         )
     )
     for turn in range(1, 6):
@@ -212,6 +218,9 @@ def test_classified_chat_session_tags_new_nodes():
             token_to_kv_pool_allocator=None,
             page_size=1,
             eviction_policy="heter_cache",
+            eviction_policy_config={
+                "quota": {"caps": {"struct": 0.3, "agentic": 0.4, "chat": 0.3}}
+            },
         )
     )
     for turn, at in enumerate((0.0, 25.0, 50.0, 75.0, 100.0), 1):

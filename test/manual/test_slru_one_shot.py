@@ -7,7 +7,7 @@
 2. **共享数达到阈值就退出一次性带**，即使创建者当初被判成 TRANS。
 3. **`queue_tag` 不参与判定**：QSTRUCT 标签救不了私有的 TRANS 节点，
    QTRANS 标签也不会把已被多次复用的节点拉回一次性带。
-4. **阈值同源**：`is_one_shot` 与 `SlruEvictPolicy.applies_to` 用同一个
+4. **阈值同源**：`is_one_shot` 与 `SlruEvictPolicy.pick` 的准入判定用同一个
    `share_min`，且共用同一本会话账。
 
     python test/manual/test_slru_one_shot.py
@@ -59,7 +59,9 @@ class FakeNode:
 def make_strategy(session_types, *, force_agentic=False, **slru):
     """构造策略 + 私有会话账（不污染进程级单例）。"""
     st = HeterCacheStrategy(
-        slru=slru or None, force_agentic=force_agentic
+        slru=slru or None,
+        force_agentic=force_agentic,
+        quota={"caps": {"struct": 0.3, "agentic": 0.4, "chat": 0.3}},
     )
     reg = SessionRegistry()
     for sid, stype in session_types.items():
@@ -155,13 +157,13 @@ def test_ledger_semantics():
     for _ in range(3):
         st.slru_evict.on_node_hit(node, "s1")
     check(node.share_sessions == 1, f"self re-reads must dedup, got {node.share_sessions}")
-    check(st.slru_evict.applies_to(node) is False, "private context must not be protected")
+    check(st.slru_evict.pick([node]) is None, "private context must not be protected")
 
     # 1 次外部命中即达阈值
     st.slru_evict.on_node_hit(node, "s2")
     check(node.share_sessions == 2, f"one foreign hit must reach min, got {node.share_sessions}")
     check(st.is_one_shot(node) is False, "cross-session template leaves the band")
-    check(st.slru_evict.applies_to(node) is True, "cross-session template is protected")
+    check(st.slru_evict.pick([node]) is node, "cross-session template is protected")
 
     # 无 session 的节点不记
     orphan = FakeNode(session_id=None)
@@ -179,18 +181,18 @@ def test_no_session_is_not_one_shot():
     check(st.is_one_shot(ghost) is False, "swept session -> not one-shot")
 
 
-def test_is_one_shot_and_applies_to_agree():
+def test_is_one_shot_and_pick_scope_agree():
     """同一阈值 + 同一本账：STRUCT 节点上两者互补。"""
-    print("[6] is_one_shot and SlruEvictPolicy.applies_to are complementary")
+    print("[6] is_one_shot and SlruEvictPolicy.pick scope are complementary")
     st, _ = make_strategy({"s1": SessionType.STRUCT})
     node = FakeNode(session_id="s1")
 
-    check(st.slru_evict.applies_to(node) is False, "share=0 must not be SLRU-scoped")
+    check(st.slru_evict.pick([node]) is None, "share=0 must not be SLRU-scoped")
     check(st.is_one_shot(node) is True, "share=0 must be one-shot")
 
     for i in range(st.slru_evict.share_min):
         st.slru_evict.on_node_hit(node, f"z{i}")
-    check(st.slru_evict.applies_to(node) is True,
+    check(st.slru_evict.pick([node]) is node,
           "at threshold the node becomes SLRU-scoped")
     check(st.is_one_shot(node) is False, "at threshold the node leaves the band")
 
@@ -226,12 +228,12 @@ def test_share_min_is_single_knob():
         st.slru_evict.on_node_hit(node, f"o{k}")
     check(node.share_sessions == 2, f"share_sessions, got {node.share_sessions}")
     check(st.is_one_shot(node) is True, "share=2 is still one-shot when min=3")
-    check(st.slru_evict.applies_to(node) is False, "share=2 is not SLRU-scoped yet")
+    check(st.slru_evict.pick([node]) is None, "share=2 is not SLRU-scoped yet")
 
     st.slru_evict.on_node_hit(node, "o2")
     check(node.share_sessions == 3, f"share_sessions, got {node.share_sessions}")
     check(st.is_one_shot(node) is False, "share=3 leaves the one-shot band")
-    check(st.slru_evict.applies_to(node) is True, "share=3 is SLRU-scoped")
+    check(st.slru_evict.pick([node]) is node, "share=3 is SLRU-scoped")
 
     # 默认值：配置不写时两边都回落到 DEFAULT_SHARE_MIN
     d, _ = make_strategy({"s1": SessionType.STRUCT})
@@ -241,7 +243,10 @@ def test_share_min_is_single_knob():
 
     # 配置非法值由 SlruParams 拦住（<2 没有意义）
     try:
-        HeterCacheStrategy(slru={"share_min": 1})
+        HeterCacheStrategy(
+            slru={"share_min": 1},
+            quota={"caps": {"struct": 0.3, "agentic": 0.4, "chat": 0.3}},
+        )
     except ValueError as exc:
         check("share_min" in str(exc), f"unexpected message: {exc}")
     else:
@@ -256,7 +261,7 @@ def main():
         test_queue_tag_is_irrelevant,
         test_ledger_semantics,
         test_no_session_is_not_one_shot,
-        test_is_one_shot_and_applies_to_agree,
+        test_is_one_shot_and_pick_scope_agree,
         test_works_under_force_agentic,
         test_share_min_is_single_knob,
     ]
