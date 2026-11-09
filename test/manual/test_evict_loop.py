@@ -160,6 +160,9 @@ def make_cache(cache_cls, strategy, nodes):
     cache.session_registry = strategy.session_registry
     cache.node_observers = tuple(strategy.node_observers)
     # evict() 依赖这三个由 __init__ 派生的字段；假缓存需要手工接上
+    # 批次 C 之后账本与遥测归驱动层持有：假缓存要把引用接上
+    cache.occupancy = strategy.occupancy
+    cache.telemetry = strategy.telemetry
     cache._needs_capacity = strategy.needs_capacity
     cache.page_size = 1
     cache.evictable_size_ = 0

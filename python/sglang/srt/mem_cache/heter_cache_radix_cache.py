@@ -76,11 +76,11 @@ class HeterCacheRadixCache(RadixCache):
 
     def _pick_victim(self, leaves, capacity: float):
         """转发至 quota_selector 纯策略决策器。"""
-        strategy = self.eviction_strategy
         return quota_selector.pick_victim(
-            strategy=strategy,
+            strategy=self.eviction_strategy,
             leaves=leaves,
-            occ=strategy.occupancy.occ,
+            # 账本由驱动层持有，这里传只读投影给纯决策器。
+            occ=self.occupancy.occ,
             capacity=capacity,
             page_size=self.page_size,
         )
@@ -90,8 +90,8 @@ class HeterCacheRadixCache(RadixCache):
 
         四个动作的顺序不可调换：
 
-        1. ``record_evict`` 必须最先。配额模式下它扣减 ``_occ``，而
-           ``_pick_victim`` 在同一个淘汰循环里每轮都读 ``_occ``——
+        1. ``record_evict`` 必须最先。它扣减配额账本，而 ``_pick_victim``
+           在同一个淘汰循环里每轮都读这份账本——
            把扣减推后会让下一轮按错误的占用选受害者；
         2. 之后才是物理释放、对外事件与摘树。
 

@@ -56,6 +56,7 @@ from sglang.srt.mem_cache.heter_utils import (
     HeterCacheNodeTag,
     session_type_to_node_tag,
 )
+from sglang.srt.mem_cache.evict_policy import HeterCacheStrategy
 from sglang.srt.mem_cache.utils import (
     get_eviction_strategy,
     split_node_hash_value,
@@ -345,45 +346,55 @@ class RadixCache(BasePrefixCache):
         self.eviction_strategy = get_eviction_strategy(
             self.eviction_policy, params.eviction_policy_config
         )
-        # 可选钩子：只有 HeterCache 策略会提供这些接口
-        # that implement them, so other policies pay nothing.
-        ## 可选钩子
-        self._hit_recorder = getattr(self.eviction_strategy, "record_hit", None)
-        self._occupancy_observer = getattr(
-            self.eviction_strategy, "observe_occupancy", None
+        # ---- 策略协定：谁提供什么，按类型一次接清 ----
+        # 以前这里用 8 处 getattr 逐个试探策略能力，属性名拼错或某处漏实现都
+        # 只会静默退化成「该能力不存在」。现在按类型显式装配：HeterCache 把自己
+        # 的三个协作者（占用账本 / 遥测 / 节点观测器）交出来，其它策略一律留空。
+        heter = (
+            self.eviction_strategy
+            if isinstance(self.eviction_strategy, HeterCacheStrategy)
+            else None
         )
-        # 配额启用时，策略需要 allocator 的可用量/容量来判断是否承压；
-        # 未启用就不碰 allocator，测试用的极简替身也能跑。
-        self._needs_capacity = bool(
-            getattr(self.eviction_strategy, "needs_capacity", False)
-        )
-        # 实验开关（HeterCacheStrategy.force_agentic）：把所有节点直接标成 QAGENT，
-        # 让 QAGENT-only 的插件（RR / T-LRU）拿到 100% 的流量。只改 queue_tag，
-        # 不动 session_type —— 分类器自身的统计仍然可测。
-        self.force_agentic = bool(
-            getattr(self.eviction_strategy, "force_agentic", False)
-        )
-        # 节点生命周期观测器：命中记账与分裂继承（当前只有 SLRU 的共享数账本）。
-        # 队内选点（RR / MT）不在这里——它们只由配额裁决调用，不参与节点生命周期。
-        self.node_observers = tuple(
-            getattr(self.eviction_strategy, "node_observers", ()) or ()
-        )
-        # 需要「插入期记账」的插件（目前是 SLRU 的分裂继承）与配额的节点入账。
-        # 在这里解析成函数元组：无插件时是空元组，插入/分裂路径只多一次空循环。
+        self._heter = heter
+        if heter is not None:
+            # 账本归驱动层持有：驱逐循环与配额仲裁读的是同一份，
+            # 但仲裁只拿只读投影（occ），不持有 tracker。
+            self.occupancy = heter.occupancy
+            self.telemetry = heter.telemetry
+            self._hit_recorder = heter.record_hit
+            self._occupancy_observer = heter
+            # 配额仲裁要 allocator 的可用量/容量判断承压；其它策略不碰 allocator，
+            # 测试里的极简替身因此仍能跑。
+            self._needs_capacity = True
+            # 实验开关：把节点直接标成 QAGENT，只改 queue_tag，不动 session_type，
+            # 分类器自身的统计仍然可测。
+            self.force_agentic = heter.force_agentic
+            # 节点生命周期观测器：命中记账与分裂继承（当前只有 SLRU 的共享数账本）。
+            # 队内选点（RR / MT）不在这里——它们只由配额裁决调用。
+            self.node_observers = heter.node_observers
+            # 配额的节点入账只挂「新建节点」一条路径。不能挂 _insert_observers：
+            # 分裂也会触发它，而分裂时占用净变化为 0，再记一次就是双计。
+            self._record_insert = heter.record_insert
+        else:
+            self.occupancy = None
+            self.telemetry = None
+            self._hit_recorder = None
+            self._occupancy_observer = None
+            self._needs_capacity = False
+            self.force_agentic = False
+            self.node_observers = ()
+            self._record_insert = None
+
+        # 两个回调元组在这里解析一次，插入/分裂热路径只做空循环。
         self._insert_observers = tuple(
-            ov.on_node_inserted
+            getattr(ov, "on_node_inserted")
             for ov in self.node_observers
             if hasattr(ov, "on_node_inserted")
         )
-        # 配额的节点入账只挂“新建节点”一条路径（插入点里显式调用）。
-        # 不能挂 _insert_observers：分裂也会触发它，而分裂时 child.key 同步
-        # 变短、队列归属不变，占用净变化为 0，再记一次就是双计。
-        self._record_insert = getattr(self.eviction_strategy, "record_insert", None)
-        # 需要命中期记录的插件（目前是 SLRU 的共享会话数账本）。
-        # 不经过任何标签策略：`force_agentic` 等实验开关下账本同样要维护，
+        # 命中记账不经过标签策略：force_agentic 等实验开关下账本同样要维护，
         # 否则 SLRU 的准入条件会退化成恒真/恒假。
         self._hit_observers = tuple(
-            ov.on_node_hit
+            getattr(ov, "on_node_hit")
             for ov in self.node_observers
             if hasattr(ov, "on_node_hit")
         )
