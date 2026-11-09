@@ -848,9 +848,7 @@ class SessionRegistry:
         now: Optional[float] = None,
     ) -> Optional[SessionState]:
         """新请求落盘时调用：重设有效链长 L，缺口 d 清零，重置活跃时钟。
-
-        d 强制置零逻辑：
-        新 prompt 已经完整执行预填充，旧缺口带来的重计算开销已被吸收，不再递延。
+        d 强制置零:新 prompt 已经完整执行预填充，旧缺口带来的重计算开销已被吸收，不再递延。
         """
         if not session_id:
             return None

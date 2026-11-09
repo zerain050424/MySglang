@@ -221,7 +221,7 @@ class HeterCacheStrategy(EvictionStrategy):
         self.node_observers = (self.slru_evict,)
 
     def _node_tag(self, node) -> HeterCacheNodeTag:
-        """节点的生效标签（已收敛枚举）。force_agentic 开启时统一按 agentic 算。"""
+        """节点的生效标签。force_agentic 开启时统一按 agentic 算。"""
         if self.force_agentic:
             return HeterCacheNodeTag.QAGENT
         return HeterCacheNodeTag.coerce(getattr(node, "queue_tag", None))

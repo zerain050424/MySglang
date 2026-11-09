@@ -988,7 +988,7 @@ class RadixCache(BasePrefixCache):
                 child_key = key.child_key(self.page_size)
 
         if len(key): ## 如果还有剩余的key,说明没有匹配到子节点,需要创建新的子节点
-            # HeterCache：新片段从「已匹配长度」处开始（绝对偏移）。
+            # HeterCache：新片段从已匹配长度处开始（绝对偏移）。
             new_node = TreeNode(priority=priority, abs_start=total_prefix_length)
             new_node.parent = node
             new_node.key = key
@@ -1009,12 +1009,12 @@ class RadixCache(BasePrefixCache):
                 decode_start is not None and total_prefix_length >= decode_start
             )
             new_node.session_id = session_id
-            self.session_registry.attach(session_id, len(new_node.value))
+            self.session_registry.attach(session_id, len(new_node.value)) ##插入新请求
             node.children[child_key] = new_node
 
             for observe in self._insert_observers:
                 observe(new_node)
-            # 配额账本：只记“新出现的 token”，分裂路径不走这里（净变化为 0）。
+            # 配额账本：只记新出现的 token,分裂路径不走这里（净变化为 0）。
             if self._record_insert is not None:
                 self._record_insert(new_node)
             if (
@@ -1022,7 +1022,7 @@ class RadixCache(BasePrefixCache):
                 and node is not self.root_node
                 and len(node.children) >= 2
             ):
-                # 分叉点即「多请求共用前缀」的结构证据，直接标 QSTRUCT。
+                # 多请求共用前缀标记QSTRUCT。
                 node.queue_tag = HeterCacheNodeTag.QSTRUCT
             self.evictable_size_ += len(key)
             self._update_leaf_status(node)
