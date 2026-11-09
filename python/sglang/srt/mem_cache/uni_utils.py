@@ -1,3 +1,19 @@
+"""HeterCache 的共享数据模型：任务/会话分类、参数组、会话账本。
+
+三个消费者都依赖这里，所以口径必须单点定义，避免"策略算一套、指标算一套"：
+
+* ``evict_policy``：评分（lognormal 复用概率 / 位置项）与 one-shot 判定；
+* ``victim_override``：改写器的作用域、共享数阈值、会话类型；
+* ``quota_selector`` / profile：队列标签与占用口径。
+
+命名约定：``SimpleHybridTaskType`` 是**节点级**任务类型（由 ``queue_tag`` 推得），
+``SessionType`` 是**会话级**分类（由分类器推得）。两者经常不一致，判定归属时
+必须明确用哪一个（见 ``is_one_shot`` 与 ``MultiTurnEvictPolicy.applies_to``）。
+
+进程级状态只有一处：``SessionRegistry.global_instance()``。它被所有 radix cache
+实例共享，因此 ``clear()`` 是全局语义（这正是 ``/flush_cache`` 需要的）。
+"""
+
 import math
 import zlib
 import dataclasses
@@ -12,10 +28,13 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 # SPDX-License-Identifier: Apache-2.0
 from enum import Enum
 
-# 单轮 workload 没有「下一轮」，节点级只保留位置项。
-
-
 class SimpleHybridTaskType(str, enum.Enum):
+    """节点级任务类型，由 ``queue_tag`` 推导（见 ``task_type_of_tag``）。
+
+    决定评分模型：多轮用复用概率，单轮用位置项——单轮没有"下一轮"，
+    时间维度上无话可说，只保留位置项。
+    """
+
     MULTI_TURN_CHAT = "multi_turn_chat"
     MULTI_TURN_AGENTIC = "multi_turn_agentic"
     STRUCT_SINGLE_TURN = "struct_single_turn"
@@ -23,6 +42,12 @@ class SimpleHybridTaskType(str, enum.Enum):
 
 
 class SessionType(str, enum.Enum):
+    """会话级分类结果，由 ``SessionRegistry._classify`` 依据轮数/工具调用/间隔推出。
+
+    与节点标签分属两层：一个 TRANS 会话插入的片段后来可能被多会话复用，
+    那时标签仍是 QTRANS，但已不该算 one-shot。
+    """
+
     TRANS = "trans"
     STRUCT = "struct"
     CHAT = "chat"
@@ -42,10 +67,17 @@ class SimpleHybridQueueTag(str, enum.Enum):
 
 
 def session_bloom_bits(session_id) -> int:
-    """session_id -> 64 bit bloom（4 函数），饱和在 ~8 个会话后误判率上升。
+    """把 session_id 哈希成 64 bit 布隆位图（4 个哈希函数），用于共享数去重。
 
-    位布局归共享会话数账本的所有者（SlruEvictPolicy）使用；
-    节点上的 ``session_bloom`` 语义因此与任何标签策略无关。
+    为什么是 bloom 而不是集合：共享数账本挂在每个节点上，会话数上万时集合
+    会持续涨内存；bloom 固定 8 字节，误判方向是"当作已记过"（少计一次共享），
+    对本策略是可接受的保守偏差。经验上 ~8 个会话后误判开始明显。
+
+    Args:
+        session_id: 会话标识；非 str 会先转字符串。
+
+    Returns:
+        64 bit 位图，位布局只与 session_id 有关，与任何标签策略无关。
     """
     text = "sid:" + (session_id if isinstance(session_id, str) else str(session_id))
     h = zlib.crc32(text.encode("utf-8", "replace")) & 0xFFFFFFFF
@@ -56,12 +88,16 @@ def session_bloom_bits(session_id) -> int:
     return bits
 
 
-# 节点共享会话数的饱和上界（8 bit，够用且能塞进诊断快照）。
+# 共享会话数的饱和上界：8 bit，够用且能原样塞进诊断快照。
 SESSION_SHARE_MAX = 255
 
 
 def session_type_to_queue_tag(session_type: SessionType) -> SimpleHybridQueueTag:
-    """Map a session classifier result to the queue used for newly owned KV."""
+    """把会话分类结果映射成"新写入 KV 该归哪个队列"的标签。
+
+    只在节点出生时使用：出生标签回答"谁创建了这段"，之后的复用事实由共享数
+    账本记录，不回写标签。
+    """
     return {
         SessionType.TRANS: SimpleHybridQueueTag.QTRANS,
         SessionType.STRUCT: SimpleHybridQueueTag.QSTRUCT,
@@ -73,6 +109,10 @@ def session_type_to_queue_tag(session_type: SessionType) -> SimpleHybridQueueTag
 # ---------------------------------------------------------------------------
 # SimpleHybrid 的可调参数组
 #
+# 用 dataclass 而非裸 kwargs：让 eviction_policy_config 有层级、可校验、可整体
+# 传递。配置只接受分组形式 {"rr":{...},"slru":{...},"mt":{...},"quota":{...}}，
+# 拼错的键会在构造处报错——实验配置静默失效比启动失败更难查。
+#
 #   RrParams        : Agentic 会话级轮询配额（跨会话公平）
 #   SlruParams      : SLRU 的共享会话数阈值（决定 one-shot 分界与保护范围）
 #   MultiTurnParams : 多轮对话（QCHAT）带内权重
@@ -83,7 +123,20 @@ def session_type_to_queue_tag(session_type: SessionType) -> SimpleHybridQueueTag
 
 
 def _coerce_params(cls, value, *, name: str):
-    """把 None / dict / 实例统一成参数组实例。"""
+    """把 None / dict / 参数组实例统一成实例。
+
+    Args:
+        cls: 参数组类。
+        value: None（取默认值）、dict（按关键字展开）或已有实例。
+        name: 错误消息里的配置分组名（如 ``"quota"``）。
+
+    Returns:
+        参数组实例。
+
+    Raises:
+        ValueError: dict 里出现未知键；消息会列出该组已知键名。
+        TypeError: 传入既不是 None/dict 也不是该组的实例。
+    """
     if value is None:
         return cls()
     if isinstance(value, cls):
@@ -103,10 +156,16 @@ def _coerce_params(cls, value, *, name: str):
 
 @dataclasses.dataclass
 class RrParams:
-    """Agentic 会话级轮询（round-robin）配额参数。
+    """Agentic 会话级轮询参数。
 
-    enabled 为真时，淘汰阶段在会话之间轮询挑 victim，并用
-    `RrEvictPolicy.loss_cap()` 限制单会话本轮可以承受的 KV 缺口。
+    ``fair_rr`` 打开后，淘汰在会话之间轮询挑 victim，并用
+    ``RrEvictPolicy.loss_cap`` 限制单会话本轮可承受的 KV 缺口。
+
+    Attributes:
+        fair_rr: 会话轮询开关。
+        kappa: 单轮缺口上限的比例系数，与 ``min_retain_*`` 一起取较小值。
+        min_retain_tokens: 每条会话至少保留的绝对 token 数。
+        min_retain_frac: 每条会话至少保留的比例（相对链长 L）。
     """
 
     fair_rr: bool = False  # Agentic 会话轮询开关
@@ -136,7 +195,7 @@ class RrParams:
 
 # 跨会话模板的共享会话数阈值。
 #
-# 语义：除创建者外还有 >= N 个会话命中过同一节点（即共 >= N+1 个会话用过）。
+# 语义：共享数 >= N 意味着共 N 个会话用过（创建者首次重读即计 1）。
 # 它同时决定两件事，两处必须同源，所以只允许配置一处：
 #   * SlruEvictPolicy.applies_to       : 是否受 SLRU 保护（进候选池）
 #   * SimpleHybridStrategy.is_one_shot : 是否退出 one-shot 带
@@ -145,15 +204,18 @@ DEFAULT_SHARE_MIN = 2
 
 @dataclasses.dataclass
 class SlruParams:
-    """SLRU 的共享会话数阈值。
+    """SLRU 的共享会话数阈值（唯一配置入口）。
 
-    配置形式：``--radix-eviction-policy-config '{"slru": {"share_min": 2}}'``。
+    为什么只允许一处配置：同一个数既决定"是否受 SLRU 保护"，又决定"是否退出
+    one-shot 带"。两处分别配置必然漂移，最后表现为"受保护的节点被当 one-shot
+    清掉"这类难查的错。
 
-    共享数由 `SlruEvictPolicy` 记账（见 victim_override）：每个不同会话 +1，
-    创建者在节点插入那一刻就计入，同一会话由`session_bloom` 去重。
-    因此 `share_min = 2` 意味着共 2 个会话用过
-    ＝创建者 + 1 次外部命中，才算跨会话模板、才开始受保护；
-    低于该值的节点（以及 TRANS 会话的节点）进 one-shot 带优先淘汰。
+    共享数由 ``SlruEvictPolicy`` 记账：每个不同会话 +1，同会话由 bloom 去重。
+    ``share_min = 2`` 意味着共 2 个会话用过（创建者 + 1 次外部命中）才算
+    跨会话模板。
+
+    Attributes:
+        share_min: 受保护的共享会话数阈值，必须 >= 2。
     """
 
     share_min: int = DEFAULT_SHARE_MIN
@@ -177,14 +239,16 @@ class SlruParams:
 class MultiTurnParams:
     """多轮对话（QCHAT）带内改写器的参数。
 
-    配置形式：``--radix-eviction-policy-config '{"mt": {"enabled": true}}'``。
+    带内权重取 ``1 - prob(e) = CDF(elapsed; mu, sigma)``，mu/sigma 来自
+    ``TASK_CONFIG``（UniCache 原机制）。该权重只用于带内排序，不参与跨队列
+    仲裁——跨队列由 ``quota_selector`` 负责。
 
-    带内权重 1 - prob(e) = CDF(elapsed; μ, σ)，μ/σ 取
-    ``TASK_CONFIG[MULTI_TURN_CHAT]``（UniCache 原机制，μ=4.77 / σ=1.279）；
-    带内排序不乘其他队列的权重——QCHAT 带内语义等价于全局 victim_key。
-    enabled 默认 True：mt 改写器只在 victim 落入 QCHAT 带时接管
-    （调用链 applies_to 门禁），带内语义与全局 victim_key 等价，
-    差异仅在 tie-break=LRU，默认不改变淘汰分布。
+    默认开启不改变淘汰分布：改写器只在候选落入 QCHAT 带时接管
+    （``applies_to`` 门禁），带内语义与全局 ``victim_key`` 等价，
+    差异仅在 tie-break 用 LRU。
+
+    Attributes:
+        enabled: 是否启用改写器。
     """
 
     enabled: bool = True
@@ -309,13 +373,13 @@ class QuotaParams:
 
 @lru_cache(maxsize=8)
 def _cached_lognorm_params(mu: float, sigma: float):
-    """Cache lognormal parameters to avoid recomputation."""
+    """缓存 lognormal 的派生常数（避免每次命中回调都重算 sqrt）。"""
     return mu, sigma, sigma * math.sqrt(2.0)
 
 
 @lru_cache(maxsize=8)
 def _cached_lognorm_params_v1(mu: float, sigma: float):
-    """Cache lognormal parameters to avoid recomputation."""
+    """同上，但多返回两个供概率密度使用的常数（历史实现保留）。"""
     inv_sigma = 1.0 / sigma
     denom = sigma * math.sqrt(2.0)
     norm_const = inv_sigma / math.sqrt(2.0 * math.pi)
@@ -323,7 +387,7 @@ def _cached_lognorm_params_v1(mu: float, sigma: float):
 
 
 def _cached_lognorm_prob(x: float, mu: float, sigma: float) -> float:
-    """CDF of lognormal distribution (erf-based)."""
+    """lognormal 的 CDF（erf 近似）。与 ``_cached_lognorm_cdf`` 同值，保留给旧调用方。"""
     if x <= 0:
         return 0.0
     mu, sigma, inv_sigma, denom, _ = _cached_lognorm_params_v1(mu, sigma)
@@ -332,7 +396,17 @@ def _cached_lognorm_prob(x: float, mu: float, sigma: float) -> float:
 
 
 def _cached_lognorm_cdf(x: float, mu: float, sigma: float) -> float:
-    """CDF of lognormal distribution using fast erf-based approximation."""
+    """lognormal 的 CDF（erf 近似，无 SciPy 依赖）。
+
+    x <= 0 直接返回 0：``math.log(0)`` 会抛错，而刚写入的节点必然出现 x=0。
+
+    Args:
+        x: 已经过的秒数。
+        mu, sigma: 分布参数，来自 ``TASK_CONFIG``。
+
+    Returns:
+        ``P(reuse_interval <= x)``，即"复用已经发生过"的概率。
+    """
     if x <= 0:
         return 0.0
     mu, sigma, denom = _cached_lognorm_params(mu, sigma)
@@ -340,18 +414,24 @@ def _cached_lognorm_cdf(x: float, mu: float, sigma: float) -> float:
     return 0.5 * (1.0 + math.erf(z))
 
 
-   # (mu, sigma) per multi-turn workload type
+# 多轮任务的复用间隔分布参数 (mu, sigma)，lognormal（UniCache 原机制）。
+# 评分与改写器都必须从这里取值：两边各写一份会让"评分为正、改写为负"。
 TASK_CONFIG = {
     SimpleHybridTaskType.MULTI_TURN_CHAT: (4.77, 1.279),
     SimpleHybridTaskType.MULTI_TURN_AGENTIC: (1.81, 1.092),
 }
 
-# profile/记账用的四类工作负载标签（顺序即打印顺序）。
+# profile 与记账用的四类标签（顺序即打印顺序）。
+# random 不参与跨队列配额：它整行都是 one-shot，在阶段 0 就被清掉。
 WORKLOAD_LABELS = ("chat", "agentic", "struct", "random")
 
 
 def workload_label_of(task_type) -> str:
-    """把任务类型映射到四类工作负载标签。"""
+    """把节点级任务类型映射成四类工作负载标签。
+
+    未知类型回落到 ``"chat"``：多轮是最保守的归类（保留最久），比误判成
+    one-shot 直接清掉安全。
+    """
     return {
         SimpleHybridTaskType.MULTI_TURN_CHAT: "chat",
         SimpleHybridTaskType.MULTI_TURN_AGENTIC: "agentic",
@@ -364,17 +444,22 @@ def workload_label_of(task_type) -> str:
 # 节点口径的小工具与标签映射
 #
 # 放在这里而不是各自的策略模块里：evict_policy / victim_override / 指标统计
-# 都要用同一套口径，重复实现迟早会漂移（abs_start 语义已经在 HeterCache 迁移中踩过一次）。
+# 都用同一套口径。重复实现一定会漂移——abs_start 的语义在 HeterCache 迁移中
+# 就踩过一次，当时"片段长度"与"绝对偏移"被混用，评分整体偏了一个前缀长度。
 # ---------------------------------------------------------------------------
 
 
 def node_num_tokens(node) -> int:
-    """片段长度（radix 片段的 token 数）。"""
+    """节点的片段长度（radix 片段的 token 数），非驻留节点返回 0。"""
     return len(node.value) if node.value is not None else 0
 
 
 def node_end_offset(node) -> int:
-    """片段在整条序列中的绝对结束偏移（HeterCache 的 num_hashed_tokens）。"""
+    """片段在整条序列中的绝对结束偏移（HeterCache 的 num_hashed_tokens）。
+
+    注意这不是片段长度：struct 的位置项要的是"离序列尾部有多远"，用长度会
+    把长序列的尾部当成长前缀。
+    """
     num_tokens = node_num_tokens(node)
     abs_start = getattr(node, "abs_start", None)
     if abs_start is None:
@@ -383,7 +468,11 @@ def node_end_offset(node) -> int:
 
 
 def task_type_of_tag(tag) -> SimpleHybridTaskType:
-    """queue_tag -> 任务类型。策略与淘汰改写器共用这一份映射。"""
+    """queue_tag 映射到任务类型；未知/缺失标签按多轮 chat 处理。
+
+    未知标签回落到 chat 而不是 random：random 会被排进 one-shot 带直接清掉，
+    多轮归类最多是多留一段时间。
+    """
     return {
         SimpleHybridQueueTag.QTRANS: SimpleHybridTaskType.RANDOM_SINGLE_TURN,
         SimpleHybridQueueTag.QSTRUCT: SimpleHybridTaskType.STRUCT_SINGLE_TURN,
@@ -394,11 +483,24 @@ def task_type_of_tag(tag) -> SimpleHybridTaskType:
 
 @dataclasses.dataclass
 class SessionState:
-    """一条会话的 KV记账。
+    """单条会话的 KV 记账 + 分类证据。
 
-    `d` 只在两处变化：会话自己的请求写入时归零、其片段被删时累加。
-    `classifier_gaps`、tool-call 与跨会话命中证据只用于更新会话类型；
-    原 `gaps` / `L` 仍服务于 KV 账本，避免分类器改变其记账语义。
+    两套字段故意分开，互不干扰：
+
+    * **KV 记账**：``L``（最近一次 prompt 长度）与 ``d``（当前缺口）。``d`` 只在
+      两处变化——会话自己的请求写入时归零（``touch``）、其节点被删时累加
+      （``charge``）。RR 的 ``loss_cap`` 直接读这两个值。
+    * **分类证据**：``classifier_gaps`` / ``turn_count`` / ``tool_call_count`` /
+      ``cross_session_shared``，只用于推 ``session_type``。
+
+    分开的原因是：分类器改一次阈值就会把历史 replay 的分类结果改掉，如果两者
+    共用 ``gaps``，连带会把 KV 缺口的口径也改掉。
+
+    Attributes:
+        L: 最近一次请求的 prompt 长度（token）。
+        d: 当前 KV 缺口（已删但仍在该会话活跃链里的 token）。
+        node_count: 仍驻留的节点数。
+        last_rid: 用于 chunked prefill 去重——同一 rid 重入不算新的一轮。
     """
 
     session_id: str
@@ -423,30 +525,32 @@ class SessionState:
 
 logger = logging.getLogger(__name__)
 
-# 调试开关：d 超过 L 时打印具体节点（默认关，零开销）
+# 调试开关：d 超过 L 时打印具体节点。默认关——这两个分支都在逐节点热路径上，
+# 只要打开就会把淘汰循环拖慢一个量级。
 _D_BREAK_LOG = os.environ.get("SGLANG_SESSION_D_BREAK_LOG", "0") == "1"
-# 只追踪单个会话的每一次 charge，用于核对是否存在重复计账
+# 只追踪单个会话的每一次 charge，用于核对是否重复计账。
 _TRACE_SID = os.environ.get("SGLANG_SESSION_TRACE_SID", "")
 
 
 class SessionRegistry:
-    """
-    会话表：独立维护 KV 记账与逐步升级的会话类型。
-    `observe_request` / `record_cross_session_hit` 更新分类证据；`touch`、`charge`、
-    `attach` 保持 KV 记账职责。节点按鸭子类型读取 `session_id` 与 `value`。
+    """会话表：KV 缺口记账 + 会话类型分类。
 
-    进程级共享
-    ----------
-    缓存层通过 `global_instance()` 取用**同一个**账本，因此：
+    职责划分：``observe_request`` / ``record_cross_session_hit`` 只更新分类证据；
+    ``touch`` / ``charge`` / ``attach`` 只更新 KV 记账。两边共用一个
+    ``SessionState``，但字段不重叠（见该类文档）。
 
-      * 同一进程内所有 radix cache 实例（device/host、重复构造）看到同一份
-        `d`/`L`/`gaps`，RR 的 `loss_cap` 与分类器不会各算一套；
-      * `clear()` 是全局的 —— `/flush_cache` 清的是整本账（这正是想要的语义）；
-      * 需要隔离（单测、对照实验并行）时用 `reset_global()` 丢弃单例，或直接
-        `SessionRegistry()` 造私有实例并在构造缓存后覆盖 `cache.session_registry`。
+    节点按鸭子类型读取 ``session_id`` 与 ``value``，因此本模块不依赖 radix 树类型。
 
-    访问方全部在调度线程（match / insert / evict）里，`sweep()` 由 `touch()` 顺带
-    触发，因此这里不加锁。
+    **进程级共享**：缓存层统一走 ``global_instance()``，所以
+
+    * 同一进程内所有 cache 实例看到同一份 ``d``/``L``，RR 的 ``loss_cap`` 与
+      分类器不会各算一套；
+    * ``clear()`` 是全局语义（``/flush_cache`` 清的本来就是整本账）；
+    * 需要隔离（单测、并行对照实验）时用 ``reset_global()`` 丢弃单例，或自建
+      ``SessionRegistry()`` 后覆盖 ``cache.session_registry``。
+
+    并发：所有调用方都在调度线程（match / insert / evict），``sweep()`` 由
+    ``touch()`` 顺带触发，因此不加锁。
     """
 
     # 进程级单例。用基类名访问，避免子类各持一份。
@@ -454,7 +558,7 @@ class SessionRegistry:
 
     @classmethod
     def global_instance(cls) -> "SessionRegistry":
-        """返回进程级共享账本（首次调用时用默认 TTL 创建）。"""
+        """返回进程级共享账本；首次调用时按默认 TTL 创建。"""
         inst = SessionRegistry._global
         if inst is None:
             inst = SessionRegistry()
@@ -463,10 +567,10 @@ class SessionRegistry:
 
     @classmethod
     def reset_global(cls) -> Optional["SessionRegistry"]:
-        """丢弃单例并返回旧实例；下一次 `global_instance()` 会新建。
+        """丢弃单例并返回旧实例，下一次 ``global_instance()`` 会新建。
 
-        用于测试隔离与「换参数重建」：单例一旦创建就固定了 `idle_ttl` /
-        `empty_grace`，想换参数必须先 reset。
+        参数（``idle_ttl`` / ``empty_grace``）在单例创建时就固定了，想换参数
+        必须先 reset——这是测试隔离和"换配置重建"的唯一入口。
         """
         old = SessionRegistry._global
         SessionRegistry._global = None
@@ -501,7 +605,20 @@ class SessionRegistry:
         tool_call=None,
         now: Optional[float] = None,
     ) -> Optional[SessionState]:
-        """用当前请求可见的会话证据更新分类；同一 rid（如 chunked 重入）只计一次。"""
+        """用当前请求的会话证据更新分类；同一 rid（chunked 重入）只计一次。
+
+        只动分类字段，不碰 KV 记账（``d`` / ``L`` 归 ``touch`` 管）。
+
+        Args:
+            session_id: 会话标识；缺失时直接返回 None。
+            rid: 请求 id，用于识别 chunked prefill 的重复进入。
+            prompt_len: 本次请求的 prompt 长度。
+            tool_call: 工具调用证据（存在即视为 agentic 的正向信号）。
+            now: 注入时钟，便于离线回放与测试。
+
+        Returns:
+            该会话的状态；``session_id`` 为空时返回 None。
+        """
         if not session_id:
             return None
         now = time.monotonic() if now is None else now
@@ -528,7 +645,18 @@ class SessionRegistry:
     def record_cross_session_hit(
         self, session_id: Optional[str], owner_session_id: Optional[str]
     ) -> Optional[SessionState]:
-        """Record that this session reused a radix segment first inserted by another session."""
+        """记录"本会话复用了别的会话插入的片段"，作为跨会话共享证据。
+
+        跨会话共享会把单轮 TRANS 升为 STRUCT（结构化负载），因此这是分类证据，
+        不参与 KV 记账。
+
+        Args:
+            session_id: 复用了别人片段的会话。
+            owner_session_id: 片段创建者。两者相同（或任一缺失）时不算证据。
+
+        Returns:
+            本会话的状态；无需更新时返回查询结果。
+        """
         if not session_id or not owner_session_id or session_id == owner_session_id:
             return self.get(session_id)
         st = self._sessions.get(session_id)
@@ -540,9 +668,24 @@ class SessionRegistry:
 
     @classmethod
     def _classify(cls, state: SessionState) -> SessionType:
-        if state.turn_count < cls.MULTI_TURN_MIN: # 小于阈值轮数, 认为是单轮 workload，按跨会话共享证据区分结构化与非结构化
+        """按"轮数 -> 工具调用 -> 轮间间隔 -> 上下文增长"的顺序推会话类型。
+
+        顺序不能换：工具调用与短间隔都是 agentic 的正向证据，先判它们可以避免
+        一条真正的 agent 会话因为偶尔一次长间隔被判成 chat（chat 的 T-LRU 语义
+        完全不同，误判会直接改变保护策略）。
+
+        阈值都放在类属性上，便于离线回放时按 trace 重标定。
+
+        Args:
+            state: 会话状态（只读分类字段）。
+
+        Returns:
+            推得的会话类型。
+        """
+        # 轮数不足：按"是否被别的会话复用"区分结构化文档与一次性事务。
+        if state.turn_count < cls.MULTI_TURN_MIN:
             return SessionType.STRUCT if state.cross_session_shared else SessionType.TRANS
-        if state.tool_call_count: # 存在Tool_call, 认为是 agentic workload
+        if state.tool_call_count:  # 工具调用是 agentic 的强正向证据
             return SessionType.AGENTIC
         if state.classifier_gaps:
             ordered = sorted(state.classifier_gaps)
@@ -552,14 +695,15 @@ class SessionRegistry:
                 if len(ordered) % 2
                 else (ordered[middle - 1] + ordered[middle]) / 2
             )
-            if median_gap < cls.GAP_SPLIT_S: # 轮间间隔小于阈值, 认为是Agentic
+            if median_gap < cls.GAP_SPLIT_S:  # 连续短间隔：agentic
                 return SessionType.AGENTIC
-            if median_gap > cls.GAP_SPLIT_S: # 轮间间隔大于阈值, 认为是Chat
+            if median_gap > cls.GAP_SPLIT_S:  # 长间隔：人在读，判 chat
                 return SessionType.CHAT
         growth = state.latest_context_len - state.first_context_len
         return (
             SessionType.AGENTIC
-            if growth >= cls.AGENTIC_CONTEXT_GROWTH_TOKENS #上下文长度增长超过阈值, 认为是Agentic
+            # 间隔恰好等于阈值时无法区分，退回"上下文是否持续增长"这一证据。
+            if growth >= cls.AGENTIC_CONTEXT_GROWTH_TOKENS
             else SessionType.CHAT
         )
 
@@ -571,7 +715,20 @@ class SessionRegistry:
         prompt_len: int = 0,
         now: Optional[float] = None,
     ) -> Optional[SessionState]:
-        """会话自己的请求被写入时调用：记轮间隔、更新 L、缺口归零。"""
+        """会话自己的请求被写入时调用：更新 L、缺口归零、记录轮间间隔。
+
+        ``d`` 在这里归零而不是"递减"：新一轮 prompt 已经重新 prefill，之前的缺口
+        不再代表延迟代价。
+
+        Args:
+            session_id: 会话标识；缺失时直接返回。
+            rid: 请求 id；与上次相同时说明是 chunked prefill 重入，不计新的一轮。
+            prompt_len: 本次 prompt 长度，写入 ``L``。
+            now: 注入时钟；``touch`` 同时是 ``sweep`` 的触发点。
+
+        Returns:
+            该会话状态；``session_id`` 为空时返回 None。
+        """
         if not session_id:
             return None
         now = time.monotonic() if now is None else now
@@ -579,7 +736,8 @@ class SessionRegistry:
         if st is None:
             st = self._sessions[session_id] = SessionState(session_id=session_id)
         elif rid != st.last_rid and st.last_active > 0.0:
-            # chunked prefill 会让同一请求多次进入插入路径，只有换 rid 才算新的一轮
+            # chunked prefill 会让同一请求多次进入插入路径；只有换 rid 才算新的一轮，
+            # 否则会把一个请求切成多"轮"，把 agentic 误判成 chat。
             st.gaps.append(now - st.last_active)
             if len(st.gaps) > self.GAP_WINDOW:
                 del st.gaps[0]
@@ -594,7 +752,14 @@ class SessionRegistry:
         return st
 
     def attach(self, session_id: Optional[str], num_tokens: int = 0) -> None:
-        """新增一个归属该会话的节点。"""
+        """登记一个归属该会话的新节点（token 数与节点数各 +1）。
+
+        只用于观测与 sweep 的存活判据，不参与 ``d`` 的计算。
+
+        Args:
+            session_id: 会话标识。
+            num_tokens: 新节点的 token 数。
+        """
         if not session_id:
             return
         st = self._sessions.get(session_id)
@@ -604,7 +769,14 @@ class SessionRegistry:
         st.attached += num_tokens
 
     def charge(self, node) -> None:
-        """节点被删时调用：所属会话缺口累加，存活节点数减一。"""
+        """节点被删时调用：所属会话缺口累加，存活节点数减一。
+
+        级联删除会对每个节点各调一次，因此缺口是累加的；本方法同时是
+        ``/flush_cache`` 之外唯一会改动 ``d`` 的入口。
+
+        Args:
+            node: 被删除的节点（读取 ``session_id`` / ``value``）。
+        """
         session_id = getattr(node, "session_id", None)
         if not session_id:
             return
@@ -624,7 +796,8 @@ class SessionRegistry:
                 len(getattr(node, "key", []) or []), num_tokens, st.d, st.L,
             )
         if _D_BREAK_LOG and st.L and st.d > st.L + 32:
-            # d 不应超过该会话最近一次写入的链长；超过说明归属或长度口径有问题
+            # d 不应超过该会话最近一次写入的链长；一旦超过，说明节点归属或长度
+            # 口径出了问题，这条日志是唯一能定位到具体节点的地方。
             logger.warning(
                 "[session d break] sid=%s d=%d L=%d +%d abs_start=%s "
                 "attached=%d charged=%d live=%d node_count=%d",
@@ -641,12 +814,27 @@ class SessionRegistry:
     def clear(self) -> None:
         """清空全部会话记账。
 
-        缓存 flush / reset 必须调用：跨 run 复用同一个 server 时，`d`/`L`/`gaps`
-        如果残留，RR 的 loss_cap 会读到上一轮的缺口，实验之间互相污染。
+        ``/flush_cache`` 与缓存 reset 必须调用：跨 run 复用同一个 server 时，
+        残留的 ``d``/``L`` 会让 RR 的 ``loss_cap`` 读到上一轮的缺口，实验之间
+        互相污染。
         """
         self._sessions.clear()
 
     def sweep(self, now: Optional[float] = None) -> int:
+        """回收长时间不活跃的会话，返回回收条数。
+
+        由 ``touch`` 每 ``SWEEP_EVERY`` 次顺带触发，不单独起线程：账本只在调度
+        线程上被访问，加锁的代价比顺带清理高。
+
+        两种回收条件：超过 ``idle_ttl``；或节点已全部清空且过了 ``empty_grace``
+        （后者让刚 flush 完的会话还能保留一小段时间的分类证据）。
+
+        Args:
+            now: 注入时钟。
+
+        Returns:
+            被回收的会话数。
+        """
         now = time.monotonic() if now is None else now
         dead = [
             sid
@@ -660,7 +848,11 @@ class SessionRegistry:
 
     # ---- 观测 ----
     def summary(self) -> Dict[str, float]:
-        """给 [SimpleHybrid profile] 用的缺口分布。"""
+        """缺口分布摘要，供 ``[SimpleHybrid profile]`` 打印。
+
+        ``d_nonzero`` 是最有用的一个：它告诉你有多少会话真的处于"被削过"的状态，
+        只看 ``d_sum`` 会被少数大缺口带偏。
+        """
         ds = sorted(st.d for st in self._sessions.values())
         if not ds:
             return {"sessions": 0, "d_sum": 0, "d_p50": 0, "d_max": 0, "d_nonzero": 0}

@@ -1,34 +1,27 @@
-"""VictimOverride: 淘汰候选节点改写器插件。
+"""HeterCache 的候选改写器插件（VictimOverride）。
 
-【功能定位】
-将多样化的淘汰裁决逻辑从SimpleHybridStrategy中解耦，提供可插拔的候选重选能力。
-允许不同策略根据自身状态（如会话配额、分段水位等），对全局选出的默认淘汰候选进行重定向。
+从 ``SimpleHybridStrategy`` 里解耦出来的"重选候选"能力：全局先用 ``victim_key``
+选出一个基础候选，再按注册顺序询问改写器，后者可基于自己的状态（会话配额、
+分段水位、生存概率）把候选改写成别的叶子。
 
-【核心接口协议】
-    - applies_to(node) -> bool:
-        判断当前候选节点是否落在该改写器的管辖范围内。
-    - pick(leaves, registry) -> Optional[Node]:
-        在合法的叶子节点池中挑出本策略优先淘汰的节点；返回 None 表示弃权/不干预。
+接口：
 
-【调度规则与硬性约束】
-1. 链式覆盖原则（Last-in Precedence）：
-   - 缓存层按注册顺序逐个询问改写器，后注册者若生效将覆盖前者的选择（如：会话级 RR 策略先修正一次，结构队列策略若命中管辖权可再次覆盖）。
-2. 只挑不删（Separation of Concerns）：
-   - 改写器仅负责挑选候选节点，绝对不执行释放 KV 或删除节点的操作，最终驱逐仍由 `_evict_one()` 统一落盘执行。
-3. 安全回退（Fall-through Guarantee）：
-   - 若返回 None 或无法决策，必须立即安全回退到原候选节点，严禁阻塞淘汰推进（防止 evict 循环自旋）。
-4. 候选集封闭（Scope Boundary）：
-   - 只能在传入的 `leaves`（可淘汰叶子集合）内部做重选，禁止跨范围构造或越界选取新节点。
-5. 观测与仲裁分离：
-   - 节点的 `queue` 属性仅用于性能分析与日志观测（记录该淘汰归属于哪个策略队列），绝对不得参与跨队列的仲裁判定（跨队列仲裁统一由全局 `victim_key` 排序决定）。
+* ``applies_to(node) -> bool``：当前候选是否在本改写器管辖范围内；
+* ``pick(leaves, registry) -> Optional[TreeNode]``：在本范围内重选，返回
+  ``None`` 表示弃权。
 
-【内置策略实现清单】
-- RrEvictPolicy:
-    实现会话级轮询公平性（Round-Robin），内部维护独立的会话轮询序号及配额违约计数。
-- SlruEvictPolicy:
-    分段式 LRU（Probation → Protected，段内按 recency 排序）。同时独占维护节点共享会话数账本（通过 `on_node_hit` 触发）。
-    配合 `scope="non_one_shot"` 可组装为带 One-shot 隔离带的 SLRU模式。
+四条硬约束（违反任何一条都会让淘汰循环出错）：
 
+1. **只挑不删**：改写器不得释放 KV / 改树，副作用统一由缓存层 ``_evict_one``
+   执行，否则同一节点会被二次释放。
+2. **必可回退**：返回 ``None`` 时调用方保留原候选；改写器也不许抛错阻塞淘汰
+   推进（会导致 evict 自旋）。
+3. **候选集封闭**：只能在传入的 ``leaves`` 内重选，不得构造新节点。
+4. **观测与仲裁分离**：``queue`` 只用于 profile 归类，不参与仲裁；跨队列仲裁
+   属于 ``quota_selector``。
+
+内置实现：``RrEvictPolicy``（会话轮询）、``SlruEvictPolicy``（分段 LRU + 共享数
+账本）、``MultiTurnEvictPolicy``（多轮带内 1-prob(e) 排序）。
 """
 
 from __future__ import annotations
@@ -58,50 +51,52 @@ if TYPE_CHECKING:  # pragma: no cover
     from sglang.srt.mem_cache.uni_utils import SessionState
 
 
-# ---- HeterCache 插件侧表：替代 TreeNode 上的内嵌插件状态----
-# 设计：策略插件私有状态不再内嵌 TreeNode 字段，改由本模块持侧表。
-# WeakKeyDictionary 以节点为弱键：节点被 GC（分裂清理/驱逐/reset）时
-# 条目自动消失，与旧内嵌字段生命周期等价，无需显式清理钩子。
-# 键为 TreeNode，读侧缺省为 0。
+# ---- HeterCache 插件的侧表 ----
+# 插件私有状态不内嵌到 TreeNode 上（那会污染所有缓存实现），改用本模块的侧表。
+# WeakKeyDictionary 以节点为弱键：节点被 GC（驱逐/分裂清理/reset）时条目自动
+# 消失，生命周期与内嵌字段等价，因此不需要任何显式清理钩子。
 _SLRU_META = weakref.WeakKeyDictionary()  # node -> [share_sessions, session_bloom]
 
 
 class VictimOverride(ABC):
-    """插件位基类。子类只需实现 applies_to / pick。"""
+    """候选改写器的抽象基类：子类只要实现 ``applies_to`` / ``pick``。"""
 
     name: str = "override"
-    # 会话账本由构造方注入（见 SlruEvictPolicy.__init__）。基类不得在 import
-    # 时抓死全局单例，否则 SessionRegistry.reset_global() / 测试里的
-    # `cache.session_registry = SessionRegistry()` 都到不了插件。
-    # 观测字段：本改写器管辖的队列，仅用于 profile 记账。
-    # 不得参与仲裁判定（否则退化为 proposer 形态，见设计讨论）。
+    # 本改写器管辖的队列；**仅**用于 profile 归类，不得参与仲裁判定。
     queue: Optional[SimpleHybridQueueTag] = None
 
     @abstractmethod
     def applies_to(self, node) -> bool:
-        """当前候选是否归本改写器管。"""
+        """判断候选是否计入本改写器的管辖范围。"""
 
     @abstractmethod
     def pick(self, leaves: Iterable["TreeNode"], registry) -> Optional["TreeNode"]:
-        """返回本改写器更愿意淘汰的节点；None表示不接管。"""
+        """在管辖范围内重选候选；返回 None 表示弃权，调用方保留原候选。"""
 
     def stats(self) -> Dict[str, float]:
+        """返回本改写器的观测量；无观测的插件返回空字典。"""
         return {}
 
     def reset(self) -> None:
-        """清空内部状态（缓存 reset / 进程复用）。"""
+        """清空内部状态（缓存 reset / 跨 run 复用同一进程时调用）。"""
 
     def __repr__(self) -> str:  # pragma: no cover - 调试用
         return f"<{type(self).__name__} name={self.name}>"
 
 
 class RrEvictPolicy(VictimOverride):
-    """
-    Agentic 会话轮询（round-robin）。
-    语义：
-      * 只处理 Agentic 队列的叶子，按会话聚合，每个会话取最深的那片叶子；
-      * 本轮缺口 `d` 超过 `loss_cap(L)` 的会话直接跳过，避免把一条会话掏空；
-      * 按照访问距离进行轮询删除。
+    """Agentic 队列的会话级轮询（round-robin）。
+
+    目的：agentic 队列里常有几十条并行会话，按全局分数淘汰会让同一条会话
+    连续挨刀，下一轮 prefill 时集中爆发。这里改成"按会话轮着削"：
+
+    * 只处理 agentic 叶子，并归到所属会话（每会话只取最深的叶子——删它才能
+      一次腾出最多空间）；
+    * 本轮缺口 ``d`` 已达上限的会话直接跳过，避免把一条会话掏空；
+    * 其余会话按"最久未被选中"排序，实现跨会话轮询。
+
+    Args:
+        params: ``RrParams``；``fair_rr`` 为假时整个改写器弃权。
     """
 
     name = "rr"
@@ -116,7 +111,17 @@ class RrEvictPolicy(VictimOverride):
     # ---- 参数 ----
 
     def loss_cap(self, chain_len: int) -> float:
-        """单会话本轮可以承受的 KV 缺口上限。"""
+        """单会话在本轮可以承受的 KV 缺口上限（token）。
+
+        取 ``kappa * L`` 与 ``L - keep`` 的较小值：前者限制"一次最多削掉多少
+        比例"，后者保证会话至少留下 ``min_retain_*`` 的底。
+
+        Args:
+            chain_len: 会话当前链长 L（token）。
+
+        Returns:
+            允许的缺口上限，``>= 0``。
+        """
         keep = max(
             self.params.min_retain_tokens, self.params.min_retain_frac * chain_len
         )
@@ -126,7 +131,8 @@ class RrEvictPolicy(VictimOverride):
 
     # ---- 插件接口 ----
 
-    def applies_to(self, node) -> bool: ##检测是否属于这个策略的作用域
+    def applies_to(self, node) -> bool:
+        """只对 agentic 队列的叶子生效；关闭 ``fair_rr`` 时始终弃权。"""
         if not self.params.fair_rr or node is None:
             return False
         return (
@@ -135,6 +141,18 @@ class RrEvictPolicy(VictimOverride):
         )
 
     def pick(self, leaves, registry, *, max_deficit=None) -> Optional["TreeNode"]:
+        """按会话轮询选一个 agentic 叶子；没有可动会话时返回 None。
+
+        Args:
+            leaves: 当前可淘汰叶子集合。
+            registry: 会话账本，提供每会话的 ``d`` / ``L``。
+            max_deficit: 配额缺口上限（token）。跨队列配额点名 agentic 时传入，
+                保证单次淘汰不会为了追配额而削穿一条会话；弹性区为 None，
+                退回 ``loss_cap`` 语义。
+
+        Returns:
+            选中的叶子；无候选时返回 None 并累加违约计数。
+        """
         if not self.params.fair_rr:
             return None
         agentic = [node for node in leaves if self.applies_to(node)]
@@ -148,10 +166,16 @@ class RrEvictPolicy(VictimOverride):
     # ---- 内部 ----
 
     def _pick_round_robin(self, leaves, registry, max_deficit=None) -> Optional["TreeNode"]:
-        """挑最久未被删除的 Agentic 会话的最深叶子。
+        """挑"最久未被选中且缺口未达上限"的会话，返回它最深的叶子。
 
-        `max_deficit` 是外部（跨队列配额）给的上限：本轮允许把单会话缺口再推高
-        到多少 token。与 `loss_cap(L)` 取 min，即“配额缺口不得把单个会话削穿”。
+        Args:
+            leaves: 已限定在 agentic 范围内的叶子。
+            registry: 会话账本。
+            max_deficit: 本轮缺口上限；与 ``loss_cap(L)`` 取 min，即"配额缺口
+                不得把单个会话削穿"。
+
+        Returns:
+            选中的叶子；所有会话都达上限时返回 None（由调用方回退）。
         """
         tails: Dict[str, Tuple["TreeNode", "SessionState"]] = {}
         for node in leaves:
@@ -163,18 +187,18 @@ class RrEvictPolicy(VictimOverride):
                 continue
             current = tails.get(sid)
             if current is None or node_end_offset(node) > node_end_offset(current[0]):
-                # 会话内部只保留最深节点
+                # 每会话只留最深叶子：删它才能一次腾出最多空间。
                 tails[sid] = (node, state)
 
         best = None
-        for sid, (node, state) in tails.items():  # 跨会话轮询
+        for sid, (node, state) in tails.items():
             limit = self.loss_cap(state.L)
             if max_deficit is not None:
                 limit = min(limit, max_deficit)
             if state.d >= limit:
-                # 本会话缺口已经够大（loss_cap 或配额缺口），本轮不再动它
+                # 缺口已达上限（loss_cap 或配额缺口），本轮不再动它。
                 continue
-            last = self._rr_last.get(sid, -1)  # -1 = 从未被选中
+            last = self._rr_last.get(sid, -1)  # -1 = 从未被选中，优先照顾
             if best is None or last < best[0]:
                 best = (last, sid, node)
         if best is None:
@@ -200,46 +224,30 @@ class RrEvictPolicy(VictimOverride):
 
 
 class SlruEvictPolicy(VictimOverride):
-    """S-LRU 针对 QSTRUCT 队列的淘汰候选改写器。
+    """STRUCT 队列的分段 LRU 改写器，同时独占持有"共享会话数"账本。
 
-    【功能定位】
-    本类承担双重职责：
-    1. 独占维护全局的节点共享会话数（Node Share Sessions）账本。
-    2. 针对 STRUCT 队列中脱离一次性带（One-shot）、进入共享保护段的节点，执行段内 LRU 候选改写。
+双重职责：
 
-    【账本维护机制（独占所有权）】
-    - 独占写入点：
-    共享会话账（`share_sessions` / `session_bloom`，存于本模块 `_SLRU_META`
-    侧表）的唯一写入口为 `on_node_hit()`；分裂时的继承拷贝走
-    `on_node_inserted()`。两者的触发分别由缓存层 `_hit_observers` 与
-    `_insert_observers` 统一调度。
-    - 职责边界划分：
-    树基础拓扑维护（节点创建、分裂）仍留在 RadixCache 树核心层；共享账本
-    由本类以侧表独占持有（节点被正常 GC 时条目随之消失），节点字段不再内嵌。
+1. **账本**：维护每个节点被多少个不同的会话命中过（``share``）与一份 bloom 位图
+   （用于同会话去重）。这台账本同时被两处读取——``SimpleHybridStrategy.is_one_shot``
+   判 one-shot，和本类的 ``applies_to`` 判"是否受保护"，所以阈值只允许一个来源
+   （``SlruParams.share_min``），否则两处口径会漂移。
+2. **选点**：在受保护的 struct 叶子中按访问时间做段内 LRU。
 
-    【计数口径与设计权衡】
-    - 去重与饱和计数：
-    按独立会话为粒度计数，通过 `session_bloom` 过滤同一会话内的后续多轮重复命中，计数上限受限于 `SESSION_SHARE_MAX`。
+账本写入点只有两个，都由缓存层调度：``on_node_hit``（命中去重计数）与
+``on_node_inserted``（分裂时新父节点继承）。树拓扑维护仍留在 RadixCache。
 
-    【候选改写裁决（Victim Selection）】
-    - `applies_to(node) -> bool`:
-    筛选落在管辖范围内的候选叶子：属于 STRUCT 会话，且跨会话使用计数已达标（`share_sessions >= share_min`）。
-    - `pick(leaves, registry) -> Optional[Node]`:
-    在受管辖的叶子节点集合中，挑选访问时间戳最早的节点返回（执行段内 LRU）。
-    - 判定边界：
-    阈值直接采用 `SlruParams.share_min`，确保候选拦截范围与系统的 `is_one_shot` 判定标准源头一致。
-    """
+Args:
+    session_registry: 会话账本；省略时取全局单例。
+    share_min: 保护阈值；省略时取 ``DEFAULT_SHARE_MIN``，下限 2。
+"""
 
-    # 观测字段：本改写器管辖的队列，仅用于 profile 记账。
-    # 不得参与仲裁判定（否则退化为 proposer 形态，见设计讨论）。
     queue: Optional[SimpleHybridQueueTag] =  SimpleHybridQueueTag.QSTRUCT
 
     def __init__(self, session_registry=None, share_min=None) -> None:
-        # 与策略共用同一本会话账（SimpleHybridStrategy.__init__ 注入），
-        # 保证 is_one_shot 与 applies_to 看到同一份 session_type。
+        # 与策略共用同一本会话账（由 SimpleHybridStrategy 注入）：is_one_shot 与
+        # applies_to 必须看到同一份 session_type，否则"受保护"与"one-shot"会打架。
         self.session_registry = session_registry or SessionRegistry.global_instance()
-        # 共享数阈值：唯一配置入口是 SlruParams.share_min（由策略注入）。
-        # 它同时决定「是否受 SLRU 保护」与「是否退出 one-shot 带」。
         self.share_min = max(
             2,
             int(DEFAULT_SHARE_MIN if share_min is None else share_min),
@@ -252,7 +260,18 @@ class SlruEvictPolicy(VictimOverride):
     # ------------------------------------------------------------ 共享会话数账本
 
     def _record_session(self, node, session_id) -> bool:
-        """把 (node, session) 记进账本（_SLRU_META 侧表）；已记过则去重。返回是否真的新增。"""
+        """把 (node, session) 记进共享数账本；同会话重复命中只算一次。
+
+        去重用 64 bit bloom 而不是集合：会话数上万时集合会持续涨内存，而
+        bloom 的误判方向是"当作已记过"（少计一次），对本策略足够安全。
+
+        Args:
+            node: 被命中的节点。
+            session_id: 命中该节点的会话；缺失时不计数。
+
+        Returns:
+            True 表示该会话是首次命中，共享数确实 +1。
+        """
         if node is None or not session_id:
             return False
         bits = session_bloom_bits(session_id)
@@ -266,11 +285,13 @@ class SlruEvictPolicy(VictimOverride):
         return True
 
     def on_node_inserted(self, node) -> None:
-        """分裂回调：新父节点继承 child 的共享账本条目。
+        """分裂回调：新父节点继承子节点的共享账本条目。
 
-        分裂不改变「哪些请求经过这段前缀」，两半都继承（旧实现是
-        radix_cache 分裂路径里的显式字段拷贝）；分裂出的新父节点只有一个
-        子树。非分裂的普通插入不带子节点，自然落回 (0, 0) 缺省，不建条目。
+        分裂不改变"哪些会话经过这段前缀"，所以两半都该继承。新父节点只有一个
+        子树，取该子树的值即可；普通插入（不带子节点）直接返回，不建条目。
+
+        Args:
+            node: 新挂上树的节点（普通插入的叶子，或分裂出来的父节点）。
         """
         if not node.children:
             return
@@ -286,23 +307,30 @@ class SlruEvictPolicy(VictimOverride):
             _SLRU_META[node] = [share, bloom]
 
     def on_node_hit(self, node, session_id=None) -> None:
-        """命中路径的记账钩子：不同会话数 +1（同一会话去重）。
+        """命中去重记账：新会话命中则共享数 +1。
 
-        由缓存层 `RadixCache._record_node_hit()` 在更新 `queue_tag` 之前调用，
-        保证同一次命中里账本与标签看到的是同一份事实。
+        必须在缓存层更新 ``queue_tag`` 之前调用：同一次命中里账本与标签要看到
+        同一份事实，否则 one-shot 判定会用到过期的共享数。
+
+        Args:
+            node: 被命中的节点。
+            session_id: 命中该节点的会话。
         """
         self._record_session(node, session_id)
 
     @staticmethod
     def share_of(node) -> int:
-        """节点已被多少个不同会话命中过（创建者首次重读计 1）；读 _SLRU_META 侧表。"""
+        """返回节点被多少个不同会话命中过（创建者自己的首次重读计 1）。
+
+        读侧表，无条目按 0：节点从未被命中过就不该享受共享保护。
+        """
         entry = _SLRU_META.get(node)
         return int(entry[0]) if entry else 0
 
     # ------------------------------------------------------------ 插件接口
 
     def applies_to(self, node) -> bool:
-        """当前候选是否归本改写器管。"""
+        """是否受 SLRU 保护：STRUCT 会话且共享数已达 ``share_min``。"""
         if node is None:
             return False
         st = self.session_registry.get(getattr(node, "session_id", None))
@@ -313,7 +341,15 @@ class SlruEvictPolicy(VictimOverride):
         )
 
     def pick(self, leaves: Iterable["TreeNode"], registry=None) -> Optional["TreeNode"]:
-        """返回本改写器更愿意淘汰的节点；None表示不接管。"""
+        """在受保护的 struct 叶子中挑最久未访问的一个（段内 LRU）。
+
+        Args:
+            leaves: 当前可淘汰叶子集合。
+            registry: 未使用；保留基类签名。
+
+        Returns:
+            选中的叶子；范围内无候选时返回 None（放弃改写，调用方保留原候选）。
+        """
         struct = [node for node in leaves if self.applies_to(node)]
         if not struct:
             return None
@@ -336,10 +372,7 @@ class SlruEvictPolicy(VictimOverride):
         }
 
     def reset(self) -> None:
-        """清空内部状态（缓存 reset / 进程复用）。
-
-        共享账本条目在 _SLRU_META 侧表，随节点 GC 一起丢弃，不用清。
-        """
+        """只清计数器。共享账本条目在侧表里随节点 GC 一起消失，不需要清。"""
         self.share_counted = 0
         self.share_dedup = 0
         self.slru_picks = 0
@@ -349,32 +382,27 @@ class SlruEvictPolicy(VictimOverride):
 
 
 class MultiTurnEvictPolicy(VictimOverride):
-    """多轮对话的带内改写器：复用 UniCache 的 lognormal 复用机制
-    （带内归属按 SessionType ∈ {CHAT, AGENTIC} 判定）。
+    """CHAT 队列的带内改写器：用 lognormal 生存概率挑最冷的节点。
 
-    【权重定义（1 - prob(e)）】
-    带内排序权重 = 复用时间已过期的概率：
+权重取"复用已经过期的概率"（UniCache 原机制）：
 
-        w = 1 - reuse_prob = CDF(elapsed; μ, σ)
+    w = 1 - reuse_prob = CDF(elapsed; mu, sigma)
 
-    其中 reuse_prob = 1 - CDF 是 UniCache calculate_priority 对多轮任务
-    的原有口径（lognormal，μ/σ 来自 TASK_CONFIG）；**越大越先淘汰**。
-    同权重时退化为段内 LRU（最久未访问先走）。
+``reuse_prob = 1 - CDF`` 是 ``_reuse_score`` 对多轮任务用的同一个量，所以这里
+**越大越先淘汰**，与全局分数方向相反但结论一致。同权重时退化为段内 LRU。
 
-    【接管语义】
-    带内归属按 **SessionType ∈ {CHAT, AGENTIC}** 判定（多轮两类负载），
-    而非节点标签——分类器产出会话类型，NodeTag 不一定与之对齐。调用链
-    的 applies_to(victim) 门禁只对落入本带的 victim 接管，绝不跨带改写。
-
-    """
+带内归属按 **SessionType ∈ {CHAT, AGENTIC}** 判定，而不是节点标签：分类器产出
+的是会话类型，``queue_tag`` 不一定与之对齐。``applies_to`` 只在候选落入多轮
+负载时接管，绝不跨带改写。
+"""
 
     name = "mt"
     queue = SimpleHybridQueueTag.QCHAT
 
     def __init__(self, params: MultiTurnParams, registry=None) -> None:
         self.params = params
-        # 会话账本：applies_to 按 SessionType 判定（节点标签与会话类型可能不对齐，
-        # 与 SlruEvictPolicy / is_one_shot 同用一本账，判定同源）。
+        # 与 SLRU / one-shot 同用一本会话账：带内归属只认 SessionType，
+        # 不认 queue_tag（标签会因分叉、命中间隔等原因漂移）。
         self.registry = registry or SessionRegistry.global_instance()
         # ---- 观测 ----
         self.mt_picks = 0       # 带内实际改写的次数
@@ -383,12 +411,10 @@ class MultiTurnEvictPolicy(VictimOverride):
     # ------------------------------------------------------------ 插件接口
 
     def applies_to(self, node) -> bool:
-        """按 SessionType 判定（CHAT / AGENTIC 两类多轮负载）。
+        """是否属于多轮带：会话类型为 CHAT 或 AGENTIC。
 
-        分类器产出的是**会话类型**，而节点标签（queue_tag）不一定与之对齐；
-        因此带内归属只认 SessionRegistry——与 one-shot 判定同源，规避标签
-        漂移。无会话证据（session_id 缺失，或账本已被 sweep）时不接管，
-        保留原候选。
+        无会话证据（未带 session_id，或账本已被 sweep）时不接管，保留原候选：
+        标签可能已经漂移，宁可不改写。
         """
         if node is None:
             return False
@@ -399,12 +425,20 @@ class MultiTurnEvictPolicy(VictimOverride):
         )
 
     def pick(self, leaves, registry=None) -> Optional["TreeNode"]:
+        """在多轮带内挑"过期概率"最高的节点；带内无候选时返回 None。
+
+        Args:
+            leaves: 当前可淘汰叶子集合。
+            registry: 未使用；保留基类签名。
+
+        Returns:
+            选中的叶子；带内无候选时返回 None 并累加 fallback 计数。
+        """
         mt_nodes = [node for node in (leaves or ()) if self.applies_to(node)]
         if not mt_nodes:
             self.mt_fallbacks += 1
             return None
-        # CHAT 取 TASK_CONFIG[MULTI_TURN_CHAT]（μ=4.77 / σ=1.279）；AGENTIC 取
-        # TASK_CONFIG[MULTI_TURN_AGENTIC]（μ=1.81 / σ=1.092）——与 _reuse_score 同一套参数。
+        # 参数与 _reuse_score 同源（TASK_CONFIG），避免评分为正、改写为负的分歧。
         best = None
         for node in mt_nodes:
             st = self.registry.get(getattr(node, "session_id", None))
@@ -417,7 +451,7 @@ class MultiTurnEvictPolicy(VictimOverride):
             mu, sigma = TASK_CONFIG[cfg_key]
             elapsed = time.monotonic() - node.last_access_time
             weight = _cached_lognorm_cdf(int(elapsed), mu, sigma)  # 1-prob(e)
-            # 权重大者先走；同分退化为 LRU（更久未访问 = 更小的 last_access）
+            # 权重大者先走；同分用 -last_access 让更久未访问的胜出（key 取 max）。
             key = (weight, -node.last_access_time)
             if best is None or key > best[0]:
                 best = (key, node)
