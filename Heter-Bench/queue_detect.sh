@@ -19,8 +19,7 @@ tmux has-session -t "${BENCH_SESSION}" 2>/dev/null && tmux kill-session -t "${BE
 
 # ── 1) 起 server（tmux；约 40s 就绪）─────────────────────────
 tmux new -d -s "${SRV_SESSION}" "cd ${HETER_BENCH_DIR} \
- && SGLANG_QUEUE_OCC_LOG=1 SGLANG_QUEUE_OCC_INTERVAL=30 \
-    SGLANG_NODE_LABEL_DUMP=${HETER_BENCH_DIR}/result/node_labels_phased.jsonl \
+ &&     SGLANG_NODE_LABEL_DUMP=${HETER_BENCH_DIR}/result/node_labels_phased.jsonl \
     SGLANG_NODE_LABEL_INTERVAL=30 \
     POLICY=heter_cache MAX_TOTAL_TOKENS=100000 \
     bash serve.sh"

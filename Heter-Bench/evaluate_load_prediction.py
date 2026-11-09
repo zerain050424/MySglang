@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Evaluate window-level workload prediction from Heter-Bench outputs."""
+"""Evaluate window-level workload prediction from Heter-Bench outputs.
+
+数据源：server 日志里的 `[QueueOcc]` 行（每 30s 一行，由 radix_cache 的队列占用
+采样器打印）。**该采样器已移除**——现在跑这个脚本会解析不到任何样本，主流程会
+直接报错而不是输出空表。要恢复，先把采样器加回 radix_cache，或把解析口径改成
+`[HeterCache profile]` 的多行表格。
+"""
 
 from __future__ import annotations
 
@@ -200,9 +206,15 @@ def main() -> None:
     args = parser.parse_args()
     if args.window_s <= 0 or args.step_s <= 0:
         raise SystemExit("window and step must be positive")
+    occ = _occ_observations(args.occ_log)
+    if not occ:
+        raise SystemExit(
+            f"no [QueueOcc] samples in {args.occ_log}: the queue-occupancy sampler "
+            "was removed from radix_cache; only [HeterCache profile] is emitted now."
+        )
     result = evaluate(
         _read_rows(args.requests_csv),
-        _occ_observations(args.occ_log),
+        occ,
         _task_labels(args.task_labels_json),
         args.window_s,
         args.step_s,

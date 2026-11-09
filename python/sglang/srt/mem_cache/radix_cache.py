@@ -399,27 +399,6 @@ class RadixCache(BasePrefixCache):
         self.session_registry = SessionRegistry.global_instance()
         self.reset()
 
-        # ---- 策略无关的「按工作负载占用」采样器（env 门控，默认关）----
-        # 用途：LRU 等不触发 [HeterCache profile] 的策略，也能拿到每队列
-        # 占用占比。__init__ 在 scheduler 进程内执行，这里起一个 daemon 线程，
-        # 周期性调 _per_queue_token_count()（基类方法，树上节点带 queue_tag，
-        # 任何策略都可用）。默认关闭：无 env 时这里只做一次 os.environ.get 判空。
-        _occ_env = os.environ.get("SGLANG_QUEUE_OCC_LOG", "0")
-        heterlog.info(
-            "OccSampler",
-            f"env={_occ_env} pid={os.getpid()} policy={self.eviction_policy}",
-        )
-        if _occ_env == "1":
-            interval = int(os.environ.get("SGLANG_QUEUE_OCC_INTERVAL", "30"))
-            t = threading.Thread(
-                target=self._queue_occ_log_loop,
-                args=(interval,),
-                daemon=True,
-                name="queue-occ-sampler",
-            )
-            t.start()
-            heterlog.info("OccSampler", f"thread started, alive={t.is_alive()}")
-
         # ---- 节点级标签快照（env 门控，默认关）----
         # 用途：把状态机给每个 radix 节点打的队列标签 与 节点真实归属
         # (session_id)一起落盘，用于节点级标注准确率统计，见
@@ -772,37 +751,6 @@ class RadixCache(BasePrefixCache):
             return bool(fn(node))
         return bool(getattr(node, "is_decode", False))
 
-    def _queue_occ_log_loop(self, interval: float) -> None:
-        """后台循环：每 interval 秒打一行按队列的占用占比。
-        输出格式：`[QueueOcc] chat=.. agentic=.. struct=.. random=..`
-        其中数值是 `_per_queue_token_count` 的 total（含 response 段）。
-        并发说明：树在 scheduler 主线程上被增删，这里在 daemon 线程里只读遍历；
-        GIL 保证不会崩，最坏读到一次瞬时不一致的计数（采样统计可接受）。
-        """
-        i = 0
-        while True:
-            time.sleep(interval)
-            i += 1
-            try:
-                counts = self._per_queue_token_count()
-                _snapshot = {
-                    k: int(v['total']) for k, v in sorted(counts.items())
-                } if counts else {}
-                heterlog.info("OccSampler", f"tick={i} counts={_snapshot}")
-                if counts:
-                    msg = " ".join(
-                        f"{k}={int(v['total'])}" for k, v in sorted(counts.items())
-                    )
-                    heterlog.info("QueueOcc", msg)
-                tag_counts = self._per_queue_tag_token_count()
-                if tag_counts:
-                    msg = " ".join(
-                        f"{k}={v}" for k, v in sorted(tag_counts.items())
-                    )
-                    heterlog.info("TagOcc", msg)
-            except Exception:  # 采样失败不能影响主流程
-                logger.exception("queue occ sampler failed")
-
     def _per_queue_token_count(self) -> dict:
         """按队列统计驻留 token，**包含各自的 response(decode) 段**。
         「这个队列到底占了池子多少」——is_decode 只决定淘汰优先级，
@@ -836,7 +784,7 @@ class RadixCache(BasePrefixCache):
     def _node_label_dump_loop(self, path: str, interval: float) -> None:
         """后台循环：每 interval 秒把整棵树上每个节点的标签快照追加到 path(JSONL)。
 
-        与 `[QueueOcc]` 的区别：occupancy 只给聚合占比，这里给**逐节点**的
+        与 `[HeterCache profile]` 的区别：那张表只给聚合占比，这里给**逐节点**的
         (状态机标签, 真实归属 session_id, token 数, 命中次数, 距上次访问时间,
         子节点数, 是否 decode 段, 绝对起始偏移)，是节点级标注准确率的唯一数据源。
 
@@ -895,26 +843,6 @@ class RadixCache(BasePrefixCache):
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
         return len(rows)
-
-    def _per_queue_tag_token_count(self) -> dict:
-        """按**原始队列标签**统计驻留 token：qtrans/qstruct/qagent/qchat。
-
-        与 `_per_queue_token_count` 的区别：这里不经过队列名折叠的
-        `qtrans -> random` 折叠，因此能单独观察「非共享内容 = qtrans」的比例，
-        用于核对「共享前缀才报 qstruct」的口径（节点级标注统计用）。
-        返回 {queue_tag: token 数}，键是枚举的 value 字符串。
-        """
-        out: dict = {}
-        stack = [self.root_node]
-        while stack:
-            node = stack.pop()
-            for child in node.children.values():
-                if child.evicted:
-                    continue
-                tag = getattr(child.queue_tag, "value", str(child.queue_tag))
-                out[tag] = out.get(tag, 0) + len(child.key)
-                stack.append(child)
-        return out
 
     def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:
         if self.disable:

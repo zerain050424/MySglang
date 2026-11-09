@@ -156,15 +156,14 @@ source env.sh
   --output result/phased_load_prediction.json
 ```
 
-服务器需要打开 workload 占用采样，才能从现有缓存分类结果计算预测标签：
+**数据源已下线**：这里原本依赖 server 侧 `SGLANG_QUEUE_OCC_LOG` 打印的 `[QueueOcc]`
+日志。该采样器（策略无关的队列占用日志）已从 `radix_cache` 删除，现在只有
+`[HeterCache profile]`（每 30s 一张按队列的表，含 occ / hit / evicted / target / cap）。
+`evaluate_load_prediction.py` 只认 `[QueueOcc]` 的行格式，喂新日志会直接报「解析不到
+任何样本」——要恢复这条评测，得先把采样器加回来或改写解析口径。
 
-```bash
-SGLANG_QUEUE_OCC_LOG=1 SGLANG_QUEUE_OCC_INTERVAL=30 \
-  POLICY=heter_cache MAX_TOTAL_TOKENS=100000 bash serve.sh
-```
-
-实验输出的 CSV 保存真实数据集标签，`evaluate_load_prediction.py` 读取 CSV 与带时间戳
-的 `[QueueOcc]` 日志，按默认 60 秒窗口、30 秒步长和 10% 主导差距计算窗口级准确率：
+实验输出的 CSV 保存真实数据集标签，脚本按 60 秒窗口、30 秒步长和 10% 主导差距
+计算窗口级准确率（需要上面那份日志）：
 
 ```bash
 "$PY" evaluate_load_prediction.py \
