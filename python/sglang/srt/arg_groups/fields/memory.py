@@ -264,9 +264,9 @@ class Memory(msgspec.Struct):
     ] = None
 
     # -------------------------------------------------------------------------
-    # SimpleHYBRID
+    # HeterCache
     # -------------------------------------------------------------------------
-    enable_simple_hybrid: A[
+    enable_heter_cache: A[
         bool,
-        "使用 SimpleHybridRadixCache（RadixCache + 多级队列淘汰），面向文本对话 benchmark",
+        "使用 HeterCacheRadixCache（RadixCache + 多级队列淘汰），面向文本对话 benchmark",
     ] = False

@@ -1,11 +1,11 @@
-"""``simple_hybrid`` 后端的 radix cache。
+"""``heter_cache`` 后端的 radix cache。
 
 在 RadixCache 之上叠一层"分带淘汰"：one-shot 带（random 整轮请求、单轮 response
 段）永远先清空，可调度内容（各 workload 的 prompt 段 + 多轮 response 段）再竞争。
 本模块只负责**执行**淘汰（释放 KV、改树、记账），候选选择委托给
 ``quota_selector.pick_victim``，原因见该函数文档。
 
-导入本模块即注册 ``--radix-cache-backend=simple_hybrid`` 后端。
+导入本模块即注册 ``--radix-cache-backend=heter_cache`` 后端。
 """
 
 import logging
@@ -13,14 +13,14 @@ import time
 
 from sglang.srt.mem_cache import quota_selector
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams, EvictResult
-from sglang.srt.mem_cache.evict_policy import SimpleHybridStrategy
+from sglang.srt.mem_cache.evict_policy import HeterCacheStrategy
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.registry import register_radix_cache_backend
 
 logger = logging.getLogger(__name__)
 
 
-class SimpleHybridRadixCache(RadixCache):
+class HeterCacheRadixCache(RadixCache):
     """RadixCache + 多级队列淘汰。
 
     HeterCache 的落地点：树结构与插入/匹配沿用 RadixCache，只有 ``evict`` 的
@@ -48,8 +48,8 @@ class SimpleHybridRadixCache(RadixCache):
         # 禁用 radix cache 时无操作
         if self.disable:
             return EvictResult()
-        # 非 SimpleHybrid 策略没有分带/配额语义，退回基类的 LRU 淘汰
-        if not isinstance(self.eviction_strategy, SimpleHybridStrategy):
+        # 非 HeterCache 策略没有分带/配额语义，退回基类的 LRU 淘汰
+        if not isinstance(self.eviction_strategy, HeterCacheStrategy):
             return super().evict(params)
 
         start_time = time.perf_counter()
@@ -148,14 +148,14 @@ class SimpleHybridRadixCache(RadixCache):
         return total
 
 
-def _simple_hybrid_factory(ctx):
+def _heter_cache_factory(ctx):
     """registry 工厂：由 TreeCacheBuildContext 构造本缓存。"""
-    return SimpleHybridRadixCache(ctx.params)
+    return HeterCacheRadixCache(ctx.params)
 
 
 try:
-    # 模块导入即注册后端，供 --radix-cache-backend=simple_hybrid 使用
-    register_radix_cache_backend("simple_hybrid", _simple_hybrid_factory)
+    # 模块导入即注册后端，供 --radix-cache-backend=heter_cache 使用
+    register_radix_cache_backend("heter_cache", _heter_cache_factory)
 except ValueError:
     # 重复导入（例如测试里按路径二次加载）时 registry 拒绝重名，幂等处理即可
     pass

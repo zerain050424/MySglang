@@ -1,6 +1,6 @@
 """跨队列配额的仲裁数学。
 
-HeterCache 在 ``simple_hybrid`` 后端上按队列（struct / agentic / chat）分配 KV 池。
+HeterCache 在 ``heter_cache`` 后端上按队列（struct / agentic / chat）分配 KV 池。
 本模块只回答两个问题，不碰树、不碰节点内容：
 
 1. 各队列此刻的**有效目标** ``target`` 是多少（max-min 水填充 + 上下限夹紧）；
@@ -35,7 +35,7 @@ def effective_targets(
 
     Args:
         occ: 各队列的可调度占用（token）。口径为「排除 one-shot、包含 locked」，
-            与 ``SimpleHybridStrategy._occ`` 一致。
+            与 ``HeterCacheStrategy._occ`` 一致。
         capacity: 池容量（token），采样自 ``token_to_kv_pool_allocator.size``。
         params: 配额参数，``caps`` / ``reservations`` 为比例，函数内换算成 token。
 
@@ -197,7 +197,7 @@ def pick_victim(
     阶段 2  未配置配额：保留原路径（全局 ``victim_key`` + 改写器链），行为不变。
 
     Args:
-        strategy: ``SimpleHybridStrategy``，提供 is_one_shot / *_key / quota_* 接口。
+        strategy: ``HeterCacheStrategy``，提供 is_one_shot / *_key / quota_* 接口。
         leaves: 当前可淘汰叶子集合（已排除 locked 节点）。
         capacity: 池容量（token），仅供配额仲裁使用。
         page_size: 页大小，用于推导 chunk。

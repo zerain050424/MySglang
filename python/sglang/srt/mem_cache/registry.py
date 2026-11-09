@@ -145,12 +145,12 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
             os.environ["FLEXKV_CONFIG_PATH"] = get_memory().flexkv_config_file
         return _flexkv_factory(ctx)
 
-    if get_memory().enable_simple_hybrid:
-        # SimpleHYBRID：RadixCache + 多级队列淘汰
-        from sglang.srt.mem_cache.simple_hybrid_radix_cache import (
-            SimpleHybridRadixCache,
+    if get_memory().enable_heter_cache:
+        # HeterCache：RadixCache + 多级队列淘汰
+        from sglang.srt.mem_cache.heter_cache_radix_cache import (
+            HeterCacheRadixCache,
         )
-        return SimpleHybridRadixCache(params)
+        return HeterCacheRadixCache(params)
 
     return _create_unified_radix_cache(ctx, server_args, params)
 

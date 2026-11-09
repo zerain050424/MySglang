@@ -6,7 +6,7 @@
 * ``victim_override``：改写器的作用域、共享数阈值、会话类型；
 * ``quota_selector`` / profile：队列标签与占用口径。
 
-命名约定：``SimpleHybridTaskType`` 是**节点级**任务类型（由 ``queue_tag`` 推得），
+命名约定：``HeterCacheTaskType`` 是**节点级**任务类型（由 ``queue_tag`` 推得），
 ``SessionType`` 是**会话级**分类（由分类器推得）。两者经常不一致，判定归属时
 必须明确用哪一个（见 ``is_one_shot`` 与 ``MultiTurnEvictPolicy.applies_to``）。
 
@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 # SPDX-License-Identifier: Apache-2.0
 from enum import Enum
 
-class SimpleHybridTaskType(str, enum.Enum):
+class HeterCacheTaskType(str, enum.Enum):
     """节点级任务类型，由 ``queue_tag`` 推导（见 ``task_type_of_tag``）。
 
     决定评分模型：多轮用复用概率，单轮用位置项——单轮没有"下一轮"，
@@ -54,7 +54,7 @@ class SessionType(str, enum.Enum):
     AGENTIC = "agentic"
 
 
-class SimpleHybridQueueTag(str, enum.Enum):
+class HeterCacheQueueTag(str, enum.Enum):
     """HeterCache 节点状态标签。
 
     标签由会话分类器与 radix 结构证据共同维护；非会话请求保留旧命中间隔规则。
@@ -92,22 +92,22 @@ def session_bloom_bits(session_id) -> int:
 SESSION_SHARE_MAX = 255
 
 
-def session_type_to_queue_tag(session_type: SessionType) -> SimpleHybridQueueTag:
+def session_type_to_queue_tag(session_type: SessionType) -> HeterCacheQueueTag:
     """把会话分类结果映射成"新写入 KV 该归哪个队列"的标签。
 
     只在节点出生时使用：出生标签回答"谁创建了这段"，之后的复用事实由共享数
     账本记录，不回写标签。
     """
     return {
-        SessionType.TRANS: SimpleHybridQueueTag.QTRANS,
-        SessionType.STRUCT: SimpleHybridQueueTag.QSTRUCT,
-        SessionType.AGENTIC: SimpleHybridQueueTag.QAGENT,
-        SessionType.CHAT: SimpleHybridQueueTag.QCHAT,
+        SessionType.TRANS: HeterCacheQueueTag.QTRANS,
+        SessionType.STRUCT: HeterCacheQueueTag.QSTRUCT,
+        SessionType.AGENTIC: HeterCacheQueueTag.QAGENT,
+        SessionType.CHAT: HeterCacheQueueTag.QCHAT,
     }[session_type]
 
 
 # ---------------------------------------------------------------------------
-# SimpleHybrid 的可调参数组
+# HeterCache 的可调参数组
 #
 # 用 dataclass 而非裸 kwargs：让 eviction_policy_config 有层级、可校验、可整体
 # 传递。配置只接受分组形式 {"rr":{...},"slru":{...},"mt":{...},"quota":{...}}，
@@ -198,7 +198,7 @@ class RrParams:
 # 语义：共享数 >= N 意味着共 N 个会话用过（创建者首次重读即计 1）。
 # 它同时决定两件事，两处必须同源，所以只允许配置一处：
 #   * SlruEvictPolicy.applies_to       : 是否受 SLRU 保护（进候选池）
-#   * SimpleHybridStrategy.is_one_shot : 是否退出 one-shot 带
+#   * HeterCacheStrategy.is_one_shot : 是否退出 one-shot 带
 DEFAULT_SHARE_MIN = 2
 
 
@@ -417,8 +417,8 @@ def _cached_lognorm_cdf(x: float, mu: float, sigma: float) -> float:
 # 多轮任务的复用间隔分布参数 (mu, sigma)，lognormal（UniCache 原机制）。
 # 评分与改写器都必须从这里取值：两边各写一份会让"评分为正、改写为负"。
 TASK_CONFIG = {
-    SimpleHybridTaskType.MULTI_TURN_CHAT: (4.77, 1.279),
-    SimpleHybridTaskType.MULTI_TURN_AGENTIC: (1.81, 1.092),
+    HeterCacheTaskType.MULTI_TURN_CHAT: (4.77, 1.279),
+    HeterCacheTaskType.MULTI_TURN_AGENTIC: (1.81, 1.092),
 }
 
 # profile 与记账用的四类标签（顺序即打印顺序）。
@@ -433,10 +433,10 @@ def workload_label_of(task_type) -> str:
     one-shot 直接清掉安全。
     """
     return {
-        SimpleHybridTaskType.MULTI_TURN_CHAT: "chat",
-        SimpleHybridTaskType.MULTI_TURN_AGENTIC: "agentic",
-        SimpleHybridTaskType.STRUCT_SINGLE_TURN: "struct",
-        SimpleHybridTaskType.RANDOM_SINGLE_TURN: "random",
+        HeterCacheTaskType.MULTI_TURN_CHAT: "chat",
+        HeterCacheTaskType.MULTI_TURN_AGENTIC: "agentic",
+        HeterCacheTaskType.STRUCT_SINGLE_TURN: "struct",
+        HeterCacheTaskType.RANDOM_SINGLE_TURN: "random",
     }.get(task_type, "chat")
 
 
@@ -467,18 +467,18 @@ def node_end_offset(node) -> int:
     return abs_start + num_tokens
 
 
-def task_type_of_tag(tag) -> SimpleHybridTaskType:
+def task_type_of_tag(tag) -> HeterCacheTaskType:
     """queue_tag 映射到任务类型；未知/缺失标签按多轮 chat 处理。
 
     未知标签回落到 chat 而不是 random：random 会被排进 one-shot 带直接清掉，
     多轮归类最多是多留一段时间。
     """
     return {
-        SimpleHybridQueueTag.QTRANS: SimpleHybridTaskType.RANDOM_SINGLE_TURN,
-        SimpleHybridQueueTag.QSTRUCT: SimpleHybridTaskType.STRUCT_SINGLE_TURN,
-        SimpleHybridQueueTag.QAGENT: SimpleHybridTaskType.MULTI_TURN_AGENTIC,
-        SimpleHybridQueueTag.QCHAT: SimpleHybridTaskType.MULTI_TURN_CHAT,
-    }.get(tag, SimpleHybridTaskType.MULTI_TURN_CHAT)
+        HeterCacheQueueTag.QTRANS: HeterCacheTaskType.RANDOM_SINGLE_TURN,
+        HeterCacheQueueTag.QSTRUCT: HeterCacheTaskType.STRUCT_SINGLE_TURN,
+        HeterCacheQueueTag.QAGENT: HeterCacheTaskType.MULTI_TURN_AGENTIC,
+        HeterCacheQueueTag.QCHAT: HeterCacheTaskType.MULTI_TURN_CHAT,
+    }.get(tag, HeterCacheTaskType.MULTI_TURN_CHAT)
 
 
 @dataclasses.dataclass
@@ -848,7 +848,7 @@ class SessionRegistry:
 
     # ---- 观测 ----
     def summary(self) -> Dict[str, float]:
-        """缺口分布摘要，供 ``[SimpleHybrid profile]`` 打印。
+        """缺口分布摘要，供 ``[HeterCache profile]`` 打印。
 
         ``d_nonzero`` 是最有用的一个：它告诉你有多少会话真的处于"被削过"的状态，
         只看 ``d_sum`` 会被少数大缺口带偏。

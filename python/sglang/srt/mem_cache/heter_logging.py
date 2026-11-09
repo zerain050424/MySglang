@@ -37,7 +37,7 @@ if os.path.isdir(_LOG_DIR):
 
     if os.environ.get("HETER_STRATEGY_EVENTS"):
         heterlog.start_capture(os.environ["HETER_STRATEGY_EVENTS"])
-    # HeterProfiler：SimpleHybridStrategy 的观测账本与渲染器（Uni-Bench/profile）。
+    # HeterProfiler：HeterCacheStrategy 的观测账本与渲染器（Uni-Bench/profile）。
     if os.path.isdir(_PROFILE_DIR):
         if _PROFILE_DIR not in sys.path:
             sys.path.insert(0, _PROFILE_DIR)

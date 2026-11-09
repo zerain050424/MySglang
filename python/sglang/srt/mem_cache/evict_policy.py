@@ -4,7 +4,7 @@
 
 1. 单节点排序（``EvictionStrategy.get_priority``）：LRU / LFU / TLRU / SLRU 等
    原生策略，以及 HeterCache 的 ``reuse_score``；
-2. 多队列仲裁（``SimpleHybridStrategy``）：把节点归到 struct / agentic / chat /
+2. 多队列仲裁（``HeterCacheStrategy``）：把节点归到 struct / agentic / chat /
    random 四个队列，分带淘汰，并把队内细节委托给 ``victim_override`` 的改写器。
 
 所有 ``get_priority`` 的共同契约：**返回值越小越先被淘汰**。这个约定必须由每个
@@ -38,7 +38,7 @@ from sglang.srt.mem_cache.uni_utils import (
     QuotaParams,
     TASK_CONFIG,
     workload_label_of,
-    SimpleHybridTaskType,
+    HeterCacheTaskType,
     _cached_lognorm_cdf,
     task_type_of_tag,
 )
@@ -177,8 +177,8 @@ class SLRUStrategy(EvictionStrategy):
         return (is_protected, node.last_access_time)
 
 
-class SimpleHybridStrategy(EvictionStrategy):
-    """HeterCache 的多队列淘汰策略（``--radix-eviction-policy simple_hybrid``）。
+class HeterCacheStrategy(EvictionStrategy):
+    """HeterCache 的多队列淘汰策略（``--radix-eviction-policy heter_cache``）。
 
     把节点归入四个队列（struct / agentic / chat / random），并按三个层次做题：
 
@@ -279,7 +279,7 @@ class SimpleHybridStrategy(EvictionStrategy):
             self._occ[q] = 0.0
 
 
-    def _task_type_of(self, node) -> SimpleHybridTaskType:
+    def _task_type_of(self, node) -> HeterCacheTaskType:
         """把节点的 ``queue_tag`` 映射回任务类型（评分与队列归属的唯一入口）。
 
         映射表在 ``uni_utils``，保证策略、改写器、指标不会各算一套。
@@ -289,7 +289,7 @@ class SimpleHybridStrategy(EvictionStrategy):
         注意 one-shot 判定不走这里：那个只看会话类型 + 跨会话共享数。
         """
         if self.force_agentic:
-            return SimpleHybridTaskType.MULTI_TURN_AGENTIC
+            return HeterCacheTaskType.MULTI_TURN_AGENTIC
         
         return task_type_of_tag(getattr(node, "queue_tag", None))
 
@@ -312,7 +312,7 @@ class SimpleHybridStrategy(EvictionStrategy):
         if cfg is not None:  # 多轮任务
             mu, sigma = cfg
             return 1.0 - _cached_lognorm_cdf(e, mu, sigma)
-        if task_type == SimpleHybridTaskType.STRUCT_SINGLE_TURN:
+        if task_type == HeterCacheTaskType.STRUCT_SINGLE_TURN:
             # HeterCache 的 offset 是块在序列中的绝对结束位置，不是 radix 片段长度。
             offset_factor = 1.0 - _node_end_offset(node) / (self.max_offset or 1)
             return max(0.0, min(1.0, offset_factor))
@@ -470,7 +470,7 @@ class SimpleHybridStrategy(EvictionStrategy):
             available: 当前可用 token。
             capacity: 池容量（token）。
             has_capacity: 调用方是否真拿到了可用量；False 表示配额未启用或后端
-                不是 simple_hybrid，此时分不清承压，只能用常规窗口。
+                不是 heter_cache，此时分不清承压，只能用常规窗口。
 
         Returns:
             True 表示调用方应该马上做一次 ``observe_occupancy``。
@@ -569,7 +569,7 @@ class SimpleHybridStrategy(EvictionStrategy):
                 queue_capacities(self.quota, self._capacity) if quota_on else None
             ),
         )
-        heterlog.info("Profile", f"[SimpleHybrid profile]\n{_profile}")
+        heterlog.info("Profile", f"[HeterCache profile]\n{_profile}")
 
     # ---- 跨队列配额（阶段 1a/1b）：缓存层只调下面这几个入口 ----
 

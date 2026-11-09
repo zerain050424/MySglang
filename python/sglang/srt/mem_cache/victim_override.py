@@ -1,6 +1,6 @@
 """HeterCache 的候选改写器插件（VictimOverride）。
 
-从 ``SimpleHybridStrategy`` 里解耦出来的"重选候选"能力：全局先用 ``victim_key``
+从 ``HeterCacheStrategy`` 里解耦出来的"重选候选"能力：全局先用 ``victim_key``
 选出一个基础候选，再按注册顺序询问改写器，后者可基于自己的状态（会话配额、
 分段水位、生存概率）把候选改写成别的叶子。
 
@@ -36,8 +36,8 @@ from sglang.srt.mem_cache.uni_utils import (
     SESSION_SHARE_MAX,
     SessionRegistry,
     SessionType,
-    SimpleHybridQueueTag,
-    SimpleHybridTaskType,
+    HeterCacheQueueTag,
+    HeterCacheTaskType,
     MultiTurnParams,
     TASK_CONFIG,
     _cached_lognorm_cdf,
@@ -63,7 +63,7 @@ class VictimOverride(ABC):
 
     name: str = "override"
     # 本改写器管辖的队列；**仅**用于 profile 归类，不得参与仲裁判定。
-    queue: Optional[SimpleHybridQueueTag] = None
+    queue: Optional[HeterCacheQueueTag] = None
 
     @abstractmethod
     def applies_to(self, node) -> bool:
@@ -100,7 +100,7 @@ class RrEvictPolicy(VictimOverride):
     """
 
     name = "rr"
-    queue = SimpleHybridQueueTag.QAGENT
+    queue = HeterCacheQueueTag.QAGENT
 
     def __init__(self, params: RrParams):
         self.params = params
@@ -137,7 +137,7 @@ class RrEvictPolicy(VictimOverride):
             return False
         return (
             task_type_of_tag(getattr(node, "queue_tag", None))
-            == SimpleHybridTaskType.MULTI_TURN_AGENTIC
+            == HeterCacheTaskType.MULTI_TURN_AGENTIC
         )
 
     def pick(self, leaves, registry, *, max_deficit=None) -> Optional["TreeNode"]:
@@ -229,7 +229,7 @@ class SlruEvictPolicy(VictimOverride):
 双重职责：
 
 1. **账本**：维护每个节点被多少个不同的会话命中过（``share``）与一份 bloom 位图
-   （用于同会话去重）。这台账本同时被两处读取——``SimpleHybridStrategy.is_one_shot``
+   （用于同会话去重）。这台账本同时被两处读取——``HeterCacheStrategy.is_one_shot``
    判 one-shot，和本类的 ``applies_to`` 判"是否受保护"，所以阈值只允许一个来源
    （``SlruParams.share_min``），否则两处口径会漂移。
 2. **选点**：在受保护的 struct 叶子中按访问时间做段内 LRU。
@@ -242,10 +242,10 @@ Args:
     share_min: 保护阈值；省略时取 ``DEFAULT_SHARE_MIN``，下限 2。
 """
 
-    queue: Optional[SimpleHybridQueueTag] =  SimpleHybridQueueTag.QSTRUCT
+    queue: Optional[HeterCacheQueueTag] =  HeterCacheQueueTag.QSTRUCT
 
     def __init__(self, session_registry=None, share_min=None) -> None:
-        # 与策略共用同一本会话账（由 SimpleHybridStrategy 注入）：is_one_shot 与
+        # 与策略共用同一本会话账（由 HeterCacheStrategy 注入）：is_one_shot 与
         # applies_to 必须看到同一份 session_type，否则"受保护"与"one-shot"会打架。
         self.session_registry = session_registry or SessionRegistry.global_instance()
         self.share_min = max(
@@ -397,7 +397,7 @@ class MultiTurnEvictPolicy(VictimOverride):
 """
 
     name = "mt"
-    queue = SimpleHybridQueueTag.QCHAT
+    queue = HeterCacheQueueTag.QCHAT
 
     def __init__(self, params: MultiTurnParams, registry=None) -> None:
         self.params = params
@@ -444,9 +444,9 @@ class MultiTurnEvictPolicy(VictimOverride):
             st = self.registry.get(getattr(node, "session_id", None))
             stype = st.session_type if st is not None else SessionType.CHAT
             cfg_key = (
-                SimpleHybridTaskType.MULTI_TURN_AGENTIC
+                HeterCacheTaskType.MULTI_TURN_AGENTIC
                 if stype == SessionType.AGENTIC
-                else SimpleHybridTaskType.MULTI_TURN_CHAT
+                else HeterCacheTaskType.MULTI_TURN_CHAT
             )
             mu, sigma = TASK_CONFIG[cfg_key]
             elapsed = time.monotonic() - node.last_access_time

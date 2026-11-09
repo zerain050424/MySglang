@@ -53,7 +53,7 @@ from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.uni_utils import (
     SessionRegistry,
     SessionType,
-    SimpleHybridQueueTag,
+    HeterCacheQueueTag,
     session_type_to_queue_tag,
 )
 from sglang.srt.mem_cache.utils import (
@@ -283,15 +283,15 @@ class TreeNode: ## TreeNode 是基数树（RadixTree）的节点，每个节点�
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
 
-        # ---- HeterCache（SimpleHYBRID / T-LRU / SLRU）相关状态 ----
+        # ---- HeterCache（多队列 / T-LRU / SLRU）相关状态 ----
         # 注意：插件私有记账（SLRU 共享账）已改为外挂侧表
         # （见 victim_override._SLRU_META，WeakKeyDictionary，
         # 节点回收时条目自动消失），不再内嵌在 TreeNode 上。
 
         self.abs_start = abs_start
-        self.queue_tag = SimpleHybridQueueTag.QTRANS ## 负载类型
+        self.queue_tag = HeterCacheQueueTag.QTRANS ## 负载类型
         self.is_decode = False
-        # SimpleHYBRID：节点归属的会话
+        # HeterCache：节点归属的会话
         self.session_id: Optional[str] = None
 
     @property
@@ -345,7 +345,7 @@ class RadixCache(BasePrefixCache):
         self.eviction_strategy = get_eviction_strategy(
             self.eviction_policy, params.eviction_policy_config
         )
-        # Optional SimpleHYBRID hooks:present only on strategies
+        # 可选钩子：只有 HeterCache 策略会提供这些接口
         # that implement them, so other policies pay nothing.
         ## 可选钩子
         self._hit_recorder = getattr(self.eviction_strategy, "record_hit", None)
@@ -357,7 +357,7 @@ class RadixCache(BasePrefixCache):
         self._needs_capacity = bool(
             getattr(self.eviction_strategy, "needs_capacity", False)
         )
-        # 实验开关（SimpleHybridStrategy.force_agentic）：把所有节点直接标成 QAGENT，
+        # 实验开关（HeterCacheStrategy.force_agentic）：把所有节点直接标成 QAGENT，
         # 让 QAGENT-only 的插件（RR / T-LRU）拿到 100% 的流量。只改 queue_tag，
         # 不动 session_type —— 分类器自身的统计仍然可测。
         self.force_agentic = bool(
@@ -389,7 +389,7 @@ class RadixCache(BasePrefixCache):
         )
 
         self.evictable_leaves = set()
-        # SimpleHYBRID：会话级 KV 账本（每会话 d/L/gaps），供公平淘汰使用。
+        # HeterCache：会话级 KV 账本（每会话 d/L/gaps），供公平淘汰使用。
         # 进程级单例：同进程内多个缓存实例共享同一本账（见 SessionRegistry 文档）。
         # 需要隔离时（单测 / 并行对照）构造后覆盖本属性：
         #     cache.session_registry = SessionRegistry()
@@ -397,7 +397,7 @@ class RadixCache(BasePrefixCache):
         self.reset()
 
         # ---- 策略无关的「按工作负载占用」采样器（env 门控，默认关）----
-        # 用途：LRU 等不触发 [SimpleHybrid profile] 的策略，也能拿到每队列
+        # 用途：LRU 等不触发 [HeterCache profile] 的策略，也能拿到每队列
         # 占用占比。__init__ 在 scheduler 进程内执行，这里起一个 daemon 线程，
         # 周期性调 _per_workload_token_count()（基类方法，树上节点带 queue_tag，
         # 任何策略都可用）。默认关闭：无 env 时这里只做一次 os.environ.get 判空。
@@ -622,7 +622,7 @@ class RadixCache(BasePrefixCache):
         # 定位 prompt/output 边界，使 decode 部分节点可以单独标记；
         # 不再要求客户端提供工作负载类型标签。
         decode_start = (len(req.origin_input_ids) // self.page_size) * self.page_size
-        # SimpleHYBRID：会话账本入口。请求写入后链完整驻留，缺口归零。
+        # HeterCache：会话账本入口。请求写入后链完整驻留，缺口归零。
         self.session_registry.touch(
             req.session_id, getattr(req, "rid", ""), len(radix_key)
         )
@@ -772,9 +772,9 @@ class RadixCache(BasePrefixCache):
         return EvictResult(num_tokens_evicted=num_evicted)
 
     def _is_one_shot(self, node) -> bool:
-        """一次性内容判定：优先用策略口径（SimpleHybrid 有多轮/单轮之分）。
+        """一次性内容判定：优先用策略口径（HeterCache 有多轮/单轮之分）。
 
-        非 SimpleHybrid 策略没有 is_one_shot，退回旧规则（is_decode 或随机单轮）。
+        非 HeterCache 策略没有 is_one_shot，退回旧规则（is_decode 或随机单轮）。
         计数与淘汰必须用同一判定，否则 profile 的分母口径与实际淘汰会互相打架。
         """
         fn = getattr(self.eviction_strategy, "is_one_shot", None)
@@ -1034,10 +1034,10 @@ class RadixCache(BasePrefixCache):
         )
         if self.force_agentic:
             # 直达 agentic 队列：跳过 8s 间隔判定与 QSTRUCT 黏性。
-            node.queue_tag = SimpleHybridQueueTag.QAGENT
-        elif node.queue_tag != SimpleHybridQueueTag.QSTRUCT:
+            node.queue_tag = HeterCacheQueueTag.QAGENT
+        elif node.queue_tag != HeterCacheQueueTag.QSTRUCT:
             if state is not None and state.session_type == SessionType.STRUCT:
-                node.queue_tag = SimpleHybridQueueTag.QSTRUCT
+                node.queue_tag = HeterCacheQueueTag.QSTRUCT
             elif (
                 state is not None
                 and node.session_id == session_id
@@ -1047,9 +1047,9 @@ class RadixCache(BasePrefixCache):
             elif state is None or session_id is None or node.session_id is None:
                 # Preserve legacy behavior outside the session classifier.
                 node.queue_tag = (
-                    SimpleHybridQueueTag.QAGENT
+                    HeterCacheQueueTag.QAGENT
                     if delta < 8.0
-                    else SimpleHybridQueueTag.QCHAT
+                    else HeterCacheQueueTag.QCHAT
                 )
         node.last_access_time = access_time
 
@@ -1062,7 +1062,7 @@ class RadixCache(BasePrefixCache):
            decode_start: Optional[int] = None,
        ):
            new_node = TreeNode(priority=child.priority)
-           # SimpleHYBRID：前缀一半继承原偏移，后缀一半整体后移 split_len。
+           # HeterCache：前缀一半继承原偏移，后缀一半整体后移 split_len。
            # 必须在覆盖 child.abs_start 之前把旧值读出来。
            new_node.abs_start = child.abs_start
            child.abs_start = child.abs_start + split_len
@@ -1072,7 +1072,7 @@ class RadixCache(BasePrefixCache):
            new_node.lock_ref = child.lock_ref
            new_node.key = child.key[:split_len]
            new_node.value = child.value[:split_len].clone()
-           # SimpleHYBRID metadata: prefix half inherits; suffix half is
+           # HeterCache metadata: prefix half inherits; suffix half is
            # reclassified as decode when the split lands at/after decode_start.
            new_node.queue_tag = child.queue_tag
            new_node.is_decode = child.is_decode
@@ -1152,7 +1152,7 @@ class RadixCache(BasePrefixCache):
                 child_key = key.child_key(self.page_size)
 
         if len(key): ## 如果还有剩余的key,说明没有匹配到子节点,需要创建新的子节点
-            # SimpleHYBRID：新片段从「已匹配长度」处开始（绝对偏移）。
+            # HeterCache：新片段从「已匹配长度」处开始（绝对偏移）。
             new_node = TreeNode(priority=priority, abs_start=total_prefix_length)
             new_node.parent = node
             new_node.key = key
@@ -1160,14 +1160,14 @@ class RadixCache(BasePrefixCache):
             state = self.session_registry.get(session_id)
             if self.force_agentic:
                 # 直达 agentic 队列：新节点不再落 QTRANS（否则会被 one-shot 带先清）
-                new_node.queue_tag = SimpleHybridQueueTag.QAGENT
+                new_node.queue_tag = HeterCacheQueueTag.QAGENT
             else:
                 # 出生标签只看「谁创建了这段」；跨会话共享的事实由
                 # SlruEvictPolicy 的共享数账本记录，与标签无关。
                 new_node.queue_tag = (
                     session_type_to_queue_tag(state.session_type)
                     if state is not None
-                    else SimpleHybridQueueTag.QTRANS
+                    else HeterCacheQueueTag.QTRANS
                 )
             new_node.is_decode = (
                 decode_start is not None and total_prefix_length >= decode_start
@@ -1187,7 +1187,7 @@ class RadixCache(BasePrefixCache):
                 and len(node.children) >= 2
             ):
                 # 分叉点即「多请求共用前缀」的结构证据，直接标 QSTRUCT。
-                node.queue_tag = SimpleHybridQueueTag.QSTRUCT
+                node.queue_tag = HeterCacheQueueTag.QSTRUCT
             self.evictable_size_ += len(key)
             self._update_leaf_status(node)
             self._update_leaf_status(new_node)
@@ -1215,7 +1215,7 @@ class RadixCache(BasePrefixCache):
                 )
 
     def _delete_leaf(self, node):
-        # SimpleHYBRID：节点消亡的唯一原语，会话缺口在此累加（覆盖淘汰与释放两条路径）
+        # HeterCache：节点消亡的唯一原语，会话缺口在此累加（覆盖淘汰与释放两条路径）
         self.session_registry.charge(node)
         key = node.key.child_key(self.page_size)
         v = node.parent.children.pop(key, None) ## 从父节点的children字典中删除当前节点，并返回删除的节点
