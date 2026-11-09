@@ -9,7 +9,7 @@
 tasks:
   - name: AgentBank_apps
     task_id: 0
-    data_path: TaskData/AgentBankData/Qwen2.5-7B-Instruct/AgentBank_apps_session_data.jsonl
+    data_path: TaskData/AgentBankData/Qwen2.5-7B-Instruct/AgentBank_apps_session_data.nosys.jsonl
     lambda_rate: 1
     mu: 0
     sigma: 0
@@ -19,7 +19,7 @@ tasks:
 
   - name: Codeparrot
     task_id: 1
-    data_path: TaskData/Codeparrot/Qwen2.5-7B-Instruct/Code_session_data.jsonl
+    data_path: TaskData/Codeparrot/Qwen2.5-7B-Instruct/Code_session_data.nosys.jsonl
     lambda_rate: 1
     mu: 0
     sigma: 0
@@ -29,7 +29,7 @@ tasks:
 
   - name: ShareGPT
     task_id: 2
-    data_path: TaskData/SharedGPT-multi-turn/Qwen2.5-7B-Instruct/ShareGPT_cleaned_valid_deduplicated_session_data.jsonl
+    data_path: TaskData/SharedGPT-multi-turn/Qwen2.5-7B-Instruct/ShareGPT_cleaned_valid_deduplicated_session_data.nosys.jsonl
     lambda_rate: 1
     mu: 4.15
     sigma: 0.971
@@ -39,7 +39,7 @@ tasks:
 
   - name: AgentBank_alfred
     task_id: 3
-    data_path: TaskData/AgentBankData/Qwen2.5-7B-Instruct/AgentBank_alfred_scale_5000_session_data.jsonl
+    data_path: TaskData/AgentBankData/Qwen2.5-7B-Instruct/AgentBank_alfred_scale_5000_session_data.nosys.jsonl
     lambda_rate: 1
     mu: 1.81
     sigma: 1.092

@@ -9,6 +9,33 @@
 
 ---
 
+## 零、准备数据（必须先做）
+
+Qwen 的默认 system prompt 只有 24 token，但运行时判定「跨会话共享」时**没有 token 门槛**：
+任一单轮会话只要命中过别人拥有的这段前缀，就会被标成 `STRUCT`。后果是标签分布严重偏斜。
+
+同一份数据上的离线消融（`docs/reports/classify_system_prompt_ablation.md`）：
+
+| 臂 | system prompt | acc | random 召回 | chat 召回 |
+|---|---|---|---|---|
+| A | 原样（生产缺省） | 0.5791 | **0.000** | 0.240 |
+| C | **只去 Qwen system** | **0.7697** | **0.993** | 0.240 |
+
+也就是说：不剥这一段，实验里根本看不到 `random` 队列，`apps` 全被算进 `struct`。
+本套件因此统一读去掉该段之后的副本：
+
+```bash
+bash mixexp/prepare_data.sh     # 生成 *.nosys.jsonl（幂等）
+```
+
+`mix_*.yaml` 与 `drift_phases.yaml` 的 `data_path` 已全部指向 `*.nosys.jsonl`。
+`run_mixexp.sh` 会在起 server 之前预检这些文件，缺失直接退出并提示上面这条命令。
+
+注意 `chat` 召回仍是 0.240——那是另一个原因（76% 的 ShareGPT 会话轮数 <5，
+结构上不可能判成 CHAT），剥 system prompt 解决不了。见第六节。
+
+---
+
 ## 一、规模阶梯
 
 规模只由 `configs/mix_<scale>.yaml` 里的 `max_record` 控制（各负载取多少条会话），
@@ -126,7 +153,8 @@ result/mixexp/server_<scale>_<arm>.log  server 日志（含 [HeterCache profile]
    所以「最弱类」是「最弱数据集」的代理，不是精确的队列指标。要看真队列数字，
    去 server 日志里的 `[HeterCache profile]`。
 2. **本仓库不含数据集**。`TaskData/` 下只有生成脚本，`*_session_data.jsonl`
-   需要在实验机上由 `tools/prepare_session_data.py` 生成；本地跑会直接报找不到文件。
+   需要在实验机上由 `tools/prepare_session_data.py` 生成，再经
+   `mixexp/prepare_data.sh` 剥掉 Qwen 公共 system 段；本地跑会直接报找不到文件。
 3. **本机无法执行**：这套脚本需要 GPU + 模型 + 数据。提交前只做了静态校验
    （`bash -n`、YAML schema + 调度构建、`HeterCacheStrategy` 参数构造、`analyze.py`
    合成数据自测、`--dry-run`）。

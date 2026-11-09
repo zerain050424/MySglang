@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # 混合负载实验：规模阶梯 × 实验臂。
 #
+# 前置：bash mixexp/prepare_data.sh 生成 *.nosys.jsonl（去掉 Qwen 公共 system 段）
+#
 # 用法：
 #   bash mixexp/run_mixexp.sh --scale smoke                 # 冒烟：全臂跑通
 #   bash mixexp/run_mixexp.sh --scale quick --arms lru,hc_full
@@ -31,7 +33,7 @@ OUTDIR="${OUTDIR:-$BENCH_DIR/result/mixexp}"
 PORT="${PORT:-30000}"
 
 usage() {
-  sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 while [ $# -gt 0 ]; do
@@ -83,6 +85,39 @@ fi
 
 mkdir -p "$OUTDIR"
 cd "$BENCH_DIR/.."
+
+# 数据预检：配置里的 data_path 必须都在。缺了立刻停——
+# 否则要等 server 起完、bench 跑到第一个任务才报错。
+check_data_paths() {
+  # 只读 yaml，不需要 sglang 依赖；$PY 不在时退回本机 python3，
+  # 免得把「解释器缺失」误报成「数据缺失」。
+  local check_py="$PY"
+  command -v "$check_py" >/dev/null 2>&1 || check_py=python3
+  "$check_py" - "$CFG" "$BENCH_DIR" <<'PYCHECK'
+import sys
+from pathlib import Path
+import yaml
+
+cfg, root = Path(sys.argv[1]), Path(sys.argv[2])
+data = yaml.safe_load(cfg.read_text(encoding="utf-8")) or {}
+missing = [
+    task["data_path"]
+    for task in data.get("tasks", [])
+    if not (root / task["data_path"]).exists()
+]
+if missing:
+    print("缺少数据文件：")
+    for path in missing:
+        print("  " + path)
+    sys.exit(1)
+PYCHECK
+}
+
+if [ "$DRY_RUN" != "1" ] && ! check_data_paths; then
+  echo
+  echo "先准备数据：bash $HERE/prepare_data.sh" >&2
+  exit 2
+fi
 
 wait_health() {
   local url="http://127.0.0.1:${PORT}/health"
