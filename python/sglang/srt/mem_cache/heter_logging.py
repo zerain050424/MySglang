@@ -1,22 +1,23 @@
-"""HeterCache 策略日志桥：把 sglang 侧的观测事件接到 Heter-Bench 的日志/账本实现。
+"""sglang ↔ Heter-Bench 的观测接缝：定位、导入、降级。
 
-策略代码（``evict_policy`` / ``radix_cache`` 等）只写 ``heterlog.xxx(...)`` 并传
-原始数据；格式化、序列化、级别门槛全部收敛在 ``Heter-Bench/log`` 的 HeterLogger 里，
-策略侧不持有文件句柄。
+本模块**只做装配**，不含任何观测逻辑。所有观测实现都在 ``Heter-Bench``：
 
-为什么用相对路径而不是 import 包：``Heter-Bench`` 是随仓库走的实验脚手架，不随
-sglang 安装分发，只能按仓库根定位（本文件向上 4 级）。
+    Heter-Bench/log/heter_logger.py         文本日志 + JSONL 事件流
+    Heter-Bench/profile/heter_profiler.py   账本与 profile 渲染
+    Heter-Bench/profile/cache_telemetry.py  遥测门面（多写收口、时钟、去重）
+    Heter-Bench/profile/node_label_logger.py 节点级标签快照
+
+为什么按仓库根定位而不是 import 包：``Heter-Bench`` 是随仓库走的实验脚手架，
+不随 sglang 安装分发，只能从本文件向上 4 级找。
+
+降级（Heter-Bench 不在旁边，例如单独打包或迁移）：下面三个名字仍可用，但都是
+空实现——``heterlog`` 退化为命名空间 logger，``HeterProfiler`` 变成不累计的
+null 对象，``CacheTelemetry`` 与 ``NodeLabelLogger`` 变成同签名空壳。策略调用点
+因此不需要判空，也不会因为缺少实验脚手架而导入失败。
 
 环境变量：
     STRAT_LOG_LEVEL:        quiet/info/debug/trace，不分大小写，默认 info。
-                            决定是否输出高频文本行（``enabled``）。
-    HETER_STRATEGY_EVENTS:  给定 JSONL 路径则开启结构化事件流落盘（``capturing``）。
-
-两个出口互相独立：只想拿事件流不必开 debug，只想看文本行也不必开 capture。
-``CacheTelemetry`` 按 ``capturing or enabled`` 判断是否值得构造事件。
-
-降级：``Heter-Bench/log`` 不在旁边时（单独打包/迁移），退化为命名空间 logger，
-不落盘也不抛错——策略调用点因此不需要判空。
+    HETER_STRATEGY_EVENTS:  给定 JSONL 路径则开启结构化事件流落盘。
 """
 
 from __future__ import annotations
@@ -24,36 +25,38 @@ from __future__ import annotations
 import logging
 import os
 import sys
-import time
-from collections import deque
+from typing import Optional
 
-_LOG_DIR = os.path.abspath(
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../../..",
-                 "Heter-Bench", "log"))
+_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../../.."))
+_LOG_DIR = os.path.join(_ROOT, "Heter-Bench", "log")
+_PROFILE_DIR = os.path.join(_ROOT, "Heter-Bench", "profile")
 
-# 观测账本目录：HeterProfiler 与 HeterLogger 同构落位（都跑在 scheduler 进程内）。
-_PROFILE_DIR = os.path.abspath(
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../../..",
-                 "Heter-Bench", "profile"))
 
-if os.path.isdir(_LOG_DIR):
-    if _LOG_DIR not in sys.path:
-        sys.path.insert(0, _LOG_DIR)
+def _add_path(path: str) -> bool:
+    """目录存在则加入 sys.path；返回是否可用。"""
+    if not os.path.isdir(path):
+        return False
+    if path not in sys.path:
+        sys.path.insert(0, path)
+    return True
+
+
+_LOG_READY = _add_path(_LOG_DIR)
+_PROFILE_READY = _add_path(_PROFILE_DIR)
+
+if _LOG_READY:
     from heter_logger import HeterLogger, heterlog  # noqa: F401, E402
 
     if os.environ.get("HETER_STRATEGY_EVENTS"):
         heterlog.start_capture(os.environ["HETER_STRATEGY_EVENTS"])
-    # HeterProfiler：HeterCacheStrategy 的观测账本与渲染器（Heter-Bench/profile）。
-    if os.path.isdir(_PROFILE_DIR):
-        if _PROFILE_DIR not in sys.path:
-            sys.path.insert(0, _PROFILE_DIR)
-        from heter_profiler import HeterProfiler  # noqa: F401, E402
 else:
-    # 兜底路径：Heter-Bench/log 不存在（单独打包/迁移）时退化为普通 logger。
+    # 兜底：命名空间 logger，不落盘也不抛错。
     _log = logging.getLogger("hetercache.strategy")
     _log.warning(
         "Heter-Bench/log not found at %s; HeterLogger degraded "
-        "(text log only, no JSONL capture).", _LOG_DIR)
+        "(text log only, no JSONL capture).",
+        _LOG_DIR,
+    )
 
     class _FallbackHeterLogger:
         """与 HeterLogger 同签名的降级实现：文本日志照打，事件流静默丢弃。
@@ -76,7 +79,7 @@ else:
             """
             return False
 
-        def set_level(self, level: str) -> None:
+        def set_level(self, level) -> None:
             _log.setLevel(str(level).upper())
 
         def start_capture(self, path: str) -> None:
@@ -94,124 +97,67 @@ else:
     heterlog = _FallbackHeterLogger()  # noqa: F811
 
 
-class CacheTelemetry:
-    """策略侧观测的唯一入口：把账本与事件流的多写、字段映射、开关判断收在一处。
+if _PROFILE_READY:
+    from cache_telemetry import CacheTelemetry  # noqa: F401, E402
+    from heter_profiler import HeterProfiler  # noqa: F401, E402
+    from node_label_logger import (  # noqa: F401, E402
+        NodeLabelLogger,
+        start_from_env as start_node_label_logger,
+    )
+else:
+    # 兜底：同签名空实现，保证策略与缓存层的导入路径永远成立。
+    _log.warning(
+        "Heter-Bench/profile not found at %s; profiler and telemetry degraded.",
+        _PROFILE_DIR,
+    )
 
-    业务层只表达意图（发生了一次命中 / 一次逐出 / 一次裁决），不再关心
-    "要不要写 profiler、要不要判开关、参数怎么拼"。上层的三个 ``record_*``
-    因此各剩一行调用。
+    class HeterProfiler:  # noqa: D101 - 与真实实现同签名
+        def record_hit(self, queue, hit_tokens) -> None:
+            pass
 
-    放在本模块而不是策略模块：这里是 sglang 与 Heter-Bench 观测实现的唯一接缝，
-    装配与降级都发生在这里，收敛点也应该在这里。
+        def record_evict(self, queue, tokens, one_shot) -> None:
+            pass
 
-    开关判据是 ``capturing or enabled``，两者对应不同出口：
+        def record_victim_source(self, source, tokens) -> None:
+            pass
 
-    * ``capturing``：事件流落盘（``HETER_STRATEGY_EVENTS``），默认关；
-    * ``enabled``：文本 debug 日志（``STRAT_LOG_LEVEL=debug``），默认关。
+        def summary(self, *args, **kwargs) -> str:
+            return ""
 
-    只判 ``enabled`` 会让开了事件流但没开 debug 的跑法丢掉全部事件；只判
-    ``capturing`` 又会让纯文本排查时看不到事件行。两个都不满足时直接返回，
-    避免白构造一份会被丢弃的事件字典。
-    """
+        def reset(self) -> None:
+            pass
 
-    # 顺带在这里定义 profile 的时钟与命中去重上限：它们都只服务观测。
-    PROFILE_INTERVAL = 30.0
-    MAX_SEEN_RIDS = 100_000
+    class CacheTelemetry:  # noqa: D101 - 与真实实现同签名
+        PROFILE_INTERVAL = 30.0
 
-    __slots__ = ("profiler", "_last_profile", "_seen_rids", "_rid_order")
+        def __init__(self, profiler) -> None:
+            self.profiler = profiler
 
-    def __init__(self, profiler):
-        """绑定账本。
+        def on_hit(self, tag, hit_tokens: int, req_id=None) -> None:
+            pass
 
-        Args:
-            profiler: HeterProfiler 实例；策略侧同时保留引用（外部消费者直接读它）。
-        """
-        self.profiler = profiler
-        self._last_profile = time.monotonic()
-        # 每请求只归因一次命中的去重账本：同一 rid 的多次 chunked prefill 只算一次。
-        self._seen_rids: set = set()
-        self._rid_order: deque = deque()
+        def on_evict(self, node_id: int, tag, tokens: int, one_shot: bool) -> None:
+            pass
 
-    @staticmethod
-    def _emitting() -> bool:
-        """是否值得进入事件构造函数。"""
-        return heterlog.capturing or heterlog.enabled
+        def on_victim_source(self, source: str, tokens: float) -> None:
+            pass
 
-    def on_hit(self, tag, hit_tokens: int, req_id=None) -> None:
-        """一次前缀命中；同一 rid 只记一次（chunked prefill 会重复进入）。
+        def wants_profile(self) -> bool:
+            return False
 
-        Args:
-            tag: 节点标签。
-            hit_tokens: 本次命中的 token 数。
-            req_id: 请求 id；为空时直接忽略（与旧行为一致）。
-        """
-        if req_id is None or req_id in self._seen_rids:
-            return
-        self._seen_rids.add(req_id)
-        self._rid_order.append(req_id)
-        if len(self._rid_order) > self.MAX_SEEN_RIDS:
-            self._seen_rids.discard(self._rid_order.popleft())
+        def observe_profile(self, *args, **kwargs) -> None:
+            pass
 
-        self.profiler.record_hit(tag.queue_name, hit_tokens)
-        if self._emitting():
-            heterlog.hit(
-                queue=tag.queue_name,
-                tag=tag.value,
-                hit_tokens=hit_tokens,
-                req=req_id,
+        def reset(self) -> None:
+            pass
+
+    class NodeLabelLogger:  # noqa: D101 - 与真实实现同签名
+        def __init__(self, cache, path: str, interval: float = 30.0) -> None:
+            raise RuntimeError(
+                "NodeLabelLogger needs Heter-Bench/profile; "
+                f"missing at {_PROFILE_DIR}."
             )
 
-    def on_evict(self, node_id: int, tag, tokens: int, one_shot: bool) -> None:
-        """一次节点逐出（级联删除时逐点上报）。"""
-        self.profiler.record_evict(tag.queue_name, tokens, one_shot=one_shot)
-        if self._emitting():
-            heterlog.evict(
-                node_id=node_id,
-                queue=tag.queue_name,
-                tag=tag.value,
-                tokens=tokens,
-                one_shot=one_shot,
-            )
-
-    def on_victim_source(self, source: str, tokens: float) -> None:
-        """一次淘汰裁决来源。"""
-        self.profiler.record_victim_source(source, tokens)
-        if self._emitting():
-            heterlog.victim_source(source, tokens)
-
-    def wants_profile(self) -> bool:
-        """profile 打印时钟是否到期。与配额校准时钟完全独立。"""
-        return time.monotonic() - self._last_profile >= self.PROFILE_INTERVAL
-
-    def observe_profile(
-        self,
-        queue_occ: dict,
-        session_summary,
-        *,
-        slru_policy,
-        mt_policy,
-        quota_occ: dict,
-        quota_targets: dict,
-        quota_caps: dict,
-    ) -> None:
-        """渲染并输出一行 profile，同时推进打印时钟。
-
-        只做渲染：目标配额与上限由调用方算好传进来，这里不碰配额数学。
-        """
-        self._last_profile = time.monotonic()
-        rendered = self.profiler.summary(
-            queue_occ,
-            session_summary,
-            slru_policy=slru_policy,
-            mt_policy=mt_policy,
-            quota_occ=quota_occ,
-            quota_targets=quota_targets,
-            quota_caps=quota_caps,
-        )
-        heterlog.info("Profile", f"[HeterCache profile]\n{rendered}")
-
-    def reset(self) -> None:
-        """清空跨 run 的累计量与去重账本（缓存 flush / reset 时调用）。"""
-        self.profiler.reset()
-        self._seen_rids.clear()
-        self._rid_order.clear()
+    def start_node_label_logger(cache) -> Optional[object]:
+        """降级态不采样：返回 None，调用方只留一个空句柄。"""
+        return None

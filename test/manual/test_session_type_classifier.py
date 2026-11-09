@@ -197,7 +197,7 @@ def test_classified_agentic_session_tags_new_nodes(tmp_path):
 
     dump_path = tmp_path / "labels.jsonl"
     # 快照已从 RadixCache 抽成独立观测组件，测试直接驱动它一次
-    from sglang.srt.mem_cache.node_label_logger import NodeLabelLogger
+    from sglang.srt.mem_cache.heter_logging import NodeLabelLogger
 
     assert NodeLabelLogger(cache, str(dump_path)).dump_once(1) == 1
     row = json.loads(dump_path.read_text())

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.node_label_logger import start_from_env
+from sglang.srt.mem_cache.heter_logging import start_node_label_logger
 
 """
 Copyright 2023-2024 SGLang Team
@@ -399,7 +399,7 @@ class RadixCache(BasePrefixCache):
         # 节点级标签快照：观测组件见 node_label_logger（env 门控，默认关）。
         # 这里只留一个句柄：采样器要读 root_node / session_registry / eviction_policy，
         # 但遍历与落盘都不在缓存类里。
-        self.node_labels = start_from_env(self)
+        self.node_labels = start_node_label_logger(self)
 
     @classmethod
     def create_simulated(
@@ -1011,7 +1011,7 @@ class RadixCache(BasePrefixCache):
             new_node.session_id = session_id
             self.session_registry.attach(session_id, len(new_node.value))
             node.children[child_key] = new_node
-            # T-LRU：新节点记下 root->self 的累计长度，并把高水位沿祖先链上抬。
+
             for observe in self._insert_observers:
                 observe(new_node)
             # 配额账本：只记“新出现的 token”，分裂路径不走这里（净变化为 0）。

@@ -11,6 +11,10 @@
 是否 decode 段, 绝对起始偏移)。数据消费方是 Heter-Bench 的节点级标注准确率
 统计（``evaluate_node_labels.py`` / ``evaluate_node_count.py``）。
 
+本模块属于实验脚手架，**不随 sglang 安装分发**：由
+``sglang/srt/mem_cache/heter_logging.py`` 按仓库根定位后加载；Heter-Bench
+不在场时该桥退化为空实现。
+
 环境变量：
     SGLANG_NODE_LABEL_DUMP:     给定 JSONL 路径则开启，空表示不开启（默认）。
     SGLANG_NODE_LABEL_INTERVAL: 采样间隔（秒），默认 30。
@@ -25,7 +29,8 @@ import threading
 import time
 from typing import TYPE_CHECKING, Optional
 
-from sglang.srt.mem_cache.heter_logging import heterlog
+from heter_logger import heterlog
+
 from sglang.srt.mem_cache.heter_utils import SessionType
 
 if TYPE_CHECKING:  # pragma: no cover - 仅类型检查，避免与缓存模块成环
