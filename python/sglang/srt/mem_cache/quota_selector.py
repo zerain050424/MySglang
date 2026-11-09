@@ -1,15 +1,14 @@
-"""跨队列配额的仲裁数学。
+"""跨队列配额仲裁与淘汰决策算法。
 
-HeterCache 在 ``heter_cache`` 后端上按队列（struct / agentic / chat）分配 KV 池。
-本模块只回答两个问题，不碰树、不碰节点内容：
+HeterCache 后端将 KV Cache 资源池按业务类型划分为三个队列（struct / agentic / chat）。
+本模块提供无状态的纯计算逻辑，不感知底层 Radix 树拓扑与节点数据，专注解决两个调度问题：
 
-1. 各队列此刻的**有效目标** ``target`` 是多少（max-min 水填充 + 上下限夹紧）；
-2. 这一轮该**点名哪个队列**承压（超上限优先，其次弹性区按超出下限最多）。
+1. 各队列当前的有效配额目标（基于 Max-Min 充水算法与上下限截断计算 target）；
+2. 本轮淘汰优先由哪个队列释放容量（超上限队列优先，其次按超出保底预留量排序）。
 
-之所以独立成模块而不是塞进策略类：这套计算是纯函数，可以脱离 torch 与缓存状态
-单测（见 ``test/manual/test_quota_selector.py``）。
-
-队内排序（SLRU 分档 / 会话轮询 / 生存概率）不在这里，属于 ``victim_override``。
+架构设计：
+抽离为独立纯函数模块，脱离 PyTorch 运行时及全局缓存状态，便于算法边界的确定性单测。
+队列内部的具体淘汰策略（如 SLRU 分级、会话轮询、保活概率）交由 victim_override 执行。
 """
 
 from __future__ import annotations
@@ -18,7 +17,7 @@ from typing import Dict, List, Tuple
 
 from sglang.srt.mem_cache.heter_utils import QUOTA_QUEUES, QuotaParams
 
-# 额度是浮点比例，比较时留容差，避免 0.5*C 的舍入把"刚好达标"误判成超标。
+# 浮点比较容差，防止乘算容量比例时的舍入误差导致临界点误判。
 _EPS = 1e-9
 
 
@@ -27,32 +26,34 @@ def effective_targets(
     capacity: float,
     params: QuotaParams,
 ) -> Dict[str, float]:
-    """用 max-min 水填充算出各队列此刻的有效目标（单位 token）。
+    """基于 Max-Min 充水算法（Water-Filling）计算各队列的动态目标配额（Token）。
 
-    分母恒为**池容量** ``capacity``（``allocator.size``），不是当前占用之和：
-    每淘汰 1 token 分母也会同步少 1，会把"降到目标"实际需要的淘汰量放大
-    1/(1-k) 倍（k=0.5、超出 300 时实际要淘汰 600），使上限型配额退化成激进清理。
+    基准容量必须固定为总池大小（allocator.size），而非各队列实时占用总和：
+    若使用动态占用作为分母，每释放 1 个 Token 都会导致分母收缩，形成负反馈放大
+    （例如上限比例为 0.5、超出 300 Token 时，实际需要淘汰 600 Token 才能达成平衡），
+    会导致常规配额保护退化为过激的深度逐出。
 
     Args:
-        occ: 各队列的可调度占用（token）。口径为「排除 one-shot、包含 locked」，
-            与 ``HeterCacheStrategy._occ`` 一致。
-        capacity: 池容量（token），采样自 ``token_to_kv_pool_allocator.size``。
-        params: 配额参数，``caps`` / ``reservations`` 为比例，函数内换算成 token。
+        occ: 各队列的可调度占用量（Token）。统计口径与 HeterCacheStrategy._occ 一致
+            （排除 one-shot，包含 locked）。
+        capacity: 缓存池总容量（Token），取自 token_to_kv_pool_allocator.size。
+        params: 配额参数，内部将 caps（上限比例）和 reservations（保底比例）换算为 Token。
 
     Returns:
-        ``{queue: target}``，键恒为 ``QUOTA_QUEUES`` 全集。
-        全部队列触顶时 ``sum(target) < capacity``：空闲容量无人认领，属正常结果。
+        各队列的有效配额字典 {queue: target}，键恒包含全部 QUOTA_QUEUES。
+        当所有队列均触及上限时，sum(target) < capacity，剩余未分配容量属于正常空闲。
 
     Raises:
-        ValueError: 配额未启用（``caps`` 为空）。调用方应先判 ``params.enabled``，
-            否则说明接线错误，静默返回 0 会把问题藏起来。
+        ValueError: 配额未启用（caps 为空）。调用方必须在外层先判断 params.enabled，
+            此处抛出异常以防静默返回 0 掩盖上游调用链异常。
 
-    水填充的三条规则：
-      1. 占用不高于下限的队列判为"未触底"，保住现有占用、不参与再分配；
-      2. 其余队列按 ``caps`` 比例分剩余容量，分到超过自己上限的夹到上限，
-         夹紧释放出的容量再分给剩下的队列（队列数固定为 3，最多 3 轮）；
-      3. 剩余容量为负（locked token 占住了池子）时仍按比例分，结果可能低于下限。
-         这是"所有队列都不可回收"的信号，交由调用方的跳队/兜底吸收，不做特判。
+    充水分配规则：
+      1. 保护未触底队列：当前占用未达到保底预留（reservation）的队列，维持其实际占用，
+         不削减也不参与剩余容量的再分配；
+      2. 剩余配额均分：其余活跃队列按 caps 权重均分剩余空闲容量。若分配值超过自身硬上限（cap），
+         则截断至 cap，溢出的额度在剩余活跃队列中继续迭代分配（3 个队列最多迭代 3 轮收敛）；
+      3. 极端欠载处理：当 Locked Token 过多导致计算出的剩余容量为负时，仍按比例缩减，
+         允许 target 算得低于保底线。此状态视为全局不可释放信号，由上层调度降级处理。
     """
     if not params.enabled:
         raise ValueError(
@@ -94,21 +95,21 @@ def over_quota_queues(
     params: QuotaParams,
     chunk: float,
 ) -> List[str]:
-    """筛出真正要减持的队列，按超出量降序返回。
+    """筛选超出配额目标的队列，按超额绝对值降序返回。
 
-    两个门禁必须同时满足，缺一个都会在边界上抖动：
-      * 相对超限 > ``deadzone``：拦住"刚好压线"的浮点抖动；
-      * 绝对超限 >= ``chunk``：拦住每次只腾出一个 token 的逐点颠簸
-        （``page_size=1`` 的实验配置下尤其明显）。
+    设置双重门限过滤，防止在阈值临界点频繁颠簸（Thrashing）：
+      - 相对超额门限（deadzone）：设置死区缓冲，过滤刚好压线的浮点波动；
+      - 绝对超额门限（chunk）：设置最小削减批次，避免每次只驱逐极少 Token 的微碎抖动
+        （在小页尺寸或单 Token 实验场景下尤为关键）。
 
     Args:
-        occ: 各队列可调度占用（token）。
-        targets: ``effective_targets`` 的输出。
-        params: 配额参数，只用到 ``deadzone``。
-        chunk: 单次最小减持量（token），见 ``resolve_chunk``。
+        occ: 各队列实时可调度占用（Token）。
+        targets: effective_targets 计算得出的目标配额。
+        params: 配额参数，读取 deadzone 容差。
+        chunk: 单次淘汰最小批次（Token），由 resolve_chunk 确定。
 
     Returns:
-        满足门禁的队列名，按 ``occ - target`` 降序；无队列满足时返回空列表。
+        超出配额且突破死区的队列名列表，按 (occ - target) 差值降序排列；无则返回空列表。
     """
     over = []
     for q in QUOTA_QUEUES:
@@ -130,25 +131,25 @@ def queue_ranking(
     chunk: float,
     capacity: float,
 ) -> List[str]:
-    """给出本轮点名的完整优先级，供调用方逐个尝试（第一个有候选的即为 Q*）。
+    """生成本轮淘汰候选队列的仲裁优先级序列，供逐级尝试。
 
-    两段式优先级：
-      1. 超上限者在前，按超出量降序 —— 这是"封顶"的强制执行部分；
-      2. 弹性区在后，按超出下限降序 —— 配额不禁止队列用得多，只要求排队。
+    采用两阶段优先级倾斜机制：
+      1. 超上限队列优先：严格约束超限，按超额量绝对值降序排列（强硬执行阶段）；
+      2. 弹性借用队列次之：未超上限但超出保底预留量的队列，按超出预留线的富余量降序排列。
 
-    返回空列表表示"没有任何队列高于下限"，即配额对这次淘汰没有意见：
-    此时要么池子并未真被这三个队列占满（locked/one-shot 占着），要么配置的
-    下限之和过大，两种情形都该交给兜底，而不是由数学层猜。
+    若返回空列表，表明当前没有任何队列高于保底线：
+    说明当前资源受困于 Locked 或 One-shot 占用，或者预留参数配置过大，
+    此时配额层不予强行干预，交由底层兜底逻辑接管。
 
     Args:
-        occ: 各队列可调度占用（token）。
-        targets: ``effective_targets`` 的输出。
-        params: 配额参数，只用到 ``reservations``。
-        chunk: 单次最小减持量（token）。
-        capacity: 池容量（token），用于把下限比例换算成 token。
+        occ: 各队列实时可调度占用（Token）。
+        targets: effective_targets 计算得出的目标配额。
+        params: 配额参数，读取 reservations 配置。
+        chunk: 单次淘汰最小批次（Token）。
+        capacity: 缓存池总容量（Token），用于将预留比例换算为绝对值。
 
     Returns:
-        队列名列表，可能为空；不含重复项。
+        排序后的队列名列表（无重复）；无候选时返回空列表。
     """
     ranking = over_quota_queues(occ, targets, params, chunk)
     elastic = [
@@ -166,15 +167,16 @@ def queue_ranking(
 
 
 def queue_capacities(params: QuotaParams, capacity: float) -> Dict[str, float]:
-    """把 ``caps`` 比例换算成各队列的硬上限（token），仅用于观测。"""
+    """将各队列的上限比例（caps）转换为实际 Token 容量绝对值，用于观测统计。"""
     return {q: params.caps[q] * max(float(capacity), 0.0) for q in QUOTA_QUEUES}
 
 
 def resolve_chunk(page_size: int, params: QuotaParams) -> int:
-    """取单次最小减持量：``max(page_size, chunk_tokens)``。
+    """计算单次淘汰的对齐粒度：取 max(page_size, chunk_tokens)。
 
-    为什么不只用 ``chunk_tokens``：page 是 KV 分配的最小粒度，减持量小于一个
-    page 时淘汰循环仍会释放整页，死区判定与实际释放量对不上。
+    设计原因：
+    Page 是底层的物理分配最小单元。若削减步长小于单个 Page，实际回收仍会释放整页，
+    导致算法计算的滞后门限（Deadzone）与底层实际释放的物理内存量产生偏差。
     """
     return max(int(page_size or 1), int(params.chunk_tokens))
 
@@ -188,27 +190,28 @@ def pick_victim(
     overrides,
     session_registry,
 ):
-    """三级淘汰的候选选择（纯决策，不释放 KV、不改树）。
+    """三级阶梯淘汰决策主入口（仅执行裁决，不产生实际内存释放或树结构修改）。
 
-    阶段 0  one-shot 带永远先清空（带内 LRU），不计配额 —— 清它没有机会成本。
-    阶段 1  配额启用：按 ``quota_ranking`` 的顺序逐个问队内策略，某队没有候选
-            就跳下一队（全 locked / 全是 one-shot / 标签全场集中到别处）；
-            全部无候选才用策略私有 RNG 兜底，保证淘汰单调推进、不 spin。
-    阶段 2  未配置配额：保留原路径（全局 ``victim_key`` + 改写器链），行为不变。
+    执行阶段：
+      - Stage 0（无复用价值清理）：One-shot 临时节点由于无跨请求复用收益，优先走内部分段 LRU
+        无条件淘汰，不计入配额开销；
+      - Stage 1（配额仲裁淘汰）：配额启用时，按 queue_ranking 优先级逐队寻找淘汰候选。
+        若某队列节点全被锁定（Locked）、均为 One-shot 或未命中，则回退遍历下一队列；
+        若均无候选，采用策略私有伪随机策略兜底，确保淘汰指针单调步进，避免死锁（Spin）；
+      - Stage 2（未启用配额降级）：未开启配额时退化为原有基准路径（全局 victim_key + 改写器链）。
 
     Args:
-        strategy: ``HeterCacheStrategy``，提供 is_one_shot / *_key / quota_* 接口。
-        leaves: 当前可淘汰叶子集合（已排除 locked 节点）。
-        capacity: 池容量（token），仅供配额仲裁使用。
-        page_size: 页大小，用于推导 chunk。
-        overrides: 改写器链（RR / SLRU / MT），仅阶段 2 使用。
-        session_registry: 会话账本，改写器的 ``pick`` 需要它。
+        strategy: HeterCacheStrategy 策略实例，提供状态与判决接口。
+        leaves: 当前可驱逐的叶子节点集合（已剔除 Locked 节点）。
+        capacity: 缓存池总容量（Token），用于配额计算。
+        page_size: 内存页大小，用于计算对齐粒度 chunk。
+        overrides: 策略改写器链（RR / SLRU / MT 等），仅在 Stage 2 生效。
+        session_registry: 会话状态账本，供改写器评估会话级开销。
 
     Returns:
-        ``(victim, source)``。``source`` 会进 ``victim_src`` 观测：
-        ``"one_shot"`` / ``"quota:<queue>"`` / ``"quota:fallback"`` / ``"global"``。
-
-    无候选时返回 ``(None, None)``，调用方据此结束淘汰循环。
+        二元组 (victim, source)。source 标识决策来源，记录于监控打点：
+        "one_shot" / "quota:<queue>" / "quota:fallback" / "global"。
+        无候选可淘汰时返回 (None, None)，驱动上层结束回收循环。
     """
     one_shot = [n for n in leaves if strategy.is_one_shot(n)]
     if one_shot:
@@ -239,23 +242,22 @@ def pick_victim(
 
 
 def struct_tier(node, share_of, share_min: int) -> Tuple[int, float]:
-    """STRUCT 队列的减持顺序键：先牺牲"刚够保护"的模板，再动高复用模板。
+    """生成 STRUCT（结构化/模板）队列的淘汰优先级 Key：优先逐出低复用模板，保护高复用模板。
 
-    可调度带里的 struct 节点必然 ``share >= share_min`` —— 更低的那些属于
-    one-shot，在阶段 0 就被清掉了。所以能分出的梯度只有两档：
+    进入可调度集合的结构化节点满足 share >= share_min（更低复用度已被 Stage 0 过滤），
+    因此只需划分两档保护梯队：
+      - Tier 0（低度复用）：share == share_min，仅达到准入门槛，置换成本最低，优先逐出；
+      - Tier 1（深度复用）：share > share_min，已被多次跨会话复用，置换代价极高，延迟淘汰。
 
-      * 0：``share == share_min``，只被最小数量的会话用过，最廉价；
-      * 1：``share > share_min``，被多会话复用，最后才牺牲。
-
-    同档内按 ``last_access_time`` 升序（最久未访问先走），与 SLRU 段内 LRU 同口径。
+    同阶梯内按 last_access_time 升序排列（最久未访问者优先），保持段内 LRU 语义。
 
     Args:
-        node: 树节点。
-        share_of: 读取节点共享会话数的可调用对象（``SlruEvictPolicy.share_of``）。
-        share_min: 保护阈值（``SlruParams.share_min``）。
+        node: 目标缓存节点。
+        share_of: 读取节点共享会话数的函数指针（SlruEvictPolicy.share_of）。
+        share_min: 模板判定的最小共享数阈值（SlruParams.share_min）。
 
     Returns:
-        可直接用于 ``min()`` 的 ``(tier, last_access_time)``。
+        可直接用于 min() 比较的排序元组 (tier, last_access_time)。
     """
     tier = 0 if share_of(node) <= share_min else 1
     return (tier, node.last_access_time)

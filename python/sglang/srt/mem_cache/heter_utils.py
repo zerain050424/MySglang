@@ -497,6 +497,10 @@ class SessionState:
 logger = logging.getLogger(__name__)
 _D_BREAK_LOG = os.environ.get("SGLANG_SESSION_D_BREAK_LOG", "0") == "1"
 _TRACE_SID = os.environ.get("SGLANG_SESSION_TRACE_SID", "")
+# sweep 耗时采样开关：默认关。一次 sweep 只要两次 perf_counter（约 0.15us），
+# 但 sweep 本身在小会话表上也只有微秒级，默认开会让相对开销变难看；
+# 真正要看时延的场合显式打开即可。
+_SWEEP_PROF = os.environ.get("SGLANG_SESSION_SWEEP_PROFILE", "0") == "1"
 
 class SessionRegistry:
     """会话KV缺口统计：维护 KV Cache 缺口（d/L 记录）并在线推断会话负载类型。
@@ -535,12 +539,21 @@ class SessionRegistry:
     MULTI_TURN_MIN = 5      # 判定多轮的最小 turn 阈值
     GAP_SPLIT_S = 15.0      # Agent 与 Chat 的间隔判定临界值（秒）
     AGENTIC_CONTEXT_GROWTH_TOKENS = 1500  # 边界兜底：判定上下文持续暴涨的 token 阈值
+    # 以下三个只服务于 sweep 耗时埋点（SGLANG_SESSION_SWEEP_PROFILE=1 时生效）。
+    SWEEP_PROF_EVERY = 64        # 每 N 次 sweep 打一行汇总，太小刷屏、太大漏尖峰
+    SWEEP_WARN_US = 2000.0       # 单次 sweep 超过 2ms 就绪告警
 
     def __init__(self, idle_ttl: float = 3600.0, empty_grace: float = 60.0):
         self._sessions: Dict[str, SessionState] = {}
         self.idle_ttl = idle_ttl          # 会话无请求的最大存活时间
         self.empty_grace = empty_grace    # 节点清空后保留分类证据的宽限期
         self._touches = 0
+        # sweep 埋点累加器：只在 _SWEEP_PROF 打开时增长。
+        self._sweep_calls = 0
+        self._sweep_us_total = 0.0
+        self._sweep_us_max = 0.0
+        self._sweep_scan = 0              # 最近一次扫描的会话数
+        self._sweep_dead = 0              # 最近一次回收的会话数
 
     # ---- 查询 ----
     def get(self, session_id: Optional[str]) -> Optional[SessionState]:
@@ -727,8 +740,21 @@ class SessionRegistry:
         回收判定：
         1. 超过 idle_ttl 未活跃；
         2. 节点全被逐出且超过 empty_grace 宽限期。
+
+        这是本模块唯一会全量遍历会话表的地方（O(会话数)），由 ``touch`` 按
+        ``SWEEP_EVERY`` 计数触发。开关 ``SGLANG_SESSION_SWEEP_PROFILE=1`` 时
+        记录本次耗时与扫描规模，供高负载下定夺要不要做增量回收。
+
+        Args:
+            now: 注入时钟，便于回放与测试。
+
+        Returns:
+            本次回收的会话数。
         """
         now = time.monotonic() if now is None else now
+        # 计时只包住真正的遍历与删除，不看 ``now`` 的取时钟开销。
+        started = time.perf_counter() if _SWEEP_PROF else 0.0
+        scanned = len(self._sessions) if _SWEEP_PROF else 0
         dead = [
             sid
             for sid, st in self._sessions.items()
@@ -737,7 +763,69 @@ class SessionRegistry:
         ]
         for sid in dead:
             del self._sessions[sid]
+        if _SWEEP_PROF:
+            self._record_sweep(time.perf_counter() - started, scanned, len(dead))
         return len(dead)
+
+    def _record_sweep(self, elapsed_s: float, scanned: int, dead: int) -> None:
+        """累加一次 sweep 的耗时样本，并按周期或超阈打印。
+
+        同时记录耗时与扫描规模：单看耗时分不清“表小但慢”还是“表大但正常”，
+        二者的优化手段完全不同。两者相除就是单会话本，能直接外推到更大规模。
+
+        Args:
+            elapsed_s: 本次 sweep 的墙钟耗时（秒）。
+            scanned: 本次遍历的会话数。
+            dead: 本次回收的会话数。
+        """
+        us = elapsed_s * 1e6
+        self._sweep_calls += 1
+        self._sweep_us_total += us
+        self._sweep_scan = scanned
+        self._sweep_dead = dead
+        if us > self._sweep_us_max:
+            self._sweep_us_max = us
+            # 爆冷门的那一次立即报，不等周期，否则尖峰会被平均值抹平。
+            if us > self.SWEEP_WARN_US:
+                logger.warning(
+                    "[Session sweep] SLOW %.1fus (scan=%d, dead=%d) 阈%.0fus",
+                    us,
+                    scanned,
+                    dead,
+                    self.SWEEP_WARN_US,
+                )
+        if self._sweep_calls % self.SWEEP_PROF_EVERY == 0:
+            avg = self._sweep_us_total / self._sweep_calls
+            per_session = us / scanned if scanned else 0.0
+            logger.info(
+                "[Session sweep] n=%d last=%.1fus avg=%.1fus max=%.1fus "
+                "scan=%d dead=%d per_session=%.3fus",
+                self._sweep_calls,
+                us,
+                avg,
+                self._sweep_us_max,
+                scanned,
+                dead,
+                per_session,
+            )
+
+    def sweep_profile(self) -> Dict[str, float]:
+        """导出 sweep 耗时统计，供 profile 行或压测脚本直接消费。
+
+        未打开 ``SGLANG_SESSION_SWEEP_PROFILE`` 时返回全零，不区分是“没测”还是
+        “零开销”。
+
+        Returns:
+            ``calls`` / ``avg_us`` / ``max_us`` / ``last_scan`` / ``last_dead``。
+        """
+        calls = self._sweep_calls
+        return {
+            "calls": calls,
+            "avg_us": self._sweep_us_total / calls if calls else 0.0,
+            "max_us": self._sweep_us_max,
+            "last_scan": self._sweep_scan,
+            "last_dead": self._sweep_dead,
+        }
 
     # ---- 监控指标 ----
     def summary(self) -> Dict[str, float]:
