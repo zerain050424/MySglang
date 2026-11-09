@@ -1,4 +1,4 @@
-"""Proof tests: SimpleHybrid "offset" must be the ABSOLUTE token offset.
+"""Proof tests: HeterCache "offset" must be the ABSOLUTE token offset.
 
 HeterCache's heap key is (-num_hashed_tokens, ...), where num_hashed_tokens is a
 block's end offset in the sequence. The sglang port used len(node.value)
@@ -9,9 +9,9 @@ not of position in the sequence. These tests pin down the intended semantics:
   node.abs_start + len(node.value)   == absolute end offset ("num_hashed_tokens")
   child.abs_start == parent.abs_start + len(parent.value)
 
-and that SimpleHybridStrategy._reuse_score() ranks by that absolute end offset.
+and that HeterCacheStrategy._reuse_score() ranks by that absolute end offset.
 
-Run:  /root/sl_old/bin/python test/manual/test_simple_hybrid_abs_offset.py
+Run:  /root/sl_old/bin/python test/manual/test_heter_cache_abs_offset.py
 """
 
 import os
@@ -30,17 +30,17 @@ from sglang.srt.mem_cache.base_prefix_cache import (  # noqa: E402
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams  # noqa: E402
-from sglang.srt.mem_cache.simple_hybrid_radix_cache import (  # noqa: E402
-    SimpleHybridRadixCache,
+from sglang.srt.mem_cache.heter_cache_radix_cache import (  # noqa: E402
+    HeterCacheRadixCache,
 )
-from sglang.srt.mem_cache.evict_policy import SimpleHybridStrategy  # noqa: E402
+from sglang.srt.mem_cache.evict_policy import HeterCacheStrategy  # noqa: E402
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey  # noqa: E402
 from sglang.srt.mem_cache.uni_utils import (  # noqa: E402
     SessionRegistry,
     SessionState,
     SessionType,
-    SimpleHybridQueueTag,
-    SimpleHybridTaskType,
+    HeterCacheQueueTag,
+    HeterCacheTaskType,
 )
 
 FAILS = []
@@ -153,17 +153,17 @@ def test_deep_tree_offsets():
 
 def _queue_tag_for(task_type):
     return {
-        SimpleHybridTaskType.MULTI_TURN_CHAT: SimpleHybridQueueTag.QCHAT,
-        SimpleHybridTaskType.MULTI_TURN_AGENTIC: SimpleHybridQueueTag.QAGENT,
-        SimpleHybridTaskType.STRUCT_SINGLE_TURN: SimpleHybridQueueTag.QSTRUCT,
-        SimpleHybridTaskType.RANDOM_SINGLE_TURN: SimpleHybridQueueTag.QTRANS,
+        HeterCacheTaskType.MULTI_TURN_CHAT: HeterCacheQueueTag.QCHAT,
+        HeterCacheTaskType.MULTI_TURN_AGENTIC: HeterCacheQueueTag.QAGENT,
+        HeterCacheTaskType.STRUCT_SINGLE_TURN: HeterCacheQueueTag.QSTRUCT,
+        HeterCacheTaskType.RANDOM_SINGLE_TURN: HeterCacheQueueTag.QTRANS,
     }[task_type]
 
 
 def _mk_node(
     n_tokens,
     abs_start,
-    task_type=SimpleHybridTaskType.STRUCT_SINGLE_TURN,
+    task_type=HeterCacheTaskType.STRUCT_SINGLE_TURN,
 ):
     return SimpleNamespace(
         value=[0] * n_tokens,
@@ -178,7 +178,7 @@ def _mk_node(
 
 def test_reuse_score_uses_absolute_offset():
     print("[5] _reuse_score: same segment length, shallower offset scores higher")
-    strategy = SimpleHybridStrategy(max_offset=2048)
+    strategy = HeterCacheStrategy(max_offset=2048)
     shallow = _mk_node(32, abs_start=0)
     deep = _mk_node(32, abs_start=3000)
     s_shallow = strategy._reuse_score(shallow)
@@ -198,7 +198,7 @@ def test_reuse_score_uses_absolute_offset():
 
 def test_no_abs_start_fallback():
     print("[6] node without abs_start falls back to segment length (no crash)")
-    strategy = SimpleHybridStrategy(max_offset=2048)
+    strategy = HeterCacheStrategy(max_offset=2048)
     node = _mk_node(32, abs_start=0)
     del node.abs_start
     s = strategy._reuse_score(node)
@@ -250,13 +250,13 @@ def test_eviction_prefers_deep_single_turn_node():
         def free_segment(self, indices=None, start_pos=0):
             return None
 
-    cache = SimpleHybridRadixCache(
+    cache = HeterCacheRadixCache(
         CacheInitParams(
             disable=False,
             req_to_token_pool=None,
             token_to_kv_pool_allocator=Alloc(),
             page_size=1,
-            eviction_policy="simple_hybrid",
+            eviction_policy="heter_cache",
         )
     )
 
@@ -270,18 +270,18 @@ def test_eviction_prefers_deep_single_turn_node():
         result.last_device_node.queue_tag = _queue_tag_for(task_type)
 
     # deep: [0..1999] then extend to [0..2031] -> 32-token child at abs_start=2000
-    insert(list(range(0, 2000)), SimpleHybridTaskType.STRUCT_SINGLE_TURN)
-    insert(list(range(0, 2032)), SimpleHybridTaskType.STRUCT_SINGLE_TURN)
+    insert(list(range(0, 2000)), HeterCacheTaskType.STRUCT_SINGLE_TURN)
+    insert(list(range(0, 2032)), HeterCacheTaskType.STRUCT_SINGLE_TURN)
     # rival: separate 32-token agentic node hanging off the root
-    insert(list(range(5000, 5032)), SimpleHybridTaskType.MULTI_TURN_AGENTIC)
+    insert(list(range(5000, 5032)), HeterCacheTaskType.MULTI_TURN_AGENTIC)
 
     deep = rival = None
     for node in cache.evictable_leaves:
         if len(node.value) != 32:
             continue
-        if node.queue_tag == SimpleHybridQueueTag.QSTRUCT:
+        if node.queue_tag == HeterCacheQueueTag.QSTRUCT:
             deep = node
-        elif node.queue_tag == SimpleHybridQueueTag.QAGENT:
+        elif node.queue_tag == HeterCacheQueueTag.QAGENT:
             rival = node
     check(deep is not None, "expected a 32-token single-turn node")
     check(rival is not None, "expected a 32-token agentic node")
@@ -329,17 +329,17 @@ def test_same_queue_picks_lowest_score():
         def free_segment(self, indices=None, start_pos=0):
             return None
 
-    cache = SimpleHybridRadixCache(
+    cache = HeterCacheRadixCache(
         CacheInitParams(
             disable=False,
             req_to_token_pool=None,
             token_to_kv_pool_allocator=Alloc(),
             page_size=1,
-            eviction_policy="simple_hybrid",
+            eviction_policy="heter_cache",
         )
     )
 
-    def insert(tokens, task_type=SimpleHybridTaskType.STRUCT_SINGLE_TURN):
+    def insert(tokens, task_type=HeterCacheTaskType.STRUCT_SINGLE_TURN):
         result = cache.insert(
             InsertParams(
                 key=RadixKey(array("q", tokens)),
@@ -382,13 +382,13 @@ def test_one_shot_still_drained_first():
         def free_segment(self, indices=None, start_pos=0):
             return None
 
-    cache = SimpleHybridRadixCache(
+    cache = HeterCacheRadixCache(
         CacheInitParams(
             disable=False,
             req_to_token_pool=None,
             token_to_kv_pool_allocator=Alloc(),
             page_size=1,
-            eviction_policy="simple_hybrid",
+            eviction_policy="heter_cache",
         )
     )
 
@@ -402,9 +402,9 @@ def test_one_shot_still_drained_first():
         result.last_device_node.queue_tag = _queue_tag_for(task_type)
 
     # random single-turn -> one-shot, low reuse value
-    insert(list(range(0, 100)), SimpleHybridTaskType.RANDOM_SINGLE_TURN)
+    insert(list(range(0, 100)), HeterCacheTaskType.RANDOM_SINGLE_TURN)
     # normal single-turn, shallow -> high reuse score
-    insert(list(range(9000, 9032)), SimpleHybridTaskType.STRUCT_SINGLE_TURN)
+    insert(list(range(9000, 9032)), HeterCacheTaskType.STRUCT_SINGLE_TURN)
 
     result = cache.evict(EvictParams(num_tokens=32))
     print(f"      evicted {result.num_tokens_evicted} tokens")
@@ -416,7 +416,7 @@ def test_one_shot_still_drained_first():
     survivors = [
         n
         for n in cache.evictable_leaves
-        if n.queue_tag == SimpleHybridQueueTag.QSTRUCT
+        if n.queue_tag == HeterCacheQueueTag.QSTRUCT
     ]
     check(len(survivors) == 1, "the shallow single-turn node must survive")
 
@@ -436,13 +436,13 @@ def test_one_shot_order_by_tree_offset():
         def free_segment(self, indices=None, start_pos=0):
             return None
 
-    cache = SimpleHybridRadixCache(
+    cache = HeterCacheRadixCache(
         CacheInitParams(
             disable=False,
             req_to_token_pool=None,
             token_to_kv_pool_allocator=Alloc(),
             page_size=1,
-            eviction_policy="simple_hybrid",
+            eviction_policy="heter_cache",
         )
     )
 
@@ -508,13 +508,13 @@ def test_one_shot_chain_stops_at_branch_and_lock():
             return None
 
     def build():
-        return SimpleHybridRadixCache(
+        return HeterCacheRadixCache(
             CacheInitParams(
                 disable=False,
                 req_to_token_pool=None,
                 token_to_kv_pool_allocator=Alloc(),
                 page_size=1,
-                eviction_policy="simple_hybrid",
+                eviction_policy="heter_cache",
             )
         )
 
@@ -580,7 +580,7 @@ def test_single_score_is_time_invariant():
     单轮的节点级分数只保留位置项。
     """
     print("[14] single-turn score must not depend on idle time")
-    strategy = SimpleHybridStrategy(max_offset=2048)
+    strategy = HeterCacheStrategy(max_offset=2048)
     fresh = _mk_node(32, abs_start=0)
     fresh.last_access_time = time.monotonic()
     idle = _mk_node(32, abs_start=0)
@@ -609,13 +609,13 @@ def _sh_cache():
         def free_segment(self, indices=None, start_pos=0):
             return None
 
-    return SimpleHybridRadixCache(
+    return HeterCacheRadixCache(
         CacheInitParams(
             disable=False,
             req_to_token_pool=None,
             token_to_kv_pool_allocator=Alloc(),
             page_size=1,
-            eviction_policy="simple_hybrid",
+            eviction_policy="heter_cache",
         )
     )
 
@@ -631,7 +631,7 @@ def test_workload_and_band_are_orthogonal():
     只有单轮负载的生成段才是一次性的。
     """
     print("[18] workload label vs eviction band must be orthogonal")
-    st = SimpleHybridStrategy()
+    st = HeterCacheStrategy()
     # one-shot 判定看「会话类型 + 跨会话共享数」，因此节点需要会话证据。
     reg = SessionRegistry()
     st.session_registry = reg
@@ -643,16 +643,16 @@ def test_workload_and_band_are_orthogonal():
     ):
         reg._sessions[sid] = SessionState(session_id=sid, session_type=stype)
 
-    prompt = _mk_node(32, 0, task_type=SimpleHybridTaskType.MULTI_TURN_AGENTIC)
+    prompt = _mk_node(32, 0, task_type=HeterCacheTaskType.MULTI_TURN_AGENTIC)
     prompt.session_id = "ag"
-    resp = _mk_node(32, 32, task_type=SimpleHybridTaskType.MULTI_TURN_AGENTIC)
+    resp = _mk_node(32, 32, task_type=HeterCacheTaskType.MULTI_TURN_AGENTIC)
     resp.is_decode = True
     resp.session_id = "ag"
-    rnd = _mk_node(32, 0, task_type=SimpleHybridTaskType.RANDOM_SINGLE_TURN)
+    rnd = _mk_node(32, 0, task_type=HeterCacheTaskType.RANDOM_SINGLE_TURN)
     rnd.session_id = "rnd"
-    code = _mk_node(32, 0, task_type=SimpleHybridTaskType.STRUCT_SINGLE_TURN)
+    code = _mk_node(32, 0, task_type=HeterCacheTaskType.STRUCT_SINGLE_TURN)
     code.session_id = "code"
-    shared = _mk_node(32, 0, task_type=SimpleHybridTaskType.STRUCT_SINGLE_TURN)
+    shared = _mk_node(32, 0, task_type=HeterCacheTaskType.STRUCT_SINGLE_TURN)
     shared.session_id = "code"
     # 被 >= share_min 个外部会话命中过：跨会话模板，退出 one-shot 带
     shared.share_sessions = st.slru_evict.share_min
@@ -701,13 +701,13 @@ def test_workload_occ_accounting_adds_up():
         result.last_device_node.queue_tag = _queue_tag_for(task)
         return result.last_device_node
 
-    ins(list(range(0, 1000)), SimpleHybridTaskType.MULTI_TURN_AGENTIC,
+    ins(list(range(0, 1000)), HeterCacheTaskType.MULTI_TURN_AGENTIC,
         decode_start=1000, session_id="ag")
-    ins(list(range(0, 2000)), SimpleHybridTaskType.MULTI_TURN_AGENTIC,
+    ins(list(range(0, 2000)), HeterCacheTaskType.MULTI_TURN_AGENTIC,
         decode_start=1000, session_id="ag")
-    ins(list(range(5000, 5100)), SimpleHybridTaskType.RANDOM_SINGLE_TURN,
+    ins(list(range(5000, 5100)), HeterCacheTaskType.RANDOM_SINGLE_TURN,
         session_id="rnd")
-    shared = ins(list(range(9000, 9100)), SimpleHybridTaskType.STRUCT_SINGLE_TURN,
+    shared = ins(list(range(9000, 9100)), HeterCacheTaskType.STRUCT_SINGLE_TURN,
                  session_id="code")
     # 把 struct 前缀标记成「已被足够多外部会话复用」：它应退出 one-shot 带
     shared.share_sessions = cache.eviction_strategy.slru_evict.share_min
@@ -739,9 +739,9 @@ def test_workload_occ_accounting_adds_up():
 def test_record_hit_uses_workload_label():
     """命中记账按 workload 归因到 HeterProfiler，且每请求只记一次。"""
     print("[20] record_hit: profile 按 workload 记账")
-    st = SimpleHybridStrategy()
+    st = HeterCacheStrategy()
     req = SimpleNamespace(rid="r1", session_id="apps_123", extra_key=None)
-    node = _mk_node(32, 0, task_type=SimpleHybridTaskType.RANDOM_SINGLE_TURN)
+    node = _mk_node(32, 0, task_type=HeterCacheTaskType.RANDOM_SINGLE_TURN)
     st.record_hit(req, node, 500)
     check(st.profiler._total_hit_tokens.get("random") == 500,
           f"profile 记到 {list(st.profiler._total_hit_tokens)}, expected random=500")
@@ -753,8 +753,8 @@ def test_record_hit_uses_workload_label():
 def test_record_evict_one_shot_scalar():
     """淘汰记账：workload 一本账 + one-shot 一个标量（decode 带可推导）。"""
     print("[21] record_evict: workload 账本 + one-shot 标量")
-    st = SimpleHybridStrategy()
-    resp = _mk_node(64, 32, task_type=SimpleHybridTaskType.MULTI_TURN_AGENTIC)
+    st = HeterCacheStrategy()
+    resp = _mk_node(64, 32, task_type=HeterCacheTaskType.MULTI_TURN_AGENTIC)
     resp.is_decode = True
     st.record_evict(resp)
     check(st._total_evicted_tokens.get("agentic") == 64,
@@ -762,7 +762,7 @@ def test_record_evict_one_shot_scalar():
     check(st._total_evicted_one_shot == 0,
           f"多轮 response 不算 one-shot，实际={st._total_evicted_one_shot}")
 
-    rnd = _mk_node(32, 0, task_type=SimpleHybridTaskType.RANDOM_SINGLE_TURN)
+    rnd = _mk_node(32, 0, task_type=HeterCacheTaskType.RANDOM_SINGLE_TURN)
     st.record_evict(rnd)
     check(st._total_evicted_tokens.get("random") == 32,
           f"random 未被单列: {st._total_evicted_tokens}")
@@ -779,7 +779,7 @@ def test_multiturn_decode_is_not_one_shot():
     只有单轮负载的生成段（以及随机单轮）才是一次性内容。
     """
     print("[22] multi-turn decode stays in its workload queue")
-    strat = SimpleHybridStrategy()
+    strat = HeterCacheStrategy()
 
     def node(tt, dec):
         return SimpleNamespace(
@@ -788,10 +788,10 @@ def test_multiturn_decode_is_not_one_shot():
         )
 
     cases = [
-        (SimpleHybridTaskType.MULTI_TURN_AGENTIC, True, "agentic", False),
-        (SimpleHybridTaskType.MULTI_TURN_CHAT, True, "chat", False),
-        (SimpleHybridTaskType.STRUCT_SINGLE_TURN, True, "struct", True),
-        (SimpleHybridTaskType.RANDOM_SINGLE_TURN, False, "random", True),
+        (HeterCacheTaskType.MULTI_TURN_AGENTIC, True, "agentic", False),
+        (HeterCacheTaskType.MULTI_TURN_CHAT, True, "chat", False),
+        (HeterCacheTaskType.STRUCT_SINGLE_TURN, True, "struct", True),
+        (HeterCacheTaskType.RANDOM_SINGLE_TURN, False, "random", True),
     ]
     for tt, dec, want_q, want_os in cases:
         n = node(tt, dec)
@@ -806,11 +806,11 @@ def test_decode_band_end_to_end():
     print("[23] end-to-end: decode band attribution is consistent")
 
     def build(task_type):
-        cache = SimpleHybridRadixCache(
+        cache = HeterCacheRadixCache(
             CacheInitParams(
                 disable=False, req_to_token_pool=None,
                 token_to_kv_pool_allocator=None, page_size=1,
-                eviction_policy="simple_hybrid",
+                eviction_policy="heter_cache",
             )
         )
         # 先有 [0,50) 前缀，再以 decode_start=50 扩展到 100 -> 后段 is_decode=True
@@ -828,8 +828,8 @@ def test_decode_band_end_to_end():
         return cache
 
     for tt, label, want_os in (
-        (SimpleHybridTaskType.MULTI_TURN_AGENTIC, "agentic", False),
-        (SimpleHybridTaskType.STRUCT_SINGLE_TURN, "struct", True),
+        (HeterCacheTaskType.MULTI_TURN_AGENTIC, "agentic", False),
+        (HeterCacheTaskType.STRUCT_SINGLE_TURN, "struct", True),
     ):
         cache = build(tt)
         dec_nodes = [n for n in cache.evictable_leaves if getattr(n, "is_decode", False)]

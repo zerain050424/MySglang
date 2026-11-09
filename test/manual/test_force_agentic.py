@@ -28,17 +28,17 @@ from sglang.srt.mem_cache.base_prefix_cache import (  # noqa: E402
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams  # noqa: E402
-from sglang.srt.mem_cache.evict_policy import SimpleHybridStrategy  # noqa: E402
+from sglang.srt.mem_cache.evict_policy import HeterCacheStrategy  # noqa: E402
 from sglang.srt.mem_cache.radix_cache import RadixKey  # noqa: E402
-from sglang.srt.mem_cache.simple_hybrid_radix_cache import (  # noqa: E402
-    SimpleHybridRadixCache,
+from sglang.srt.mem_cache.heter_cache_radix_cache import (  # noqa: E402
+    HeterCacheRadixCache,
 )
-from sglang.srt.mem_cache.uni_utils import SimpleHybridQueueTag  # noqa: E402
+from sglang.srt.mem_cache.uni_utils import HeterCacheQueueTag  # noqa: E402
 
 FAILS = []
-QAGENT = SimpleHybridQueueTag.QAGENT
-QTRANS = SimpleHybridQueueTag.QTRANS
-QSTRUCT = SimpleHybridQueueTag.QSTRUCT
+QAGENT = HeterCacheQueueTag.QAGENT
+QTRANS = HeterCacheQueueTag.QTRANS
+QSTRUCT = HeterCacheQueueTag.QSTRUCT
 
 
 def check(cond, msg):
@@ -57,13 +57,13 @@ class Alloc:
 
 def build(force_agentic):
     cfg = {"force_agentic": True} if force_agentic else None
-    return SimpleHybridRadixCache(
+    return HeterCacheRadixCache(
         CacheInitParams(
             disable=False,
             req_to_token_pool=None,
             token_to_kv_pool_allocator=Alloc(),
             page_size=1,
-            eviction_policy="simple_hybrid",
+            eviction_policy="heter_cache",
             eviction_policy_config=cfg,
         )
     )
@@ -193,13 +193,13 @@ def test_plugins_see_everything():
         "force_agentic": True,
         "slru": {"share_min": 2},
     }
-    cache = SimpleHybridRadixCache(
+    cache = HeterCacheRadixCache(
         CacheInitParams(
             disable=False,
             req_to_token_pool=None,
             token_to_kv_pool_allocator=Alloc(),
             page_size=1,
-            eviction_policy="simple_hybrid",
+            eviction_policy="heter_cache",
             eviction_policy_config=cfg,
         )
     )

@@ -121,7 +121,7 @@ def test_radix_cross_session_hit_promotes_short_session_to_struct():
     from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
-    from sglang.srt.mem_cache.uni_utils import SimpleHybridQueueTag
+    from sglang.srt.mem_cache.uni_utils import HeterCacheQueueTag
 
     cache = RadixCache(
         CacheInitParams(
@@ -129,7 +129,7 @@ def test_radix_cross_session_hit_promotes_short_session_to_struct():
             req_to_token_pool=None,
             token_to_kv_pool_allocator=None,
             page_size=1,
-            eviction_policy="simple_hybrid",
+            eviction_policy="heter_cache",
         )
     )
     cache.insert(
@@ -150,7 +150,7 @@ def test_radix_cross_session_hit_promotes_short_session_to_struct():
     )
     state = cache.session_registry.get("short")
     assert state.session_type is SessionType.STRUCT
-    assert result.last_device_node.queue_tag is SimpleHybridQueueTag.QSTRUCT
+    assert result.last_device_node.queue_tag is HeterCacheQueueTag.QSTRUCT
 
 
 def test_classified_agentic_session_tags_new_nodes(tmp_path):
@@ -161,7 +161,7 @@ def test_classified_agentic_session_tags_new_nodes(tmp_path):
     from sglang.srt.mem_cache.base_prefix_cache import InsertParams
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
-    from sglang.srt.mem_cache.uni_utils import SimpleHybridQueueTag
+    from sglang.srt.mem_cache.uni_utils import HeterCacheQueueTag
 
     cache = RadixCache(
         CacheInitParams(
@@ -169,7 +169,7 @@ def test_classified_agentic_session_tags_new_nodes(tmp_path):
             req_to_token_pool=None,
             token_to_kv_pool_allocator=None,
             page_size=1,
-            eviction_policy="simple_hybrid",
+            eviction_policy="heter_cache",
         )
     )
     for turn in range(1, 6):
@@ -185,7 +185,7 @@ def test_classified_agentic_session_tags_new_nodes(tmp_path):
             session_id="agent",
         )
     )
-    assert result.last_device_node.queue_tag is SimpleHybridQueueTag.QAGENT
+    assert result.last_device_node.queue_tag is HeterCacheQueueTag.QAGENT
 
     import json
 
@@ -203,7 +203,7 @@ def test_classified_chat_session_tags_new_nodes():
     from sglang.srt.mem_cache.base_prefix_cache import InsertParams
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
-    from sglang.srt.mem_cache.uni_utils import SimpleHybridQueueTag
+    from sglang.srt.mem_cache.uni_utils import HeterCacheQueueTag
 
     cache = RadixCache(
         CacheInitParams(
@@ -211,7 +211,7 @@ def test_classified_chat_session_tags_new_nodes():
             req_to_token_pool=None,
             token_to_kv_pool_allocator=None,
             page_size=1,
-            eviction_policy="simple_hybrid",
+            eviction_policy="heter_cache",
         )
     )
     for turn, at in enumerate((0.0, 25.0, 50.0, 75.0, 100.0), 1):
@@ -226,10 +226,10 @@ def test_classified_chat_session_tags_new_nodes():
             session_id="chat",
         )
     )
-    assert result.last_device_node.queue_tag is SimpleHybridQueueTag.QCHAT
+    assert result.last_device_node.queue_tag is HeterCacheQueueTag.QCHAT
 
 
-def test_non_simple_hybrid_preserves_legacy_delta_tags():
+def test_non_heter_cache_preserves_legacy_delta_tags():
     from array import array
     from types import SimpleNamespace
     import time
@@ -238,7 +238,7 @@ def test_non_simple_hybrid_preserves_legacy_delta_tags():
 
     from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
     from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
-    from sglang.srt.mem_cache.uni_utils import SimpleHybridQueueTag
+    from sglang.srt.mem_cache.uni_utils import HeterCacheQueueTag
 
     cache = RadixCache.create_simulated(page_size=1)
     inserted = cache.insert(
@@ -258,7 +258,7 @@ def test_non_simple_hybrid_preserves_legacy_delta_tags():
     cache.match_prefix(
         MatchPrefixParams(key=RadixKey(array("q", [30, 31])), req=req)
     )
-    assert inserted.last_device_node.queue_tag is SimpleHybridQueueTag.QAGENT
+    assert inserted.last_device_node.queue_tag is HeterCacheQueueTag.QAGENT
 
 
 def test_tokenized_tool_call_round_trips_through_msgpack():

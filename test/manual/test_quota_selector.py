@@ -253,14 +253,14 @@ def _leaf(tag, tokens, ts=0.0, session_id=None):
 
 
 TAG = {
-    "struct": uni.SimpleHybridQueueTag.QSTRUCT,
-    "agentic": uni.SimpleHybridQueueTag.QAGENT,
-    "chat": uni.SimpleHybridQueueTag.QCHAT,
+    "struct": uni.HeterCacheQueueTag.QSTRUCT,
+    "agentic": uni.HeterCacheQueueTag.QAGENT,
+    "chat": uni.HeterCacheQueueTag.QCHAT,
 }
 
 
 def _strategy(**kw):
-    return ep.SimpleHybridStrategy(
+    return ep.HeterCacheStrategy(
         quota={"caps": {"struct": 0.2, "agentic": 0.5, "chat": 0.3}, **kw}
     )
 
@@ -300,7 +300,7 @@ def test_random_is_never_counted():
     print("[14b] accounting: random-classified nodes never enter the quota ledger")
     st = _strategy()
     rnd = _leaf(TAG["agentic"], 70)          # 先造一个对象再改标签，保证可弱引用
-    rnd.queue_tag = uni.SimpleHybridQueueTag.QTRANS
+    rnd.queue_tag = uni.HeterCacheQueueTag.QTRANS
     check(st.is_one_shot(rnd) is False,
           "precondition: a session-less QTRANS node is not judged one-shot")
     check(st.workload_of(rnd) == "random", f"workload={st.workload_of(rnd)}, want random")
@@ -421,7 +421,7 @@ def test_stage1_fallback_is_seeded_random():
     def run(seed):
         # 各队列都低于下限 -> ranking 为空 -> 走兜底抽样
         # 下限=上限 且占用均低于下限 -> 无队列可点名 -> 直接走兜底
-        st = ep.SimpleHybridStrategy(
+        st = ep.HeterCacheStrategy(
             quota={"caps": {"struct": 0.2, "agentic": 0.5, "chat": 0.3},
                    "reservations": {"struct": 0.2, "agentic": 0.5, "chat": 0.3},
                    "seed": seed}
@@ -450,7 +450,7 @@ def test_stage1_fallback_is_seeded_random():
 def test_stage2_unchanged_without_quota():
     """未配置配额：走原路径（全局 victim_key + 改写器链），标签回到 global。"""
     print("[20] stage 2: no quota config keeps the original path")
-    st = ep.SimpleHybridStrategy()
+    st = ep.HeterCacheStrategy()
     check(st.quota.enabled is False, "precondition: quota off")
     # 时间必须是相对 now 的：绝对值会让 elapsed 大到 reuse_prob 全部归零
     now = uni.time.monotonic() if hasattr(uni, "time") else __import__("time").monotonic()

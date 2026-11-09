@@ -5,7 +5,7 @@
 reset 必须把「上一次 run 的状态」全部清掉，否则会串味：
 
   SessionRegistry 的 d/L/gaps  ->  RR 的 loss_cap 直接读它们
-  策略的窗口/累计/来源计数     ->  [SimpleHybrid profile] 会打印混合值
+  策略的窗口/累计/来源计数     ->  [HeterCache profile] 会打印混合值
   插件的计数器                 ->  SLRU 的 share 账本失真
 
 Run: /root/sl_old/bin/python test/manual/test_cache_reset_isolation.py
@@ -27,10 +27,10 @@ from sglang.srt.mem_cache.base_prefix_cache import (  # noqa: E402
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams  # noqa: E402
 from sglang.srt.mem_cache.radix_cache import RadixKey  # noqa: E402
-from sglang.srt.mem_cache.simple_hybrid_radix_cache import (  # noqa: E402
-    SimpleHybridRadixCache,
+from sglang.srt.mem_cache.heter_cache_radix_cache import (  # noqa: E402
+    HeterCacheRadixCache,
 )
-from sglang.srt.mem_cache.uni_utils import SimpleHybridQueueTag  # noqa: E402
+from sglang.srt.mem_cache.uni_utils import HeterCacheQueueTag  # noqa: E402
 
 FAILS = []
 
@@ -56,13 +56,13 @@ CFG = {
 
 
 def build(cfg=None):
-    return SimpleHybridRadixCache(
+    return HeterCacheRadixCache(
         CacheInitParams(
             disable=False,
             req_to_token_pool=None,
             token_to_kv_pool_allocator=Alloc(),
             page_size=1,
-            eviction_policy="simple_hybrid",
+            eviction_policy="heter_cache",
             eviction_policy_config=CFG if cfg is None else cfg,
         )
     )
@@ -184,10 +184,10 @@ def test_tags_rebuilt_from_scratch():
     insert(cache, list(range(0, 100)), sid="x")
     # 污染：把某个节点改成 QCHAT，模拟旧 run 的残留
     for n in all_nodes(cache):
-        n.queue_tag = SimpleHybridQueueTag.QCHAT
+        n.queue_tag = HeterCacheQueueTag.QCHAT
     cache.reset()
     insert(cache, list(range(0, 100)), sid="y")
-    bad = [n.queue_tag for n in all_nodes(cache) if n.queue_tag is not SimpleHybridQueueTag.QAGENT]
+    bad = [n.queue_tag for n in all_nodes(cache) if n.queue_tag is not HeterCacheQueueTag.QAGENT]
     check(not bad, f"with force_agentic every fresh node must be QAGENT, got {bad[:3]}")
 
 
