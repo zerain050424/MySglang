@@ -357,8 +357,8 @@ def test_slru_rewrites_struct_candidate(ep, shc, base):
     check(cache.deleted == [old], f"LRU-oldest must be picked, got {cache.deleted}")
     check(st.profiler._victim_sources.get("quota:struct") == 16,
           f"source must be the struct queue, got {st.profiler._victim_sources}")
-    # struct 队的选点由 struct_tier 直接完成（share 分级 + 段内 LRU），
-    # 不再经过 SlruEvictPolicy.pick，所以这里不校验 slru_picks。
+    # struct 队的选点由 struct_tier 直接完成（share 分级 + 段内 LRU）；
+    # SLRU 只是账本 + 生命周期观测器，不参与选点。
 
 
 def test_empty_tree_is_noop(ep, shc, base):

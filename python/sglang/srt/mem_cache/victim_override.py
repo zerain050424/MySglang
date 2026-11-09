@@ -53,16 +53,26 @@ _SLRU_META = weakref.WeakKeyDictionary()  # node -> [share_sessions, session_blo
 
 
 class VictimOverride(ABC):
-    """队内选点策略的抽象基类：子类只需实现 ``pick``。"""
+    """队内策略的基类：选点者实现 ``pick``，纯观测者可以不实现。
+
+    基类不再把 ``pick`` 定为抽象方法——SLRU 现在只是共享数账本 + 生命周期
+    观测器，struct 队的选点由 ``quota_selector.struct_tier`` 直接完成，让它
+    再实现一个永远收不到调用的 ``pick`` 就是死代码。
+    """
 
     name: str = "override"
     # 本改写器管辖的队列；**仅**用于 profile 归类，不得参与仲裁判定。
     queue: Optional[HeterCacheNodeTag] = None
 
-
-    @abstractmethod
     def pick(self, leaves: Iterable["TreeNode"], registry) -> Optional["TreeNode"]:
-        """在管辖范围内重选候选；返回 None 表示弃权，调用方保留原候选。"""
+        """在管辖范围内重选候选；返回 None 表示弃权。
+
+        Raises:
+            NotImplementedError: 纯观测型子类不参与选点。
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} is an observer, not a victim picker"
+        )
 
     def stats(self) -> Dict[str, float]:
         """返回本改写器的观测量；无观测的插件返回空字典。"""
@@ -212,15 +222,18 @@ class RrEvictPolicy(VictimOverride):
 
 
 class SlruEvictPolicy(VictimOverride):
-    """STRUCT 队列的分段 LRU 改写器，同时独占持有"共享会话数"账本。
+    """共享会话数账本 + 节点生命周期观测器。
 
-双重职责：
+职责：
 
 1. **账本**：维护每个节点被多少个不同的会话命中过（``share``）与一份 bloom 位图
-   （用于同会话去重）。这台账本同时被两处读取——``HeterCacheStrategy.is_one_shot``
-   判 one-shot，和 ``pick`` 判"是否受保护"，所以阈值只允许一个来源
-   （``SlruParams.share_min``），否则两处口径会漂移。
-2. **选点**：在受保护的 struct 叶子中按访问时间做段内 LRU。
+   （用于同会话去重）。这台账本被两处读取——``HeterCacheStrategy.is_one_shot``
+   判 one-shot，和 ``quota_selector.struct_tier`` 判"是否受保护"，所以阈值只允许
+   一个来源（``SlruParams.share_min``），否则两处口径会漂移。
+2. **生命周期**：``on_node_hit`` / ``on_node_inserted`` 由缓存层调用。
+
+**不参与选点**：struct 队的候选由 ``struct_tier`` 直接排，本类原来的 ``pick``
+已删除——它永远收不到调用，``slru_picks`` 也恒为 0。
 
 账本写入点只有两个，都由缓存层调度：``on_node_hit``（命中去重计数）与
 ``on_node_inserted``（分裂时新父节点继承）。树拓扑维护仍留在 RadixCache。
@@ -243,7 +256,6 @@ Args:
         # 共享会话数账本的观测（唯一写者就是本类）
         self.share_counted = 0   # 计入 share_sessions 的命中次数
         self.share_dedup = 0     # 同一会话重复命中的去重次数
-        self.slru_picks = 0      # 本改写器实际给出的候选数
 
     # ------------------------------------------------------------ 共享会话数账本
 
@@ -318,40 +330,8 @@ Args:
     # ------------------------------------------------------------ 插件接口
 
 
-    def pick(self, leaves: Iterable["TreeNode"], registry=None) -> Optional["TreeNode"]:
-        """在受保护的 struct 叶子中挑最久未访问的一个（段内 LRU）。
-
-        Args:
-            leaves: 当前可淘汰叶子集合。
-            registry: 未使用；保留基类签名。
-
-        Returns:
-            选中的叶子；范围内无候选时返回 None（放弃改写，调用方保留原候选）。
-        """
-        struct = [
-            node
-            for node in leaves
-            if (st := self.session_registry.get(getattr(node, "session_id", None)))
-            is not None
-            and st.session_type == SessionType.STRUCT
-            and self.share_of(node) >= self.share_min
-        ]
-        if not struct:
-            return None
-        now = time.monotonic()
-        nearest = None
-        victim = None
-        for node in struct:
-            delta = now - node.last_access_time
-            if nearest is None or delta > nearest:
-                nearest = delta
-                victim = node
-        self.slru_picks += 1
-        return victim
-
     def stats(self) -> Dict[str, float]:
         return {
-            "slru_picks": self.slru_picks,
             "share_counted": self.share_counted,
             "share_dedup": self.share_dedup,
         }
@@ -360,7 +340,6 @@ Args:
         """只清计数器。共享账本条目在侧表里随节点 GC 一起消失，不需要清。"""
         self.share_counted = 0
         self.share_dedup = 0
-        self.slru_picks = 0
 
     def __repr__(self) -> str:  # pragma: no cover - 调试用
         return f"<{type(self).__name__} name={self.name}>"

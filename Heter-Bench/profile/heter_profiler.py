@@ -140,11 +140,10 @@ class HeterProfiler:
             f"one_shot_evicted={self._total_evicted_one_shot:.0f}"
         )
         if slru_policy is not None:
-            # 共享会话数账本 + 本改写器实际给出的候选数。
+            # 共享会话数账本（SLRU 不参与选点，没有 picks 可报）。
             s = slru_policy.stats()
             lines.append(
                 f"  slru: min_share={slru_policy.share_min} "
-                f"picks={s['slru_picks']:.0f} "
                 f"share_counted={s['share_counted']:.0f} "
                 f"share_dedup={s['share_dedup']:.0f}"
             )
