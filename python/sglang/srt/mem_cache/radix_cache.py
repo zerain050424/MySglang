@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.heter_logging import heterlog
+from sglang.srt.mem_cache.node_label_logger import start_from_env
 
 """
 Copyright 2023-2024 SGLang Team
@@ -23,11 +23,8 @@ The radix tree data structure for managing the KV cache.
 """
 
 import heapq
-import json
 import logging
-import os
 import sys
-import threading
 import time
 from array import array
 from collections import defaultdict
@@ -399,25 +396,10 @@ class RadixCache(BasePrefixCache):
         self.session_registry = SessionRegistry.global_instance()
         self.reset()
 
-        # ---- 节点级标签快照（env 门控，默认关）----
-        # 用途：把状态机给每个 radix 节点打的队列标签 与 节点真实归属
-        # (session_id)一起落盘，用于节点级标注准确率统计，见
-        # Heter-Bench/evaluate_node_labels.py。只读遍历，不改变任何淘汰状态。
-        _dump_path = os.environ.get("SGLANG_NODE_LABEL_DUMP", "")
-        if _dump_path:
-            _dump_interval = float(os.environ.get("SGLANG_NODE_LABEL_INTERVAL", "30"))
-            t = threading.Thread(
-                target=self._node_label_dump_loop,
-                args=(_dump_path, _dump_interval),
-                daemon=True,
-                name="node-label-dumper",
-            )
-            t.start()
-            heterlog.info(
-                "NodeLabel",
-                f"dump -> {_dump_path} every {_dump_interval:.0f}s "
-                f"(pid={os.getpid()} policy={self.eviction_policy})",
-            )
+        # 节点级标签快照：观测组件见 node_label_logger（env 门控，默认关）。
+        # 这里只留一个句柄：采样器要读 root_node / session_registry / eviction_policy，
+        # 但遍历与落盘都不在缓存类里。
+        self.node_labels = start_from_env(self)
 
     @classmethod
     def create_simulated(
@@ -529,7 +511,7 @@ class RadixCache(BasePrefixCache):
         session_id = getattr(req, "session_id", None) if req is not None else None
         if self._hit_recorder is not None and session_id:
             prompt_ids = getattr(req, "origin_input_ids", None)
-            self.session_registry.observe_request(
+            self.session_registry.observe_request( ## 监测请求,进行分类
                 session_id,
                 rid or "",
                 len(prompt_ids) if prompt_ids is not None else len(key),
@@ -542,7 +524,7 @@ class RadixCache(BasePrefixCache):
             value = torch.cat(value)
         else:
             value = self._empty_match_result.device_indices
-        # Phase 3: record the request's prefix-cache hit (once per request).
+
         if self._hit_recorder is not None and params.req is not None:
             self._hit_recorder(params.req, last_node, value.numel())
         return MatchResult(
@@ -715,7 +697,6 @@ class RadixCache(BasePrefixCache):
 
         start_time = time.perf_counter()
         num_tokens = params.num_tokens
-        # 观测编排归 HeterCacheRadixCache.evict（它是唯一会挂观测协作者的缓存）。
         leaves = list(self.evictable_leaves)
         eviction_heap = [
             (self.eviction_strategy.get_priority(node), node) for node in leaves
@@ -752,14 +733,11 @@ class RadixCache(BasePrefixCache):
         return bool(getattr(node, "is_decode", False))
 
     def _per_queue_token_count(self) -> dict:
-        """按队列统计驻留 token，**包含各自的 response(decode) 段**。
-        「这个队列到底占了池子多少」——is_decode 只决定淘汰优先级，
-        不改变归属（旧口径把归属和优先级压成一个 queue_name，多轮 agentic
-        的 response 段被记进一次性带，真实占用被低估数倍）。
+        """按队列统计驻留 token，包含各自的 response(decode) 段。
+           这个队列到底占了池子多少
         返回 {label: {"total": t, "one_shot": o}}；
-        one_shot = 该队列中一次性内容的 token（random 整行、
-        struct 的 response 段；多轮恒为 0）。
-        Σ(total − one_shot) 即 profile 里的可调度占用。
+        one_shot = 该队列中一次性内容的 token（random 整行、struct 的 response 段；多轮恒为 0）。
+        Σ(total - one_shot) 即 profile 里的可调度占用。
         """
         out: dict = {}
         stack = [self.root_node]
@@ -780,69 +758,6 @@ class RadixCache(BasePrefixCache):
                     rec["one_shot"] += n
                 stack.append(child)
         return out
-
-    def _node_label_dump_loop(self, path: str, interval: float) -> None:
-        """后台循环：每 interval 秒把整棵树上每个节点的标签快照追加到 path(JSONL)。
-
-        与 `[HeterCache profile]` 的区别：那张表只给聚合占比，这里给**逐节点**的
-        (状态机标签, 真实归属 session_id, token 数, 命中次数, 距上次访问时间,
-        子节点数, 是否 decode 段, 绝对起始偏移)，是节点级标注准确率的唯一数据源。
-
-        每行一个 JSON 对象：{"ts": 墙钟, "tick": n, "policy": ..., "nodes": [...]}。
-        只读遍历（GIL 保证不崩，最坏读到一次瞬时不一致），不改变任何淘汰状态。
-        """
-        i = 0
-        while True:
-            time.sleep(interval)
-            i += 1
-            try:
-                n = self._dump_node_labels(path, i)
-                heterlog.info("NodeLabel", f"tick={i} dumped {n} nodes")
-            except Exception:  # 采样失败不能影响主流程
-                logger.exception("node label dump failed")
-
-    def _dump_node_labels(self, path: str, tick: int) -> int:
-        """把当前树的逐节点标签快照追加写入 path，返回节点数。"""
-        now_mono = time.monotonic()
-        rows = []
-        stack = [self.root_node]
-        while stack:
-            node = stack.pop()
-            for child in node.children.values():
-                if child.evicted:
-                    continue
-                stack.append(child)
-                session_state = self.session_registry.get(child.session_id)
-                rows.append({
-                    # 队列标签和会话分类分别记录，避免把分叉角色当成会话真值。
-                    "tag": getattr(child.queue_tag, "value", str(child.queue_tag)),
-                    "stype": (
-                        session_state.session_type.value
-                        if session_state is not None
-                        else SessionType.TRANS.value
-                    ),
-                    # 真实归属：由插入该片段的请求携带，前缀即负载类别
-                    "sid": child.session_id,
-                    "tok": len(child.key),
-                    "hits": child.hit_count,
-                    "dt": round(now_mono - child.last_access_time, 3),
-                    "nch": len(child.children),
-                    "dec": bool(child.is_decode),
-                    "abs": child.abs_start,
-                })
-        if not rows:
-            # 空树不落盘：某些构造路径会额外创建一个空的 RadixCache（例如 lru），
-            # 不写入才不会被当成有效快照。
-            return 0
-        record = {
-            "ts": round(time.time(), 3),
-            "tick": tick,
-            "policy": self.eviction_policy,
-            "nodes": rows,
-        }
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
-        return len(rows)
 
     def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:
         if self.disable:

@@ -2,7 +2,7 @@
 """节点级标签准确率评估：状态机给 radix 节点的队列标签，能否正确反映其真实归属。
 
 数据来源：`SGLANG_NODE_LABEL_DUMP` 让 server 每 N 秒把整棵树逐节点落盘为 JSONL
-（见 `radix_cache.py:_dump_node_labels`）。
+（见 `python/sglang/srt/mem_cache/node_label_logger.py`）。
 
 真值（GT）：节点插入时携带的 `session_id` 前缀 → 负载类别
     Code-…               -> struct   (Codeparrot)

@@ -159,3 +159,5 @@ Heter-Bench 文档里的历史数字与旧口径说明保留原文，只在需�
   驱动层 `_observe_occupancy`（编排）。策略只做判据与裁决。
 - 策略无关的队列占用日志（`OccSampler` / `QueueOcc` / `TagOcc`）已删除，
   `[HeterCache profile]` 是队列占用的唯一出口。
+- 节点级标签快照已从 `RadixCache` 抽成 `node_label_logger.NodeLabelLogger`：
+  遍历与落盘在观测组件里，缓存类只留 `self.node_labels` 一个句柄。

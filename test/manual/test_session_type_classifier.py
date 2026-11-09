@@ -196,7 +196,10 @@ def test_classified_agentic_session_tags_new_nodes(tmp_path):
     import json
 
     dump_path = tmp_path / "labels.jsonl"
-    assert cache._dump_node_labels(str(dump_path), 1) == 1
+    # 快照已从 RadixCache 抽成独立观测组件，测试直接驱动它一次
+    from sglang.srt.mem_cache.node_label_logger import NodeLabelLogger
+
+    assert NodeLabelLogger(cache, str(dump_path)).dump_once(1) == 1
     row = json.loads(dump_path.read_text())
     assert row["nodes"][0]["stype"] == "agentic"
 
