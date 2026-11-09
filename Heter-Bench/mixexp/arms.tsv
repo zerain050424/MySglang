@@ -1,0 +1,10 @@
+# arm	policy	policy_config	desc
+lru	lru	-	原生 LRU：全局单一顺序，异构负载下必有一类被饿死
+lfu	lfu	-	原生 LFU：长会话累积高频，陈旧前缀赖着不走
+slru	slru	-	原生分段 LRU：只按命中次数分两段，无队列概念
+tlru	tlru	{"threshold":4096,"next_prompt_estimate":512}	Tail-LRU：上游同方向对手，按「尾部是否还影响 TTFT」优先逐出
+hc_full	heter_cache	{"quota":{"caps":{"struct":0.2,"agentic":0.5,"chat":0.3},"reservations":{"struct":0.05,"agentic":0.2,"chat":0.1}},"rr":{"fair_rr":true,"kappa":0.5,"min_retain_tokens":512,"min_retain_frac":0.3},"slru":{"share_min":2},"mt":{"enabled":true}}	完整方案：三队列 + 队内策略 + 配额仲裁
+hc_norr	heter_cache	{"quota":{"caps":{"struct":0.2,"agentic":0.5,"chat":0.3},"reservations":{"struct":0.05,"agentic":0.2,"chat":0.1}},"rr":{"fair_rr":false,"kappa":0.5,"min_retain_tokens":512,"min_retain_frac":0.3},"slru":{"share_min":2},"mt":{"enabled":true}}	消融：关会话轮询（agentic 队内退化为无策略）
+hc_nomt	heter_cache	{"quota":{"caps":{"struct":0.2,"agentic":0.5,"chat":0.3},"reservations":{"struct":0.05,"agentic":0.2,"chat":0.1}},"rr":{"fair_rr":true,"kappa":0.5,"min_retain_tokens":512,"min_retain_frac":0.3},"slru":{"share_min":2},"mt":{"enabled":false}}	消融：关多轮改写器（chat 队内退化为无策略）
+hc_flat	heter_cache	{"quota":{"caps":{"struct":0.2,"agentic":0.5,"chat":0.3},"reservations":{"struct":0.05,"agentic":0.2,"chat":0.1}},"rr":{"fair_rr":true,"kappa":0.5,"min_retain_tokens":512,"min_retain_frac":0.3},"slru":{"share_min":2},"mt":{"enabled":true},"force_agentic":true}	消融：不分队列（全部按 agentic 归类）
+hc_caps_eq	heter_cache	{"quota":{"caps":{"struct":0.3333333333333333,"agentic":0.3333333333333333,"chat":0.3333333333333333},"reservations":{"struct":0.05,"agentic":0.2,"chat":0.1}},"rr":{"fair_rr":true,"kappa":0.5,"min_retain_tokens":512,"min_retain_frac":0.3},"slru":{"share_min":2},"mt":{"enabled":true}}	消融：配额均分 1/3，不按负载倾斜

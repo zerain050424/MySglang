@@ -1,0 +1,48 @@
+# 混合负载 · quick 规模（50/50/25/25 = 150 sessions）
+#
+# 与其它 mix_*.yaml 的唯一差异是各 task 的 max_record。
+# 改规模只改 max_record，别动比例，否则不同规模之间不可比。
+# data_path 相对 Heter-Bench 根目录解析。
+#
+# 用途：跑通各臂的完整流程并看趋势，单臂几分钟内结束。
+# 仍属预跑档：工作集偏小，淘汰压力不足时各臂会打平。
+tasks:
+  - name: AgentBank_apps
+    task_id: 0
+    data_path: TaskData/AgentBankData/Qwen2.5-7B-Instruct/AgentBank_apps_session_data.jsonl
+    lambda_rate: 1
+    mu: 0
+    sigma: 0
+    seed: 42
+    max_record: 50
+    shuffle: true
+
+  - name: Codeparrot
+    task_id: 1
+    data_path: TaskData/Codeparrot/Qwen2.5-7B-Instruct/Code_session_data.jsonl
+    lambda_rate: 1
+    mu: 0
+    sigma: 0
+    seed: 42
+    max_record: 50
+    shuffle: true
+
+  - name: ShareGPT
+    task_id: 2
+    data_path: TaskData/SharedGPT-multi-turn/Qwen2.5-7B-Instruct/ShareGPT_cleaned_valid_deduplicated_session_data.jsonl
+    lambda_rate: 1
+    mu: 4.15
+    sigma: 0.971
+    seed: 42
+    max_record: 25
+    shuffle: true
+
+  - name: AgentBank_alfred
+    task_id: 3
+    data_path: TaskData/AgentBankData/Qwen2.5-7B-Instruct/AgentBank_alfred_scale_5000_session_data.jsonl
+    lambda_rate: 1
+    mu: 1.81
+    sigma: 1.092
+    seed: 42
+    max_record: 25
+    shuffle: true

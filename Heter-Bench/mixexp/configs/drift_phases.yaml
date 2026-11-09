@@ -1,0 +1,99 @@
+# 组成漂移 · 四段相位（每段被一类负载主导）
+#
+# 用途：单策略的软肋不在「混合」，而在「组成变了之后」。
+# 每段结束会把上一段的优势负载踢到边角，测两件事：
+#   1. 上一段的工作集是否被保住（下一段回归时能否直接命中）；
+#   2. 新主导类能否在一个时间段内把命中率拉起来。
+#
+# 四个 phase 顺序刻意做成 A → B → C → A：
+# 最后一段回到第一段的负载，如果实现只做全局 LRU，
+# A 的前缀早就被 B、C 冲干净了，回归时命中率会明显掉。
+#
+# 规模杠杆同样在 max_record：每段 60 条主导 + 3×10 条陪衬 = 90 条，
+# 四段合计 360 条。要放大就把上面两个数一起乘。
+# data_path 相对 Heter-Bench 根目录解析。
+tasks:
+  - name: Codeparrot
+    task_id: 1
+    data_path: TaskData/Codeparrot/Qwen2.5-7B-Instruct/Code_session_data.jsonl
+    mu: 0
+    sigma: 0
+    seed: 42
+
+  - name: AgentBank_alfred
+    task_id: 3
+    data_path: TaskData/AgentBankData/Qwen2.5-7B-Instruct/AgentBank_alfred_scale_5000_session_data.jsonl
+    mu: 1.81
+    sigma: 1.092
+    seed: 42
+
+  - name: ShareGPT
+    task_id: 2
+    data_path: TaskData/SharedGPT-multi-turn/Qwen2.5-7B-Instruct/ShareGPT_cleaned_valid_deduplicated_session_data.jsonl
+    mu: 4.15
+    sigma: 0.971
+    seed: 42
+
+  - name: AgentBank_apps
+    task_id: 0
+    data_path: TaskData/AgentBankData/Qwen2.5-7B-Instruct/AgentBank_apps_session_data.jsonl
+    mu: 0
+    sigma: 0
+    seed: 42
+
+phases:
+  # ── 段 1：代码/结构化主导 ───────────────────────────────
+  - name: code_dominant
+    duration_s: 120
+    lambda_rate:
+      Codeparrot: 4
+      AgentBank_alfred: 1
+      ShareGPT: 1
+      AgentBank_apps: 1
+    max_record:
+      Codeparrot: 60
+      AgentBank_alfred: 10
+      ShareGPT: 10
+      AgentBank_apps: 10
+
+  # ── 段 2：agentic 主导（多轮、短间隔、长会话）────────────
+  - name: agent_dominant
+    duration_s: 120
+    lambda_rate:
+      Codeparrot: 1
+      AgentBank_alfred: 4
+      ShareGPT: 1
+      AgentBank_apps: 1
+    max_record:
+      Codeparrot: 10
+      AgentBank_alfred: 60
+      ShareGPT: 10
+      AgentBank_apps: 10
+
+  # ── 段 3：chat 主导（多轮、长间隔）─────────────────────
+  - name: chat_dominant
+    duration_s: 120
+    lambda_rate:
+      Codeparrot: 1
+      AgentBank_alfred: 1
+      ShareGPT: 4
+      AgentBank_apps: 1
+    max_record:
+      Codeparrot: 10
+      AgentBank_alfred: 10
+      ShareGPT: 60
+      AgentBank_apps: 10
+
+  # ── 段 4：回到段 1 的组成，测「回归是否还命中」───────────
+  - name: code_return
+    duration_s: 120
+    lambda_rate:
+      Codeparrot: 4
+      AgentBank_alfred: 1
+      ShareGPT: 1
+      AgentBank_apps: 1
+    max_record:
+      Codeparrot: 60
+      AgentBank_alfred: 10
+      ShareGPT: 10
+      AgentBank_apps: 10

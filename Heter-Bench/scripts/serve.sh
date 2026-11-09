@@ -22,13 +22,21 @@ LOG=${LOG:-$BENCH_DIR/result/log/server_${POLICY}_${MAX_TOTAL_TOKENS}.log}
 
 mkdir -p "$(dirname "$LOG")"
 
-# heter_cache 需要额外的 --enable-heter-cache
-EXTRA=""
+# heter_cache 需要额外的 --enable-heter-cache。
+# POLICY_CONFIG 传策略参数 JSON（含空格，必须作为一个参数整体传给 CLI）。
+# EXTRA_ARGS 是自由附加参数（如 --attention-backend triton），按空格拆分。
+SERVER_ARGS=()
 if [ "$POLICY" = "heter_cache" ]; then
-  EXTRA="--enable-heter-cache"
+  SERVER_ARGS+=(--enable-heter-cache)
 fi
-# 可选附加参数（如 --radix-cache-backend=classic），用 EXTRA_ARGS 传入
+if [ -n "${POLICY_CONFIG:-}" ]; then
+  SERVER_ARGS+=(--radix-eviction-policy-config "$POLICY_CONFIG")
+fi
 EXTRA_ARGS=${EXTRA_ARGS:-}
+if [ -n "$EXTRA_ARGS" ]; then
+  read -r -a _EXTRA <<< "$EXTRA_ARGS"
+  SERVER_ARGS+=("${_EXTRA[@]}")
+fi
 
 echo "[serve] policy=$POLICY max_total_tokens=$MAX_TOTAL_TOKENS port=$PORT"
 echo "[serve] log -> $LOG"
@@ -42,5 +50,5 @@ cd "$BENCH_DIR/.."
   --enable-metrics \
   --max-total-tokens "$MAX_TOTAL_TOKENS" \
   --port "$PORT" \
-  $EXTRA $EXTRA_ARGS \
+  "${SERVER_ARGS[@]}" \
   2>&1 | tee "$LOG"

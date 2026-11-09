@@ -30,6 +30,7 @@ Heter-Bench/
     prepare_session_data.py              # 原始数据 → session_data.jsonl
     calibrate.py                         # prefill 速率标定（token → ms）
 
+  mixexp/                 # 混合负载实验：规模阶梯 × 实验臂，见 mixexp/README.md
   eval/                   # 离线评估：节点级 / token 级 / label 口径
   profile/  log/          # 观测实现 / 运行日志
   classify/  exp/  tailshot/  RR_VS_TLRU/  W-TinyLRU/   # 实验目录
