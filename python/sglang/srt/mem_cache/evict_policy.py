@@ -16,8 +16,6 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 import logging
 import random
-import time
-from collections import deque
 from typing import TYPE_CHECKING, Tuple, Union
 from sglang.srt.mem_cache.quota_selector import (
     effective_targets,
@@ -45,7 +43,6 @@ from sglang.srt.mem_cache.victim_override import (
 )
 from sglang.srt.mem_cache.heter_logging import (
     CacheTelemetry,
-    heterlog,
     HeterProfiler,
 )
 
@@ -54,9 +51,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# 承压判据（Q5=a）：可用容量占池容量的比例低于它就算承压，
-# 此时配额账本的校准窗口从 30s 缩短到 pressure_window_s。
-PRESSURE_AVAILABLE_RATIO = 0.05
 
 
 # 节点口径统一在 heter_utils，避免策略/改写器/指标各算一套。
@@ -189,8 +183,6 @@ class HeterCacheStrategy(EvictionStrategy):
 
     注：本策略只做裁决，KV 释放与 Radix 树拓扑修改由外层缓存引擎执行。
     """
-    PROFILE_INTERVAL = 30.0   # 监控输出节流周期（秒）
-    MAX_SEEN_RIDS = 100_000   # 请求去重滑动窗口上限
 
     def __init__(
         self,
@@ -207,16 +199,11 @@ class HeterCacheStrategy(EvictionStrategy):
         self.quota = QuotaParams.from_any(quota)
         self.force_agentic = bool(force_agentic)
 
-        self._last_profile = time.monotonic()
-        self._last_reconcile = 0.0
         # 配额账本：唯一写入口在缓存层（record_insert / record_evict），
         # 策略只读它的 occ 做仲裁。
         self.occupancy = QueueOccupancyTracker()
         # 兜底淘汰:采样独立 RNG，保证实验结果在相同 seed 下可复现
         self._quota_rng = random.Random(self.quota.seed)
-        # Chunked prefill 请求去重队列，避免同一请求多次命中导致指标虚高
-        self._seen_rids: set = set()
-        self._rid_order: deque = deque()
         self.profiler = HeterProfiler()
         # 账本与事件流的多写收在门面里，下面三个 record_* 只管上报意图。
         # profiler 引用同时保留：外部消费者（Heter-Bench 的 struct_profile、测试）
@@ -235,10 +222,8 @@ class HeterCacheStrategy(EvictionStrategy):
         self.node_observers = (self.slru_evict,)
 
     def reset_bookkeeping(self) -> None:
-        """重置统计指标与去重状态（缓存 flush / reset 时调用）。"""
-        self.profiler.reset()
-        self._seen_rids.clear()
-        self._rid_order.clear()
+        """重置统计指标、去重状态与配额账本（缓存 flush / reset 时调用）。"""
+        self.telemetry.reset()
         self.occupancy.reset()
 
     def _node_tag(self, node) -> HeterCacheNodeTag:
@@ -284,17 +269,12 @@ class HeterCacheStrategy(EvictionStrategy):
     # ---- 命中/淘汰记账 ----
 
     def record_hit(self, req, node, hit_tokens: int) -> None:
-        """记录缓存命中指标。基于 rid 去重，规避 chunked prefill 重复记账。"""
-        rid = getattr(req, "rid", None)
-        if rid is None or rid in self._seen_rids:
-            return
-        self._seen_rids.add(rid)
-        self._rid_order.append(rid)
-        if len(self._rid_order) > self.MAX_SEEN_RIDS:
-            self._seen_rids.discard(self._rid_order.popleft())
-
-        tag = self._node_tag(node)
-        self.telemetry.on_hit(tag=tag, hit_tokens=hit_tokens, req_id=rid)
+        """记录缓存命中指标（去重由 telemetry 负责）。"""
+        self.telemetry.on_hit(
+            tag=self._node_tag(node),
+            hit_tokens=hit_tokens,
+            req_id=getattr(req, "rid", None),
+        )
 
     def record_evict(self, node) -> None:
         """记录节点淘汰事件并扣减配额占用（支持级联删除逐点触发）。"""
@@ -313,20 +293,21 @@ class HeterCacheStrategy(EvictionStrategy):
         """记录淘汰决策来源。"""
         self.telemetry.on_victim_source(source, tokens)
 
-    def _reconcile_interval(self, available: float, capacity: float) -> float:
-        """计算配额校准周期：内存承压时缩短至 pressure_window_s，平时为 30s。"""
-        if capacity > 0 and available / capacity < PRESSURE_AVAILABLE_RATIO:
-            return self.quota.pressure_window_s
-        return self.PROFILE_INTERVAL
-
     def wants_occupancy(self, available: float, capacity: float, *, has_capacity: bool) -> bool:
-        """判断是否需要执行全树扫描（兼顾指标打印与配额校准时钟）。"""
-        now = time.monotonic()
-        if now - self._last_profile >= self.PROFILE_INTERVAL:
+        """是否需要做一次全树快照：校准时钟或打印时钟任一到期。
+
+        两个时钟分属两个协作者：校准（tracker）服务账本正确性，打印（telemetry）
+        服务观测。调用方拿到 True 后只遍历一次，快照同时喂两边。
+        """
+        if self.telemetry.wants_profile():
             return True
-        if not has_capacity:
-            return now - self._last_reconcile >= self.PROFILE_INTERVAL
-        return now - self._last_reconcile >= self._reconcile_interval(available, capacity)
+        return self.occupancy.wants_reconcile(
+            available,
+            capacity,
+            normal_window_s=self.telemetry.PROFILE_INTERVAL,
+            pressure_window_s=self.quota.pressure_window_s,
+            has_capacity=has_capacity,
+        )
 
 
     def record_insert(self, node) -> None:
@@ -355,24 +336,32 @@ class HeterCacheStrategy(EvictionStrategy):
         available: float,
         capacity: float,
     ) -> None:
-        """全树快照聚合入口，统一触发配额校准与 profile 监控打印。"""
-        now = time.monotonic()
-        if now - self._last_reconcile >= self._reconcile_interval(available, capacity):
+        """全树快照的单一消费入口：同一份快照同时喂校准与渲染。
+
+        调用方（``RadioCache.evict``）已按 ``wants_occupancy`` 判过时钟，
+        这里再判一次是为了让该方法自身幂等——重复调用不会重复校准或刷屏。
+        """
+        if self.occupancy.wants_reconcile(
+            available,
+            capacity,
+            normal_window_s=self.telemetry.PROFILE_INTERVAL,
+            pressure_window_s=self.quota.pressure_window_s,
+            has_capacity=capacity > 0,
+        ):
             self.occupancy.reconcile(queue_occ, capacity)
-            self._last_reconcile = now
-        if now - self._last_profile < self.PROFILE_INTERVAL:
+        if not self.telemetry.wants_profile():
             return
-        self._last_profile = now
-        _profile = self.profiler.summary(
+        self.telemetry.observe_profile(
             queue_occ,
             session_summary,
             slru_policy=self.slru_evict,
             mt_policy=self.mt_evict,
             quota_occ=self.occupancy.occ,
-            quota_targets=self.quota_targets(self.occupancy.occ, self.occupancy.capacity),
+            quota_targets=self.quota_targets(
+                self.occupancy.occ, self.occupancy.capacity
+            ),
             quota_caps=queue_capacities(self.quota, self.occupancy.capacity),
         )
-        heterlog.info("Profile", f"[HeterCache profile]\n{_profile}")
 
     # ---- 跨队列配额 ----
 

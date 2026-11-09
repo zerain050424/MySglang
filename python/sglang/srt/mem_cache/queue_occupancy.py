@@ -13,9 +13,15 @@
 
 from __future__ import annotations
 
+import time
 from typing import Dict
 
 from sglang.srt.mem_cache.heter_utils import QUOTA_QUEUES
+
+# 承压判据：可用容量占池容量的比例低于它，就把校准窗口从常规值缩短到
+# ``QuotaParams.pressure_window_s``。承压时水位变化最快，旧窗口会让仲裁
+# 按过期占用点名队列。
+PRESSURE_AVAILABLE_RATIO = 0.05
 
 
 class QueueOccupancyTracker:
@@ -25,11 +31,12 @@ class QueueOccupancyTracker:
     不再判断 one-shot；``reconcile`` 用全树快照的 ``total - one_shot`` 对齐。
     """
 
-    __slots__ = ("_occ", "_capacity")
+    __slots__ = ("_occ", "_capacity", "_last_reconcile")
 
     def __init__(self) -> None:
         self._occ: Dict[str, float] = {q: 0.0 for q in QUOTA_QUEUES}
         self._capacity = 0.0
+        self._last_reconcile = 0.0
 
     @property
     def occ(self) -> Dict[str, float]:
@@ -64,6 +71,34 @@ class QueueOccupancyTracker:
         if queue in self._occ:
             self._occ[queue] = max(0.0, self._occ[queue] - tokens)
 
+    def wants_reconcile(
+        self,
+        available: float,
+        capacity: float,
+        *,
+        normal_window_s: float,
+        pressure_window_s: float,
+        has_capacity: bool,
+    ) -> bool:
+        """校准时钟是否到期。
+
+        两个窗口不是一个东西：常规窗口跟 profile 打印同频，承压窗口由
+        ``QuotaParams.pressure_window_s`` 配置，服务的是账本正确性而非观测。
+
+        Args:
+            available: 当前可用 token；``has_capacity`` 为 False 时不参考。
+            capacity: 池容量；0 表示还没拿到。
+            normal_window_s: 常规校准窗口（秒）。
+            pressure_window_s: 承压时的校准窗口（秒）。
+            has_capacity: 调用方是否真的拿到了可用量。
+        """
+        now = time.monotonic()
+        if not has_capacity or capacity <= 0:
+            return now - self._last_reconcile >= normal_window_s
+        if available / capacity < PRESSURE_AVAILABLE_RATIO:
+            return now - self._last_reconcile >= pressure_window_s
+        return now - self._last_reconcile >= normal_window_s
+
     def reconcile(self, snapshot: dict, capacity: float) -> None:
         """用全树快照校准，吸收增量维护跟不上的漂移。
 
@@ -78,8 +113,10 @@ class QueueOccupancyTracker:
             self._occ[q] = max(0.0, total - one_shot)
         if capacity > 0:
             self._capacity = float(capacity)
+        self._last_reconcile = time.monotonic()
 
     def reset(self) -> None:
         """清空账本（缓存 flush / 跨 run 复用同一进程时调用）。"""
         for q in QUOTA_QUEUES:
             self._occ[q] = 0.0
+        self._last_reconcile = 0.0
