@@ -30,7 +30,7 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Dict, Iterable, Optional, Tuple
 import time
 import weakref
-from sglang.srt.mem_cache.uni_utils import (
+from sglang.srt.mem_cache.heter_utils import (
     DEFAULT_SHARE_MIN,
     RrParams,
     SESSION_SHARE_MAX,
@@ -48,7 +48,7 @@ from sglang.srt.mem_cache.uni_utils import (
 
 if TYPE_CHECKING:  # pragma: no cover
     from sglang.srt.mem_cache.radix_cache import TreeNode
-    from sglang.srt.mem_cache.uni_utils import SessionState
+    from sglang.srt.mem_cache.heter_utils import SessionState
 
 
 # ---- HeterCache 插件的侧表 ----

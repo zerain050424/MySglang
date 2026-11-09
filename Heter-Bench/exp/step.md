@@ -9,7 +9,7 @@
 
 | 层 | 内容 | 行为变化 | 净增行数 |
 |---|---|---|---|
-| **L1** | 节点记 `session_id` + 会话状态表 + 缺口记账 | 无 | ~80（`uni_utils.py` +75，其余 +5） |
+| **L1** | 节点记 `session_id` + 会话状态表 + 缺口记账 | 无 | ~80（`heter_utils.py` +75，其余 +5） |
 | **L2** | 选择键从"全局最小分数"改为"会话缺口加权最小" | 有 | ~45 |
 
 L1 可独立合并、独立验收；L2 在 L1 的账目对得上之后再动。
@@ -30,12 +30,12 @@ L1 可独立合并、独立验收；L2 在 L1 的账目对得上之后再动。
 | | `__init__`（≈351，与 `evictable_leaves` 同处） | `self.session_registry = SessionRegistry()` | +1 |
 | | `_adopt` (503) | ① 传 `session_id=req.session_id`；② 写会话状态：`L_i`、gap 样本、`d_i = 0`、`last_active` | +12 |
 | | `_delete_leaf` (959) | 记账勾子：`d_{owner} += len(node.value)`，`node_count -= 1` | +3 |
-| `mem_cache/uni_utils.py` | 文件末尾（现 114 行） | `SessionState` + `SessionRegistry`（`touch` / `charge` / `sweep` / `summary`） | +75 |
+| `mem_cache/heter_utils.py` | 文件末尾（现 114 行） | `SessionState` + `SessionRegistry`（`touch` / `charge` / `sweep` / `summary`） | +75 |
 | `mem_cache/evict_policy.py` | `profile_summary`（≈300） | 输出 `Σd`、`p50/max d_i` | +5 |
 
 ### 1.2 数据结构
 
-放在 `uni_utils.py` 末尾，与 `WORKLOAD_LABELS` 同一模块：
+放在 `heter_utils.py` 末尾，与 `WORKLOAD_LABELS` 同一模块：
 
 ```
 SessionState        # 一条会话的账
@@ -53,14 +53,14 @@ SessionRegistry     # 表 + 四个方法
     summary()                    给 profile 日志
 ```
 
-`charge(node)` 只读 `len(node.value)` 与 `node.session_id`，按鸭子类型写，不 import `radix_cache`，因此 `uni_utils` 与 `radix_cache` / `evict_policy` 之间不会成环。
+`charge(node)` 只读 `len(node.value)` 与 `node.session_id`，按鸭子类型写，不 import `radix_cache`，因此 `heter_utils` 与 `radix_cache` / `evict_policy` 之间不会成环。
 
 ### 1.3 两个挂点的理由
 
 - **`_delete_leaf`**：节点消亡的唯一原语（`_evict_one` 的 one-shot 连删、`release_radix_session` 都经过它）。挂这里不漏账；挂 `_evict_one` 会漏掉非淘汰路径的释放。
 - **`_adopt`**：唯一同时持有 `req` 与 `prefix_len` 的插入入口（`cache_finished_req` 与 `cache_unfinished_req` 都走它）。
 
-### 1.3.1 为什么放 `uni_utils.py`
+### 1.3.1 为什么放 `heter_utils.py`
 
 - 与 `WORKLOAD_LABELS` / `alpha_key_of` 同属 HeterCache 迁移层的常量与状态，命名口径一致；
 - 该模块现在只有 `math` / `enum` / `time` / `typing` 依赖，加状态表不引入新依赖，也不反向依赖树；
@@ -144,7 +144,7 @@ S1 是纯观测改动，验收标准是**零回归**；S2、S3 才允许指标�
 
 | 文件 | 改动 | 行数 |
 |---|---|---|
-| `mem_cache/uni_utils.py` | `SessionState` + `SessionRegistry`（`touch` / `attach` / `charge` / `sweep` / `summary`） | **+123** |
+| `mem_cache/heter_utils.py` | `SessionState` + `SessionRegistry`（`touch` / `attach` / `charge` / `sweep` / `summary`） | **+123** |
 | `mem_cache/radix_cache.py` | `TreeNode.session_id`；9 处接线（import、`__init__`、`insert`、`_adopt`、`_split_node`、`_insert_helper`、`_delete_leaf`、`evict`） | +26 |
 | `mem_cache/evict_policy.py` | `profile_summary` / `maybe_update_alpha` 加会话摘要 | +10 |
 | `mem_cache/heter_cache_radix_cache.py` | profile 调用传第三份口径 | +3 |

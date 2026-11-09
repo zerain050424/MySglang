@@ -248,7 +248,7 @@ def test_arm_configs_match_framework():
             sys.modules[f"sglang.{sub}"] = m
 
     try:
-        from sglang.srt.mem_cache.uni_utils import SlruParams
+        from sglang.srt.mem_cache.heter_utils import SlruParams
     except ImportError as exc:
         # 本地仓库可能停在旧版本（分支仓库在实验机上）：按 SKIP 处理，不判失败。
         print(f"  SKIP  {exc}（分支仓库上会跑）")

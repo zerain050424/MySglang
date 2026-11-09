@@ -17,7 +17,7 @@ import sys
 HERE = pathlib.Path(__file__).resolve()
 sys.path.insert(0, str(HERE.parents[2] / "python"))
 
-from sglang.srt.mem_cache.uni_utils import SessionRegistry  # noqa: E402
+from sglang.srt.mem_cache.heter_utils import SessionRegistry  # noqa: E402
 
 FAILS = []
 

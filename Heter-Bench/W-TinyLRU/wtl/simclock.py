@@ -19,7 +19,7 @@
     sglang.srt.mem_cache.evict_policy
     sglang.srt.mem_cache.heter_cache_radix_cache
     sglang.srt.mem_cache.victim_override
-    sglang.srt.mem_cache.uni_utils
+    sglang.srt.mem_cache.heter_utils
 
 SLRU 的共享数账本不读时间（只读命中会话），故不在此列；
 它的 `pick()` 读 `time.monotonic()`，因此本模块必须覆盖 `victim_override`。
@@ -36,7 +36,7 @@ _PATCHED_MODULES = (
     "sglang.srt.mem_cache.evict_policy",
     "sglang.srt.mem_cache.heter_cache_radix_cache",
     "sglang.srt.mem_cache.victim_override",
-    "sglang.srt.mem_cache.uni_utils",
+    "sglang.srt.mem_cache.heter_utils",
 )
 
 _EPOCH = 1_700_000_000.0  # 固定墙钟起点：只为了让 time() 看起来合理，不参与排序

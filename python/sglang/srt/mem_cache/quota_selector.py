@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Tuple
 
-from sglang.srt.mem_cache.uni_utils import QUOTA_QUEUES, QuotaParams
+from sglang.srt.mem_cache.heter_utils import QUOTA_QUEUES, QuotaParams
 
 # 额度是浮点比例，比较时留容差，避免 0.5*C 的舍入把"刚好达标"误判成超标。
 _EPS = 1e-9

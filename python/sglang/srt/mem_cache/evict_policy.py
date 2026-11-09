@@ -26,7 +26,7 @@ from sglang.srt.mem_cache.quota_selector import (
     resolve_chunk,
     struct_tier,
 )
-from sglang.srt.mem_cache.uni_utils import (
+from sglang.srt.mem_cache.heter_utils import (
     node_end_offset,
     node_num_tokens,
     RrParams,
@@ -59,7 +59,7 @@ logger = logging.getLogger(__name__)
 PRESSURE_AVAILABLE_RATIO = 0.05
 
 
-# 节点口径与标签映射统一在 uni_utils，避免策略/改写器/指标各算一套。
+# 节点口径与标签映射统一在 heter_utils，避免策略/改写器/指标各算一套。
 _node_num_tokens = node_num_tokens
 _node_end_offset = node_end_offset
 
@@ -209,7 +209,7 @@ class HeterCacheStrategy(EvictionStrategy):
     ):
         """构造策略并完成插件接线。
 
-        参数组全部由 ``uni_utils`` 的参数类承载，配置只接受分组形式：
+        参数组全部由 ``heter_utils`` 的参数类承载，配置只接受分组形式：
         ``{"rr": {...}, "slru": {...}, "mt": {...}, "quota": {...}}``。
         分组设计的目的是让未知键在构造处立即报错，而不是静默忽略一项实验配置。
 
@@ -282,7 +282,7 @@ class HeterCacheStrategy(EvictionStrategy):
     def _task_type_of(self, node) -> HeterCacheTaskType:
         """把节点的 ``queue_tag`` 映射回任务类型（评分与队列归属的唯一入口）。
 
-        映射表在 ``uni_utils``，保证策略、改写器、指标不会各算一套。
+        映射表在 ``heter_utils``，保证策略、改写器、指标不会各算一套。
         ``force_agentic`` 时短路：即使节点残留 QTRANS/QCHAT/QSTRUCT 标签，
         评分与队列归属也统一按 agentic 走（缓存层会同步把标签强制成 QAGENT）。
 

@@ -6,7 +6,7 @@
 2. 按真实时间顺序喂进去，收集每轮的 `session_type`。
 
 分类规则本身不在这里复制一份——直接调用
-`python/sglang/srt/mem_cache/uni_utils.py` 的 `SessionRegistry`，
+`python/sglang/srt/mem_cache/heter_utils.py` 的 `SessionRegistry`，
 这样评测的就是生产代码，而不是它的替身。
 """
 
@@ -22,7 +22,7 @@ _SGLANG_PY = os.path.abspath(os.path.join(_HERE, "..", "..", "python"))
 if _SGLANG_PY not in sys.path:
     sys.path.insert(0, _SGLANG_PY)
 
-from sglang.srt.mem_cache.uni_utils import SessionRegistry  # noqa: E402
+from sglang.srt.mem_cache.heter_utils import SessionRegistry  # noqa: E402
 
 from session_data import PRED_LABEL, SessionRecord, Turn  # noqa: E402
 

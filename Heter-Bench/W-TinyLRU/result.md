@@ -1,7 +1,7 @@
 # 两带 SLRU 淘汰策略：设计思路 · 负载设计 · 对照组设计 · 实验结果
 
 > 分支 `TinyLRU`，策略实现位于
-> `python/sglang/srt/mem_cache/{evict_policy,victim_override,uni_utils,heter_cache_radix_cache}.py`。
+> `python/sglang/srt/mem_cache/{evict_policy,victim_override,heter_utils,heter_cache_radix_cache}.py`。
 > 本文所有数字来自 2025-11-04 在实验机（RTX 4090 / `--backend real`）上的一次性一致性重跑，
 > 结果文件 `result/mx/*.json`，汇总脚本 `mx.py`。A0/A1 完全不受被改文件影响，
 > 因此同一份 trace 上的对照点可比。

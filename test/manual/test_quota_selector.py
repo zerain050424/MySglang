@@ -36,13 +36,13 @@ def _stub_package(name):
 for _pkg in ("sglang", "sglang.srt", "sglang.srt.mem_cache"):
     _stub_package(_pkg)
 
-uni = _load("sglang.srt.mem_cache.uni_utils", os.path.join(_CACHE_DIR, "uni_utils.py"))
+hu = _load("sglang.srt.mem_cache.heter_utils", os.path.join(_CACHE_DIR, "heter_utils.py"))
 qs = _load("sglang.srt.mem_cache.quota_selector", os.path.join(_CACHE_DIR, "quota_selector.py"))
 vo = _load("sglang.srt.mem_cache.victim_override", os.path.join(_CACHE_DIR, "victim_override.py"))
 _load("sglang.srt.mem_cache.heter_logging", os.path.join(_CACHE_DIR, "heter_logging.py"))
 ep = _load("sglang.srt.mem_cache.evict_policy", os.path.join(_CACHE_DIR, "evict_policy.py"))
 
-QuotaParams = uni.QuotaParams
+QuotaParams = hu.QuotaParams
 C = 1000.0
 
 BASE = dict(caps={"struct": 0.2, "agentic": 0.5, "chat": 0.3},
@@ -253,9 +253,9 @@ def _leaf(tag, tokens, ts=0.0, session_id=None):
 
 
 TAG = {
-    "struct": uni.HeterCacheQueueTag.QSTRUCT,
-    "agentic": uni.HeterCacheQueueTag.QAGENT,
-    "chat": uni.HeterCacheQueueTag.QCHAT,
+    "struct": hu.HeterCacheQueueTag.QSTRUCT,
+    "agentic": hu.HeterCacheQueueTag.QAGENT,
+    "chat": hu.HeterCacheQueueTag.QCHAT,
 }
 
 
@@ -280,7 +280,7 @@ def test_accounting_insert_and_evict():
     # TRANS 会话 + share < share_min -> one-shot，插入与淘汰两侧都不进账
     trans = _leaf(TAG["struct"], 50, session_id="t1")
     st.session_registry.touch("t1", "r1", prompt_len=50)
-    st.session_registry.get("t1").session_type = uni.SessionType.TRANS
+    st.session_registry.get("t1").session_type = hu.SessionType.TRANS
     check(st.is_one_shot(trans), "precondition: a TRANS node with share 0 is one-shot")
     before = st._occ["struct"]
     st.record_insert(trans)
@@ -300,7 +300,7 @@ def test_random_is_never_counted():
     print("[14b] accounting: random-classified nodes never enter the quota ledger")
     st = _strategy()
     rnd = _leaf(TAG["agentic"], 70)          # 先造一个对象再改标签，保证可弱引用
-    rnd.queue_tag = uni.HeterCacheQueueTag.QTRANS
+    rnd.queue_tag = hu.HeterCacheQueueTag.QTRANS
     check(st.is_one_shot(rnd) is False,
           "precondition: a session-less QTRANS node is not judged one-shot")
     check(st.workload_of(rnd) == "random", f"workload={st.workload_of(rnd)}, want random")
@@ -374,7 +374,7 @@ def test_stage0_one_shot_preempts_quota():
     struct_node = _leaf(TAG["struct"], 100, ts=1.0)
     one = _leaf(TAG["struct"], 40, ts=99.0, session_id="s1")
     st.session_registry.touch("s1", "r1", prompt_len=40)
-    st.session_registry.get("s1").session_type = uni.SessionType.TRANS
+    st.session_registry.get("s1").session_type = hu.SessionType.TRANS
     check(st.is_one_shot(one), "precondition: TRANS node is one-shot")
     victim, source = qs.pick_victim(
         strategy=st, leaves=[struct_node, one], capacity=1000, page_size=1,
@@ -453,7 +453,7 @@ def test_stage2_unchanged_without_quota():
     st = ep.HeterCacheStrategy()
     check(st.quota.enabled is False, "precondition: quota off")
     # 时间必须是相对 now 的：绝对值会让 elapsed 大到 reuse_prob 全部归零
-    now = uni.time.monotonic() if hasattr(uni, "time") else __import__("time").monotonic()
+    now = hu.time.monotonic() if hasattr(hu, "time") else __import__("time").monotonic()
     older = _leaf(TAG["chat"], 10, ts=now - 100.0)
     newer = _leaf(TAG["chat"], 10, ts=now - 1.0)
     victim, source = qs.pick_victim(

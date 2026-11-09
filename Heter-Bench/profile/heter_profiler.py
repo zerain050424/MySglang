@@ -104,7 +104,7 @@ class HeterProfiler:
         Σocc == schedulable + Σone_shot。
         多轮负载的 one_shot 恒为 0，不打印后缀；random 整行 one-shot。
         """
-        from sglang.srt.mem_cache.uni_utils import WORKLOAD_LABELS
+        from sglang.srt.mem_cache.heter_utils import WORKLOAD_LABELS
         quota_on = quota_caps is not None
         header = "  workload           hit     evicted             occ"
         if quota_on:

@@ -156,8 +156,8 @@ def make_cache(cache_cls, strategy, nodes):
     cache.kv_events = FakeEvents()
     cache.deleted = []
     cache.metrics = []
-    uni = sys.modules["sglang.srt.mem_cache.uni_utils"]
-    cache.root_node = FakeNode(None, uni.HeterCacheQueueTag.QTRANS)
+    hu = sys.modules["sglang.srt.mem_cache.heter_utils"]
+    cache.root_node = FakeNode(None, hu.HeterCacheQueueTag.QTRANS)
     cache.root_node.ckey = "root"
     cache.evictable_leaves = set()
     for n in nodes:
@@ -194,7 +194,7 @@ def _per_workload_token_count(self):
 
 def _bootstrap():
     _install_stubs()
-    _load("sglang.srt.mem_cache.uni_utils", "sglang/srt/mem_cache/uni_utils.py")
+    _load("sglang.srt.mem_cache.heter_utils", "sglang/srt/mem_cache/heter_utils.py")
     _load("sglang.srt.mem_cache.victim_override", "sglang/srt/mem_cache/victim_override.py")
     ep = _load("sglang.srt.mem_cache.evict_policy", "sglang/srt/mem_cache/evict_policy.py")
     shc = _load(
@@ -210,10 +210,10 @@ def _bootstrap():
 
 def _strategy(ep, sessions, **slru):
     st = ep.HeterCacheStrategy(slru=slru or None)
-    reg = sys.modules["sglang.srt.mem_cache.uni_utils"].SessionRegistry()
-    uni = sys.modules["sglang.srt.mem_cache.uni_utils"]
+    reg = sys.modules["sglang.srt.mem_cache.heter_utils"].SessionRegistry()
+    hu = sys.modules["sglang.srt.mem_cache.heter_utils"]
     for sid, stype in sessions.items():
-        reg._sessions[sid] = uni.SessionState(session_id=sid, session_type=stype)
+        reg._sessions[sid] = hu.SessionState(session_id=sid, session_type=stype)
     st.session_registry = reg
     st.slru_evict.session_registry = reg
     return st
@@ -222,10 +222,10 @@ def _strategy(ep, sessions, **slru):
 def test_no_one_shot_leaves_does_not_crash(ep, shc, base):
     """历史 P0：没有 one-shot 叶子时 victim 曾是 None / 陈旧节点。"""
     print("[1] no one-shot leaves: base candidate via victim_key, no crash")
-    uni = sys.modules["sglang.srt.mem_cache.uni_utils"]
-    st = _strategy(ep, {"a1": uni.SessionType.AGENTIC})
+    hu = sys.modules["sglang.srt.mem_cache.heter_utils"]
+    st = _strategy(ep, {"a1": hu.SessionType.AGENTIC})
     nodes = [
-        FakeNode("a1", uni.HeterCacheQueueTag.QAGENT, tokens=t)
+        FakeNode("a1", hu.HeterCacheQueueTag.QAGENT, tokens=t)
         for t in (16, 32, 48)
     ]
     cache = make_cache(shc.HeterCacheRadixCache, st, nodes)
@@ -248,10 +248,10 @@ def test_no_one_shot_leaves_does_not_crash(ep, shc, base):
 def test_victim_not_reused_across_rounds(ep, shc, base):
     """历史 P0：第二轮复用上一轮已删节点 → 二次释放 / 断言失败。"""
     print("[2] victim must be recomputed every round (no double delete)")
-    uni = sys.modules["sglang.srt.mem_cache.uni_utils"]
-    st = _strategy(ep, {"a1": uni.SessionType.AGENTIC})
+    hu = sys.modules["sglang.srt.mem_cache.heter_utils"]
+    st = _strategy(ep, {"a1": hu.SessionType.AGENTIC})
     nodes = [
-        FakeNode("a1", uni.HeterCacheQueueTag.QAGENT, tokens=16) for _ in range(4)
+        FakeNode("a1", hu.HeterCacheQueueTag.QAGENT, tokens=16) for _ in range(4)
     ]
     cache = make_cache(shc.HeterCacheRadixCache, st, nodes)
 
@@ -272,16 +272,16 @@ def test_victim_not_reused_across_rounds(ep, shc, base):
 def test_one_shot_band_first(ep, shc, base):
     """one-shot 叶子先走，且按结束偏移最深优先。"""
     print("[3] one-shot leaves are drained first (deepest end offset wins)")
-    uni = sys.modules["sglang.srt.mem_cache.uni_utils"]
+    hu = sys.modules["sglang.srt.mem_cache.heter_utils"]
     st = _strategy(
         ep,
-        {"t1": uni.SessionType.TRANS, "s1": uni.SessionType.STRUCT},
+        {"t1": hu.SessionType.TRANS, "s1": hu.SessionType.STRUCT},
     )
     # 一个未共享的 TRANS 节点（one-shot） + 一个共享的 STRUCT 节点（受保护）
-    shallow = FakeNode("t1", uni.HeterCacheQueueTag.QTRANS, tokens=16, abs_start=0)
-    deep = FakeNode("t1", uni.HeterCacheQueueTag.QTRANS, tokens=16, abs_start=256)
+    shallow = FakeNode("t1", hu.HeterCacheQueueTag.QTRANS, tokens=16, abs_start=0)
+    deep = FakeNode("t1", hu.HeterCacheQueueTag.QTRANS, tokens=16, abs_start=256)
     shared = FakeNode(
-        "s1", uni.HeterCacheQueueTag.QSTRUCT, tokens=16, abs_start=0,
+        "s1", hu.HeterCacheQueueTag.QSTRUCT, tokens=16, abs_start=0,
         share_sessions=st.slru_evict.share_min,
     )
     check(st.is_one_shot(deep) is True, "sanity: trans node is one-shot")
@@ -299,15 +299,15 @@ def test_one_shot_band_first(ep, shc, base):
 def test_slru_rewrites_struct_candidate(ep, shc, base):
     """只有受保护的 struct 叶子时，来源应是 SLRU，且挑最久未访问的那片。"""
     print("[4] SLRU rewrites the candidate among protected struct leaves")
-    uni = sys.modules["sglang.srt.mem_cache.uni_utils"]
-    st = _strategy(ep, {"s1": uni.SessionType.STRUCT})
+    hu = sys.modules["sglang.srt.mem_cache.heter_utils"]
+    st = _strategy(ep, {"s1": hu.SessionType.STRUCT})
     thr = st.slru_evict.share_min
     old = FakeNode(
-        "s1", uni.HeterCacheQueueTag.QSTRUCT, tokens=16,
+        "s1", hu.HeterCacheQueueTag.QSTRUCT, tokens=16,
         last_access=1_000.0, share_sessions=thr,
     )
     new = FakeNode(
-        "s1", uni.HeterCacheQueueTag.QSTRUCT, tokens=16,
+        "s1", hu.HeterCacheQueueTag.QSTRUCT, tokens=16,
         last_access=9_999_999.0, share_sessions=thr,
     )
     cache = make_cache(shc.HeterCacheRadixCache, st, [old, new])
@@ -328,16 +328,16 @@ def test_slru_actually_rewrites_with_tag_off(ep, shc, base):
     LRU 口径不同，二者会挑出不同节点。
     """
     print("[4b] SLRU rewrites the position-scored base candidate")
-    uni = sys.modules["sglang.srt.mem_cache.uni_utils"]
-    st = _strategy(ep, {"s1": uni.SessionType.STRUCT})
+    hu = sys.modules["sglang.srt.mem_cache.heter_utils"]
+    st = _strategy(ep, {"s1": hu.SessionType.STRUCT})
     thr = st.slru_evict.share_min
     # 位置打分偏向「结束偏移小」的节点 -> 基础候选会挑 deep（offset 越界被截成 0 分）
     old_lru = FakeNode(
-        "s1", uni.HeterCacheQueueTag.QSTRUCT, tokens=16,
+        "s1", hu.HeterCacheQueueTag.QSTRUCT, tokens=16,
         abs_start=0, last_access=1_000.0, share_sessions=thr,
     )
     deep_recent = FakeNode(
-        "s1", uni.HeterCacheQueueTag.QSTRUCT, tokens=16,
+        "s1", hu.HeterCacheQueueTag.QSTRUCT, tokens=16,
         abs_start=8000, last_access=9_999_999.0, share_sessions=thr,
     )
     cache = make_cache(shc.HeterCacheRadixCache, st, [old_lru, deep_recent])
@@ -356,7 +356,7 @@ def test_slru_actually_rewrites_with_tag_off(ep, shc, base):
 def test_empty_tree_is_noop(ep, shc, base):
     """空树：直接返回 0，不报错。"""
     print("[5] empty tree returns 0")
-    uni = sys.modules["sglang.srt.mem_cache.uni_utils"]
+    hu = sys.modules["sglang.srt.mem_cache.heter_utils"]
     st = _strategy(ep, {})
     cache = make_cache(shc.HeterCacheRadixCache, st, [])
     result = cache.evict(base.EvictParams(num_tokens=128))

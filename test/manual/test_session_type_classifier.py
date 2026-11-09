@@ -8,7 +8,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "python"))
 
-from sglang.srt.mem_cache.uni_utils import SessionRegistry, SessionType
+from sglang.srt.mem_cache.heter_utils import SessionRegistry, SessionType
 
 
 def observe(registry, sid, turn, at, prompt_len, tool_call=None):
@@ -121,7 +121,7 @@ def test_radix_cross_session_hit_promotes_short_session_to_struct():
     from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
-    from sglang.srt.mem_cache.uni_utils import HeterCacheQueueTag
+    from sglang.srt.mem_cache.heter_utils import HeterCacheQueueTag
 
     cache = RadixCache(
         CacheInitParams(
@@ -161,7 +161,7 @@ def test_classified_agentic_session_tags_new_nodes(tmp_path):
     from sglang.srt.mem_cache.base_prefix_cache import InsertParams
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
-    from sglang.srt.mem_cache.uni_utils import HeterCacheQueueTag
+    from sglang.srt.mem_cache.heter_utils import HeterCacheQueueTag
 
     cache = RadixCache(
         CacheInitParams(
@@ -203,7 +203,7 @@ def test_classified_chat_session_tags_new_nodes():
     from sglang.srt.mem_cache.base_prefix_cache import InsertParams
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
-    from sglang.srt.mem_cache.uni_utils import HeterCacheQueueTag
+    from sglang.srt.mem_cache.heter_utils import HeterCacheQueueTag
 
     cache = RadixCache(
         CacheInitParams(
@@ -238,7 +238,7 @@ def test_non_heter_cache_preserves_legacy_delta_tags():
 
     from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
     from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
-    from sglang.srt.mem_cache.uni_utils import HeterCacheQueueTag
+    from sglang.srt.mem_cache.heter_utils import HeterCacheQueueTag
 
     cache = RadixCache.create_simulated(page_size=1)
     inserted = cache.insert(

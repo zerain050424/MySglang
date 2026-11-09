@@ -21,7 +21,7 @@ import dataclasses
 import json
 from typing import Dict, List, Optional
 
-# 框架侧默认值（与 sglang.srt.mem_cache.uni_utils.SlruParams 保持一致）
+# 框架侧默认值（与 sglang.srt.mem_cache.heter_utils.SlruParams 保持一致）
 DEFAULT_SHARE_MIN = 2
 # 不可达阈值：任何节点都进不了保护段 → 等价于「只有 one-shot 带」。
 BAND_ONLY_SHARE_MIN = 10 ** 6

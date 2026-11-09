@@ -11,7 +11,7 @@
     ShareGPT...           -> chat     (ShareGPT，人类节奏多轮)
     alfred_...            -> agentic  (AgentBank alfred，带 tool_call 的多轮)
 
-预测（pred）由 `uni_utils.SessionType` 映射而来，映射见 `PRED_LABEL`：
+预测（pred）由 `heter_utils.SessionType` 映射而来，映射见 `PRED_LABEL`：
 `trans` 表示「未判定」——对单轮且无跨会话结构共享的会话，这就是 random 的正确桶
 （`task_type_of_tag(QTRANS) == RANDOM_SINGLE_TURN`）。
 """

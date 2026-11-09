@@ -33,7 +33,7 @@ from sglang.srt.mem_cache.radix_cache import RadixKey  # noqa: E402
 from sglang.srt.mem_cache.heter_cache_radix_cache import (  # noqa: E402
     HeterCacheRadixCache,
 )
-from sglang.srt.mem_cache.uni_utils import HeterCacheQueueTag  # noqa: E402
+from sglang.srt.mem_cache.heter_utils import HeterCacheQueueTag  # noqa: E402
 
 FAILS = []
 QAGENT = HeterCacheQueueTag.QAGENT

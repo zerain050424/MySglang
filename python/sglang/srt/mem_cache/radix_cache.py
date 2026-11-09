@@ -50,7 +50,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.events import KVCacheEventRecorder
-from sglang.srt.mem_cache.uni_utils import (
+from sglang.srt.mem_cache.heter_utils import (
     SessionRegistry,
     SessionType,
     HeterCacheQueueTag,
