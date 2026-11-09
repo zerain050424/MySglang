@@ -183,7 +183,7 @@ def _update_eviction_metrics(self, num_evicted, start_time):
     self.metrics.append(num_evicted)
 
 
-def _per_workload_token_count(self):
+def _per_queue_token_count(self):
     return {}
 
 
@@ -204,7 +204,7 @@ def _bootstrap():
     cls = shc.HeterCacheRadixCache
     cls._delete_leaf = _delete_leaf
     cls.update_eviction_metrics = _update_eviction_metrics
-    cls._per_workload_token_count = _per_workload_token_count
+    cls._per_queue_token_count = _per_queue_token_count
     return ep, shc, sys.modules["sglang.srt.mem_cache.base_prefix_cache"]
 
 

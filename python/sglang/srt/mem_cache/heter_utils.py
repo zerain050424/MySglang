@@ -72,9 +72,23 @@ class HeterCacheNodeTag(str, enum.Enum):
             return cls.QCHAT
 
     @property
-    def workload(self) -> str:
-        """四类负载标签，既是配额配置的键，也是 profile 的列名。"""
-        return _WORKLOAD_OF[self]
+    def queue_name(self) -> str:
+        """归属队列名（配额配置的键、profile 的列名）。
+
+        把枚举投影成字符串只是为了对接 CLI 配置（`caps` / `reservations` 的键
+        必须是字符串）与日志列名；判定一律用枚举本身。
+        """
+        return _QUEUE_NAME[self]
+
+    @classmethod
+    def from_queue(cls, name) -> "HeterCacheNodeTag | None":
+        """队列名反查枚举；没有对应关系时返回 None。
+
+        反向表包含全部四项（含 ``QTRANS`` ↔ ``random``），因此与旧的"队列名
+        等于字符串"判定逐字等价。配额层只会传入 ``QUOTA_QUEUES`` 里的三个名字
+        （random 由 ``quota_ranking`` 滤掉），其余名字走 None 分支。
+        """
+        return _QUEUE_TO_TAG.get(name)
 
     @property
     def is_multi_turn(self) -> bool:
@@ -434,18 +448,19 @@ _REUSE_CONFIG = {
     HeterCacheNodeTag.QAGENT: (1.81, 1.092),
 }
 
-# 节点标签 → 负载标签。既是配额配置（caps / reservations）的键，
+# 节点标签 → 队列名。既是配额配置（caps / reservations）的键，
 # 也是 profile 的列名，所以只在这里定义一次。
-_WORKLOAD_OF = {
+_QUEUE_NAME = {
     HeterCacheNodeTag.QCHAT: "chat",
     HeterCacheNodeTag.QAGENT: "agentic",
     HeterCacheNodeTag.QSTRUCT: "struct",
     HeterCacheNodeTag.QTRANS: "random",
 }
+_QUEUE_TO_TAG = {name: tag for tag, name in _QUEUE_NAME.items()}
 
-# profile 的四类标签，顺序即打印顺序。
+# profile 的四列，顺序即打印顺序。
 # random 不参与跨队列配额：它整行都是 one-shot，在阶段 0 就被清掉。
-WORKLOAD_LABELS = ("chat", "agentic", "struct", "random")
+QUEUE_NAMES = ("chat", "agentic", "struct", "random")
 
 
 

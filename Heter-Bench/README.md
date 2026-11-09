@@ -159,12 +159,12 @@ source env.sh
 服务器需要打开 workload 占用采样，才能从现有缓存分类结果计算预测标签：
 
 ```bash
-SGLANG_WORKLOAD_OCC_LOG=1 SGLANG_WORKLOAD_OCC_INTERVAL=30 \
+SGLANG_QUEUE_OCC_LOG=1 SGLANG_QUEUE_OCC_INTERVAL=30 \
   POLICY=heter_cache MAX_TOTAL_TOKENS=100000 bash serve.sh
 ```
 
 实验输出的 CSV 保存真实数据集标签，`evaluate_load_prediction.py` 读取 CSV 与带时间戳
-的 `[workload occ]` 日志，按默认 60 秒窗口、30 秒步长和 10% 主导差距计算窗口级准确率：
+的 `[QueueOcc]` 日志，按默认 60 秒窗口、30 秒步长和 10% 主导差距计算窗口级准确率：
 
 ```bash
 "$PY" evaluate_load_prediction.py \

@@ -399,20 +399,20 @@ class RadixCache(BasePrefixCache):
         # ---- 策略无关的「按工作负载占用」采样器（env 门控，默认关）----
         # 用途：LRU 等不触发 [HeterCache profile] 的策略，也能拿到每队列
         # 占用占比。__init__ 在 scheduler 进程内执行，这里起一个 daemon 线程，
-        # 周期性调 _per_workload_token_count()（基类方法，树上节点带 queue_tag，
+        # 周期性调 _per_queue_token_count()（基类方法，树上节点带 queue_tag，
         # 任何策略都可用）。默认关闭：无 env 时这里只做一次 os.environ.get 判空。
-        _occ_env = os.environ.get("SGLANG_WORKLOAD_OCC_LOG", "0")
+        _occ_env = os.environ.get("SGLANG_QUEUE_OCC_LOG", "0")
         heterlog.info(
             "OccSampler",
             f"env={_occ_env} pid={os.getpid()} policy={self.eviction_policy}",
         )
         if _occ_env == "1":
-            interval = int(os.environ.get("SGLANG_WORKLOAD_OCC_INTERVAL", "30"))
+            interval = int(os.environ.get("SGLANG_QUEUE_OCC_INTERVAL", "30"))
             t = threading.Thread(
-                target=self._workload_occ_log_loop,
+                target=self._queue_occ_log_loop,
                 args=(interval,),
                 daemon=True,
-                name="workload-occ-sampler",
+                name="queue-occ-sampler",
             )
             t.start()
             heterlog.info("OccSampler", f"thread started, alive={t.is_alive()}")
@@ -742,7 +742,7 @@ class RadixCache(BasePrefixCache):
                 available, capacity, has_capacity=self._needs_capacity
             ):
                 self._occupancy_observer.observe_occupancy(
-                    self._per_workload_token_count(),
+                    self._per_queue_token_count(),
                     self.session_registry.summary(),
                     available=available,
                     capacity=capacity,
@@ -782,10 +782,10 @@ class RadixCache(BasePrefixCache):
             return bool(fn(node))
         return bool(getattr(node, "is_decode", False))
 
-    def _workload_occ_log_loop(self, interval: float) -> None:
-        """后台循环：每 interval 秒打一行按工作负载的占用占比。
-        输出格式：`[workload occ] chat=.. agentic=.. struct=.. random=..`
-        其中数值是 `_per_workload_token_count` 的 total（含 response 段）。
+    def _queue_occ_log_loop(self, interval: float) -> None:
+        """后台循环：每 interval 秒打一行按队列的占用占比。
+        输出格式：`[QueueOcc] chat=.. agentic=.. struct=.. random=..`
+        其中数值是 `_per_queue_token_count` 的 total（含 response 段）。
         并发说明：树在 scheduler 主线程上被增删，这里在 daemon 线程里只读遍历；
         GIL 保证不会崩，最坏读到一次瞬时不一致的计数（采样统计可接受）。
         """
@@ -794,7 +794,7 @@ class RadixCache(BasePrefixCache):
             time.sleep(interval)
             i += 1
             try:
-                counts = self._per_workload_token_count()
+                counts = self._per_queue_token_count()
                 _snapshot = {
                     k: int(v['total']) for k, v in sorted(counts.items())
                 } if counts else {}
@@ -803,23 +803,23 @@ class RadixCache(BasePrefixCache):
                     msg = " ".join(
                         f"{k}={int(v['total'])}" for k, v in sorted(counts.items())
                     )
-                    heterlog.info("WorkloadOcc", msg)
+                    heterlog.info("QueueOcc", msg)
                 tag_counts = self._per_queue_tag_token_count()
                 if tag_counts:
                     msg = " ".join(
                         f"{k}={v}" for k, v in sorted(tag_counts.items())
                     )
-                    heterlog.info("QueueOcc", msg)
+                    heterlog.info("TagOcc", msg)
             except Exception:  # 采样失败不能影响主流程
-                logger.exception("workload occ sampler failed")
+                logger.exception("queue occ sampler failed")
 
-    def _per_workload_token_count(self) -> dict:
-        """按工作负载统计驻留 token，**包含各自的 response(decode) 段**。
-        「这个 workload 到底占了池子多少」——is_decode 只决定淘汰优先级，
+    def _per_queue_token_count(self) -> dict:
+        """按队列统计驻留 token，**包含各自的 response(decode) 段**。
+        「这个队列到底占了池子多少」——is_decode 只决定淘汰优先级，
         不改变归属（旧口径把归属和优先级压成一个 queue_name，多轮 agentic
         的 response 段被记进一次性带，真实占用被低估数倍）。
         返回 {label: {"total": t, "one_shot": o}}；
-        one_shot = 该 workload 中一次性内容的 token（random 整行、
+        one_shot = 该队列中一次性内容的 token（random 整行、
         struct 的 response 段；多轮恒为 0）。
         Σ(total − one_shot) 即 profile 里的可调度占用。
         """
@@ -830,9 +830,12 @@ class RadixCache(BasePrefixCache):
             for child in node.children.values():
                 if child.evicted:
                     continue
-                workload_of = getattr(self.eviction_strategy, "workload_of", None)
-                label = workload_of(child) if workload_of is not None else "chat"
-                rec = out.setdefault(label, {"total": 0.0, "one_shot": 0.0})
+                # 标签直接读节点本身：任何策略下节点都带 queue_tag，
+                # 未知/缺失由 coerce 收敛为 chat（与旧默认一致）。
+                queue = HeterCacheNodeTag.coerce(
+                    getattr(child, "queue_tag", None)
+                ).queue_name
+                rec = out.setdefault(queue, {"total": 0.0, "one_shot": 0.0})
                 n = len(child.key)
                 rec["total"] += n
                 if self._is_one_shot(child):
@@ -843,7 +846,7 @@ class RadixCache(BasePrefixCache):
     def _node_label_dump_loop(self, path: str, interval: float) -> None:
         """后台循环：每 interval 秒把整棵树上每个节点的标签快照追加到 path(JSONL)。
 
-        与 `[workload occ]` 的区别：occupancy 只给聚合占比，这里给**逐节点**的
+        与 `[QueueOcc]` 的区别：occupancy 只给聚合占比，这里给**逐节点**的
         (状态机标签, 真实归属 session_id, token 数, 命中次数, 距上次访问时间,
         子节点数, 是否 decode 段, 绝对起始偏移)，是节点级标注准确率的唯一数据源。
 
@@ -906,7 +909,7 @@ class RadixCache(BasePrefixCache):
     def _per_queue_tag_token_count(self) -> dict:
         """按**原始队列标签**统计驻留 token：qtrans/qstruct/qagent/qchat。
 
-        与 `_per_workload_token_count` 的区别：这里不经过 `workload_of` 的
+        与 `_per_queue_token_count` 的区别：这里不经过队列名折叠的
         `qtrans -> random` 折叠，因此能单独观察「非共享内容 = qtrans」的比例，
         用于核对「共享前缀才报 qstruct」的口径（节点级标注统计用）。
         返回 {queue_tag: token 数}，键是枚举的 value 字符串。

@@ -126,7 +126,7 @@ def install(
                 strategy = cache.eviction_strategy
                 try:
                     rec["profile"] = strategy.profiler.summary(
-                        cache._per_workload_token_count(),
+                        cache._per_queue_token_count(),
                         cache.session_registry.summary(),
                         slru_policy=strategy.slru_evict,
                         mt_policy=strategy.mt_evict,

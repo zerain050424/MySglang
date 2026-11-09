@@ -48,7 +48,7 @@ class HeterCacheRadixCache(RadixCache):
             available, capacity, has_capacity=self._needs_capacity
         ):
             self._occupancy_observer.observe_occupancy(
-                self._per_workload_token_count(),
+                self._per_queue_token_count(),
                 self.session_registry.summary(),
                 available=available,
                 capacity=capacity,

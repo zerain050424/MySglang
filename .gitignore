@@ -307,3 +307,6 @@ PLAN.md
 .pi/todos/eff684f9.md
 .pi/todos/fd68bb3b.md
 .gitignore
+
+# graphify 工具输出（本地缓存，不入库）
+graphify-out/

@@ -85,31 +85,31 @@ class HeterLogger:
     # ------------------------------------------------------------------
     # 结构化事件 API（文本 debug + JSONL 同源双写）
     # ------------------------------------------------------------------
-    def evict(self, node_id, workload, tokens, task_type=None, source=None,
+    def evict(self, node_id, queue, tokens, tag=None, source=None,
               one_shot=None, step=None):
-        """一次驱逐事件（sglang-radix 节点语义：node_id/workload/tokens）。"""
+        """一次驱逐事件（sglang-radix 节点语义：node_id/queue/tokens）。"""
         self._log.debug(
-            "[Evict] node=%s workload=%s tokens=%s task_type=%s source=%s one_shot=%s step=%s",
-            node_id, workload, tokens, task_type, source, one_shot, step)
+            "[Evict] node=%s queue=%s tokens=%s tag=%s source=%s one_shot=%s step=%s",
+            node_id, queue, tokens, tag, source, one_shot, step)
         self._record({
             "ev": "evict",
             "node": node_id,
-            "workload": workload,
+            "queue": queue,
             "tokens": tokens,
-            "task_type": str(task_type) if task_type is not None else None,
+            "tag": str(tag) if tag is not None else None,
             "source": source,
             "one_shot": one_shot,
             "step": step,
         })
 
-    def hit(self, workload=None, task_type=None, hit_tokens=0, req=None):
+    def hit(self, queue=None, tag=None, hit_tokens=0, req=None):
         """一次前缀命中事件"""
-        self._log.debug("[Hit] workload=%s task_type=%s tokens=%s req=%s",
-                        workload, task_type, hit_tokens, req)
+        self._log.debug("[Hit] queue=%s tag=%s tokens=%s req=%s",
+                        queue, tag, hit_tokens, req)
         self._record({
             "ev": "hit",
-            "workload": workload,
-            "task_type": str(task_type) if task_type is not None else None,
+            "queue": queue,
+            "tag": str(tag) if tag is not None else None,
             "tokens": hit_tokens,
             "req": req,
         })

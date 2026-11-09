@@ -56,12 +56,12 @@ def _request_observations(
 
 def _parse_occ_line(line: str) -> Optional[Tuple[float, Dict[str, float]]]:
     match = re.search(
-        r"^\s*(?P<ts>\d+(?:\.\d+)?)\s+\[workload occ\]\s+(?P<body>.*)", line
+        r"^\s*(?P<ts>\d+(?:\.\d+)?)\s+\[QueueOcc\]\s+(?P<body>.*)", line
     )
     if not match:
         match = re.search(
             r"(?P<date>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[,.]\d+)?).*"
-            r"\[workload occ\]\s+(?P<body>.*)",
+            r"\[QueueOcc\]\s+(?P<body>.*)",
             line,
         )
     if not match:

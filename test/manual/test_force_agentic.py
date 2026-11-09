@@ -144,8 +144,10 @@ def test_no_one_shot_anywhere():
     check(leaves, "must have evictable leaves")
     oneshot = [n.id for n in leaves if cache.eviction_strategy.is_one_shot(n)]
     check(not oneshot, f"no leaf may be one-shot, offenders={oneshot[:5]}")
-    check(all(cache.eviction_strategy.workload_of(n) == "agentic" for n in leaves),
-          "workload_of must be agentic for every leaf")
+    check(
+        all(cache.eviction_strategy._node_tag(n) is HeterCacheNodeTag.QAGENT for n in leaves),
+        "every leaf must carry QAGENT under force_agentic",
+    )
 
 
 def test_hit_does_not_flip_to_chat():

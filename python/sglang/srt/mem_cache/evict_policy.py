@@ -285,10 +285,6 @@ class HeterCacheStrategy(EvictionStrategy):
             return False
         return st.session_type in (SessionType.TRANS, SessionType.STRUCT)
 
-    def workload_of(self, node) -> str:
-        """获取节点工作负载标签（chat / agentic / struct / random）。"""
-        return self._node_tag(node).workload
-
     def one_shot_key(self, node) -> tuple:
         """One-shot 带内淘汰排序：按访问时间升序（带内 LRU）。"""
         return (node.last_access_time,)
@@ -306,25 +302,26 @@ class HeterCacheStrategy(EvictionStrategy):
             self._seen_rids.discard(self._rid_order.popleft())
 
         tag = self._node_tag(node)
-        wkey = tag.workload
-        self.profiler.record_hit(wkey, hit_tokens)
+        queue = tag.queue_name
+        self.profiler.record_hit(queue, hit_tokens)
         if heterlog.enabled:
-            heterlog.hit(workload=wkey,
-                         task_type=tag.value,
+            heterlog.hit(queue=queue,
+                         tag=tag.value,
                          hit_tokens=hit_tokens,
                          req=rid)
 
     def record_evict(self, node) -> None:
         """记录节点淘汰事件并扣减配额占用（支持级联删除逐点触发）。"""
         tokens = _node_num_tokens(node)
-        wkey = self.workload_of(node)
+        tag = self._node_tag(node)
+        queue = tag.queue_name
         one_shot = self.is_one_shot(node)
         # 仅维护启用了配额且非 one-shot 的三队列占用
-        if self.quota.enabled and not one_shot and wkey in QUOTA_QUEUES:
-            self._occ[wkey] = max(0.0, self._occ[wkey] - tokens)
-        self.profiler.record_evict(wkey, tokens, one_shot=one_shot)
+        if self.quota.enabled and not one_shot and queue in QUOTA_QUEUES:
+            self._occ[queue] = max(0.0, self._occ[queue] - tokens)
+        self.profiler.record_evict(queue, tokens, one_shot=one_shot)
         heterlog.evict(node_id=id(node),
-                       workload=wkey,
+                       queue=queue,
                        tokens=tokens,
                        one_shot=one_shot)
 
@@ -355,10 +352,10 @@ class HeterCacheStrategy(EvictionStrategy):
         """是否需要缓存层注入 allocator 容量（配额启用时必须开启）。"""
         return self.quota.enabled
 
-    def reconcile_occupancy(self, workload_occ: dict, capacity: float) -> None:
+    def reconcile_occupancy(self, queue_occ: dict, capacity: float) -> None:
         """通过全树快照校准 _occ，吸收运行时标签变更、one-shot 晋升等增量漂移。"""
         for q in QUOTA_QUEUES:
-            rec = workload_occ.get(q) or {}
+            rec = queue_occ.get(q) or {}
             self._occ[q] = max(0.0, float(rec.get("total", 0.0)) - float(rec.get("one_shot", 0.0)))
         self._capacity = max(float(capacity), 0.0)
         self._last_reconcile = time.monotonic()
@@ -367,14 +364,14 @@ class HeterCacheStrategy(EvictionStrategy):
         """新节点挂载时增量计入配额（仅在节点创建时调用，节点分裂时不触发）。"""
         if not self.quota.enabled or self.is_one_shot(node):
             return
-        wkey = self.workload_of(node)
-        if wkey not in QUOTA_QUEUES:
+        queue = self._node_tag(node).queue_name
+        if queue not in QUOTA_QUEUES:
             return
-        self._occ[wkey] += _node_num_tokens(node)
+        self._occ[queue] += _node_num_tokens(node)
 
     def observe_occupancy(
         self,
-        workload_occ: dict,
+        queue_occ: dict,
         session_summary=None,
         *,
         available: float,
@@ -386,13 +383,13 @@ class HeterCacheStrategy(EvictionStrategy):
             self.quota.enabled
             and now - self._last_reconcile >= self._reconcile_interval(available, capacity)
         ):
-            self.reconcile_occupancy(workload_occ, capacity)
+            self.reconcile_occupancy(queue_occ, capacity)
         if now - self._last_profile < self.PROFILE_INTERVAL:
             return
         self._last_profile = now
         quota_on = self.quota.enabled
         _profile = self.profiler.summary(
-            workload_occ,
+            queue_occ,
             session_summary,
             slru_policy=self.slru_evict,
             mt_policy=self.mt_evict,
@@ -426,7 +423,13 @@ class HeterCacheStrategy(EvictionStrategy):
 
     def quota_victim(self, queue: str, leaves, capacity: float):
         """在指定队列内挑选淘汰节点。若无合适候选返回 None（触发上层跳队）。"""
-        pool = [n for n in leaves if self.workload_of(n) == queue]
+        # 队列名来自配额层（字符串），先反查成枚举再与节点标签直接比较，
+        # 中间不经过任何字符串投影。random 也反查得到 QTRANS，与旧判定等价；
+        # 未知名字返回 None，直接跳队。
+        target = HeterCacheNodeTag.from_queue(queue)
+        if target is None:
+            return None
+        pool = [n for n in leaves if self._node_tag(n) is target]
         if not pool:
             return None
         if queue == "struct":

@@ -2,16 +2,16 @@
 #
 # 定位：HeterCacheStrategy 的「记账 + 渲染」从策略类中剥离出的独立观测对象
 #   1. 独占四本累计账：total_hit / total_evicted / total_evicted_one_shot /
-#      victim_sources（键为 workload 标签，"random" 单列）；
+#      victim_sources（键为队列名，"random" 单列）；
 #   2. summary() 渲染 [HeterCache profile] 文本 —— 与旧 profile_summary
 #      逐字节等价（验收基线：diff == 0）；
 #   3. 输出口仅走 HeterLogger（heterlog 双写），本类不持文件句柄。
 #
 # 红线（本类绝不承载）：
-#   - 树遍历（_per_workload_token_count 等仍在 RadixCache —— 它们的输出
+#   - 树遍历（_per_queue_token_count 等仍在 RadixCache —— 它们的输出
 #     是 profile 渲染的输入，属于策略数据面）；
 #   - 背景采样线程（occ-sampler / node-label dump 留在 RadixCache）。
-# 树状态由外部以参传入（workload_occ / session_summary），插件观测接口
+# 树状态由外部以参传入（queue_occ / session_summary），插件观测接口
 # duck-typed（stats() / share_min），本类对策略零反向引用。
 #
 # 相对路径：本文件位于 Heter-Bench/profile/，向上一级到 Heter-Bench 再进 log。
@@ -33,12 +33,12 @@ class HeterProfiler:
     与 strategy 的契约：
       record_hit / record_evict / record_victim_source —— 三个记账收口由
       策略调用，本类只做累加，不做任何判定；
-      summary(workload_occ, session_summary, slru_policy,
+      summary(queue_occ, session_summary, slru_policy,
       mt_policy) —— 纯渲染，参数为只读引用。
     """
 
     def __init__(self):
-        # profile 用的累计量（原 strategy 字段搬移，键=workload 标签）
+        # profile 用的累计量（原 strategy 字段搬移，键=队列名）
         self._total_hit_tokens = {}
         self._total_evicted_tokens = {}
         self._total_evicted_one_shot = 0.0
@@ -51,17 +51,17 @@ class HeterProfiler:
     # ------------------------------------------------------------------
     # 记账收口（与 evict_policy 原实现逐行等价，仅状态换了持有人）
     # ------------------------------------------------------------------
-    def record_hit(self, workload, hit_tokens):
+    def record_hit(self, queue, hit_tokens):
         if self._heterlog.enabled:
-            self._heterlog.debug("ProfileBook", f"hit {workload} +{hit_tokens}")
-        self._total_hit_tokens[workload] = (
-            self._total_hit_tokens.get(workload, 0.0) + hit_tokens
+            self._heterlog.debug("ProfileBook", f"hit {queue} +{hit_tokens}")
+        self._total_hit_tokens[queue] = (
+            self._total_hit_tokens.get(queue, 0.0) + hit_tokens
         )
 
-    def record_evict(self, workload, tokens, one_shot):
+    def record_evict(self, queue, tokens, one_shot):
         """one-shot 淘汰量单记标量；random 整行 one-shot。"""
-        self._total_evicted_tokens[workload] = (
-            self._total_evicted_tokens.get(workload, 0.0) + tokens
+        self._total_evicted_tokens[queue] = (
+            self._total_evicted_tokens.get(queue, 0.0) + tokens
         )
         if one_shot:
             self._total_evicted_one_shot += tokens
@@ -83,18 +83,18 @@ class HeterProfiler:
     # 渲染（summary —— 原 profile_summary 逐字节搬移）
     # ------------------------------------------------------------------
     def summary(self,
-                workload_occ,
+                queue_occ,
                 session_summary=None,
                 slru_policy=None,
                 mt_policy=None,
                 quota_occ=None,
                 quota_targets=None,
                 quota_caps=None) -> str:
-        """返回各 workload 的 profile 摘要。
+        """返回各队列的 profile 摘要。
 
         字段含义：
-          hit / evicted : 累计命中 / 淘汰 token，按 workload（与 occ 同口径，可比较）
-          occ           : 该 workload 的全部驻留 token（含 response 段）；
+          hit / evicted : 累计命中 / 淘汰 token，按队列（与 occ 同口径，可比较）
+          occ           : 该队列的全部驻留 token（含 response 段）；
                           `occ(-N)` 后缀 = 其中 one-shot 部分（random 整行、
                           struct 的 response 段）
           q_occ / target / cap : 只在启用跨队列配额时出现。q_occ 是配额口径的
@@ -104,16 +104,16 @@ class HeterProfiler:
         Σocc == schedulable + Σone_shot。
         多轮负载的 one_shot 恒为 0，不打印后缀；random 整行 one-shot。
         """
-        from sglang.srt.mem_cache.heter_utils import WORKLOAD_LABELS
+        from sglang.srt.mem_cache.heter_utils import QUEUE_NAMES
         quota_on = quota_caps is not None
-        header = "  workload           hit     evicted             occ"
+        header = "  queue              hit     evicted             occ"
         if quota_on:
             header += "       q_occ    target       cap"
         lines = [header]
         pool = 0
         schedulable = 0
-        for q in WORKLOAD_LABELS:
-            c = workload_occ.get(q)
+        for q in QUEUE_NAMES:
+            c = queue_occ.get(q)
             if not c:
                 continue
             pool += c["total"]

@@ -610,17 +610,17 @@ def _sh_cache():
     )
 
 
-def test_workload_and_band_are_orthogonal():
+def test_queue_and_band_are_orthogonal():
     """profile 口径：工作负载归属 与 淘汰带 是两个正交维度。
 
     两个维度：
-      - workload：response 段属于 agentic（记账不能丢）；
+      - queue：response 段属于 agentic（记账不能丢）；
       - one-shot：**多轮**的 response 不是一次性内容 —— 它会成为下一轮
                   prompt 的前缀（对齐 HeterCache：按会话类型归队，没有
                   「decode 就先进 one-shot」这条规则）。
     只有单轮负载的生成段才是一次性的。
     """
-    print("[18] workload label vs eviction band must be orthogonal")
+    print("[18] queue attribution vs eviction band must be orthogonal")
     st = HeterCacheStrategy()
     # one-shot 判定看「会话类型 + 跨会话共享数」，因此节点需要会话证据。
     reg = SessionRegistry()
@@ -647,9 +647,9 @@ def test_workload_and_band_are_orthogonal():
     # 被 >= share_min 个外部会话命中过：跨会话模板，退出 one-shot 带
     shared.share_sessions = st.slru_evict.share_min
 
-    check(st.workload_of(prompt) == "agentic", "agentic prompt workload")
+    check(st._node_tag(prompt) is HeterCacheNodeTag.QAGENT, "agentic prompt tag")
     check(
-        st.workload_of(resp) == "agentic" and not st.is_one_shot(resp),
+        st._node_tag(resp) is HeterCacheNodeTag.QAGENT and not st.is_one_shot(resp),
         "多轮 agentic 的 response 应留在 agentic 队列，而不是 one-shot",
     )
     check(st.is_one_shot(rnd), "random request is one-shot")
@@ -661,13 +661,13 @@ def test_workload_and_band_are_orthogonal():
         not st.is_one_shot(shared),
         "STRUCT 前缀一旦被 >=share_min 个外部会话复用就不再是一次性内容",
     )
-    check(st.workload_of(rnd) == "random", "apps/mind2web must not fold into 'single'")
-    check(st.workload_of(code) == "struct", "codeparrot workload = struct")
+    check(st._node_tag(rnd) is HeterCacheNodeTag.QTRANS, "apps/mind2web must stay QTRANS")
+    check(st._node_tag(code) is HeterCacheNodeTag.QSTRUCT, "codeparrot tag = QSTRUCT")
 
 
-def test_workload_occ_accounting_adds_up():
-    """占用统计：每个 workload 的 total/one_shot 必须与插入量对得上。"""
-    print("[19] workload occupancy accounting must add up")
+def test_queue_occ_accounting_adds_up():
+    """占用统计：每个队列的 total/one_shot 必须与插入量对得上。"""
+    print("[19] queue occupancy accounting must add up")
     cache = _sh_cache()
 
     # one-shot 判定看会话类型 + 共享数，所以插入时要带 session_id 并预先登记类型
@@ -702,8 +702,8 @@ def test_workload_occ_accounting_adds_up():
     # 把 struct 前缀标记成「已被足够多外部会话复用」：它应退出 one-shot 带
     shared.share_sessions = cache.eviction_strategy.slru_evict.share_min
 
-    wl = cache._per_workload_token_count()
-    print(f"      workload={ {k:{kk:int(vv) for kk,vv in v.items()} for k,v in wl.items()} }")
+    wl = cache._per_queue_token_count()
+    print(f"      queue={ {k:{kk:int(vv) for kk,vv in v.items()} for k,v in wl.items()} }")
 
     ag = wl.get("agentic", {})
     check(ag.get("total") == 2000, f"agentic total={ag.get('total')}, expected 2000")
@@ -726,9 +726,9 @@ def test_workload_occ_accounting_adds_up():
     check(tot_os == 100, f"one_shot={tot_os}, expected 100 (只有 random 整行)")
 
 
-def test_record_hit_uses_workload_label():
-    """命中记账按 workload 归因到 HeterProfiler，且每请求只记一次。"""
-    print("[20] record_hit: profile 按 workload 记账")
+def test_record_hit_uses_queue_name():
+    """命中记账按队列归因到 HeterProfiler，且每请求只记一次。"""
+    print("[20] record_hit: profile 按队列记账")
     st = HeterCacheStrategy()
     req = SimpleNamespace(rid="r1", session_id="apps_123", extra_key=None)
     node = _mk_node(32, 0, tag=HeterCacheNodeTag.QTRANS)
@@ -741,14 +741,14 @@ def test_record_hit_uses_workload_label():
 
 
 def test_record_evict_one_shot_scalar():
-    """淘汰记账：workload 一本账 + one-shot 一个标量（decode 带可推导）。"""
-    print("[21] record_evict: workload 账本 + one-shot 标量")
+    """淘汰记账：队列一本账 + one-shot 一个标量（decode 带可推导）。"""
+    print("[21] record_evict: 队列账本 + one-shot 标量")
     st = HeterCacheStrategy()
     resp = _mk_node(64, 32, tag=HeterCacheNodeTag.QAGENT)
     resp.is_decode = True
     st.record_evict(resp)
     check(st._total_evicted_tokens.get("agentic") == 64,
-          f"workload 记账={st._total_evicted_tokens}, expected agentic=64")
+          f"队列记账={st._total_evicted_tokens}, expected agentic=64")
     check(st._total_evicted_one_shot == 0,
           f"多轮 response 不算 one-shot，实际={st._total_evicted_one_shot}")
 
@@ -768,7 +768,7 @@ def test_multiturn_decode_is_not_one_shot():
     导致「上一轮结束 → 下一轮开始」的窗口里被优先驱逐。
     只有单轮负载的生成段（以及随机单轮）才是一次性内容。
     """
-    print("[22] multi-turn decode stays in its workload queue")
+    print("[22] multi-turn decode stays in its queue")
     strat = HeterCacheStrategy()
 
     def node(tt, dec):
@@ -785,9 +785,9 @@ def test_multiturn_decode_is_not_one_shot():
     ]
     for tt, dec, want_q, want_os in cases:
         n = node(tt, dec)
-        got_q, got_os = strat.workload_of(n), strat.is_one_shot(n)
+        got_q, got_os = strat._node_tag(n).queue_name, strat.is_one_shot(n)
         print(f"      {tt.value:<18} is_decode={dec!s:<5} -> {got_q:<12} one_shot={got_os}")
-        check(got_q == want_q, f"{tt.value} decode={dec}: workload={got_q}, expected {want_q}")
+        check(got_q == want_q, f"{tt.value} decode={dec}: queue={got_q}, expected {want_q}")
         check(got_os == want_os, f"{tt.value} decode={dec}: one_shot={got_os}, expected {want_os}")
 
 
@@ -834,10 +834,10 @@ def test_decode_band_end_to_end():
             cache.eviction_strategy.is_one_shot(n) == want_os,
             f"{label}: strategy/radix disagreement on one_shot",
         )
-        counts = cache._per_workload_token_count()
+        counts = cache._per_queue_token_count()
         rec = counts.get(label, {"total": 0.0, "one_shot": 0.0})
         want_os_tokens = 50.0 if want_os else 0.0
-        check(rec["total"] == 100.0, f"{label}: workload total={rec['total']}, expected 100")
+        check(rec["total"] == 100.0, f"{label}: queue total={rec['total']}, expected 100")
         check(
             rec["one_shot"] == want_os_tokens,
             f"{label}: one_shot tokens={rec['one_shot']}, expected {want_os_tokens}",
@@ -859,9 +859,9 @@ def main():
         test_one_shot_order_by_tree_offset,
         test_one_shot_chain_stops_at_branch_and_lock,
         test_single_score_is_time_invariant,
-        test_workload_and_band_are_orthogonal,
-        test_workload_occ_accounting_adds_up,
-        test_record_hit_uses_workload_label,
+        test_queue_and_band_are_orthogonal,
+        test_queue_occ_accounting_adds_up,
+        test_record_hit_uses_queue_name,
         test_record_evict_one_shot_scalar,
         test_multiturn_decode_is_not_one_shot,
         test_decode_band_end_to_end,

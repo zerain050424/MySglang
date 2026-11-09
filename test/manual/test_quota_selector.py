@@ -294,7 +294,7 @@ def test_accounting_insert_and_evict():
 def test_random_is_never_counted():
     """random 不参与配额：无会话证据的 QTRANS 节点（is_one_shot=False）也不能进账。
 
-    这类节点 wkey="random"，不在 QUOTA_QUEUES 里；漏掉白名单就会在
+    这类节点 queue_name="random"，不在 QUOTA_QUEUES 里；漏掉白名单就会在
     record_evict 扣减时打到不存在的键上（KeyError）。
     """
     print("[14b] accounting: random-classified nodes never enter the quota ledger")
@@ -303,7 +303,7 @@ def test_random_is_never_counted():
     rnd.queue_tag = hu.HeterCacheNodeTag.QTRANS
     check(st.is_one_shot(rnd) is False,
           "precondition: a session-less QTRANS node is not judged one-shot")
-    check(st.workload_of(rnd) == "random", f"workload={st.workload_of(rnd)}, want random")
+    check(st._node_tag(rnd) is hu.HeterCacheNodeTag.QTRANS, "tag must stay QTRANS")
     st.record_insert(rnd)
     st.record_evict(rnd)
     check(all(v == 0.0 for v in st._occ.values()),
