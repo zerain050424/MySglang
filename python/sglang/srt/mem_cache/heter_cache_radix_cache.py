@@ -76,9 +76,11 @@ class HeterCacheRadixCache(RadixCache):
 
     def _pick_victim(self, leaves, capacity: float):
         """转发至 quota_selector 纯策略决策器。"""
+        strategy = self.eviction_strategy
         return quota_selector.pick_victim(
-            strategy=self.eviction_strategy,
+            strategy=strategy,
             leaves=leaves,
+            occ=strategy.occupancy.occ,
             capacity=capacity,
             page_size=self.page_size,
         )

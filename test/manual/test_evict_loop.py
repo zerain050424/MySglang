@@ -216,6 +216,7 @@ def _per_queue_token_count(self):
 def _bootstrap():
     _install_stubs()
     _load("sglang.srt.mem_cache.heter_utils", "sglang/srt/mem_cache/heter_utils.py")
+    _load("sglang.srt.mem_cache.queue_occupancy", "sglang/srt/mem_cache/queue_occupancy.py")
     # evict_policy 现在直接依赖 quota_selector 与 heter_logging（观测门面）：
     # 这两者必须先于它装载，否则包路径被 stub 掉后无法按名解析。
     _load("sglang.srt.mem_cache.quota_selector", "sglang/srt/mem_cache/quota_selector.py")

@@ -37,6 +37,7 @@ from sglang.srt.mem_cache.heter_utils import (
     QuotaParams,
     HeterCacheNodeTag,
 )
+from sglang.srt.mem_cache.queue_occupancy import QueueOccupancyTracker
 from sglang.srt.mem_cache.victim_override import (
     RrEvictPolicy,
     SlruEvictPolicy,
@@ -208,9 +209,9 @@ class HeterCacheStrategy(EvictionStrategy):
 
         self._last_profile = time.monotonic()
         self._last_reconcile = 0.0
-        self._capacity = 0.0
-        # 各队列实时可调度占用（排除 one-shot，包含 locked）
-        self._occ: dict = {q: 0.0 for q in QUOTA_QUEUES}
+        # 配额账本：唯一写入口在缓存层（record_insert / record_evict），
+        # 策略只读它的 occ 做仲裁。
+        self.occupancy = QueueOccupancyTracker()
         # 兜底淘汰:采样独立 RNG，保证实验结果在相同 seed 下可复现
         self._quota_rng = random.Random(self.quota.seed)
         # Chunked prefill 请求去重队列，避免同一请求多次命中导致指标虚高
@@ -238,14 +239,30 @@ class HeterCacheStrategy(EvictionStrategy):
         self.profiler.reset()
         self._seen_rids.clear()
         self._rid_order.clear()
-        for q in QUOTA_QUEUES:
-            self._occ[q] = 0.0
+        self.occupancy.reset()
 
     def _node_tag(self, node) -> HeterCacheNodeTag:
         """节点的生效标签（已收敛枚举）。force_agentic 开启时统一按 agentic 算。"""
         if self.force_agentic:
             return HeterCacheNodeTag.QAGENT
         return HeterCacheNodeTag.coerce(getattr(node, "queue_tag", None))
+
+    def get_priority(self, node: TreeNode) -> Tuple[int, float, float]:
+        """HeterCache 没有单节点全局排序，调用方应走配额裁决。
+
+        ``EvictionStrategy`` 把 ``get_priority`` 定为抽象方法，必须有实现才能
+        实例化；但配额仲裁是按队列与目标占用的水填充分配，不是按节点打分，
+        这里直接报错而不是退回某个默认序。
+
+        Raises:
+            NotImplementedError: 总是抛出。HeterCache 必须搭配 HeterCacheRadixCache
+                使用（它走 ``quota_selector.pick_victim``）；挂到其它树上时
+                registry 的守卫会在启动期拦住。
+        """
+        raise NotImplementedError(
+            "HeterCacheStrategy has no single-node ordering; "
+            "use quota arbitration (quota_selector.pick_victim) instead"
+        )
 
     def is_one_shot(self, node) -> bool:
         """判定节点是否属于 One-shot 带。
@@ -286,8 +303,8 @@ class HeterCacheStrategy(EvictionStrategy):
         queue = tag.queue_name
         one_shot = self.is_one_shot(node)
         # 仅维护启用了配额且非 one-shot 的三队列占用
-        if not one_shot and queue in QUOTA_QUEUES:
-            self._occ[queue] = max(0.0, self._occ[queue] - tokens)
+        if not one_shot:
+            self.occupancy.evict(queue, tokens)
         self.telemetry.on_evict(
             node_id=id(node), tag=tag, tokens=tokens, one_shot=one_shot
         )
@@ -312,22 +329,23 @@ class HeterCacheStrategy(EvictionStrategy):
         return now - self._last_reconcile >= self._reconcile_interval(available, capacity)
 
 
-    def reconcile_occupancy(self, queue_occ: dict, capacity: float) -> None:
-        """通过全树快照校准 _occ，吸收运行时标签变更、one-shot 晋升等增量漂移。"""
-        for q in QUOTA_QUEUES:
-            rec = queue_occ.get(q) or {}
-            self._occ[q] = max(0.0, float(rec.get("total", 0.0)) - float(rec.get("one_shot", 0.0)))
-        self._capacity = max(float(capacity), 0.0)
-        self._last_reconcile = time.monotonic()
-
     def record_insert(self, node) -> None:
         """新节点挂载时增量计入配额（仅在节点创建时调用，节点分裂时不触发）。"""
         if self.is_one_shot(node):
             return
-        queue = self._node_tag(node).queue_name
-        if queue not in QUOTA_QUEUES:
-            return
-        self._occ[queue] += _node_num_tokens(node)
+        self.occupancy.insert(self._node_tag(node).queue_name, _node_num_tokens(node))
+
+    @property
+    def needs_capacity(self) -> bool:
+        """告诉缓存层：每次淘汰都必须注入 allocator 容量。
+
+        这不是开关，是驱动层的探测信号：``RadixCache`` 用
+        ``getattr(strategy, "needs_capacity", False)`` 决定要不要读
+        ``available_size()/size``。没有这个属性，capacity 恒为 0，
+        ``effective_targets`` 会把所有 target 算成 0，配额退化成
+        “每个队列都超上限”。
+        """
+        return True
 
     def observe_occupancy(
         self,
@@ -340,7 +358,8 @@ class HeterCacheStrategy(EvictionStrategy):
         """全树快照聚合入口，统一触发配额校准与 profile 监控打印。"""
         now = time.monotonic()
         if now - self._last_reconcile >= self._reconcile_interval(available, capacity):
-            self.reconcile_occupancy(queue_occ, capacity)
+            self.occupancy.reconcile(queue_occ, capacity)
+            self._last_reconcile = now
         if now - self._last_profile < self.PROFILE_INTERVAL:
             return
         self._last_profile = now
@@ -349,27 +368,33 @@ class HeterCacheStrategy(EvictionStrategy):
             session_summary,
             slru_policy=self.slru_evict,
             mt_policy=self.mt_evict,
-            quota_occ=self._occ,
-            quota_targets=self.quota_targets(self._capacity),
-            quota_caps=queue_capacities(self.quota, self._capacity),
+            quota_occ=self.occupancy.occ,
+            quota_targets=self.quota_targets(self.occupancy.occ, self.occupancy.capacity),
+            quota_caps=queue_capacities(self.quota, self.occupancy.capacity),
         )
         heterlog.info("Profile", f"[HeterCache profile]\n{_profile}")
 
     # ---- 跨队列配额 ----
 
-    def quota_ranking(self, capacity: float, page_size: int) -> list:
-        """获取当前淘汰候选队列的优先级序列。"""
-        targets = effective_targets(self._occ, capacity, self.quota)
+    def quota_ranking(self, occ: dict, capacity: float, page_size: int) -> list:
+        """当前淘汰候选队列的优先级序列。
+
+        Args:
+            occ: 配额口径的各队列占用（来自 QueueOccupancyTracker）。
+            capacity: 池容量（Token）。
+            page_size: 内存页大小，用于推算单次最小减持量。
+        """
+        targets = effective_targets(occ, capacity, self.quota)
         chunk = resolve_chunk(page_size, self.quota)
         return queue_ranking(
-            self._occ, targets, self.quota, chunk=float(chunk), capacity=capacity
+            occ, targets, self.quota, chunk=float(chunk), capacity=capacity
         )
 
-    def quota_targets(self, capacity: float) -> dict:
-        """获取各队列的目标 Token 配额（仅观测用途）。"""
-        return effective_targets(self._occ, capacity, self.quota)
+    def quota_targets(self, occ: dict, capacity: float) -> dict:
+        """各队列的目标 Token 配额（仅观测用途）。"""
+        return effective_targets(occ, capacity, self.quota)
 
-    def quota_victim(self, queue: str, leaves, capacity: float):
+    def quota_victim(self, queue: str, leaves, occ: dict, capacity: float):
         """在指定队列内挑选淘汰节点。若无合适候选返回 None（触发上层跳队）。"""
         target = HeterCacheNodeTag.from_queue(queue)
         if target is None:
@@ -387,7 +412,9 @@ class HeterCacheStrategy(EvictionStrategy):
         if queue == "agentic" and self.rr_evict is not None:
             # RR 轮询调度，受配额超额缺口上限约束
             picked = self.rr_evict.pick(
-                pool, self.session_registry, max_deficit=self._quota_gap("agentic", capacity)
+                pool,
+                self.session_registry,
+                max_deficit=self._quota_gap("agentic", occ, capacity),
             )
             if picked is not None:
                 return picked
@@ -397,12 +424,12 @@ class HeterCacheStrategy(EvictionStrategy):
                 return picked
         return None
 
-    def _quota_gap(self, queue: str, capacity: float):
+    def _quota_gap(self, queue: str, occ: dict, capacity: float):
         """计算队列超出有效配额的 Token 数；未超限时返回 None。"""
         if capacity <= 0:
             return None
-        target = effective_targets(self._occ, capacity, self.quota)[queue]
-        gap = self._occ[queue] - target
+        target = effective_targets(occ, capacity, self.quota)[queue]
+        gap = occ[queue] - target
         return gap if gap > 0 else None
 
     def quota_fallback(self, leaves):

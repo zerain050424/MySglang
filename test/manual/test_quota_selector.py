@@ -37,6 +37,8 @@ for _pkg in ("sglang", "sglang.srt", "sglang.srt.mem_cache"):
     _stub_package(_pkg)
 
 hu = _load("sglang.srt.mem_cache.heter_utils", os.path.join(_CACHE_DIR, "heter_utils.py"))
+# 配额账本已独立成模块，evict_policy 直接依赖它
+_load("sglang.srt.mem_cache.queue_occupancy", os.path.join(_CACHE_DIR, "queue_occupancy.py"))
 qs = _load("sglang.srt.mem_cache.quota_selector", os.path.join(_CACHE_DIR, "quota_selector.py"))
 vo = _load("sglang.srt.mem_cache.victim_override", os.path.join(_CACHE_DIR, "victim_override.py"))
 _load("sglang.srt.mem_cache.heter_logging", os.path.join(_CACHE_DIR, "heter_logging.py"))
@@ -271,24 +273,24 @@ def test_accounting_insert_and_evict():
     st = _strategy()
     st.record_insert(_leaf(TAG["agentic"], 100))
     st.record_insert(_leaf(TAG["struct"], 40))
-    check(st._occ["agentic"] == 100, f"agentic={st._occ['agentic']}, want 100")
-    check(st._occ["struct"] == 40, f"struct={st._occ['struct']}, want 40")
+    check(st.occupancy.occ["agentic"] == 100, f"agentic={st.occupancy.occ['agentic']}, want 100")
+    check(st.occupancy.occ["struct"] == 40, f"struct={st.occupancy.occ['struct']}, want 40")
 
     st.record_evict(_leaf(TAG["agentic"], 30))
-    check(st._occ["agentic"] == 70, f"after evict agentic={st._occ['agentic']}, want 70")
+    check(st.occupancy.occ["agentic"] == 70, f"after evict agentic={st.occupancy.occ['agentic']}, want 70")
 
     # TRANS 会话 + share < share_min -> one-shot，插入与淘汰两侧都不进账
     trans = _leaf(TAG["struct"], 50, session_id="t1")
     st.session_registry.touch("t1", "r1", prompt_len=50)
     st.session_registry.get("t1").session_type = hu.SessionType.TRANS
     check(st.is_one_shot(trans), "precondition: a TRANS node with share 0 is one-shot")
-    before = st._occ["struct"]
+    before = st.occupancy.occ["struct"]
     st.record_insert(trans)
-    check(st._occ["struct"] == before,
-          f"one-shot insert must not be counted, {before} -> {st._occ['struct']}")
+    check(st.occupancy.occ["struct"] == before,
+          f"one-shot insert must not be counted, {before} -> {st.occupancy.occ['struct']}")
     st.record_evict(trans)
-    check(st._occ["struct"] == before,
-          f"one-shot evict must not be counted, {before} -> {st._occ['struct']}")
+    check(st.occupancy.occ["struct"] == before,
+          f"one-shot evict must not be counted, {before} -> {st.occupancy.occ['struct']}")
 
 
 def test_random_is_never_counted():
@@ -306,8 +308,8 @@ def test_random_is_never_counted():
     check(st._node_tag(rnd) is hu.HeterCacheNodeTag.QTRANS, "tag must stay QTRANS")
     st.record_insert(rnd)
     st.record_evict(rnd)
-    check(all(v == 0.0 for v in st._occ.values()),
-          f"random must not touch any quota queue, got {st._occ}")
+    check(all(v == 0.0 for v in st.occupancy.occ.values()),
+          f"random must not touch any quota queue, got {st.occupancy.occ}")
 
 
 def test_accounting_cascade_decrements_each_node():
@@ -316,14 +318,14 @@ def test_accounting_cascade_decrements_each_node():
     st = _strategy()
     for n in (40, 60, 100):
         st.record_insert(_leaf(TAG["chat"], n))
-    check(st._occ["chat"] == 200, f"chat={st._occ['chat']}, want 200")
+    check(st.occupancy.occ["chat"] == 200, f"chat={st.occupancy.occ['chat']}, want 200")
     # 模拟一次 victim + 两个祖先的级联删除
     for n in (100, 60):
         st.record_evict(_leaf(TAG["chat"], n))
-    check(st._occ["chat"] == 40, f"chat={st._occ['chat']}, want 40")
+    check(st.occupancy.occ["chat"] == 40, f"chat={st.occupancy.occ['chat']}, want 40")
     # 扣不穿地板
     st.record_evict(_leaf(TAG["chat"], 999))
-    check(st._occ["chat"] == 0.0, f"occ must clamp at 0, got {st._occ['chat']}")
+    check(st.occupancy.occ["chat"] == 0.0, f"occ must clamp at 0, got {st.occupancy.occ['chat']}")
 
 
 def test_snapshot_heals_drift():
@@ -332,34 +334,34 @@ def test_snapshot_heals_drift():
     st = _strategy()
     st.record_insert(_leaf(TAG["agentic"], 500))
     # 人为打偏（等价于改标签 + 漏记）
-    st._occ["agentic"] += 300
-    st._occ["struct"] -= 120
+    st.occupancy.occ["agentic"] += 300
+    st.occupancy.occ["struct"] -= 120
     truth = {
         "struct": {"total": 400, "one_shot": 100},
         "agentic": {"total": 600, "one_shot": 0},
         "chat": {"total": 200, "one_shot": 200},
         "random": {"total": 90, "one_shot": 90},
     }
-    st.reconcile_occupancy(truth, capacity=1000)
-    check(st._occ["struct"] == 300, f"struct={st._occ['struct']}, want 300 (total-one_shot)")
-    check(st._occ["agentic"] == 600, f"agentic={st._occ['agentic']}, want 600")
-    check(st._occ["chat"] == 0, f"chat={st._occ['chat']}, want 0 (整行 one-shot)")
-    check(st._capacity == 1000, f"capacity={st._capacity}, want 1000")
+    st.occupancy.reconcile(truth, capacity=1000)
+    check(st.occupancy.occ["struct"] == 300, f"struct={st.occupancy.occ['struct']}, want 300 (total-one_shot)")
+    check(st.occupancy.occ["agentic"] == 600, f"agentic={st.occupancy.occ['agentic']}, want 600")
+    check(st.occupancy.occ["chat"] == 0, f"chat={st.occupancy.occ['chat']}, want 0 (整行 one-shot)")
+    check(st.occupancy.capacity == 1000, f"capacity={st.occupancy.capacity}, want 1000")
 
 
 def test_quota_gap_gate():
     """配额缺口：超配额才给 RR 上限，弹性区不限制。"""
     print("[16] quota gap is only defined when the queue is over its target")
     st = _strategy()
-    st.reconcile_occupancy({"struct": {"total": 0, "one_shot": 0},
+    st.occupancy.reconcile({"struct": {"total": 0, "one_shot": 0},
                             "agentic": {"total": 600, "one_shot": 0},
                             "chat": {"total": 0, "one_shot": 0}}, capacity=1000)
-    check(abs(st._quota_gap("agentic", 1000) - 100) < 1e-6,
-          f"gap={st._quota_gap('agentic', 1000)}, want 100 (600-500)")
-    st.reconcile_occupancy({"struct": {"total": 0, "one_shot": 0},
+    check(abs(st._quota_gap("agentic", st.occupancy.occ, 1000) - 100) < 1e-6,
+          f"gap={st._quota_gap('agentic', st.occupancy.occ, 1000)}, want 100 (600-500)")
+    st.occupancy.reconcile({"struct": {"total": 0, "one_shot": 0},
                             "agentic": {"total": 300, "one_shot": 0},
                             "chat": {"total": 0, "one_shot": 0}}, capacity=1000)
-    check(st._quota_gap("agentic", 1000) is None,
+    check(st._quota_gap("agentic", st.occupancy.occ, 1000) is None,
           "under-target queue must not constrain RR")
 
 
@@ -367,7 +369,7 @@ def test_stage0_one_shot_preempts_quota():
     """组合顺序：one-shot 带永远先清空，即使配额点名了别的队列。"""
     print("[17] stage 0: one-shot drains first even when quota names a queue")
     st = _strategy()
-    st.reconcile_occupancy({"struct": {"total": 900, "one_shot": 0},
+    st.occupancy.reconcile({"struct": {"total": 900, "one_shot": 0},
                             "agentic": {"total": 0, "one_shot": 0},
                             "chat": {"total": 0, "one_shot": 0}}, capacity=1000)
     # struct 严重超配额；但同时存在一个 one-shot 叶子
@@ -377,32 +379,34 @@ def test_stage0_one_shot_preempts_quota():
     st.session_registry.get("s1").session_type = hu.SessionType.TRANS
     check(st.is_one_shot(one), "precondition: TRANS node is one-shot")
     victim, source = qs.pick_victim(
-        strategy=st, leaves=[struct_node, one], capacity=1000, page_size=1)
+        strategy=st, leaves=[struct_node, one], occ=st.occupancy.occ,
+        capacity=1000, page_size=1)
     check(victim is one and source == "one_shot",
           f"one-shot must win, got source={source}")
-    check("struct" in st.quota_ranking(1000, 1), "precondition: struct is over cap")
+    check("struct" in st.quota_ranking(st.occupancy.occ, 1000, 1), "precondition: struct is over cap")
 
 
 def test_stage1_quota_labels_and_skip():
     """组合顺序：点名队列出 victim 时标 quota:<queue>；无候选则跳队。"""
     print("[18] stage 1: quota names a queue, skips empty ones")
     st = _strategy()
-    st.reconcile_occupancy({"struct": {"total": 900, "one_shot": 0},
+    st.occupancy.reconcile({"struct": {"total": 900, "one_shot": 0},
                             "agentic": {"total": 600, "one_shot": 0},
                             "chat": {"total": 0, "one_shot": 0}}, capacity=1000)
-    rank = st.quota_ranking(1000, 1)
+    rank = st.quota_ranking(st.occupancy.occ, 1000, 1)
     check(rank[0] == "struct", f"struct overshoots most (900-200), got {rank}")
 
     # 第一名 struct 无候选（一个 struct 叶子都没给）-> 应跳到 agentic
     agentic_node = _leaf(TAG["agentic"], 100, ts=1.0)
     victim, source = qs.pick_victim(
-        strategy=st, leaves=[agentic_node], capacity=1000, page_size=1)
+        strategy=st, leaves=[agentic_node], occ=st.occupancy.occ,
+        capacity=1000, page_size=1)
     check(victim is agentic_node and source == "quota:agentic",
           f"must skip the empty struct queue, got {source}")
 
     # 所有队列都没候选 -> 兜底，不 busy-loop
     victim, source = qs.pick_victim(
-        strategy=st, leaves=[], capacity=1000, page_size=1)
+        strategy=st, leaves=[], occ=st.occupancy.occ, capacity=1000, page_size=1)
     check(victim is None and source is None,
           f"empty leaves must yield (None, None), got {(victim, source)}")
 
@@ -423,13 +427,13 @@ def test_stage1_fallback_is_seeded_random():
                    "reservations": {"struct": 0.2, "agentic": 0.5, "chat": 0.3},
                    "seed": seed}
         )
-        st.reconcile_occupancy({"struct": {"total": 100, "one_shot": 0},
+        st.occupancy.reconcile({"struct": {"total": 100, "one_shot": 0},
                                 "agentic": {"total": 100, "one_shot": 0},
                                 "chat": {"total": 100, "one_shot": 0}}, capacity=1000)
         picks = []
         for _ in range(6):
             victim, source = qs.pick_victim(
-                strategy=st, leaves=leaves, capacity=1000, page_size=1)
+                strategy=st, leaves=leaves, occ=st.occupancy.occ, capacity=1000, page_size=1)
             picks.append((index[id(victim)], source))
         return picks
 

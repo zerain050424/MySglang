@@ -34,7 +34,7 @@ def effective_targets(
     会导致常规配额保护退化为过激的深度逐出。
 
     Args:
-        occ: 各队列的可调度占用量（Token）。统计口径与 HeterCacheStrategy._occ 一致
+        occ: 各队列的可调度占用量（Token）。统计口径与 QueueOccupancyTracker 一致
             （排除 one-shot，包含 locked）。
         capacity: 缓存池总容量（Token），取自 token_to_kv_pool_allocator.size。
         params: 配额参数，内部将 caps（上限比例）和 reservations（保底比例）换算为 Token。
@@ -175,6 +175,7 @@ def pick_victim(
     *,
     strategy,
     leaves,
+    occ: dict,
     capacity: float,
     page_size: int,
 ):
@@ -190,8 +191,9 @@ def pick_victim(
     没有“未开配额”的降级路径：配额必填，候选只能由队列仲裁产生。
 
     Args:
-        strategy: HeterCacheStrategy 策略实例，提供状态与判决接口。
+        strategy: HeterCacheStrategy 策略实例，提供判决接口。
         leaves: 当前可驱逐的叶子节点集合。
+        occ: 配额口径的各队列占用（来自 QueueOccupancyTracker，只读）。
         capacity: 缓存池总容量（Token），用于配额计算。
         page_size: 内存页大小，用于计算对齐粒度 chunk。
 
@@ -206,8 +208,8 @@ def pick_victim(
     if not leaves:
         return None, None
 
-    for queue in strategy.quota_ranking(capacity, page_size):
-        victim = strategy.quota_victim(queue, leaves, capacity)
+    for queue in strategy.quota_ranking(occ, capacity, page_size):
+        victim = strategy.quota_victim(queue, leaves, occ, capacity)
         if victim is not None:
             return victim, f"quota:{queue}"
     return strategy.quota_fallback(leaves), "quota:fallback"
