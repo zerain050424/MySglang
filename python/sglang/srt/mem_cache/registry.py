@@ -284,6 +284,19 @@ def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
                 "option that selected another tree cache for this model."
             )
 
+    if get_memory().radix_eviction_policy == "heter_cache":
+        from sglang.srt.mem_cache.heter_cache_radix_cache import HeterCacheRadixCache
+
+        # heter_cache 没有单节点优先级（get_priority 直接抛错）：它靠配额仲裁选受害者，
+        # 而配额仲裁只在 HeterCacheRadixCache 的 evict 里。挂到其它树上会在第一次淘汰时
+        # 才暴露，这里提前到启动期拦住。
+        if not isinstance(cache, HeterCacheRadixCache):
+            raise ValueError(
+                "--radix-eviction-policy heter_cache requires the HeterCache tree "
+                "cache (add --enable-heter-cache), but "
+                f"tree_cache is {type(cache).__name__}."
+            )
+
     hicache_attached = cache.cache_controller is not None
     streaming_wrapped = False
     if (

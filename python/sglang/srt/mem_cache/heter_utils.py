@@ -8,7 +8,7 @@
 
 命名约定：``HeterCacheNodeTag`` 是**节点级**标签（KV 片段出生时盖章），
 ``SessionType`` 是**会话级**分类（由分类器推得）。两者经常不一致，判定归属时
-必须明确用哪一个（见 ``is_one_shot`` 与 ``MultiTurnEvictPolicy.applies_to``）。
+必须明确用哪一个（见 ``is_one_shot`` 与 ``MultiTurnEvictPolicy.pick``）。
 
 进程级状态只有一处：``SessionRegistry.global_instance()``。它被所有 radix cache
 实例共享，因此 ``clear()`` 是全局语义（这正是 ``/flush_cache`` 需要的）。
@@ -89,11 +89,6 @@ class HeterCacheNodeTag(str, enum.Enum):
         （random 由 ``quota_ranking`` 滤掉），其余名字走 None 分支。
         """
         return _QUEUE_TO_TAG.get(name)
-
-    @property
-    def is_multi_turn(self) -> bool:
-        """是否属于多轮带：只有多轮才有“下一轮复用概率”可言。"""
-        return self in (HeterCacheNodeTag.QCHAT, HeterCacheNodeTag.QAGENT)
 
     @property
     def reuse_config(self) -> Optional[Tuple[float, float]]:
@@ -235,7 +230,7 @@ class RrParams:
 #
 # 语义：共享数 >= N 意味着共 N 个会话用过（创建者首次重读即计 1）。
 # 它同时决定两件事，两处必须同源，所以只允许配置一处：
-#   * SlruEvictPolicy.applies_to       : 是否受 SLRU 保护（进候选池）
+#   * SlruEvictPolicy.share_of         : 共享数，决定是否退出 one-shot 带
 #   * HeterCacheStrategy.is_one_shot : 是否退出 one-shot 带
 DEFAULT_SHARE_MIN = 2
 
@@ -305,6 +300,9 @@ QUOTA_QUEUES = ("struct", "agentic", "chat")
 class QuotaParams:
     """跨队列配额：下限 rho + 上限 k，中间是弹性区。
 
+    配额必填。没有“关掉配额”这个态了——早期的未配额降级路径（全局复用分）
+    已删除，`caps` 不给就直接报错，而不是静默退回一套不同语义的淘汰。
+
     配置形式：
         --radix-eviction-policy-config '{"quota": {
             "caps": {"struct": 0.2, "agentic": 0.5, "chat": 0.3},
@@ -323,14 +321,10 @@ class QuotaParams:
 
     def __post_init__(self):
         if not self.caps:
-            # 空 caps = 关闭配额（默认）。只校验标量，不要求三个队列。
-            self._validate_scalars()
-            if self.reservations:
-                raise ValueError(
-                    "quota.reservations requires quota.caps; got "
-                    f"{sorted(self.reservations)}."
-                )
-            return
+            raise ValueError(
+                "quota.caps is required: HeterCache now evicts only through "
+                f"quota arbitration; give all of {list(QUOTA_QUEUES)}."
+            )
 
         unknown = set(self.caps) - set(QUOTA_QUEUES)
         if unknown:
@@ -384,11 +378,6 @@ class QuotaParams:
             )
         if not isinstance(self.seed, int) or isinstance(self.seed, bool):
             raise ValueError(f"quota.seed must be int, got {self.seed!r}")
-
-    @property
-    def enabled(self) -> bool:
-        """未配置 caps 即关闭：此时淘汰行为与引入配额前完全一致。"""
-        return bool(self.caps)
 
     @classmethod
     def from_any(cls, value=None) -> "QuotaParams":

@@ -18,7 +18,7 @@ SLRU 的共享数账本（``SlruEvictPolicy.stats()``）、它实际给出的候
      "available":.., "evictable_size":.., "protected_size":..,
      "slru":{"slru_picks":..,"share_counted":..,"share_dedup":..},
      "slru_share_min":2,
-     "victim_src":{"one_shot":..,"qstruct":..,"global":..},
+     "victim_src":{"one_shot":..,"qstruct":..,"qchat":..},
      "profile":"..."}
 
 分析侧（``wtl.analyze``）用它画两件事：

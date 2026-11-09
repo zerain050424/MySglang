@@ -2,11 +2,11 @@
 
 为什么需要它
 ------------
-``HeterCacheStrategy`` 的复用分数（``_reuse_score``）用
-``time.monotonic()``。离线回放若用真实时钟，
-整条 trace 会在几秒内跑完，所有 ``elapsed`` 都≈0：
+队内策略（``MultiTurnEvictPolicy`` 的 1 - CDF(elapsed)、``SlruEvictPolicy`` 的
+段内 LRU）都用 ``time.monotonic()``。离线回放若用真实时钟，整条 trace 会在几秒
+内跑完，所有 ``elapsed`` 都≈0：
 
-* ``reuse_prob = 1 - lognorm_cdf(elapsed)`` 全部≈1，队列间不再有区分度。
+* ``CDF(elapsed)`` 全部≈0，多轮带内的排序退化为无区分。
 
 于是回放退化成「按 token 数量比大小」，与真机行为无关。
 本模块把 sglang 这几个模块内的 ``time`` 换成一个由 trace 时间戳驱动的替身，
@@ -21,8 +21,9 @@
     sglang.srt.mem_cache.victim_override
     sglang.srt.mem_cache.heter_utils
 
-SLRU 的共享数账本不读时间（只读命中会话），故不在此列；
-它的 `pick()` 读 `time.monotonic()`，因此本模块必须覆盖 `victim_override`。
+SLRU 的共享数账本不读时间（只读命中会话），但它的 ``pick()`` 与 MT 的权重都读
+`time.monotonic()`，因此本模块必须覆盖 `victim_override`；`evict_policy` 则因为
+配额校准与承压窗口判断也读时钟，同样需要覆盖。
 """
 
 from __future__ import annotations

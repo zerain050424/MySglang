@@ -43,10 +43,6 @@ def effective_targets(
         各队列的有效配额字典 {queue: target}，键恒包含全部 QUOTA_QUEUES。
         当所有队列均触及上限时，sum(target) < capacity，剩余未分配容量属于正常空闲。
 
-    Raises:
-        ValueError: 配额未启用（caps 为空）。调用方必须在外层先判断 params.enabled，
-            此处抛出异常以防静默返回 0 掩盖上游调用链异常。
-
     充水分配规则：
       1. 保护未触底队列：当前占用未达到保底预留（reservation）的队列，维持其实际占用，
          不削减也不参与剩余容量的再分配；
@@ -55,12 +51,6 @@ def effective_targets(
       3. 极端欠载处理：当 Locked Token 过多导致计算出的剩余容量为负时，仍按比例缩减，
          允许 target 算得低于保底线。此状态视为全局不可释放信号，由上层调度降级处理。
     """
-    if not params.enabled:
-        raise ValueError(
-            "effective_targets needs quota.caps; QuotaParams.enabled is False "
-            "(the strategy must skip the selector entirely when quota is off)."
-        )
-
     total_capacity = max(float(capacity), 0.0)
     if total_capacity <= 0.0:
         return {q: 0.0 for q in QUOTA_QUEUES}
@@ -187,30 +177,27 @@ def pick_victim(
     leaves,
     capacity: float,
     page_size: int,
-    overrides,
-    session_registry,
 ):
-    """三级阶梯淘汰决策主入口（仅执行裁决，不产生实际内存释放或树结构修改）。
+    """两级淘汰决策主入口（仅执行裁决，不产生实际内存释放或树结构修改）。
 
     执行阶段：
-      - Stage 0（无复用价值清理）：One-shot 临时节点由于无跨请求复用收益，优先走内部分段 LRU
-        无条件淘汰，不计入配额开销；
-      - Stage 1（配额仲裁淘汰）：配额启用时，按 queue_ranking 优先级逐队寻找淘汰候选。
-        若某队列节点全被锁定、均为 One-shot 或未命中，则回退遍历下一队列；
-        若均无候选，采用策略私有伪随机策略兜底，确保淘汰指针单调步进；
-      - Stage 2（未启用配额降级）：未开启配额时退化为原有基准路径（全局 victim_key + 改写器链）。
+      - Stage 0（无复用价值清理）：One-shot 临时节点没有跨请求复用收益，走内部
+        分段 LRU 无条件淘汰，不计入配额开销；
+      - Stage 1（配额仲裁）：按 queue_ranking 的优先级逐队找候选；某队列全被锁定、
+        均为 one-shot 或队内策略弃权就跳下一队；所有队列都无候选时用策略私有
+        伪随机兜底，保证淘汰指针单调步进。
+
+    没有“未开配额”的降级路径：配额必填，候选只能由队列仲裁产生。
 
     Args:
         strategy: HeterCacheStrategy 策略实例，提供状态与判决接口。
         leaves: 当前可驱逐的叶子节点集合。
         capacity: 缓存池总容量（Token），用于配额计算。
         page_size: 内存页大小，用于计算对齐粒度 chunk。
-        overrides: 策略改写器链（RR / SLRU / MT 等），仅在 Stage 2 生效。
-        session_registry: 会话状态账本，供改写器评估会话级开销。
 
     Returns:
         二元组 (victim, source)。source 标识决策来源，记录于监控打点：
-        "one_shot" / "quota:<queue>" / "quota:fallback" / "global"。
+        "one_shot" / "quota:<queue>" / "quota:fallback"。
         无候选可淘汰时返回 (None, None)，驱动上层结束回收循环。
     """
     one_shot = [n for n in leaves if strategy.is_one_shot(n)]
@@ -219,26 +206,11 @@ def pick_victim(
     if not leaves:
         return None, None
 
-    if strategy.quota.enabled:
-        for queue in strategy.quota_ranking(capacity, page_size):
-            victim = strategy.quota_victim(queue, leaves, capacity)
-            if victim is not None:
-                return victim, f"quota:{queue}"
-        return strategy.quota_fallback(leaves), "quota:fallback"
-
-    victim = min(leaves, key=strategy.victim_key)
-    source = "global"
-    for override in overrides:
-        if override.applies_to(victim):
-            alt = override.pick(leaves, session_registry)
-            if alt is not None:
-                victim = alt
-                source = (
-                    override.queue.value
-                    if override.queue is not None
-                    else override.name
-                )
-    return victim, source
+    for queue in strategy.quota_ranking(capacity, page_size):
+        victim = strategy.quota_victim(queue, leaves, capacity)
+        if victim is not None:
+            return victim, f"quota:{queue}"
+    return strategy.quota_fallback(leaves), "quota:fallback"
 
 
 def struct_tier(node, share_of, share_min: int) -> Tuple[int, float]:

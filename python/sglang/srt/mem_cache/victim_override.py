@@ -1,21 +1,18 @@
-"""HeterCache 的候选改写器插件（VictimOverride）。
+"""HeterCache 的队内候选策略（VictimOverride）。
 
-从 ``HeterCacheStrategy`` 里解耦出来的"重选候选"能力：全局先用 ``victim_key``
-选出一个基础候选，再按注册顺序询问改写器，后者可基于自己的状态（会话配额、
-分段水位、生存概率）把候选改写成别的叶子。
+配额层先按队列把叶子筛成 ``pool``，再交给该队列的队内策略决出具体牺牲节点。
+早期版本是"全局 ``victim_key`` 先选一个基础候选，再问改写器要不要改写"，
+全局复用分删除后这条链已不存在，改写器变成了真正意义上的**队内选点者**：
 
-接口：
-
-* ``applies_to(node) -> bool``：当前候选是否在本改写器管辖范围内；
-* ``pick(leaves, registry) -> Optional[TreeNode]``：在本范围内重选，返回
-  ``None`` 表示弃权。
+* ``pick(leaves, registry) -> Optional[TreeNode]``：在给定池内选点，返回
+  ``None`` 表示弃权（调用方跳下一个队列）。
 
 四条硬约束（违反任何一条都会让淘汰循环出错）：
 
 1. **只挑不删**：改写器不得释放 KV / 改树，副作用统一由缓存层 ``_evict_one``
    执行，否则同一节点会被二次释放。
-2. **必可回退**：返回 ``None`` 时调用方保留原候选；改写器也不许抛错阻塞淘汰
-   推进（会导致 evict 自旋）。
+2. **必可弃权**：返回 ``None`` 表示本队列无候选，调用方跳下一个队列；改写器
+   也不许抛错阻塞淘汰推进（会导致 evict 自旋）。
 3. **候选集封闭**：只能在传入的 ``leaves`` 内重选，不得构造新节点。
 4. **观测与仲裁分离**：``queue`` 只用于 profile 归类，不参与仲裁；跨队列仲裁
    属于 ``quota_selector``。
@@ -56,15 +53,12 @@ _SLRU_META = weakref.WeakKeyDictionary()  # node -> [share_sessions, session_blo
 
 
 class VictimOverride(ABC):
-    """候选改写器的抽象基类：子类只要实现 ``applies_to`` / ``pick``。"""
+    """队内选点策略的抽象基类：子类只需实现 ``pick``。"""
 
     name: str = "override"
     # 本改写器管辖的队列；**仅**用于 profile 归类，不得参与仲裁判定。
     queue: Optional[HeterCacheNodeTag] = None
 
-    @abstractmethod
-    def applies_to(self, node) -> bool:
-        """判断候选是否计入本改写器的管辖范围。"""
 
     @abstractmethod
     def pick(self, leaves: Iterable["TreeNode"], registry) -> Optional["TreeNode"]:
@@ -128,14 +122,6 @@ class RrEvictPolicy(VictimOverride):
 
     # ---- 插件接口 ----
 
-    def applies_to(self, node) -> bool:
-        """只对 agentic 队列的叶子生效；关闭 ``fair_rr`` 时始终弃权。"""
-        if not self.params.fair_rr or node is None:
-            return False
-        return (
-            HeterCacheNodeTag.coerce(getattr(node, "queue_tag", None))
-            is HeterCacheNodeTag.QAGENT
-        )
 
     def pick(self, leaves, registry, *, max_deficit=None) -> Optional["TreeNode"]:
         """按会话轮询选一个 agentic 叶子；没有可动会话时返回 None。
@@ -152,7 +138,12 @@ class RrEvictPolicy(VictimOverride):
         """
         if not self.params.fair_rr:
             return None
-        agentic = [node for node in leaves if self.applies_to(node)]
+        agentic = [
+            node
+            for node in leaves
+            if HeterCacheNodeTag.coerce(getattr(node, "queue_tag", None))
+            is HeterCacheNodeTag.QAGENT
+        ]
         if not agentic:
             return None
         victim = self._pick_round_robin(agentic, registry, max_deficit=max_deficit)
@@ -227,7 +218,7 @@ class SlruEvictPolicy(VictimOverride):
 
 1. **账本**：维护每个节点被多少个不同的会话命中过（``share``）与一份 bloom 位图
    （用于同会话去重）。这台账本同时被两处读取——``HeterCacheStrategy.is_one_shot``
-   判 one-shot，和本类的 ``applies_to`` 判"是否受保护"，所以阈值只允许一个来源
+   判 one-shot，和 ``pick`` 判"是否受保护"，所以阈值只允许一个来源
    （``SlruParams.share_min``），否则两处口径会漂移。
 2. **选点**：在受保护的 struct 叶子中按访问时间做段内 LRU。
 
@@ -243,7 +234,7 @@ Args:
 
     def __init__(self, session_registry=None, share_min=None) -> None:
         # 与策略共用同一本会话账（由 HeterCacheStrategy 注入）：is_one_shot 与
-        # applies_to 必须看到同一份 session_type，否则"受保护"与"one-shot"会打架。
+        # pick 必须看到同一份 session_type，否则"受保护"与"one-shot"会打架。
         self.session_registry = session_registry or SessionRegistry.global_instance()
         self.share_min = max(
             2,
@@ -326,16 +317,6 @@ Args:
 
     # ------------------------------------------------------------ 插件接口
 
-    def applies_to(self, node) -> bool:
-        """是否受 SLRU 保护：STRUCT 会话且共享数已达 ``share_min``。"""
-        if node is None:
-            return False
-        st = self.session_registry.get(getattr(node, "session_id", None))
-        stype = st.session_type if st is not None else None
-        return (
-            stype == SessionType.STRUCT
-            and self.share_of(node) >= self.share_min
-        )
 
     def pick(self, leaves: Iterable["TreeNode"], registry=None) -> Optional["TreeNode"]:
         """在受保护的 struct 叶子中挑最久未访问的一个（段内 LRU）。
@@ -347,7 +328,14 @@ Args:
         Returns:
             选中的叶子；范围内无候选时返回 None（放弃改写，调用方保留原候选）。
         """
-        struct = [node for node in leaves if self.applies_to(node)]
+        struct = [
+            node
+            for node in leaves
+            if (st := self.session_registry.get(getattr(node, "session_id", None)))
+            is not None
+            and st.session_type == SessionType.STRUCT
+            and self.share_of(node) >= self.share_min
+        ]
         if not struct:
             return None
         now = time.monotonic()
@@ -385,12 +373,11 @@ class MultiTurnEvictPolicy(VictimOverride):
 
     w = 1 - reuse_prob = CDF(elapsed; mu, sigma)
 
-``reuse_prob = 1 - CDF`` 是 ``_reuse_score`` 对多轮任务用的同一个量，所以这里
-**越大越先淘汰**，与全局分数方向相反但结论一致。同权重时退化为段内 LRU。
+权重取对数正态的 ``CDF(elapsed)``：``1 - CDF`` 才是"还没被复用"的概率，
+所以这里**越大越先淘汰**。同权重时退化为段内 LRU。
 
 带内归属按 **SessionType ∈ {CHAT, AGENTIC}** 判定，而不是节点标签：分类器产出
-的是会话类型，``queue_tag`` 不一定与之对齐。``applies_to`` 只在候选落入多轮
-负载时接管，绝不跨带改写。
+的是会话类型，``queue_tag`` 不一定与之对齐。本类只处理传入的池，绝不跨带取点。
 """
 
     name = "mt"
@@ -407,19 +394,6 @@ class MultiTurnEvictPolicy(VictimOverride):
 
     # ------------------------------------------------------------ 插件接口
 
-    def applies_to(self, node) -> bool:
-        """是否属于多轮带：会话类型为 CHAT 或 AGENTIC。
-
-        无会话证据（未带 session_id，或账本已被 sweep）时不接管，保留原候选：
-        标签可能已经漂移，宁可不改写。
-        """
-        if node is None:
-            return False
-        st = self.registry.get(getattr(node, "session_id", None))
-        return st is not None and st.session_type in (
-            SessionType.CHAT,
-            SessionType.AGENTIC,
-        )
 
     def pick(self, leaves, registry=None) -> Optional["TreeNode"]:
         """在多轮带内挑"过期概率"最高的节点；带内无候选时返回 None。
@@ -431,11 +405,17 @@ class MultiTurnEvictPolicy(VictimOverride):
         Returns:
             选中的叶子；带内无候选时返回 None 并累加 fallback 计数。
         """
-        mt_nodes = [node for node in (leaves or ()) if self.applies_to(node)]
+        mt_nodes = [
+            node
+            for node in (leaves or ())
+            if (st := self.registry.get(getattr(node, "session_id", None))) is not None
+            and st.session_type in (SessionType.CHAT, SessionType.AGENTIC)
+        ]
         if not mt_nodes:
             self.mt_fallbacks += 1
             return None
-        # 参数与 _reuse_score 同源（HeterCacheNodeTag.reuse_config），避免评分为正、改写为负的分歧。
+        # 参数统一取自 HeterCacheNodeTag.reuse_config：多轮带的排序与其它
+        # 复用间隔判断共用一个分布定义，避免两处各写一份 mu/sigma。
         best = None
         for node in mt_nodes:
             st = self.registry.get(getattr(node, "session_id", None))

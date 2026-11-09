@@ -75,14 +75,12 @@ class HeterCacheRadixCache(RadixCache):
         return EvictResult(num_tokens_evicted=num_evicted)
 
     def _pick_victim(self, leaves, capacity: float):
-        """注入上下文并转发至 quota_selector 纯策略决策器。"""
+        """转发至 quota_selector 纯策略决策器。"""
         return quota_selector.pick_victim(
             strategy=self.eviction_strategy,
             leaves=leaves,
             capacity=capacity,
             page_size=self.page_size,
-            overrides=self.victim_overrides,
-            session_registry=self.session_registry,
         )
 
     def _release_node(self, node) -> int:

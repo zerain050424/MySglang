@@ -2,7 +2,7 @@
 #
 # 定位：HeterCacheStrategy 的「记账 + 渲染」从策略类中剥离出的独立观测对象
 #   1. 独占四本累计账：total_hit / total_evicted / total_evicted_one_shot /
-#      victim_sources（键为队列名，"random" 单列）；
+#      victim_sources（键为裁决来源：one_shot 带 / quota:<queue> / fallback）；
 #   2. summary() 渲染 [HeterCache profile] 文本 —— 与旧 profile_summary
 #      逐字节等价（验收基线：diff == 0）；
 #   3. 输出口仅走 HeterLogger（heterlog 双写），本类不持文件句柄。
@@ -42,7 +42,7 @@ class HeterProfiler:
         self._total_hit_tokens = {}
         self._total_evicted_tokens = {}
         self._total_evicted_one_shot = 0.0
-        # 淘汰来源记账：one_shot 带 / 全局 victim_key / 各插件（queue 名），
+        # 淘汰来源记账：one_shot 带 / 配额点名队列 / 随机兜底，
         # 供 profile 打印本次淘汰由哪个队列的策略决定。
         self._victim_sources = {}
         # profile 渲染走 heterlog 的 info 通道（级别门槛在 heterlog）
@@ -67,7 +67,7 @@ class HeterProfiler:
             self._total_evicted_one_shot += tokens
 
     def record_victim_source(self, source, tokens):
-        """记录本次淘汰由谁决定（one_shot 硬优先带 / 全局 victim_key /
+        """记录本次淘汰由谁决定（one_shot 硬优先带 / 配额点名队列 /
         插件的 queue 名）。只做观测，不参与仲裁。"""
         self._victim_sources[source] = (
             self._victim_sources.get(source, 0.0) + tokens

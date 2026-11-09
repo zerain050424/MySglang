@@ -67,7 +67,9 @@ def install_stable_ties(strategy) -> bool:
         setattr(strategy, name, key_fn)
         patched.append(name)
 
-    for name in ("victim_key", "one_shot_key", "get_priority"):
+    # 只剩 one_shot_key：victim_key 与 HeterCache 的 get_priority 已随
+    # 全局复用分一起删除，没有稳定排序键可打补丁。
+    for name in ("one_shot_key",):
         wrap(name)
     if patched:
         logger.debug("[compat] stable ties installed on %s", patched)

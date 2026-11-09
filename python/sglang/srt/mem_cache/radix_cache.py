@@ -363,16 +363,16 @@ class RadixCache(BasePrefixCache):
         self.force_agentic = bool(
             getattr(self.eviction_strategy, "force_agentic", False)
         )
-        # 可插拔的淘汰候选改写器：RR 会话公平 / struct 队内顺序等。
-        # 空元组表示没有任何插件，淘汰走原来的全局 victim_key。
-        self.victim_overrides = tuple(
-            getattr(self.eviction_strategy, "victim_overrides", ()) or ()
+        # 节点生命周期观测器：命中记账与分裂继承（当前只有 SLRU 的共享数账本）。
+        # 队内选点（RR / MT）不在这里——它们只由配额裁决调用，不参与节点生命周期。
+        self.node_observers = tuple(
+            getattr(self.eviction_strategy, "node_observers", ()) or ()
         )
         # 需要「插入期记账」的插件（目前是 SLRU 的分裂继承）与配额的节点入账。
         # 在这里解析成函数元组：无插件时是空元组，插入/分裂路径只多一次空循环。
         self._insert_observers = tuple(
             ov.on_node_inserted
-            for ov in self.victim_overrides
+            for ov in self.node_observers
             if hasattr(ov, "on_node_inserted")
         )
         # 配额的节点入账只挂“新建节点”一条路径（插入点里显式调用）。
@@ -384,7 +384,7 @@ class RadixCache(BasePrefixCache):
         # 否则 SLRU 的准入条件会退化成恒真/恒假。
         self._hit_observers = tuple(
             ov.on_node_hit
-            for ov in self.victim_overrides
+            for ov in self.node_observers
             if hasattr(ov, "on_node_hit")
         )
 
@@ -458,9 +458,9 @@ class RadixCache(BasePrefixCache):
     ##### Public API #####
 
     def reset(self):
-        # 插件可能持有节点引用（Q_struct 的索引）/ 计数器，必须先于树一起清空
-        for override in getattr(self, "victim_overrides", ()):
-            override.reset()
+        # 观测器可能持有节点引用（SLRU 的弱引用表）/ 计数器，必须先于树一起清空
+        for observer in getattr(self, "node_observers", ()):
+            observer.reset()
         # 会话账本与策略计数器同样属于「上一次 run 的状态」。`/flush_cache` 会走到
         # 这里，因此复用同一个 server 跑多个 seed 时不会串味（RR 的 loss_cap 直接
         # 读 SessionRegistry 的 d/L）。
