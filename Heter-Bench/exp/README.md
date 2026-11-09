@@ -1,7 +1,7 @@
-# Uni-Bench 实验设计总纲
+# Heter-Bench 实验设计总纲
 
-> 位置：`Uni-Bench/exp/README.md`
-> 范围：本目录收录 HeterCache(SimpleHybrid) 在 sglang 上的两个受控实验设计。
+> 位置：`Heter-Bench/exp/README.md`
+> 范围：本目录收录 HeterCache 在 sglang 上的两个受控实验设计。
 > 状态：Tailshot 已实现并产数（`result/tailshot*`）；Cascade 已设计并完成首次实测（`result/cascade/R3.*`），完整矩阵待跑。
 
 ---
@@ -10,7 +10,7 @@
 
 | 类别 | 路径 | 说明 |
 |---|---|---|
-| 压测驱动 | `bench_unicache.py` | asyncio + aiohttp，混合负载，逐请求 CSV |
+| 压测驱动 | `bench_hetercache.py` | asyncio + aiohttp，混合负载，逐请求 CSV |
 | 起 server | `serve.sh` / `env.sh` / `config.sh` | `POLICY` × `MAX_TOTAL_TOKENS` |
 | 数据 | `TaskData/` | alfred(agentic) / apps(random) / Codeparrot(single) / ShareGPT(text) |
 | 标定 | `calibrate.py` | 冷启动 prefill 速率 → `ttft = a + b·L` |
@@ -25,7 +25,7 @@
 
 ## 1.1 目标
 
-定量暴露 **node-level recency 的尾部驱逐缺陷**：多轮长对话在轮间空窗被外来流挤出缓存、尾部（最新 turn）叶子先被驱逐，下一轮到达时整段历史重算 KV，TTFT 恶化。对照组：`simple_hybrid`（HeterCache 迁移版：lognormal 复用概率 + alpha 在线平衡 + 两带驱逐）。
+定量暴露 **node-level recency 的尾部驱逐缺陷**：多轮长对话在轮间空窗被外来流挤出缓存、尾部（最新 turn）叶子先被驱逐，下一轮到达时整段历史重算 KV，TTFT 恶化。对照组：`heter_cache`（HeterCache 迁移版：lognormal 复用概率 + alpha 在线平衡 + 两带驱逐）。
 
 ## 1.2 设计要点
 
@@ -88,7 +88,7 @@ CSV 逐请求：
 4. `calibrate` 负截距使小长度段低估 ~30%，仅适合量级判断
 5. `gap_since_prev_end_s` = 本轮完成 − 上轮完成，含本轮耗时，只能做有效性自检
 6. `F` 是 offered 而非实际写入（实测 LRU 65.4 / 213.6 / 792.0 at F=150/400/1200）
-7. `simple_hybrid` 必须同时给 `--radix-eviction-policy simple_hybrid` 与 `--enable-simple-hybrid`
+7. `heter_cache` 必须同时给 `--radix-eviction-policy heter_cache` 与 `--enable-heter-cache`
 8. `max_record` 取文件前 N 行而非随机抽样（Codeparrot 前 88 行均值高 26%）
 
 ---
@@ -101,8 +101,8 @@ CSV 逐请求：
 
 | run | wipe 数 | 按会话分布 | HHI |
 |---|---|---|---|
-| `simple_hybrid_F1200` | 0 | — | — |
-| `simple_hybrid_F2000` | 0 | — | — |
+| `heter_cache_F1200` | 0 | — | — |
+| `heter_cache_F2000` | 0 | — | — |
 | `lru_F2000` | 73 | 20 / 18 / 18 / 17 | **0.251** |
 
 `HHI = Σ(share_i²)`，`1/N = 0.25` ⇒ 完全均摊。原因：Tailshot 给所有受害者同一个 30s，`last_access_time` 几乎相同 ⇒ 分数并列 ⇒ `min()` 事实轮转。
@@ -264,7 +264,7 @@ staggered 变体：victim i 在 t=6·i 秒到达（i=0..11），其余不变。�
 
 ## 2.14 改动清单（未实现，待批准）
 
-1. `bench_unicache.py`：CSV 加 `ts/queue_time_ms/prefill_ms`；支持 `gap_mode/gap_s/pause_after_turn/pause_s`；`arrival.mode=fixed` + `gate_after` 屏障
+1. `bench_hetercache.py`：CSV 加 `ts/queue_time_ms/prefill_ms`；支持 `gap_mode/gap_s/pause_after_turn/pause_s`；`arrival.mode=fixed` + `gate_after` 屏障
 2. `TaskData/victim_pool12_{H,W,C}.jsonl`：从 `AgentBank_alfred_scale_5000` 切 12 条 ≥26 轮（不截断 prompt）
 3. `tailshot/cascade_R1..R5.yaml`
 4. `tailshot/run_cascade.sh`（复用 `run_matrix.sh` 骨架）
@@ -388,7 +388,7 @@ R3 hot   ... 19:1649/1711  20:1721/1763  21:1768/1826  26:2262/2401   ← 全程
 池:     35,975 (默认 mem-fraction) | 73,120 (0.79)
 标定:   8319 tok/s = 0.1202 ms/token, 截距 -82 ms
 数据:   alfred +248.8 tok/轮; turn12≈2,266, turn20≈4,533, turn24≈5,665, turn34≈8,325
-server: --radix-eviction-policy {lru|simple_hybrid} [--enable-simple-hybrid]
+server: --radix-eviction-policy {lru|heter_cache} [--enable-heter-cache]
         --max-total-tokens N --enable-metrics --port 30000
 驱动:   concurrency=32, arrival_scale=1, wait_scale=1
 ```

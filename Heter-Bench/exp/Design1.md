@@ -153,7 +153,7 @@ band-0（one-shot：random 整请求、单轮 response 段）的行为保持不�
 
 ## 8. 与现有实现的差异
 
-| | 现有（`SimpleHybridStrategy` + 全局 `min(victim_key)`） | Design1 |
+| | 现有（`HeterCacheStrategy` + 全局 `min(victim_key)`） | Design1 |
 |---|---|---|
 | 竞争单位 | 节点 | 会话 |
 | 分数维度 | `reuse_score(node)`，会话内所有节点同分 | `P_i · d_i`，随缺口变化 |

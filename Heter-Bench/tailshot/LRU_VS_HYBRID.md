@@ -1,9 +1,9 @@
-# LRU vs SimpleHybrid：搅拌压力下的前缀缓存存活能力
+# LRU vs HeterCache：搅拌压力下的前缀缓存存活能力
 
 > 位置：`/root/sg-unicache/Uni-Bench/tailshot/`
 > 结论速览：把「重访间隔」固定为 30 s，只扫「池子周转速率」——LRU 在
 > `池容量 / F ≈ 30 s` 处发生**阈值型崩溃**（受害者重算率 8.5% → 98.1%，
-> TTFT p99 62 → 297 ms），而 `simple_hybrid` 在同一位置**保持 8.6% 不动**
+> TTFT p99 62 → 297 ms），而 `heter_cache` 在同一位置**保持 8.6% 不动**
 > （TTFT p99 116 ms）。
 
 ---
@@ -18,13 +18,13 @@
 | 策略 | 启动参数 | 机制 |
 |---|---|---|
 | `lru` | `--radix-eviction-policy lru` | 经典 LRU（RadixCache 默认） |
-| `simple_hybrid` | `--radix-eviction-policy simple_hybrid` **+** `--enable-simple-hybrid`（缺一不可） | RadixCache + 多级队列淘汰：按 workload 分类（single/random/agentic/text…），带 one-shot 识别与在线 `alpha` 权重再平衡 |
+| `heter_cache` | `--radix-eviction-policy heter_cache` **+** `--enable-heter-cache`（缺一不可） | RadixCache + 多级队列淘汰：按 workload 分类（single/random/agentic/text…），带 one-shot 识别与在线 `alpha` 权重再平衡 |
 
 ### 1.1 文件地图
 
 ```
 /root/sg-unicache/Uni-Bench/
-├── bench_unicache.py                # 压测驱动（混合负载到达流 + 逐请求 CSV）
+├── bench_hetercache.py                # 压测驱动（混合负载到达流 + 逐请求 CSV）
 ├── calibrate.py                     # 冷启动 prefill 速率标定（token → ms）
 ├── serve.sh                         # 起单个 server（POLICY / MAX_TOTAL_TOKENS）
 ├── config.sh / env.sh               # 默认配置 / venv 环境
@@ -48,7 +48,7 @@
 result/tailshot/
   <policy>_<cell>.json      # 聚合指标
   <policy>_<cell>.csv       # 逐请求明细 ← 真正的分析入口
-  server_<policy>_<cell>.log# server 日志（含 [SimpleHybrid profile]）
+  server_<policy>_<cell>.log# server 日志（含 [HeterCache profile]）
   calib_<policy>.json       # 每策略一次的 prefill 标定
   matrix.log                # 8 格的启停时间线
 ```
@@ -83,7 +83,7 @@ LRU 的结构性弱点不在**总容量**，而在**重访间隔**：只要两�
 
 ## 3. 三条流如何拼到一根时间轴上
 
-`bench_unicache.py --tasks-config` 的混合负载模式，逐函数对齐 HeterCache
+`bench_hetercache.py --tasks-config` 的混合负载模式，逐函数对齐 HeterCache
 `vllm/simulator/simulator.py`：
 
 1. 每个 task 读自己的 `session_data.jsonl`（`max_record` 截断），用
@@ -174,7 +174,7 @@ victim_pool.jsonl
 3. 对 `L ∈ {1000, 2000, 4000, 8000, 16000, 24000}`、每档 `reps=2`，
    **每次先 flush** 再发冷启动请求，测 TTFT；
 4. 最小二乘拟合 `ttft_ms = a + L / rate`。
-| 参数 | LRU | simple_hybrid |
+| 参数 | LRU | heter_cache |
 |---|---|---|---|
 | `prefill_rate_tok_per_s` | **8319.6** | 8331.2 |
 | `ttft_ms_per_token` | **0.1202** | 0.1200 |
@@ -196,10 +196,10 @@ victim_pool.jsonl
 | `lru_F150` | 8.8% | 43.2% | 49 ms | 72 ms | 池周转 240 s ≫ 30 s，**无感** |
 | `lru_F400` | 8.5% | 43.0% | 53 ms | 112 ms | 周转 90 s，p99 开始爬，**仍未破防** |
 | `lru_F1200` | **98.1%** | 98.9% | **166 ms** | **297 ms** | 周转 30 s = 重访间隔 → **每轮重算整条上下文** |
-| `simple_hybrid_control` | 8.6% | 43.2% | 39 ms | 62 ms | 与 LRU 同基线 |
-| `simple_hybrid_F150` | 8.6% | 42.4% | 48 ms | 68 ms | 无退化 |
-| `simple_hybrid_F400` | 8.6% | 42.6% | 54 ms | 83 ms | 无退化（p99 比 LRU 低 29 ms） |
-| `simple_hybrid_F1200` | **8.8%** | 42.4% | 54 ms | **116 ms** | 重算率**基本不动**（8.8%），p99 为 LRU 的 39% |
+| `heter_cache_control` | 8.6% | 43.2% | 39 ms | 62 ms | 与 LRU 同基线 |
+| `heter_cache_F150` | 8.6% | 42.4% | 48 ms | 68 ms | 无退化 |
+| `heter_cache_F400` | 8.6% | 42.6% | 54 ms | 83 ms | 无退化（p99 比 LRU 低 29 ms） |
+| `heter_cache_F1200` | **8.8%** | 42.4% | 54 ms | **116 ms** | 重算率**基本不动**（8.8%），p99 为 LRU 的 39% |
 
 聚合侧的对照（全局口径，仅作规模校验）：
 
@@ -209,7 +209,7 @@ victim_pool.jsonl
 | `lru_F150` | 242 | 71.13% | 723.97 | 0.33 | 89.32% |
 | `lru_F400` | 506 | 58.42% | 653.38 | 0.77 | 89.34% |
 | `lru_F1200` | 1348 | 34.87% | 620.43 | 2.17 | **10.09%** |
-| `simple_hybrid_F1200` | 1348 | 35.27% | 620.42 | 2.17 | **89.39%** |
+| `heter_cache_F1200` | 1348 | 35.27% | 620.42 | 2.17 | **89.39%** |
 
 ---
 
@@ -228,14 +228,14 @@ bash tailshot/run_matrix.sh 2>&1 | tee result/tailshot/matrix.log
 bash tailshot/run_full_after.sh
 
 # 单格手动跑（改旋钮用）
-POLICY=simple_hybrid MAX_TOTAL_TOKENS=100000 bash serve.sh
-/root/sl_old/bin/python bench_unicache.py \
+POLICY=heter_cache MAX_TOTAL_TOKENS=100000 bash serve.sh
+/root/sl_old/bin/python bench_hetercache.py \
   --tasks-config tailshot/tailshot_F1200.yaml \
   --concurrency 32 --replay-mode incremental \
   --arrival-scale 1 --wait-scale 1 --output result/x.json
 
 # 最省事的冒烟（40 条 apps，验证链路）
-/root/sl_old/bin/python bench_unicache.py \
+/root/sl_old/bin/python bench_hetercache.py \
   --tasks-config tailshot/tailshot_smoke.yaml \
   --concurrency 32 --output result/smoke.json
 ```
@@ -254,7 +254,7 @@ POLICY=simple_hybrid MAX_TOTAL_TOKENS=100000 bash serve.sh
    严格尾部结论需扩 victim 池（如 16 条 × 更多轮）。
 4. **`calibrate` 的负截距**使小长度段偏低（1K 预测 37 ms vs 实测 99 ms），
    用它换算 ~2K 级受害者重算会**低估约 30%**，只适合做量级判断。
-5. **`simple_hybrid_F1200` 被跑了两次**（21:02–21:12 与 21:14–21:24），CSV/JSON
+5. **`heter_cache_F1200` 被跑了两次**（21:02–21:12 与 21:14–21:24），CSV/JSON
    被第二次覆盖，目录里只剩一份（`mtime 21:24:27`）。**本文所有数字取自第二次**；
    第一次那版的受害者 `p99 = 97 ms`、重算率 med = 8.6%，两次结论方向一致但尾部
    差 19 ms，引用时请注明取自哪一次。
@@ -262,8 +262,8 @@ POLICY=simple_hybrid MAX_TOTAL_TOKENS=100000 bash serve.sh
    所以中位数是 30.5 s 而不是 30.0 s；它只能做有效性自检，不能当纯 `wait` 用。
 7. **F 是 offered token/s，不是实际写入速率**（实测 LRU **65.4 / 213.6 / 792.0** token/s，
    因为搅拌流自身有 6–83% 的前缀命中）。两套口径混用会得出错误的临界值，见 §4.1。
-8. **`serve.sh` 里 `POLICY=simple_hybrid` 必须同时有**
-   `--radix-eviction-policy simple_hybrid` **和** `--enable-simple-hybrid`；
+8. **`serve.sh` 里 `POLICY=heter_cache` 必须同时有**
+   `--radix-eviction-policy heter_cache` **和** `--enable-heter-cache`；
    且不要开 `--enable-session-radix-cache` 等 unified-only flag（启动报错）。
 9. **`run_full_after.sh` 的自动化链是断的**：它靠 `grep "MATRIX ALL DONE"` 同步，
    而该行只在 `run_matrix.sh` 正常跑完时才写；实测 `matrix.log` 里伴随过
@@ -282,7 +282,7 @@ POLICY=simple_hybrid MAX_TOTAL_TOKENS=100000 bash serve.sh
 # 环境
 model:      /root/autodl-tmp/model/Qwen2.5-7B-Instruct   (Qwen2.5-7B, bf16, 28 层)
 python:     /root/sl_old/bin/python                       (venv，torch 2.13.0)
-server:     --radix-eviction-policy {lru|simple_hybrid} [--enable-simple-hybrid]
+server:     --radix-eviction-policy {lru|heter_cache} [--enable-heter-cache]
             --max-total-tokens 100000 --enable-metrics --port 30000
 有效池:      35,975 token（实测）
 

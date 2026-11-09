@@ -1,4 +1,4 @@
-# Uni-Bench 服务器复现流程（AutoDL + Qwen2.5-7B-Instruct）
+# Heter-Bench 服务器复现流程（AutoDL + Qwen2.5-7B-Instruct）
 
 本目录在服务器 `/root/sg-unicache/Uni-Bench`，是对本地 HeterCache 数据准备与发送逻辑的
 **复用 + 服务器适配**。所有脚本含中文注释，可直接按序执行。
@@ -37,20 +37,20 @@ bash TaskData/AgentBankData/data.sh
 #   AgentBank_apps_session_data.jsonl                (apps_* 仅为数据集命名空间)
 ```
 
-## 二、起 server（simple_hybrid 实验组）
+## 二、起 server（heter_cache 实验组）
 
 ```bash
 # 需要先停掉占用 GPU/端口的其他 server
-POLICY=simple_hybrid MAX_TOTAL_TOKENS=100000 bash serve.sh
+POLICY=heter_cache MAX_TOTAL_TOKENS=100000 bash serve.sh
 # 或 lru 基线
 POLICY=lru MAX_TOTAL_TOKENS=100000 bash serve.sh
 ```
 
-## 三、跑负载（bench_unicache.py）
+## 三、跑负载（bench_hetercache.py）
 
 ```bash
 source env.sh
-"$PY" bench_unicache.py \
+"$PY" bench_hetercache.py \
   --data-path TaskData/Codeparrot/Qwen2.5-7B-Instruct/Code_session_data.jsonl \
   --base-url http://127.0.0.1:30000 --concurrency 8 --num-sessions 30 \
   --output result/smoke.json
@@ -59,7 +59,7 @@ source env.sh
 ## 四、全矩阵实验
 
 ```bash
-bash run_all.sh   # POLICIES="lru simple_hybrid" × TOKENS_LIST="50000 100000 200000"
+bash run_all.sh   # POLICIES="lru heter_cache" × TOKENS_LIST="50000 100000 200000"
 ```
 
 ## 关键设计（为什么这么改）
@@ -83,4 +83,4 @@ bash run_all.sh   # POLICIES="lru simple_hybrid" × TOKENS_LIST="50000 100000 20
 - demo `ShareGPT_cleaned_valid_session_data_head20.jsonl` 是 Llama-3 tokenizer 产物，
   仅可用于验证链路，勿用于正式对比。
 - 3GB 的 alfred session_data 用 `--num-sessions` 限制样本量。
-- simple_hybrid 需要 `--radix-eviction-policy=simple_hybrid` + `--enable-simple-hybrid` 同时给。
+- heter_cache 需要 `--radix-eviction-policy=heter_cache` + `--enable-heter-cache` 同时给。

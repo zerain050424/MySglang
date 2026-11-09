@@ -115,7 +115,7 @@ k=2–4 剩下的全是多轮会话，按规则只可能是 trans/struct，所�
 ## 复现
 
 ```bash
-cd Uni-Bench/classify
+cd Heter-Bench/classify
 /root/sl_old/bin/python run_eval.py --source trace --min-share-tokens 64 --tag share64
 # 产物：../result/classify/report_share64.md / metrics_share64.json / sessions_share64.csv
 # 对照：run_eval.py --source trace --tag baseline

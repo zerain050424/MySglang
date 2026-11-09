@@ -1,7 +1,7 @@
 # 两带 SLRU 淘汰策略：设计思路 · 负载设计 · 对照组设计 · 实验结果
 
 > 分支 `TinyLRU`，策略实现位于
-> `python/sglang/srt/mem_cache/{evict_policy,victim_override,uni_utils,simple_hybrid_radix_cache}.py`。
+> `python/sglang/srt/mem_cache/{evict_policy,victim_override,uni_utils,heter_cache_radix_cache}.py`。
 > 本文所有数字来自 2025-11-04 在实验机（RTX 4090 / `--backend real`）上的一次性一致性重跑，
 > 结果文件 `result/mx/*.json`，汇总脚本 `mx.py`。A0/A1 完全不受被改文件影响，
 > 因此同一份 trace 上的对照点可比。
@@ -48,7 +48,7 @@
 ### 1.2 两带结构
 
 ```
-每轮淘汰（simple_hybrid_radix_cache.evict）：
+每轮淘汰（heter_cache_radix_cache.evict）：
     leaves   = evictable_leaves
     one_shot = [n for n in leaves if is_one_shot(n)]
     if one_shot:  victim = min(one_shot, key=one_shot_key)   # 带0：硬优先，内部 LRU
@@ -181,9 +181,9 @@ A0 在 25k 上仍能拿到 59% 的模板完整率，A3 在 25k 上仍能到 85.8
 |---|---|---|
 | **A0** | `lru` | SGLang 默认基线（recency 能力边界） |
 | **A1** | `slru`, `protected_threshold=2` | **上游分段 LRU**：能力上限参照（频数晋升，无准入、无 aging） |
-| **A2** | `simple_hybrid`, `slru.share_min=10^6` | **只有 one-shot 带**：阈值不可达 ⇒ 保护段永不成立。与 A3 只差「保护是否存在」，用来隔离保护机制的净贡献 |
-| **A3** | `simple_hybrid`, `slru.share_min=2` | **主对象**：两带 SLRU（one-shot 带 + 跨会话共享保护段 · 段内 LRU） |
-| **A4** | `simple_hybrid`, `slru.share_min=3` | **剂量反应**：要 3 个会话命中过才进保护段（阈值敏感性 / 是否存在拐点） |
+| **A2** | `heter_cache`, `slru.share_min=10^6` | **只有 one-shot 带**：阈值不可达 ⇒ 保护段永不成立。与 A3 只差「保护是否存在」，用来隔离保护机制的净贡献 |
+| **A3** | `heter_cache`, `slru.share_min=2` | **主对象**：两带 SLRU（one-shot 带 + 跨会话共享保护段 · 段内 LRU） |
+| **A4** | `heter_cache`, `slru.share_min=3` | **剂量反应**：要 3 个会话命中过才进保护段（阈值敏感性 / 是否存在拐点） |
 
 设计原则：`A3 − A2` 是保护的**净贡献**，`A3 − A1` 是相对上游能力的**增量**，
 `A3 − A0` 是相对默认基线的**总收益**。A4 不是「更好的臂」，而是**剂量探针**：
@@ -365,7 +365,7 @@ A0 在 25k 上仍能拿到 59% 的模板完整率，A3 在 25k 上仍能到 85.8
 
 ```bash
 # 0) 生成 trace（实验机，需真 sglang）
-cd Uni-Bench/W-TinyLRU && source ../env.sh
+cd Heter-Bench/W-TinyLRU && source ../env.sh
 export PYTHONPATH="$PWD:$PWD/../../python:${PYTHONPATH:-}"
 python -m wtl.synth --out-dir result/data/dslru3 --scenario dslru \
   --prefix-depth 2048 --variants 64 --sessions-per-template 5 --turns 3 \

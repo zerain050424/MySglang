@@ -30,9 +30,9 @@
 |---|---|---|
 | **A0** | `--radix-eviction-policy lru` | SGLang 原生基线（无 one-shot 带、无跨会话保护） |
 | **A1** | `--radix-eviction-policy slru` | 上游分段 LRU（按 `hit_count>=2` 晋升 protected） |
-| **A2** | `simple_hybrid` + `{"slru":{"share_min":1000000}}` | **one-shot 带 + 分类器** 的贡献 = A2 − A0；保护段不可达 |
-| **A3** | `simple_hybrid` + `{"slru":{"share_min":2}}` | **跨会话保护** 的贡献 = A3 − A2（主对象） |
-| **A4** | `simple_hybrid` + `{"slru":{"share_min":3}}` | 阈值消融：要 3 个会话命中过才进保护段 |
+| **A2** | `heter_cache` + `{"slru":{"share_min":1000000}}` | **one-shot 带 + 分类器** 的贡献 = A2 − A0；保护段不可达 |
+| **A3** | `heter_cache` + `{"slru":{"share_min":2}}` | **跨会话保护** 的贡献 = A3 − A2（主对象） |
+| **A4** | `heter_cache` + `{"slru":{"share_min":3}}` | 阈值消融：要 3 个会话命中过才进保护段 |
 
 固定配置（所有臂一致，避免混入跨队列因素）：
 
@@ -96,7 +96,7 @@ python -m wtl.synth --out-dir data/exp/D2 \
 ```
 
 > `noise_frac=2.0` ⇒ burst 会话数 = 2 × 模板会话数；`--phased` 把 burst 均分到每个模板块之后。
-> 需要 `--no-shuffle` 才能保住块顺序；在线端用 `bench_unicache.py --no-shuffle`（已支持）。
+> 需要 `--no-shuffle` 才能保住块顺序；在线端用 `bench_hetercache.py --no-shuffle`（已支持）。
 
 ### 3.3 D-SLRU（主场景）
 
@@ -165,7 +165,7 @@ python -m wtl.synth --out-dir data/exp/D2 \
 |---|---|---|
 | **命中率** | `Σcached_tokens / Σprompt_tokens`，**按成分拆分**（struct / burst） | 离线 rows、在线逐请求 CSV |
 | **结构复用保留度** | `ret@P full_rate`（模板前缀整段命中比例）、`cover@P`（部分保留） | `RetentionTracker` |
-| **TTFT** | `p50 / p90 / p99`，并给 `prefill_ms` 与 `queue_time_ms` 分解 | 在线 `bench_unicache` CSV |
+| **TTFT** | `p50 / p90 / p99`，并给 `prefill_ms` 与 `queue_time_ms` 分解 | 在线 `bench_hetercache` CSV |
 
 ### 5.2 护栏
 
@@ -207,7 +207,7 @@ python -m wtl.synth --out-dir data/exp/D2 \
 |---|---|---|---|---|---|
 | **S6** | A0, A2, A3 | D2 | 200k / 50k tokens | 42 | **6 次** |
 
-每次 `bench_unicache` 跑 D2（768 session、~1150 请求、并发 32）约 8–12 分钟 ⇒
+每次 `bench_hetercache` 跑 D2（768 session、~1150 请求、并发 32）约 8–12 分钟 ⇒
 **约 1–1.5 小时机时**。只跑 6 次是有意的：TTFT 用**同池同负载的配对残差**判断，
 不需要多 seed 覆盖（每请求都是一次配对样本）。
 
@@ -228,7 +228,7 @@ python -m wtl.synth --out-dir data/exp/D2 \
 ## 8. 执行步骤
 
 ```bash
-cd Uni-Bench/W-TinyLRU
+cd Heter-Bench/W-TinyLRU
 export PYTHONPATH=/path/to/sglang/python
 
 # 0) 前置门控（机制没被行使就别跑正式矩阵）

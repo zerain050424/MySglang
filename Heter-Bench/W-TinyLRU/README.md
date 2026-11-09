@@ -1,4 +1,4 @@
-# W-TinyLRU 实验套件（Uni-Bench/W-TinyLRU）
+# W-TinyLRU 实验套件（Heter-Bench/W-TinyLRU）
 
 实现文档：`python/sglang/srt/mem_cache/TAG_LRU.md`（标签版 TinyLRU 的规则/参数/淘汰顺序/实测）
 **本目录不修改任何框架代码**：观测全部通过子类 / 运行时 monkeypatch / 运行时属性完成。
@@ -9,7 +9,7 @@ W-TinyLRU/
 ├── wtl/
 │   ├── arms.py                实验臂 A0–A4（单一事实来源）
 │   ├── simclock.py            事件驱动仿真时钟（替换 sglang 模块内的 time）
-│   ├── trace.py               session_data.jsonl 读取 + 到达调度（与 bench_unicache 同语义）
+│   ├── trace.py               session_data.jsonl 读取 + 到达调度（与 bench_hetercache 同语义）
 │   ├── synth.py               合成「共享前缀强度阶梯」trace（场景 A）
 │   ├── prefix_stats.py        共享前缀 LCP 统计（M1 的基准）
 │   ├── backends.py            RealBackend（真 RadixCache）/ FakeBackend（镜像 LRU，smoke）
@@ -30,7 +30,7 @@ W-TinyLRU/
 ## 1. 环境
 
 ```bash
-# 实验机（与 Uni-Bench 相同）
+# 实验机（与 Heter-Bench 相同）
 export PYTHONPATH=/path/to/MySglang/python:$PYTHONPATH
 export PY=/root/sl_old/bin/python          # 或 source ../env.sh
 
@@ -49,7 +49,7 @@ python tests/test_smoke.py
 ## 2. 快速开始
 
 ```bash
-cd Uni-Bench/W-TinyLRU
+cd Heter-Bench/W-TinyLRU
 
 # 0) 链路自检（无 GPU）
 python tests/test_smoke.py
@@ -133,7 +133,7 @@ python -m wtl.replay --arm A3 --data-path data/synth_p2048_b10/session_data.json
 
 | 证据 | 来源 | 用途 |
 |---|---|---|
-| `victim_src`（`one_shot` / `qstruct` / `global`） | `SimpleHybridStrategy._victim_sources` | **gate**：`one_shot` 占绝大多数说明一次性带在干活；`qstruct` 说明 SLRU 真的给了候选 |
+| `victim_src`（`one_shot` / `qstruct` / `global`） | `HeterCacheStrategy._victim_sources` | **gate**：`one_shot` 占绝大多数说明一次性带在干活；`qstruct` 说明 SLRU 真的给了候选 |
 | `slru.share_counted / share_dedup` | `SlruEvictPolicy.stats()` | 跨会话共享数账本是否在工作（区分「跨会话复用」与「同一会话反复读」） |
 | `slru.slru_picks` | 同上 | SLRU 实际改写候选的次数（=0 说明没被行使） |
 | `slru_share_min` | `SlruParams.share_min` | 唯一旋钮，越大保护越难触发（A2 用不可达值当基线） |
@@ -166,9 +166,9 @@ python -m wtl.replay --arm A3 --data-path data/synth_p2048_b10/session_data.json
 |---|---|---|
 | A0 | `lru` | 上游基线 |
 | A1 | `slru`（`protected_threshold=2`） | 上游分段 LRU 参照：按 `hit_count` 划分段位 |
-| A2 | `simple_hybrid` + `share_min=1000000` | 只有 one-shot 带、保护段不可达 → 隔离「保护机制」的贡献 |
-| **A3** | `simple_hybrid` + `share_min=2` | 主对象：两带 SLRU |
-| A4 | `simple_hybrid` + `share_min=3` | 消融：要 3 个会话命中过才进保护段 |
+| A2 | `heter_cache` + `share_min=1000000` | 只有 one-shot 带、保护段不可达 → 隔离「保护机制」的贡献 |
+| **A3** | `heter_cache` + `share_min=2` | 主对象：两带 SLRU |
+| A4 | `heter_cache` + `share_min=3` | 消融：要 3 个会话命中过才进保护段 |
 
 主负载 `D-SLRU`（`wtl/synth.py --scenario dslru`）：
 
@@ -201,7 +201,7 @@ python -m wtl.replay --arm A3 --data-path data/synth_p2048_b10/session_data.json
 | 淘汰/删除事件 | 子类覆写 `_evict_one` / `_delete_leaf`（只读） | `backends.py` |
 | 节点路径哈希/深度 | 给 `TreeNode` 挂 `_wtl_pd/_wtl_ph` 记忆化属性（框架不读） | `backends.py` |
 | 仿真时间 | 替换 `sglang.srt.mem_cache.{radix_cache,evict_policy,...}` 模块级 `time` | `simclock.py` |
-| 真机 struct 快照 | 运行时包装 `SimpleHybridRadixCache.evict`，退出时 atexit flush | `struct_profile.py` |
+| 真机 struct 快照 | 运行时包装 `HeterCacheRadixCache.evict`，退出时 atexit flush | `struct_profile.py` |
 | 服务启动 | 复制 `launch_server.__main__` 的调用序列 + 先装埋点 | `serve.py` |
 
 框架侧唯一「被用到」的私有接口是 `evictable_size_` / `_profile_token_counts` / `session_registry`
@@ -216,7 +216,7 @@ python -m wtl.replay --arm A3 --data-path data/synth_p2048_b10/session_data.json
 ```jsonc
 {
   "schema": "wtl.replay/1", "backend": "real",
-  "arm": "A3", "policy": "simple_hybrid", "config": {...},
+  "arm": "A3", "policy": "heter_cache", "config": {...},
   "pool_tokens": 51234, "pool_ratio": 0.3, "calib_peak": 170780,
   "seed": 42, "wait_scale": 1.0, "arrival_scale": 1.0, "trace_fp": "…",
   "layers_by_task": {"ShareGPT": [512, 1024, 2048]},
@@ -274,7 +274,7 @@ python -m wtl.replay --arm A3 --data-path data/synth_p2048_b10/session_data.json
 |---|---|
 | §2.1 M1 保留度 | `metrics.RetentionTracker` + `prefix_stats` + `analyze` |
 | §2.2 M2 命中率 | 客户端 `cached/prompt`；服务端 `sglang:cache_hit_rate` 交叉校验 |
-| §2.3 M3 TTFT | `bench_unicache` 已有；`analyze` 做请求级配对与分解列 |
+| §2.3 M3 TTFT | `bench_hetercache` 已有；`analyze` 做请求级配对与分解列 |
 | §2.4 M4 机制（含 gate） | `struct` / `victim_src` / `qstruct_pct` / G2 |
 | §2.4 后悔率/浪费率 | `RegretTracker`（token 级精确） |
 | §4.1 prefix_stats | `wtl/prefix_stats.py` |
@@ -296,7 +296,7 @@ python -m wtl.replay --arm A3 --data-path data/synth_p2048_b10/session_data.json
 用 `--backend fake` 只验证链路，正式结果回到实验机跑。
 
 **Q：跑得太慢？**
-* `SimpleHybridRadixCache.evict` 每次都会调 `_profile_token_counts()`（O(树大小)），
+* `HeterCacheRadixCache.evict` 每次都会调 `_profile_token_counts()`（O(树大小)），
   这是框架行为，不是本套件加的；用 `--num-sessions 200~400` 控制树规模；
 * `run_matrix --jobs 12` 并发；`--regret-window 0` 关掉后悔率统计可以再快一截；
 * 工作集校准按 `(workload, seed, sessions, wait_scale…)` 缓存，矩阵里只算一次。

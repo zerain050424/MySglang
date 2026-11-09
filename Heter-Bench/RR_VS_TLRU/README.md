@@ -107,12 +107,12 @@ SEEDS="42 43 44" bash run_matrix.sh
 
 | 项 | a2（插件） | a3（原生） |
 |---|---|---|
-| 后端 | `SimpleHybridRadixCache` | `UnifiedRadixCache`（registry 硬校验） |
-| 启动参数 | `--enable-simple-hybrid --radix-eviction-policy simple_hybrid` | `--radix-eviction-policy tlru`（**不加** `--enable-simple-hybrid`） |
+| 后端 | `HeterCacheRadixCache` | `UnifiedRadixCache`（registry 硬校验） |
+| 启动参数 | `--enable-heter-cache --radix-eviction-policy heter_cache` | `--radix-eviction-policy tlru`（**不加** `--enable-heter-cache`） |
 | 配置键 | `{"tlru": {...}}` | `{"threshold": ..., "next_prompt_estimate": ...}` |
 | 作用域 | 仅 QAGENT（`force_agentic` 下即全部） | 全局所有叶子 |
 | 记账 | `_tlru_*` 由插件在插入期维护 | `unified_tree_core` 原生维护 |
-| profile | `[SimpleHybrid profile]` 有 `victim_src` / `tlru:` | **无**（没有这套日志），只能看 resume 指标 |
+| profile | `[HeterCache profile]` 有 `victim_src` / `tlru:` | **无**（没有这套日志），只能看 resume 指标 |
 
 ```bash
 # 原生 TLRU，与三个插件臂完全相同的负载/预算/seed
@@ -157,7 +157,7 @@ ARMS=a3_native_tlru RESUME_MODES=simultaneous BUDGETS=22000 SEEDS="42" bash run_
 
 ```
 result/<arm>/<resume_mode>/<budget>/
-  server_<seed>.log         # 含 [SimpleHybrid profile]
+  server_<seed>.log         # 含 [HeterCache profile]
   profile_<seed>.txt
   <seed>.json               # summary，含 phases{burst_start_s, burst_end_s, victim_resumed_s}
   <seed>.csv                # 逐请求明细，含 resume_phase 列

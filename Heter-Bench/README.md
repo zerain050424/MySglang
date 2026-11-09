@@ -1,13 +1,13 @@
-# Uni-Bench
+# Heter-Bench
 
-用 **ShareGPT 多轮 session 数据** 对 sglang 的 `SimpleHybridRadixCache`
+用 **ShareGPT 多轮 session 数据** 对 sglang 的 `HeterCacheRadixCache`
 （RadixCache + 多级队列淘汰）做前缀缓存 benchmark。
 
 ## 目录
 
 ```
-Uni-Bench/
-  bench_unicache.py    # 多轮压测 driver（asyncio + aiohttp）
+Heter-Bench/
+  bench_hetercache.py    # 多轮压测 driver（asyncio + aiohttp）
   config.sh            # 配置（被 run_all.sh source）
   serve.sh             # 启动单个 server（指定 policy / cache 大小）
   run_all.sh           # 实验矩阵：policy × cache 大小，自动启停 + 汇总
@@ -30,8 +30,8 @@ Uni-Bench/
 
 ## 前置条件
 
-1. **sglang 已按前面 Phase 1–6 打好补丁**（`SimpleHybridStrategy` + `SimpleHybridRadixCache`
-   + `--enable-simple-hybrid` + profile 日志）。
+1. **sglang 已按前面 Phase 1–6 打好补丁**（`HeterCacheStrategy` + `HeterCacheRadixCache`
+   + `--enable-heter-cache` + profile 日志）。
 2. **数据**：HeterCache 的 `session_data.jsonl`。生成方式：
    ```bash
    cd /home/rain/HeterCache/TaskData/SharedGPT-multi-turn
@@ -47,16 +47,16 @@ Uni-Bench/
 cd /home/rain/sglang
 
 # 1) 起实验组 server（另一个终端）
-POLICY=simple_hybrid MAX_TOTAL_TOKENS=200000 bash Uni-Bench/serve.sh
+POLICY=heter_cache MAX_TOTAL_TOKENS=200000 bash Heter-Bench/serve.sh
 
 # 2) 跑 driver（20-session demo）
-python Uni-Bench/bench_unicache.py \
+python Heter-Bench/bench_hetercache.py \
   --data-path /home/rain/HeterCache/demo/ShareGPT_cleaned_valid_session_data_head20.jsonl \
   --base-url http://127.0.0.1:30000 \
   --concurrency 8 \
-  --output Uni-Bench/result/smoke.json
+  --output Heter-Bench/result/smoke.json
 
-# 3) 观察 server 日志里的 [SimpleHybrid profile]（每 30s）：text 队列应有 hit/evicted/alpha
+# 3) 观察 server 日志里的 [HeterCache profile]（每 30s）：text 队列应有 hit/evicted/alpha
 ```
 
 冒烟预期：cache 调大（无淘汰）时命中率接近上限——跨 session 共享 31-token system prompt
@@ -65,16 +65,16 @@ python Uni-Bench/bench_unicache.py \
 ## 混合负载（模仿 HeterCache 异构负载混合）
 
 把多个异构负载按 HeterCache 的「比例」（`lambda_rate` Poisson 会话到达率之比）混成
-一条到达流交错压测，触发 SimpleHybrid 的多队列（text/single/random/agentic…）竞争。
+一条到达流交错压测，触发 HeterCache 的多队列（text/single/random/agentic…）竞争。
 
 ```bash
 cd /root/sg-unicache/Uni-Bench
-# 起 server（simple_hybrid）
-POLICY=simple_hybrid MAX_TOTAL_TOKENS=100000 bash serve.sh
+# 起 server（heter_cache）
+POLICY=heter_cache MAX_TOTAL_TOKENS=100000 bash serve.sh
 
 # 跑混合负载（4 类负载 lambda_rate=1:1:1:1，见 hybrid_tasks_config.yaml）
 source env.sh
-"$PY" bench_unicache.py \
+"$PY" bench_hetercache.py \
   --tasks-config hybrid_tasks_config.yaml \
   --base-url http://127.0.0.1:30000 \
   --concurrency 32 --arrival-scale 1 --wait-scale 1 \
@@ -95,10 +95,10 @@ source env.sh
 
 ```bash
 cd /home/rain/sglang
-# 编辑 Uni-Bench/config.sh：DATA 换成全量 session_data.jsonl
-bash Uni-Bench/run_all.sh
+# 编辑 Heter-Bench/config.sh：DATA 换成全量 session_data.jsonl
+bash Heter-Bench/run_all.sh
 ```
-默认矩阵：`POLICIES="lru simple_hybrid"` × `TOKENS_LIST="50000 100000 200000"`。
+默认矩阵：`POLICIES="lru heter_cache"` × `TOKENS_LIST="50000 100000 200000"`。
 
 ## 关键参数
 
@@ -116,7 +116,7 @@ bash Uni-Bench/run_all.sh
 | `cache_hit_rate_pct` | 前缀缓存命中率（核心） |
 | `ttft_p50/p99_ms` | 首 token 时延分位 |
 | `e2e_p99_ms` | 端到端时延分位 |
-| `[SimpleHybrid profile]`（server 日志） | 各队列 hit/evicted/occ/alpha |
+| `[HeterCache profile]`（server 日志） | 各队列 hit/evicted/occ/alpha |
 
 ## 陷阱清单
 
@@ -131,8 +131,8 @@ bash Uni-Bench/run_all.sh
 
 ## 与其他基线的对比
 
-把 `POLICIES` 改成 `"lru lfu slru simple_hybrid"` 即可多基线对比（这些策略都在
-`RADIX_EVICTION_POLICY_CHOICES` 里，无需 `--enable-simple-hybrid`）。
+把 `POLICIES` 改成 `"lru lfu slru heter_cache"` 即可多基线对比（这些策略都在
+`RADIX_EVICTION_POLICY_CHOICES` 里，无需 `--enable-heter-cache`）。
 
 ## 四阶段负载自动预测准确率实验
 
@@ -147,9 +147,9 @@ bash Uni-Bench/run_all.sh
 结构复用真值仅指 Codeparrot；AgentBank apps 保留为 `random`。先启动服务，再运行：
 
 ```bash
-POLICY=simple_hybrid MAX_TOTAL_TOKENS=100000 bash serve.sh
+POLICY=heter_cache MAX_TOTAL_TOKENS=100000 bash serve.sh
 source env.sh
-"$PY" bench_unicache.py \
+"$PY" bench_hetercache.py \
   --phases-config phased_load_prediction.yaml \
   --base-url http://127.0.0.1:30000 \
   --concurrency 32 --arrival-scale 1 --wait-scale 1 \
@@ -160,7 +160,7 @@ source env.sh
 
 ```bash
 SGLANG_WORKLOAD_OCC_LOG=1 SGLANG_WORKLOAD_OCC_INTERVAL=30 \
-  POLICY=simple_hybrid MAX_TOTAL_TOKENS=100000 bash serve.sh
+  POLICY=heter_cache MAX_TOTAL_TOKENS=100000 bash serve.sh
 ```
 
 实验输出的 CSV 保存真实数据集标签，`evaluate_load_prediction.py` 读取 CSV 与带时间戳
@@ -169,7 +169,7 @@ SGLANG_WORKLOAD_OCC_LOG=1 SGLANG_WORKLOAD_OCC_INTERVAL=30 \
 ```bash
 "$PY" evaluate_load_prediction.py \
   --requests-csv result/phased_load_prediction.csv \
-  --occ-log result/server_simple_hybrid_100000.log \
+  --occ-log result/server_heter_cache_100000.log \
   --output result/phased_load_prediction_accuracy.json
 ```
 

@@ -62,7 +62,7 @@
 ## 复现
 
 ```bash
-cd Uni-Bench/classify
+cd Heter-Bench/classify
 /root/sl_old/bin/python run_eval.py --source trace                 # 真实 trace 主结果
 /root/sl_old/bin/python run_eval.py --source task --max-per-workload 1500 --tag task
 /root/sl_old/bin/python sweep.py --source trace --tag trace        # 单变量扫描

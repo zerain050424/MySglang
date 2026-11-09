@@ -1,6 +1,6 @@
-# Uni-Bench 完整 Benchmark 指南
+# Heter-Bench 完整 Benchmark 指南
 
-> 目标：在 sglang 的 `SimpleHybridRadixCache`（RadixCache + 多级队列淘汰）上做
+> 目标：在 sglang 的 `HeterCacheRadixCache`（RadixCache + 多级队列淘汰）上做
 > **前缀缓存（prefix caching）命中率 + 时延** benchmark。
 >
 > 目录：`/root/sg-unicache/Uni-Bench`
@@ -101,8 +101,8 @@ bash TaskData/mashqa_data/data.sh
 ```bash
 cd /root/sg-unicache/Uni-Bench
 
-# 实验组：simple_hybrid（需要两个 flag 同时给，缺一不可）
-POLICY=simple_hybrid MAX_TOTAL_TOKENS=100000 bash serve.sh
+# 实验组：heter_cache（需要两个 flag 同时给，缺一不可）
+POLICY=heter_cache MAX_TOTAL_TOKENS=100000 bash serve.sh
 
 # 基线：lru（或 lfu / slru，均在 RADIX_EVICTION_POLICY_CHOICES 里）
 POLICY=lru MAX_TOTAL_TOKENS=100000 bash serve.sh
@@ -114,12 +114,12 @@ POLICY=lru MAX_TOTAL_TOKENS=100000 bash serve.sh
 cd /root/sg-unicache
 /root/sl_old/bin/python -m sglang.launch_server \
   --model-path /root/autodl-tmp/model/Qwen2.5-7B-Instruct \
-  --radix-eviction-policy simple_hybrid \
+  --radix-eviction-policy heter_cache \
   --enable-metrics \
   --max-total-tokens 100000 \
   --port 30000 \
-  --enable-simple-hybrid \
-  2>&1 | tee Uni-Bench/result/server_simple_hybrid_100000.log
+  --enable-heter-cache \
+  2>&1 | tee Heter-Bench/result/server_heter_cache_100000.log
 ```
 
 ### 2.2 关键环境变量（可 source config.sh 后覆盖）
@@ -128,7 +128,7 @@ cd /root/sg-unicache
 |---|---|---|
 | `MODEL` | `/root/autodl-tmp/model/Qwen2.5-7B-Instruct` | 模型路径（tokenizer 必须与数据一致） |
 | `PORT` | `30000` | 服务端口 |
-| `POLICY` | `lru` | 淘汰策略：`lru/lfu/slru/simple_hybrid` |
+| `POLICY` | `lru` | 淘汰策略：`lru/lfu/slru/heter_cache` |
 | `MAX_TOTAL_TOKENS` | `200000` | **KV pool token 上限**：调小到装不下工作集才触发淘汰，policy 差异才显现 |
 | `LOG` | `result/server_${POLICY}_${MAX_TOTAL_TOKENS}.log` | server 日志 |
 
@@ -138,8 +138,8 @@ cd /root/sg-unicache
 # 服务就绪后 /health 返回 200（run_all.sh 内部也用这个探测）
 curl -sf http://127.0.0.1:30000/health && echo "OK"
 
-# 观察 simple_hybrid 的多队列统计（每 30s 打一次 [SimpleHybrid profile]）
-tail -f result/server_simple_hybrid_100000.log | grep -i "SimpleHybrid"
+# 观察 heter_cache 的多队列统计（每 30s 打一次 [HeterCache profile]）
+tail -f result/server_heter_cache_100000.log | grep -i "HeterCache"
 ```
 
 停止所有 sglang server：
@@ -170,7 +170,7 @@ source env.sh
 # ============ 多轮负载（--wait-scale 生效）============
 
 # ShareGPT 多轮文本（mu=4.15 / sigma=0.971，平均 3.16 轮）
-"$PY" bench_unicache.py \
+"$PY" bench_hetercache.py \
   --data-path TaskData/SharedGPT-multi-turn/Qwen2.5-7B-Instruct/ShareGPT_cleaned_valid_deduplicated_session_data.jsonl \
   --base-url http://127.0.0.1:30000 \
   --concurrency 32 --num-sessions 2000 \
@@ -178,7 +178,7 @@ source env.sh
   --output result/bench_sharegpt.json
 
 # AgentBank alfred 多轮 agentic（mu=1.81 / sigma=1.092，平均 42 轮，wait-scale=1 显著拉长）
-"$PY" bench_unicache.py \
+"$PY" bench_hetercache.py \
   --data-path TaskData/AgentBankData/Qwen2.5-7B-Instruct/AgentBank_alfred_scale_5000_session_data.jsonl \
   --base-url http://127.0.0.1:30000 \
   --concurrency 32 --num-sessions 2000 \
@@ -188,14 +188,14 @@ source env.sh
 # ============ 单轮负载（--wait-scale 无效，可省略）============
 
 # Codeparrot 单轮代码（num_turns=1）
-"$PY" bench_unicache.py \
+"$PY" bench_hetercache.py \
   --data-path TaskData/Codeparrot/Qwen2.5-7B-Instruct/Code_session_data.jsonl \
   --base-url http://127.0.0.1:30000 \
   --concurrency 32 --num-sessions 2000 \
   --output result/bench_codeparrot.json
 
 # AgentBank apps 单轮 API（num_turns=1）
-"$PY" bench_unicache.py \
+"$PY" bench_hetercache.py \
   --data-path TaskData/AgentBankData/Qwen2.5-7B-Instruct/AgentBank_apps_session_data.jsonl \
   --base-url http://127.0.0.1:30000 \
   --concurrency 32 --num-sessions 2000 \
@@ -203,7 +203,7 @@ source env.sh
 
 # MASHQA 单轮问答（★ 必须 --no-shuffle：同文档问题相邻才能共享长文档前缀）
 #   建议 --concurrency 4~8，减少同文档兄弟问题的并发竞争（racing）
-"$PY" bench_unicache.py \
+"$PY" bench_hetercache.py \
   --data-path TaskData/mashqa_data/Qwen2.5-7B-Instruct/mashqa_session_data.jsonl \
   --base-url http://127.0.0.1:30000 \
   --concurrency 8 --num-sessions 2000 \
@@ -211,7 +211,7 @@ source env.sh
   --output result/bench_mashqa.json
 
 # 冒烟：ShareGPT 30 会话（快速验证链路）
-"$PY" bench_unicache.py \
+"$PY" bench_hetercache.py \
   --data-path TaskData/SharedGPT-multi-turn/Qwen2.5-7B-Instruct/ShareGPT_cleaned_valid_deduplicated_session_data.jsonl \
   --base-url http://127.0.0.1:30000 \
   --concurrency 8 --num-sessions 30 \
@@ -262,7 +262,7 @@ source env.sh
 ## 4. 多负载（混合）测试
 
 多负载模式：多个**异构负载**按 UniCache 的「比例」混成**一条到达流**交错压测，触发
-SimpleHybrid 的多队列（text/single/random/agentic…）竞争同一 KV 池。
+HeterCache 的多队列（text/single/random/agentic…）竞争同一 KV 池。
 
 ### 4.1 混合原理（对齐 UniCache `vllm/simulator/simulator.py`）
 
@@ -279,7 +279,7 @@ cd /root/sg-unicache/Uni-Bench
 source env.sh
 
 # 混合负载（默认 4 类负载 lambda_rate=1:1:1:1，见 hybrid_tasks_config.yaml）
-"$PY" bench_unicache.py \
+"$PY" bench_hetercache.py \
   --tasks-config hybrid_tasks_config.yaml \
   --base-url http://127.0.0.1:30000 \
   --concurrency 32 --arrival-scale 1 --wait-scale 0 \
@@ -403,11 +403,11 @@ wall_time ≈ max(数据加载, 推理计算) + 调度等待
 ```bash
 cd /root/sg-unicache/Uni-Bench
 
-# 默认：POLICIES="lru simple_hybrid" × TOKENS_LIST="50000 100000 200000"
+# 默认：POLICIES="lru heter_cache" × TOKENS_LIST="50000 100000 200000"
 bash run_all.sh
 
 # 自定义
-POLICIES="lru lfu slru simple_hybrid" TOKENS_LIST="50000 200000" bash run_all.sh
+POLICIES="lru lfu slru heter_cache" TOKENS_LIST="50000 200000" bash run_all.sh
 ```
 
 输出：`result/bench_<policy>_<tokens>.json` + 终端汇总表（hit% / ttft_p50 / ttft_p99 / reqs / err）。
@@ -426,7 +426,7 @@ POLICIES="lru lfu slru simple_hybrid" TOKENS_LIST="50000 200000" bash run_all.sh
 | `session_id` 无正确前缀 | 全落 single 队列 | 保留数据 id 前缀（`ShareGPT-multi-turn-*`/`alfred_*`/`apps_*`/`Code-*`） |
 | 每 session 不同 `extra_key` | 跨 session 共享失效 | 用 `session_id`，`extra_key` 留空 |
 | 会话内并发发轮次 | 命中率虚低 | driver 已保证会话内串行 |
-| simple_hybrid 只给一个 flag | 启动报错 | `--radix-eviction-policy=simple_hybrid` + `--enable-simple-hybrid` 同时给 |
+| heter_cache 只给一个 flag | 启动报错 | `--radix-eviction-policy=heter_cache` + `--enable-heter-cache` 同时给 |
 | 端口/GPU 被旧 server 占用 | 启动失败或 OOM | 先 `killall_sglang.sh` |
 | 单负载读全文件（大文件） | 启动前卡 2~5 min | 加 `--no-shuffle` |
 | 多轮负载 `wait_scale=1` | 跑数小时 | 命中率实验用 `wait_scale=0` |

@@ -94,9 +94,9 @@ d_i 只在两处变化：请求写入时归零、片段被删时累加。
 
 | 文件 | 位置 | 改动 |
 |---|---|---|
-| `mem_cache/simple_hybrid_radix_cache.py` | `evict` (20)，第 47–52 行 `min(leaves, key=strategy.victim_key)` | 改为会话级选择（见 2.2） |
+| `mem_cache/heter_cache_radix_cache.py` | `evict` (20)，第 47–52 行 `min(leaves, key=strategy.victim_key)` | 改为会话级选择（见 2.2） |
 | | `_evict_one` (56) | 加护栏过滤与放宽路径 |
-| `mem_cache/evict_policy.py` | `SimpleHybridStrategy` | 加 `session_victim_key(state)`、`P_i` 四档量化与 200ms 节流；**现有 `victim_key` / `_reuse_score` / `is_one_shot` 不动** |
+| `mem_cache/evict_policy.py` | `HeterCacheStrategy` | 加 `session_victim_key(state)`、`P_i` 四档量化与 200ms 节流；**现有 `victim_key` / `_reuse_score` / `is_one_shot` 不动** |
 | `arg_groups/kv_cache_hook.py` | (≈375) | `--radix-eviction-policy-config` 校验 `fair_drr` / `kappa` / `min_retain` / `pin_ttl` |
 | `arg_groups/choices.py` | (184) | 不新增 policy 名，用 config 开关 |
 
@@ -132,7 +132,7 @@ S1 是纯观测改动，验收标准是**零回归**；S2、S3 才允许指标�
 ## 4. 不做的事
 
 - 不动 `_reuse_score` / `is_one_shot` / 两带结构 / alpha 控制器。
-- 不动 `TaskData`、`bench_unicache.py`、`exp/` 下的实验脚本。
+- 不动 `TaskData`、`bench_hetercache.py`、`exp/` 下的实验脚本。
 - 不引入 `cost()` 折算（见 `Design1.md` §9）。
 - 不做跨 workload 仲裁。
 
@@ -147,7 +147,7 @@ S1 是纯观测改动，验收标准是**零回归**；S2、S3 才允许指标�
 | `mem_cache/uni_utils.py` | `SessionState` + `SessionRegistry`（`touch` / `attach` / `charge` / `sweep` / `summary`） | **+123** |
 | `mem_cache/radix_cache.py` | `TreeNode.session_id`；9 处接线（import、`__init__`、`insert`、`_adopt`、`_split_node`、`_insert_helper`、`_delete_leaf`、`evict`） | +26 |
 | `mem_cache/evict_policy.py` | `profile_summary` / `maybe_update_alpha` 加会话摘要 | +10 |
-| `mem_cache/simple_hybrid_radix_cache.py` | profile 调用传第三份口径 | +3 |
+| `mem_cache/heter_cache_radix_cache.py` | profile 调用传第三份口径 | +3 |
 
 `base_prefix_cache.py` 无需改动：`InsertParams.session_id` 字段本来就有。
 
@@ -165,7 +165,7 @@ S1 是纯观测改动，验收标准是**零回归**；S2、S3 才允许指标�
 ### 账目自洽
 
 ```
-[SimpleHybrid profile]  各次
+[HeterCache profile]  各次
   sessions=17  d_sum=0      d_p50=0  d_max=0    d_nonzero=0
   sessions=23  d_sum=5200   d_p50=52 d_max=692  d_nonzero=12
   sessions=34  d_sum=12208  d_p50=0  d_max=2695 d_nonzero=12

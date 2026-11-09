@@ -109,7 +109,7 @@ k=2–4 恒为 0 是 `>4` 轮门槛本身决定的（多轮会话此时只可能
 ## 复现
 
 ```bash
-cd Uni-Bench/classify
+cd Heter-Bench/classify
 # C：去 Qwen system，生产阈值
 /root/sl_old/bin/python run_eval.py --source trace --strip-system-prompt qwen --tag stripqwen_ms1
 # D：去 Qwen system + 抬阈值
