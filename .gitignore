@@ -284,14 +284,14 @@ artifacts/
 # Internal, non-published docs
 internal-docs/
 
-# Uni-Bench 数据与结果不入库（benchmark 用）
-Uni-Bench/TaskData/**/*.json
-Uni-Bench/TaskData/**/*.jsonl
-Uni-Bench/*.jsonl
-Uni-Bench/result/
+# Heter-Bench 数据与结果不入库（benchmark 用）
+Heter-Bench/TaskData/**/*.json
+Heter-Bench/TaskData/**/*.jsonl
+Heter-Bench/*.jsonl
+Heter-Bench/result/
 
-# Uni-Bench 备份/临时数据
-Uni-Bench/**/*.bak
+# Heter-Bench 备份/临时数据
+Heter-Bench/**/*.bak
 PLAN.md
 .pi/todos/0e508907.md
 .pi/todos/7e2dc9c5.md

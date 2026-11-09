@@ -23,7 +23,7 @@ import tempfile
 import yaml
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-BENCH_DIR = os.path.abspath(os.path.join(HERE, "..", "..", "Uni-Bench"))
+BENCH_DIR = os.path.abspath(os.path.join(HERE, "..", "..", "Heter-Bench"))
 BENCH = os.path.join(BENCH_DIR, "bench_unicache.py")
 BASE_YAML = os.path.join(BENCH_DIR, "RR_VS_TLRU", "configs", "burst_pause.yaml")
 

@@ -420,7 +420,7 @@ class RadixCache(BasePrefixCache):
         # ---- 节点级标签快照（env 门控，默认关）----
         # 用途：把状态机给每个 radix 节点打的队列标签 与 节点真实归属
         # (session_id)一起落盘，用于节点级标注准确率统计，见
-        # Uni-Bench/evaluate_node_labels.py。只读遍历，不改变任何淘汰状态。
+        # Heter-Bench/evaluate_node_labels.py。只读遍历，不改变任何淘汰状态。
         _dump_path = os.environ.get("SGLANG_NODE_LABEL_DUMP", "")
         if _dump_path:
             _dump_interval = float(os.environ.get("SGLANG_NODE_LABEL_INTERVAL", "30"))

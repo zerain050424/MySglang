@@ -294,7 +294,7 @@ def test_bench_passes_only_completed_tool_calls(monkeypatch):
     import asyncio
     from argparse import Namespace
 
-    bench_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "Uni-Bench"))
+    bench_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "Heter-Bench"))
     sys.path.insert(0, bench_path)
     import bench_unicache
 

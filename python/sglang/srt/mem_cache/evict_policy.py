@@ -249,7 +249,7 @@ class HeterCacheStrategy(EvictionStrategy):
         # 每请求只归因一次命中的去重账本（同一请求多次 chunked prefill 只算一次）。
         self._seen_rids: set = set()
         self._rid_order: deque = deque()
-        # 观测账本已外挂到 Uni-Bench/profile 的 HeterProfiler：记账/渲染同口径，
+        # 观测账本已外挂到 Heter-Bench/profile 的 HeterProfiler：记账/渲染同口径，
         # reset 随 reset_bookkeeping 委托清空；树采集仍在本类内。
         self.profiler = HeterProfiler()
 
@@ -424,7 +424,7 @@ class HeterCacheStrategy(EvictionStrategy):
         if self.quota.enabled and not one_shot and wkey in QUOTA_QUEUES:
             self._occ[wkey] = max(0.0, self._occ[wkey] - tokens)
         self.profiler.record_evict(wkey, tokens, one_shot=one_shot)
-        # 节点级驱逐事件，供 Uni-Bench 结果矩阵归因。
+        # 节点级驱逐事件，供 Heter-Bench 结果矩阵归因。
         heterlog.evict(node_id=id(node),
                        workload=wkey,
                        tokens=tokens,

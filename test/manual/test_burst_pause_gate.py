@@ -11,7 +11,7 @@ import sys
 import time
 
 BENCH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "..", "..", "Uni-Bench", "bench_unicache.py"
+    os.path.dirname(os.path.abspath(__file__)), "..", "..", "Heter-Bench", "bench_unicache.py"
 )
 spec = importlib.util.spec_from_file_location("bench_unicache", BENCH)
 bench = importlib.util.module_from_spec(spec)
