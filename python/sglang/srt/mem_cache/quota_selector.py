@@ -55,7 +55,7 @@ def effective_targets(
     if total_capacity <= 0.0:
         return {q: 0.0 for q in QUOTA_QUEUES}
     cap = {q: params.caps[q] * total_capacity for q in QUOTA_QUEUES} ## 上限
-    rho = {q: params.reservations.get(q, 0.0) * total_capacity for q in QUOTA_QUEUES} ## 上限
+    rho = {q: params.reservations.get(q, 0.0) * total_capacity for q in QUOTA_QUEUES} ## 下限
 
     fixed = [q for q in QUOTA_QUEUES if occ.get(q, 0) <= rho[q]] ## 安全队列
     active = [q for q in QUOTA_QUEUES if q not in fixed] ## 竞争队列
