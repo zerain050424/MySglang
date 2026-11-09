@@ -85,6 +85,29 @@ class HeterCacheRadixCache(RadixCache):
             session_registry=self.session_registry,
         )
 
+    def _release_node(self, node) -> int:
+        """释放一个节点的全部资源并从树上摘除，返回释放的 token 数。
+
+        四个动作的顺序不可调换：
+
+        1. ``record_evict`` 必须最先。配额模式下它扣减 ``_occ``，而
+           ``_pick_victim`` 在同一个淘汰循环里每轮都读 ``_occ``——
+           把扣减推后会让下一轮按错误的占用选受害者；
+        2. 之后才是物理释放、对外事件与摘树。
+
+        Args:
+            node: 待释放的叶子节点。
+
+        Returns:
+            该节点释出的 token 数（先取值再释放，value 不会被释放动作改写）。
+        """
+        released = len(node.value)
+        self.eviction_strategy.record_evict(node)
+        self.token_to_kv_pool_allocator.free_segment(node.value, start_pos=0)
+        self.kv_events.record_remove(node)
+        self._delete_leaf(node)
+        return released
+
     def _evict_one(self, node) -> int:
         """释放目标叶子节点，并对 One-shot 私有祖先链执行向上级联清理。
 
@@ -92,6 +115,8 @@ class HeterCacheRadixCache(RadixCache):
         单轮会话的叶子被逐出后，其上游私有 Prompt 节点已失去复用价值。
         若不级联清理，这些孤立祖先会在下一轮重新变为叶子引发反复单步淘汰。
         沿祖先链向上连带删除，遇根节点、上锁节点或分叉点（含其它活跃子树）即止。
+
+        单个节点的释放细节见 ``_release_node``；本方法只负责“往上走到哪”的判断。
         """
         total = 0
         cur = node
@@ -99,11 +124,7 @@ class HeterCacheRadixCache(RadixCache):
         one_shot = strategy.is_one_shot(node)
         while True:
             parent = cur.parent
-            self.eviction_strategy.record_evict(cur)
-            self.token_to_kv_pool_allocator.free_segment(cur.value, start_pos=0)
-            self.kv_events.record_remove(cur)
-            total += len(cur.value)
-            self._delete_leaf(cur)
+            total += self._release_node(cur)
             # 级联剪枝条件：整条祖先链均为未上锁且无其它分支的 One-shot 私有节点
             if (one_shot and parent is not None and parent is not self.root_node
                     and parent.lock_ref == 0 and not parent.children
