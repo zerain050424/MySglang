@@ -34,6 +34,15 @@ class HeterLogger:
 
     NAMESPACE = "hetercache.strategy"
 
+    # 级别名 → logging 级别。直接用 setLevel("debug") 会抛 ValueError：
+    # 标准库只认大写或整数，而文档与实验脚本习惯写小写，故在这里统一折算。
+    _LEVELS = {
+        "quiet": logging.WARNING,
+        "info": logging.INFO,
+        "debug": logging.DEBUG,
+        "trace": logging.DEBUG,
+    }
+
     def __init__(self):
         self._log = logging.getLogger(self.NAMESPACE)
         self._log.propagate = False
@@ -43,7 +52,7 @@ class HeterLogger:
                 logging.Formatter(
                     "%(asctime)s [%(name)s] %(levelname)-7s %(message)s"))
             self._log.addHandler(_h)
-        self._log.setLevel(os.environ.get("STRAT_LOG_LEVEL", "INFO"))
+        self.set_level(os.environ.get("STRAT_LOG_LEVEL", "info"))
         self._fp = None
         self._lock = threading.RLock()
 
@@ -55,9 +64,32 @@ class HeterLogger:
         """是否处于 DEBUG 级别（供高频路径在进入循环前短路）。"""
         return self._log.isEnabledFor(logging.DEBUG)
 
-    def set_level(self, level: str) -> None:
-        """quiet/info/debug/trace -> logging 级别。"""
-        self._log.setLevel(str(level).upper())
+    @property
+    def capturing(self) -> bool:
+        """是否正在往 JSONL 落事件流（与文本日志级别无关）。
+
+        与 ``enabled`` 是两个出口：调试级别影响文本行，本属性影响结构化事件。
+        调用方需要任一出口时用 ``capturing or enabled``，两者都不满足时应直接
+        返回，不要白构造一份会被 ``_record`` 丢弃的字典。
+        """
+        return self._fp is not None
+
+    def set_level(self, level) -> None:
+        """quiet/info/debug/trace（大小写不敏感，也接受 logging 级别整数）。
+
+        Raises:
+            ValueError: 未知级别名。启动即失败，好过静默停在默认级别。
+        """
+        if isinstance(level, int):
+            self._log.setLevel(level)
+            return
+        name = str(level).strip().lower()
+        if name not in self._LEVELS:
+            raise ValueError(
+                f"unknown STRAT_LOG_LEVEL {level!r}; "
+                f"expected one of {sorted(self._LEVELS)}"
+            )
+        self._log.setLevel(self._LEVELS[name])
 
     # ------------------------------------------------------------------
     # JSONL 事件捕获

@@ -44,7 +44,11 @@ from sglang.srt.mem_cache.victim_override import (
     SlruEvictPolicy,
     MultiTurnEvictPolicy,
 )
-from sglang.srt.mem_cache.heter_logging import heterlog, HeterProfiler
+from sglang.srt.mem_cache.heter_logging import (
+    CacheTelemetry,
+    heterlog,
+    HeterProfiler,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.radix_cache import TreeNode
@@ -215,6 +219,10 @@ class HeterCacheStrategy(EvictionStrategy):
         self._seen_rids: set = set()
         self._rid_order: deque = deque()
         self.profiler = HeterProfiler()
+        # 账本与事件流的多写收在门面里，下面三个 record_* 只管上报意图。
+        # profiler 引用同时保留：外部消费者（Heter-Bench 的 struct_profile、测试）
+        # 直接读 strategy.profiler，不经过门面。
+        self.telemetry = CacheTelemetry(self.profiler)
 
         self.rr_evict = RrEvictPolicy(self.rr) if self.rr.fair_rr else None
         self.session_registry = SessionRegistry.global_instance()
@@ -302,13 +310,7 @@ class HeterCacheStrategy(EvictionStrategy):
             self._seen_rids.discard(self._rid_order.popleft())
 
         tag = self._node_tag(node)
-        queue = tag.queue_name
-        self.profiler.record_hit(queue, hit_tokens)
-        if heterlog.enabled:
-            heterlog.hit(queue=queue,
-                         tag=tag.value,
-                         hit_tokens=hit_tokens,
-                         req=rid)
+        self.telemetry.on_hit(tag=tag, hit_tokens=hit_tokens, req_id=rid)
 
     def record_evict(self, node) -> None:
         """记录节点淘汰事件并扣减配额占用（支持级联删除逐点触发）。"""
@@ -319,16 +321,13 @@ class HeterCacheStrategy(EvictionStrategy):
         # 仅维护启用了配额且非 one-shot 的三队列占用
         if self.quota.enabled and not one_shot and queue in QUOTA_QUEUES:
             self._occ[queue] = max(0.0, self._occ[queue] - tokens)
-        self.profiler.record_evict(queue, tokens, one_shot=one_shot)
-        heterlog.evict(node_id=id(node),
-                       queue=queue,
-                       tokens=tokens,
-                       one_shot=one_shot)
+        self.telemetry.on_evict(
+            node_id=id(node), tag=tag, tokens=tokens, one_shot=one_shot
+        )
 
     def record_victim_source(self, source: str, tokens: float) -> None:
         """记录淘汰决策来源。"""
-        self.profiler.record_victim_source(source, tokens)
-        heterlog.victim_source(source, tokens)
+        self.telemetry.on_victim_source(source, tokens)
 
     def _reconcile_interval(self, available: float, capacity: float) -> float:
         """计算配额校准周期：内存承压时缩短至 pressure_window_s，平时为 30s。"""
