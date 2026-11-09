@@ -252,7 +252,7 @@ class HeterCacheStrategy(EvictionStrategy):
     # ---- 命中/淘汰记账 ----
 
     def record_hit(self, req, node, hit_tokens: int) -> None:
-        """记录缓存命中指标（去重由 telemetry 负责）。"""
+        """记录缓存命中指标。"""
         self.telemetry.on_hit(
             tag=self._node_tag(node),
             hit_tokens=hit_tokens,
