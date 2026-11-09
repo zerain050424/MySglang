@@ -34,7 +34,7 @@ fi
 for f in AgentBank_alfred_scale_5000.json AgentBank_apps.json; do
     [ -f "$f" ] || { echo "  [skip] $f 不存在"; continue; }
     base="$(basename "$f" .json)"
-    $PY "$UB/prepare_session_data.py" \
+    $PY "$UB/tools/prepare_session_data.py" \
         --raw_data_path  "$UB/TaskData/AgentBankData/$f" \
         --save_data_path "$OUT_DIR/${base}_session_data.jsonl" \
         --tokenizer_path "$TOKENIZER"

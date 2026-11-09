@@ -12,7 +12,7 @@ run_one () {
   local PORT=30000
   echo "=== [$TAG] server up (policy=$POLICY) $(date +%T) ==="
   POLICY=$POLICY MAX_TOTAL_TOKENS=100000 PORT=$PORT \
-    LOG=$OUT/server_${TAG}.log EXTRA_ARGS="$EXTRA_ARGS" nohup bash "$BENCH/serve.sh" > /dev/null 2>&1 &
+    LOG=$OUT/server_${TAG}.log EXTRA_ARGS="$EXTRA_ARGS" nohup bash "$BENCH/scripts/serve.sh" > /dev/null 2>&1 &
   local SPID=$!
   # 等待健康（最长 10 分钟）
   for i in $(seq 1 120); do
@@ -26,13 +26,13 @@ run_one () {
 
   # 冷启动标定（每策略一次，随 server 生命周期）
   if [ ! -f "$OUT/calib_${POLICY}.json" ]; then
-    /root/sl_old/bin/python "$BENCH/calibrate.py" \
+    /root/sl_old/bin/python "$BENCH/tools/calibrate.py" \
       --base-url "http://127.0.0.1:$PORT" \
       --output "$OUT/calib_${POLICY}.json"
   fi
 
   echo "=== [$TAG] bench start $(date +%T) ==="
-  /root/sl_old/bin/python "$BENCH/bench_hetercache.py" \
+  /root/sl_old/bin/python "$BENCH/scripts/bench_hetercache.py" \
     --tasks-config "$CFG" --concurrency 32 \
     --arrival-scale 1 --wait-scale 1 \
     --base-url "http://127.0.0.1:$PORT" \

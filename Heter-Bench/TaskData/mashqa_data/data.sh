@@ -20,7 +20,7 @@ cd "$UB/TaskData/mashqa_data"
 $PY prepare_data.py --input-dir "$RAW_DIR" --output mashqa.json
 
 # 2) 转 session_data
-$PY "$UB/prepare_session_data.py" \
+$PY "$UB/tools/prepare_session_data.py" \
     --raw_data_path  "$UB/TaskData/mashqa_data/mashqa.json" \
     --save_data_path "$OUT_DIR/mashqa_session_data.jsonl" \
     --tokenizer_path "$TOKENIZER"

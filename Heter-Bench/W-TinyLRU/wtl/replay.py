@@ -6,7 +6,7 @@
         --num-sessions 300 --seed 42 --out result/offline_A3_alfred_r0.3_s42.json
 
     # 混合四负载（与在线实验同构）
-    python -m wtl.replay --arm A3 --tasks-config ../hybrid_tasks_config.yaml \\
+    python -m wtl.replay --arm A3 --tasks-config ../configs/hybrid_tasks_config.yaml \\
         --pool-ratio 0.6 --out result/offline_A3_hybrid_r0.6_s42.json
 
     # 合成前缀阶梯（场景 A）

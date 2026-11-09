@@ -22,7 +22,7 @@ tmux new -d -s "${SRV_SESSION}" "cd ${HETER_BENCH_DIR} \
  &&     SGLANG_NODE_LABEL_DUMP=${HETER_BENCH_DIR}/result/node_labels_phased.jsonl \
     SGLANG_NODE_LABEL_INTERVAL=30 \
     POLICY=heter_cache MAX_TOTAL_TOKENS=100000 \
-    bash serve.sh"
+    bash scripts/serve.sh"
 
 echo "Waiting for server at ${SERVER_URL} ..."
 TIMEOUT=600   # 最多等 10 分钟
@@ -39,8 +39,8 @@ echo SERVER_READY
 
 # ── 2) 起 bench（另一 tmux；~15–18 min）─────────────────────
 tmux new -d -s "${BENCH_SESSION}" "cd ${HETER_BENCH_DIR} \
- && source env.sh \
- && \"\$PY\" bench_hetercache.py --phases-config phased_load_prediction.yaml \
+ && source scripts/env.sh \
+ && \"\$PY\" scripts/bench_hetercache.py --phases-config configs/phased_load_prediction.yaml \
       --base-url ${SERVER_URL} --concurrency 32 \
       --arrival-scale 1 --wait-scale 1 \
       --output result/phased_load_prediction_C.json \

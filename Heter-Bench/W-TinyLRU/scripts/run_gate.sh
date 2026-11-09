@@ -5,9 +5,9 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$HERE"
-if [ -f ../env.sh ]; then
+if [ -f ../../scripts/env.sh ]; then
   # shellcheck disable=SC1091
-  source ../env.sh
+  source ../../scripts/env.sh
 fi
 PY="${WTL_PY:-${PY:-python}}"
 export PYTHONPATH="$HERE:$HERE/../../python:${PYTHONPATH:-}"

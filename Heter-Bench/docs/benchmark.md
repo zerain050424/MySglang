@@ -102,10 +102,10 @@ bash TaskData/mashqa_data/data.sh
 cd /root/sg-unicache/Uni-Bench
 
 # 实验组：heter_cache（需要两个 flag 同时给，缺一不可）
-POLICY=heter_cache MAX_TOTAL_TOKENS=100000 bash serve.sh
+POLICY=heter_cache MAX_TOTAL_TOKENS=100000 bash scripts/serve.sh
 
 # 基线：lru（或 lfu / slru，均在 RADIX_EVICTION_POLICY_CHOICES 里）
-POLICY=lru MAX_TOTAL_TOKENS=100000 bash serve.sh
+POLICY=lru MAX_TOTAL_TOKENS=100000 bash scripts/serve.sh
 ```
 
 `serve.sh` 实际执行的命令等价于：
@@ -122,7 +122,7 @@ cd /root/sg-unicache
   2>&1 | tee Heter-Bench/result/server_heter_cache_100000.log
 ```
 
-### 2.2 关键环境变量（可 source config.sh 后覆盖）
+### 2.2 关键环境变量（可 source scripts/config.sh 后覆盖）
 
 | 变量 | 默认 | 含义 |
 |---|---|---|
@@ -165,12 +165,12 @@ bash /root/sg-unicache/scripts/killall_sglang.sh
 
 ```bash
 cd /root/sg-unicache/Uni-Bench
-source env.sh
+source scripts/env.sh
 
 # ============ 多轮负载（--wait-scale 生效）============
 
 # ShareGPT 多轮文本（mu=4.15 / sigma=0.971，平均 3.16 轮）
-"$PY" bench_hetercache.py \
+"$PY" scripts/bench_hetercache.py \
   --data-path TaskData/SharedGPT-multi-turn/Qwen2.5-7B-Instruct/ShareGPT_cleaned_valid_deduplicated_session_data.jsonl \
   --base-url http://127.0.0.1:30000 \
   --concurrency 32 --num-sessions 2000 \
@@ -178,7 +178,7 @@ source env.sh
   --output result/bench_sharegpt.json
 
 # AgentBank alfred 多轮 agentic（mu=1.81 / sigma=1.092，平均 42 轮，wait-scale=1 显著拉长）
-"$PY" bench_hetercache.py \
+"$PY" scripts/bench_hetercache.py \
   --data-path TaskData/AgentBankData/Qwen2.5-7B-Instruct/AgentBank_alfred_scale_5000_session_data.jsonl \
   --base-url http://127.0.0.1:30000 \
   --concurrency 32 --num-sessions 2000 \
@@ -188,14 +188,14 @@ source env.sh
 # ============ 单轮负载（--wait-scale 无效，可省略）============
 
 # Codeparrot 单轮代码（num_turns=1）
-"$PY" bench_hetercache.py \
+"$PY" scripts/bench_hetercache.py \
   --data-path TaskData/Codeparrot/Qwen2.5-7B-Instruct/Code_session_data.jsonl \
   --base-url http://127.0.0.1:30000 \
   --concurrency 32 --num-sessions 2000 \
   --output result/bench_codeparrot.json
 
 # AgentBank apps 单轮 API（num_turns=1）
-"$PY" bench_hetercache.py \
+"$PY" scripts/bench_hetercache.py \
   --data-path TaskData/AgentBankData/Qwen2.5-7B-Instruct/AgentBank_apps_session_data.jsonl \
   --base-url http://127.0.0.1:30000 \
   --concurrency 32 --num-sessions 2000 \
@@ -203,7 +203,7 @@ source env.sh
 
 # MASHQA 单轮问答（★ 必须 --no-shuffle：同文档问题相邻才能共享长文档前缀）
 #   建议 --concurrency 4~8，减少同文档兄弟问题的并发竞争（racing）
-"$PY" bench_hetercache.py \
+"$PY" scripts/bench_hetercache.py \
   --data-path TaskData/mashqa_data/Qwen2.5-7B-Instruct/mashqa_session_data.jsonl \
   --base-url http://127.0.0.1:30000 \
   --concurrency 8 --num-sessions 2000 \
@@ -211,7 +211,7 @@ source env.sh
   --output result/bench_mashqa.json
 
 # 冒烟：ShareGPT 30 会话（快速验证链路）
-"$PY" bench_hetercache.py \
+"$PY" scripts/bench_hetercache.py \
   --data-path TaskData/SharedGPT-multi-turn/Qwen2.5-7B-Instruct/ShareGPT_cleaned_valid_deduplicated_session_data.jsonl \
   --base-url http://127.0.0.1:30000 \
   --concurrency 8 --num-sessions 30 \
@@ -231,7 +231,7 @@ source env.sh
 | `--no-shuffle` | 关 | 保持文件原序（mashqa 同文档问题相邻；**同时启用提前终止加载，避免读全文件**） |
 | `--wait-scale` | 0.0 | 轮间等待缩放：0=不等（快速跑）；1=按 lognormal(mu,sigma) 真实等待（**仅多轮 num_turns>1 生效**） |
 | `--mu` / `--sigma` | None | 全局覆盖轮间 lognormal 参数；None=按负载类型取 |
-| `--arrival-config` | `arrival_config.yaml` | 轮间 mu/sigma 查表（按 session_id 前缀区分负载） |
+| `--arrival-config` | `configs/arrival_config.yaml` | 轮间 mu/sigma 查表（按 session_id 前缀区分负载） |
 | `--timeout-s` | 1800 | 单请求超时（秒） |
 | `--output` | None | 结果 JSON 输出路径 |
 
@@ -276,11 +276,11 @@ HeterCache 的多队列（text/single/random/agentic…）竞争同一 KV 池。
 
 ```bash
 cd /root/sg-unicache/Uni-Bench
-source env.sh
+source scripts/env.sh
 
 # 混合负载（默认 4 类负载 lambda_rate=1:1:1:1，见 hybrid_tasks_config.yaml）
-"$PY" bench_hetercache.py \
-  --tasks-config hybrid_tasks_config.yaml \
+"$PY" scripts/bench_hetercache.py \
+  --tasks-config configs/hybrid_tasks_config.yaml \
   --base-url http://127.0.0.1:30000 \
   --concurrency 32 --arrival-scale 1 --wait-scale 0 \
   --output result/hybrid.json
@@ -293,7 +293,7 @@ source env.sh
 | `--tasks-config` | None | 混合负载 YAML（含每个 task 的 data_path/lambda_rate/mu/sigma/seed/max_record） |
 | `--arrival-scale` | 1.0 | 会话到达时刻整体缩放：`1`=UniCache 真实 Poisson 节奏；`0`=全部立即到达（等同单负载并发）；`<1` 加速冒烟 |
 
-`hybrid_tasks_config.yaml` 字段（逐字段对齐 UniCache `tasks_config.yaml`）：
+`configs/hybrid_tasks_config.yaml` 字段（逐字段对齐 UniCache `tasks_config.yaml`）：
 
 ```yaml
 tasks:
@@ -365,7 +365,7 @@ wall_time ≈ max(数据加载, 推理计算) + 调度等待
 > 注意：单负载模式默认读全文件，ShareGPT(1.9GB)/alfred(2.9GB) 额外有 **~2-5 min**
 > 数据加载时间；加 `--no-shuffle`（文件顺序无关时）可省掉这步。
 
-### 5.4 混合负载预估（默认 `hybrid_tasks_config.yaml`：apps1800 + code1800 + sharegpt500 + alfred500）
+### 5.4 混合负载预估（默认 `configs/hybrid_tasks_config.yaml`：apps1800 + code1800 + sharegpt500 + alfred500）
 
 | 场景 | 关键参数 | 预估 wall |
 |---|---|---|
@@ -404,15 +404,15 @@ wall_time ≈ max(数据加载, 推理计算) + 调度等待
 cd /root/sg-unicache/Uni-Bench
 
 # 默认：POLICIES="lru heter_cache" × TOKENS_LIST="50000 100000 200000"
-bash run_all.sh
+bash scripts/run_all.sh
 
 # 自定义
-POLICIES="lru lfu slru heter_cache" TOKENS_LIST="50000 200000" bash run_all.sh
+POLICIES="lru lfu slru heter_cache" TOKENS_LIST="50000 200000" bash scripts/run_all.sh
 ```
 
 输出：`result/bench_<policy>_<tokens>.json` + 终端汇总表（hit% / ttft_p50 / ttft_p99 / reqs / err）。
 
-> 注意：`run_all.sh` 走**单负载**路径（`--data-path $DATA`），`DATA` 在 config.sh 里配置。
+> 注意：`run_all.sh` 走**单负载**路径（`--data-path $DATA`），`DATA` 在 `scripts/config.sh` 里配置。
 > 混合负载请用第 4 节的 `--tasks-config` 手动逐 policy 跑。
 
 ---

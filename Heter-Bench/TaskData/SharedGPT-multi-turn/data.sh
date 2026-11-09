@@ -24,7 +24,7 @@ $PY clean_ShareGPT_V3.py --raw_data_path "$RAW" --clean_data_path ShareGPT_clean
 $PY deduplicate.py   # 内部硬编码读/写本目录下文件
 
 # 4) 转 session_data（逐 turn token 化，Qwen2.5-7B tokenizer）
-$PY "$UB/prepare_session_data.py" \
+$PY "$UB/tools/prepare_session_data.py" \
     --raw_data_path  "$UB/TaskData/SharedGPT-multi-turn/ShareGPT_cleaned_valid_deduplicated.json" \
     --save_data_path "$OUT_DIR/ShareGPT_cleaned_valid_deduplicated_session_data.jsonl" \
     --tokenizer_path "$TOKENIZER"

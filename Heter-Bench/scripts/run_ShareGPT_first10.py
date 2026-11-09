@@ -13,7 +13,7 @@ import aiohttp
 import bench_hetercache as bu            # 复用 Stats / run_session / one_request
 
 DATA = (
-    HERE / "TaskData/SharedGPT-multi-turn/Qwen2.5-7B-Instruct"
+    HERE.parent / "TaskData/SharedGPT-multi-turn/Qwen2.5-7B-Instruct"
     / "ShareGPT_cleaned_valid_deduplicated_session_data.jsonl"
 )
 
@@ -64,7 +64,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument(
         "--arrival-config",
-        default=str(HERE / "arrival_config.yaml"),
+        default=str(HERE.parent / "configs" / "arrival_config.yaml"),
         help="到达间隔 YAML 路径（模仿 HeterCache tasks_config.yaml）",
     )
     p.add_argument("--mu", type=float, default=None,

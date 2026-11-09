@@ -11,31 +11,28 @@ Heter-Bench/
   docs/                   # 说明与实验报告，索引见 docs/README.md
   archive/                # 历史配置快照，仅供追溯
 
-  # 运行入口（实验机按路径直接调用，改名/搬动前先改 queue_detect.sh 里的远端命令）
-  bench_hetercache.py     # 多轮压测 driver（asyncio + aiohttp）
-  serve.sh                # 起单个 server（指定 policy / cache 大小）
-  run_all.sh              # 实验矩阵：policy × cache 大小，自动启停 + 汇总
-  run_single.sh           # 单场景驱动
-  run_ShareGPT_first10.py # 冒烟：前 10 个 session
-  queue_detect.sh         # 远端：排队检测 + 分阶段负载
-  config.sh / env.sh      # 配置与环境变量（被上面几个 source）
+  scripts/                # 运行入口（实验机按路径调用，改名/搬动前先改 queue_detect.sh）
+    bench_hetercache.py   # 多轮压测 driver（asyncio + aiohttp）
+    serve.sh              # 起单个 server（指定 policy / cache 大小）
+    run_all.sh            # 实验矩阵：policy × cache 大小，自动启停 + 汇总
+    run_single.sh         # 单场景驱动
+    run_ShareGPT_first10.py  # 冒烟：前 10 个 session
+    queue_detect.sh       # 远端：排队检测 + 分阶段负载
+    config.sh / env.sh    # 配置与环境变量（被上面几个 source）
 
-  # 配置与工具
-  arrival_config.yaml         # 轮间到达间隔，按 session_id 前缀区分负载
-  hybrid_tasks_config.yaml    # 混合负载配比
-  phased_load_prediction*.yaml/.json  # 分阶段负载及其标签
-  prepare_session_data.py     # 原始数据 → session_data.jsonl
-  calibrate.py                # prefill 速率标定（token → ms）
+  configs/                # 全部 yaml / json 配置
+    arrival_config.yaml                  # 轮间到达间隔，按 session_id 前缀区分负载
+    hybrid_tasks_config.yaml             # 混合负载配比
+    phased_load_prediction.yaml          # 分阶段负载
+    phased_load_prediction_task_labels.json
 
-  # 离线评估
-  eval/                   # 节点级 / token 级 / label 口径的离线分析
+  tools/                  # 数据准备与标定
+    prepare_session_data.py              # 原始数据 → session_data.jsonl
+    calibrate.py                         # prefill 速率标定（token → ms）
 
-  # 实验与运行时目录
+  eval/                   # 离线评估：节点级 / token 级 / label 口径
   profile/  log/          # 观测实现 / 运行日志
-  classify/               # 会话类型分类器
-  exp/                    # d_i 记账实验
-  tailshot/               # 长尾存活实验
-  RR_VS_TLRU/  W-TinyLRU/ # 对照策略
+  classify/  exp/  tailshot/  RR_VS_TLRU/  W-TinyLRU/   # 实验目录
   TaskData/               # 会话数据集
 ```
 
@@ -71,10 +68,10 @@ Heter-Bench/
 cd /home/rain/sglang
 
 # 1) 起实验组 server（另一个终端）
-POLICY=heter_cache MAX_TOTAL_TOKENS=200000 bash Heter-Bench/serve.sh
+POLICY=heter_cache MAX_TOTAL_TOKENS=200000 bash Heter-Bench/scripts/serve.sh
 
 # 2) 跑 driver（20-session demo）
-python Heter-Bench/bench_hetercache.py \
+python Heter-Bench/scripts/bench_hetercache.py \
   --data-path /home/rain/HeterCache/demo/ShareGPT_cleaned_valid_session_data_head20.jsonl \
   --base-url http://127.0.0.1:30000 \
   --concurrency 8 \
@@ -94,12 +91,12 @@ python Heter-Bench/bench_hetercache.py \
 ```bash
 cd /root/sg-unicache/Uni-Bench
 # 起 server（heter_cache）
-POLICY=heter_cache MAX_TOTAL_TOKENS=100000 bash serve.sh
+POLICY=heter_cache MAX_TOTAL_TOKENS=100000 bash scripts/serve.sh
 
-# 跑混合负载（4 类负载 lambda_rate=1:1:1:1，见 hybrid_tasks_config.yaml）
-source env.sh
-"$PY" bench_hetercache.py \
-  --tasks-config hybrid_tasks_config.yaml \
+# 跑混合负载（4 类负载 lambda_rate=1:1:1:1，见 configs/hybrid_tasks_config.yaml）
+source scripts/env.sh
+"$PY" scripts/bench_hetercache.py \
+  --tasks-config configs/hybrid_tasks_config.yaml \
   --base-url http://127.0.0.1:30000 \
   --concurrency 32 --arrival-scale 1 --wait-scale 1 \
   --output result/hybrid.json
@@ -119,8 +116,8 @@ source env.sh
 
 ```bash
 cd /home/rain/sglang
-# 编辑 Heter-Bench/config.sh：DATA 换成全量 session_data.jsonl
-bash Heter-Bench/run_all.sh
+# 编辑 Heter-Bench/scripts/config.sh：DATA 换成全量 session_data.jsonl
+bash Heter-Bench/scripts/run_all.sh
 ```
 默认矩阵：`POLICIES="lru heter_cache"` × `TOKENS_LIST="50000 100000 200000"`。
 
@@ -171,10 +168,10 @@ bash Heter-Bench/run_all.sh
 结构复用真值仅指 Codeparrot；AgentBank apps 保留为 `random`。先启动服务，再运行：
 
 ```bash
-POLICY=heter_cache MAX_TOTAL_TOKENS=100000 bash serve.sh
-source env.sh
-"$PY" bench_hetercache.py \
-  --phases-config phased_load_prediction.yaml \
+POLICY=heter_cache MAX_TOTAL_TOKENS=100000 bash scripts/serve.sh
+source scripts/env.sh
+"$PY" scripts/bench_hetercache.py \
+  --phases-config configs/phased_load_prediction.yaml \
   --base-url http://127.0.0.1:30000 \
   --concurrency 32 --arrival-scale 1 --wait-scale 1 \
   --output result/phased_load_prediction.json

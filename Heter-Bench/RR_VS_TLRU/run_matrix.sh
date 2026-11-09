@@ -21,7 +21,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 BENCH_DIR="$(cd .. && pwd)"
-source "$BENCH_DIR/env.sh"
+source "$BENCH_DIR/scripts/env.sh"
 
 ARMS=${ARMS:-"a0_control a1_rr"}
 RESUME_MODES=${RESUME_MODES:-"simultaneous batched"}
@@ -99,7 +99,7 @@ run_one() {  # $1=arm $2=mode $3=budget $4=seed $5=当前 server 的日志路径
     mark=$(wc -l < "$log")
   fi
   echo "[matrix] bench arm=${arm} mode=${mode} budget=${budget} seed=${seed}"
-  "$PY" "$BENCH_DIR/bench_hetercache.py" \
+  "$PY" "$BENCH_DIR/scripts/bench_hetercache.py" \
     --tasks-config "$TASKS_CONFIG" \
     --burst-duration-s "$BURST_DURATION_S" \
     --resume-mode "$mode" \

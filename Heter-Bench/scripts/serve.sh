@@ -2,17 +2,17 @@
 # 启动一个 sglang server。服务器环境修正见 env.sh。
 #
 # 用法：
-#   POLICY=heter_cache MAX_TOTAL_TOKENS=100000 bash serve.sh
-#   POLICY=lru          MAX_TOTAL_TOKENS=100000 bash serve.sh
+#   POLICY=heter_cache MAX_TOTAL_TOKENS=100000 bash scripts/serve.sh
+#   POLICY=lru          MAX_TOTAL_TOKENS=100000 bash scripts/serve.sh
 #
 # 注意：heter_cache 需要同时加 --enable-heter-cache（选择 HeterCacheRadixCache）
 #      和 --radix-eviction-policy=heter_cache（选择 HeterCacheStrategy），缺一不可。
 set -eu
-BENCH_DIR="$(cd "$(dirname "$0")" && pwd)"
+BENCH_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 # shellcheck source=env.sh
-source "$BENCH_DIR/env.sh"
+source "$BENCH_DIR/scripts/env.sh"
 # shellcheck source=config.sh
-source "$BENCH_DIR/config.sh"
+source "$BENCH_DIR/scripts/config.sh"
 
 MODEL=${MODEL:-/root/autodl-tmp/model/Qwen2.5-7B-Instruct}
 PORT=${PORT:-30000}

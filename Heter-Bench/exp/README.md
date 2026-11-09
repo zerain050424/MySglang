@@ -10,10 +10,10 @@
 
 | 类别 | 路径 | 说明 |
 |---|---|---|
-| 压测驱动 | `bench_hetercache.py` | asyncio + aiohttp，混合负载，逐请求 CSV |
-| 起 server | `serve.sh` / `env.sh` / `config.sh` | `POLICY` × `MAX_TOTAL_TOKENS` |
+| 压测驱动 | `../scripts/bench_hetercache.py` | asyncio + aiohttp，混合负载，逐请求 CSV |
+| 起 server | `../scripts/{serve,env,config}.sh` | `POLICY` × `MAX_TOTAL_TOKENS` |
 | 数据 | `TaskData/` | alfred(agentic) / apps(random) / Codeparrot(single) / ShareGPT(text) |
-| 标定 | `calibrate.py` | 冷启动 prefill 速率 → `ttft = a + b·L` |
+| 标定 | `../tools/calibrate.py` | 冷启动 prefill 速率 → `ttft = a + b·L` |
 | 实验 1 | `tailshot/` + `result/tailshot*` | 已完成的 Tailshot 矩阵 |
 | 实验 2 | `exp/`（本文件） | Cascade 设计 + 首次实测 |
 
@@ -264,7 +264,7 @@ staggered 变体：victim i 在 t=6·i 秒到达（i=0..11），其余不变。�
 
 ## 2.14 改动清单（未实现，待批准）
 
-1. `bench_hetercache.py`：CSV 加 `ts/queue_time_ms/prefill_ms`；支持 `gap_mode/gap_s/pause_after_turn/pause_s`；`arrival.mode=fixed` + `gate_after` 屏障
+1. `../scripts/bench_hetercache.py`：CSV 加 `ts/queue_time_ms/prefill_ms`；支持 `gap_mode/gap_s/pause_after_turn/pause_s`；`arrival.mode=fixed` + `gate_after` 屏障
 2. `TaskData/victim_pool12_{H,W,C}.jsonl`：从 `AgentBank_alfred_scale_5000` 切 12 条 ≥26 轮（不截断 prompt）
 3. `tailshot/cascade_R1..R5.yaml`
 4. `tailshot/run_cascade.sh`（复用 `run_matrix.sh` 骨架）

@@ -5,7 +5,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 BENCH_DIR="$(cd .. && pwd)"          # Heter-Bench/
-source "$BENCH_DIR/env.sh"           # $PY + 库路径
+source "$BENCH_DIR/scripts/env.sh"           # $PY + 库路径
 
 ARM=${1:?usage: serve_arm.sh <arm> <max_total_tokens> [config.json]}
 BUDGET=${2:?usage: serve_arm.sh <arm> <max_total_tokens> [config.json]}

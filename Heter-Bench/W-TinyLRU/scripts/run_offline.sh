@@ -7,7 +7,7 @@
 #   bash scripts/run_offline.sh --mode synth --arms A0,A2,A3 --synth-depths 512,2048,8192
 #
 # 环境变量：
-#   WTL_PY        指定解释器（默认优先用 Heter-Bench/env.sh 的 PY，否则 python）
+#   WTL_PY        指定解释器（默认优先用 Heter-Bench/scripts/env.sh 的 PY，否则 python）
 #   UNIBENCH_ROOT 数据根目录（默认 ../）
 set -euo pipefail
 
@@ -15,9 +15,9 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$HERE"
 
 # 实验机上的 Heter-Bench 环境（venv / LD_LIBRARY_PATH）；不存在就跳过
-if [ -f ../env.sh ] && [ "${WTL_SKIP_UNIBENCH_ENV:-0}" != "1" ]; then
+if [ -f ../../scripts/env.sh ] && [ "${WTL_SKIP_UNIBENCH_ENV:-0}" != "1" ]; then
   # shellcheck disable=SC1091
-  source ../env.sh
+  source ../../scripts/env.sh
 fi
 PY="${WTL_PY:-${PY:-python}}"
 

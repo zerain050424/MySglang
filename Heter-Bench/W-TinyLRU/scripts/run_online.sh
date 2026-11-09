@@ -9,23 +9,23 @@
 #   * 每臂独立的 SGLANG_STRUCT_PROFILE，便于 analyze 分组；
 #   * 结果命名 bench_<arm>_<mode>_<tokens>k_s<seed>.json，analyze 从文件名解析元数据。
 #
-# 环境变量：MODEL / DATA / PORT / CONC / WAIT_SCALE（来自 ../config.sh，可覆盖）
+# 环境变量：MODEL / DATA / PORT / CONC / WAIT_SCALE（来自 ../../scripts/config.sh，可覆盖）
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"   # W-TinyLRU
 cd "$HERE"
 
-if [ -f ../env.sh ]; then
+if [ -f ../../scripts/env.sh ]; then
   # shellcheck disable=SC1091
-  source ../env.sh
+  source ../../scripts/env.sh
 fi
-if [ -f ../config.sh ]; then
+if [ -f ../../scripts/config.sh ]; then
   # shellcheck disable=SC1091
-  set +u; source ../config.sh; set -u
+  set +u; source ../../scripts/config.sh; set -u
 fi
 PY="${WTL_PY:-${PY:-python}}"
 PORT="${PORT:-30000}"
-MODEL="${MODEL:?需要 MODEL（或在 ../config.sh 里配置）}"
+MODEL="${MODEL:?需要 MODEL（或在 ../../scripts/config.sh 里配置）}"
 CONC="${CONC:-32}"
 WAIT_SCALE="${WAIT_SCALE:-1.0}"
 ARRIVAL_SCALE="${ARRIVAL_SCALE:-1.0}"
@@ -33,7 +33,7 @@ SEEDS="${SEEDS:-42}"
 TOKENS_LIST="${TOKENS_LIST:-100000}"
 ARMS="${ARMS:-A0 A2 A3}"
 MODES="${MODES:-hybrid sharegpt}"
-CLIENT="${CLIENT:-$HERE/../bench_hetercache.py}"
+CLIENT="${CLIENT:-$HERE/../scripts/bench_hetercache.py}"
 OUTDIR="${OUTDIR:-$HERE/result/online}"
 mkdir -p "$OUTDIR"
 
@@ -62,7 +62,7 @@ arm_policy() {
 
 bench_mode_args() {
   case "$1" in
-    hybrid)   echo "--tasks-config $HERE/../hybrid_tasks_config.yaml" ;;
+    hybrid)   echo "--tasks-config $HERE/../configs/hybrid_tasks_config.yaml" ;;
     sharegpt) echo "--data-path $HERE/../TaskData/SharedGPT-multi-turn/Qwen2.5-7B-Instruct/ShareGPT_cleaned_valid_deduplicated_session_data.jsonl" ;;
     alfred)   echo "--data-path $HERE/../TaskData/AgentBankData/Qwen2.5-7B-Instruct/AgentBank_alfred_scale_5000_session_data.jsonl" ;;
     codeparrot) echo "--data-path $HERE/../TaskData/Codeparrot/Qwen2.5-7B-Instruct/Code_session_data.jsonl" ;;

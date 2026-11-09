@@ -13,7 +13,7 @@ run_one () {
   echo "=== [$TAG] server up (policy=$POLICY) $(date +%T) ==="
   POLICY=$POLICY MAX_TOTAL_TOKENS=100000 PORT=$PORT \
     LOG=$OUT/server_${TAG}.log EXTRA_ARGS="--mem-fraction-static 0.79" \
-    nohup bash "$BENCH/serve.sh" > /dev/null 2>&1 &
+    nohup bash "$BENCH/scripts/serve.sh" > /dev/null 2>&1 &
   for i in $(seq 1 120); do
     sleep 5
     if curl -sf "http://127.0.0.1:$PORT/health" > /dev/null 2>&1; then break; fi
@@ -22,7 +22,7 @@ run_one () {
     echo "=== [$TAG] server FAILED ==="; return 1
   fi
   echo "=== [$TAG] bench start $(date +%T) ==="
-  /root/sl_old/bin/python "$BENCH/bench_hetercache.py" \
+  /root/sl_old/bin/python "$BENCH/scripts/bench_hetercache.py" \
     --tasks-config "$CFG" --concurrency 32 \
     --arrival-scale 1 --wait-scale 1 \
     --base-url "http://127.0.0.1:$PORT" \

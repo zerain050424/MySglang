@@ -1,4 +1,4 @@
-"""trace 读取与到达调度（与 ``Heter-Bench/bench_hetercache.py`` 同语义）。
+"""trace 读取与到达调度（与 ``Heter-Bench/scripts/bench_hetercache.py`` 同语义）。
 
 为什么要自己重写而不是 import
 -----------------------------
@@ -56,7 +56,7 @@ WORKLOADS: Dict[str, Dict[str, Any]] = {
         "note": "多轮 chat：共享前缀是会话内历史（H5 护栏臂）",
     },
     "hybrid": {
-        "path": "hybrid_tasks_config.yaml",  # 走 --tasks-config
+        "path": "configs/hybrid_tasks_config.yaml",  # 走 --tasks-config
         "mu": 0.0, "sigma": 0.0, "task": "hybrid",
         "note": "四负载混合（1:1:1:1），与 Heter-Bench 在线实验同构",
     },

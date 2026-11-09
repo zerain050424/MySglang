@@ -10,7 +10,7 @@
 | HeterCache 部署 venv | `/root/sl_old`（python 3.12.3，torch 2.13.0，与 9-26 基线 pin 一致） |
 | 模型（tokenizer 必须一致） | `/root/autodl-tmp/model/Qwen2.5-7B-Instruct` |
 | 原始数据集 | `/root/autodl-tmp/TaskData/`（下载脚本见 `download_datasets.sh`） |
-| server 启动环境 | `env.sh`（venv python + ninja PATH + LD_LIBRARY_PATH） |
+| server 启动环境 | `scripts/env.sh`（venv python + ninja PATH + LD_LIBRARY_PATH） |
 
 ## 一、数据准备（每个负载一次）
 
@@ -41,16 +41,16 @@ bash TaskData/AgentBankData/data.sh
 
 ```bash
 # 需要先停掉占用 GPU/端口的其他 server
-POLICY=heter_cache MAX_TOTAL_TOKENS=100000 bash serve.sh
+POLICY=heter_cache MAX_TOTAL_TOKENS=100000 bash scripts/serve.sh
 # 或 lru 基线
-POLICY=lru MAX_TOTAL_TOKENS=100000 bash serve.sh
+POLICY=lru MAX_TOTAL_TOKENS=100000 bash scripts/serve.sh
 ```
 
 ## 三、跑负载（bench_hetercache.py）
 
 ```bash
-source env.sh
-"$PY" bench_hetercache.py \
+source scripts/env.sh
+"$PY" scripts/bench_hetercache.py \
   --data-path TaskData/Codeparrot/Qwen2.5-7B-Instruct/Code_session_data.jsonl \
   --base-url http://127.0.0.1:30000 --concurrency 8 --num-sessions 30 \
   --output result/smoke.json
@@ -59,7 +59,7 @@ source env.sh
 ## 四、全矩阵实验
 
 ```bash
-bash run_all.sh   # POLICIES="lru heter_cache" × TOKENS_LIST="50000 100000 200000"
+bash scripts/run_all.sh   # POLICIES="lru heter_cache" × TOKENS_LIST="50000 100000 200000"
 ```
 
 ## 关键设计（为什么这么改）

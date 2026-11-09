@@ -42,23 +42,3 @@ tasks:
     sigma: 1.092
     seed: 42
 
-  - name: file            # file_ShareGPT-multi-turn-*（无 HeterCache 到达间隔实测值）
-    task_id: 4
-    lambda_rate: 1
-    mu: 5.07658           # 复用概率 lognormal 拟合值（evictor.py）
-    sigma: 1.06383
-    seed: 42
-
-  - name: image           # image_ShareGPT-multi-turn-*
-    task_id: 5
-    lambda_rate: 1
-    mu: 4.4449            # 复用概率 lognormal 拟合值（evictor.py）
-    sigma: 1.09066
-    seed: 42
-
-  - name: search          # search_ShareGPT-multi-turn-*
-    task_id: 6
-    lambda_rate: 1
-    mu: 4.961663          # 复用概率 lognormal 拟合值（evictor.py）
-    sigma: 1.13877
-    seed: 42

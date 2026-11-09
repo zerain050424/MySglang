@@ -4,9 +4,9 @@
 # 把 5 个单负载数据集的压测集成到一个脚本，按「策略」输出到独立目录。
 #
 # 用法（server 需已用同一 policy 启动，见 serve.sh）：
-#   bash run_single.sh lru             # → result/LRU/
-#   bash run_single.sh heter_cache   # → result/HeterCache/
-#   POLICY=lfu bash run_single.sh      # → result/LFU/
+#   bash scripts/run_single.sh lru             # → result/LRU/
+#   bash scripts/run_single.sh heter_cache   # → result/HeterCache/
+#   POLICY=lfu bash scripts/run_single.sh      # → result/LFU/
 #
 # 可调环境变量：
 #   NUM_SESSIONS=2000   每个负载的 session 数
@@ -16,11 +16,11 @@
 # =============================================================================
 set -eu
 
-BENCH_DIR="$(cd "$(dirname "$0")" && pwd)"
+BENCH_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 # shellcheck source=env.sh
-source "$BENCH_DIR/env.sh"
+source "$BENCH_DIR/scripts/env.sh"
 # shellcheck source=config.sh
-source "$BENCH_DIR/config.sh"
+source "$BENCH_DIR/scripts/config.sh"
 
 cd "$BENCH_DIR"
 
@@ -46,7 +46,7 @@ mkdir -p "$OUTDIR"
 # 健康检查：server 未就绪则退出（提示先起 server）
 if ! curl -sf "$BASE_URL/health" >/dev/null 2>&1; then
   echo "!! server 未就绪（$BASE_URL/health），请先起 server："
-  echo "   POLICY=$POLICY MAX_TOTAL_TOKENS=100000 bash $BENCH_DIR/serve.sh"
+  echo "   POLICY=$POLICY MAX_TOTAL_TOKENS=100000 bash $BENCH_DIR/scripts/serve.sh"
   exit 1
 fi
 
@@ -60,7 +60,7 @@ run() {
   local name="$1" data="$2"; shift 2
   echo "--------------------------------------------------"
   echo ">>> [$DIR] $name"
-  "$PY" "$BENCH_DIR/bench_hetercache.py" \
+  "$PY" "$BENCH_DIR/scripts/bench_hetercache.py" \
     --data-path "$data" \
     --base-url "$BASE_URL" \
     --output "$OUTDIR/bench_${name}.json" \

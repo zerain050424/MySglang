@@ -26,14 +26,14 @@
   - 「比例」= 各 task 的 lambda_rate 之比（session 到达速率之比）。
 
 用法（单负载）：
-  python bench_hetercache.py \
+  python scripts/bench_hetercache.py \
       --data-path /path/ShareGPT_..._session_data.jsonl \
       --base-url http://127.0.0.1:30000 \
       --concurrency 32 --output result/bench.json
 
 用法（混合负载，模仿 HeterCache Hybrid/tasks_config.yaml）：
-  python bench_hetercache.py \
-      --tasks-config hybrid_tasks_config.yaml \
+  python scripts/bench_hetercache.py \
+      --tasks-config configs/hybrid_tasks_config.yaml \
       --base-url http://127.0.0.1:30000 \
       --concurrency 32 --arrival-scale 1 --wait-scale 1 --output result/hybrid.json
 """
@@ -96,7 +96,7 @@ def load_sessions(path: str, num_sessions: int, seed: Optional[int] = None,
 def load_arrival_config(path: Optional[str]) -> Dict[str, Dict[str, Any]]:
     """读取到达间隔 YAML，返回 {task_name: {task_id, lambda_rate, mu, sigma, seed}}。
 
-    结构对齐 HeterCache 的 tasks_config.yaml（见 Heter-Bench/arrival_config.yaml）。
+    结构对齐 HeterCache 的 tasks_config.yaml（见 Heter-Bench/configs/arrival_config.yaml）。
     仅单负载模式使用：根据 session_id 前缀查该负载类型的轮间 mu/sigma。
     """
     if not path:
@@ -877,7 +877,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-shuffle", action="store_true", help="保持 session 文件原始顺序（mashqa 同文档问题相邻）")
     p.add_argument(
         "--arrival-config",
-        default=str(Path(__file__).resolve().parent / "arrival_config.yaml"),
+        default=str(Path(__file__).resolve().parent.parent / "configs" / "arrival_config.yaml"),
         help="到达间隔 YAML 路径（单负载模式按 session_id 前缀查 mu/sigma）",
     )
     p.add_argument("--mu", type=float, default=None,

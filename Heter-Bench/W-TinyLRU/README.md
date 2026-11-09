@@ -32,7 +32,7 @@ W-TinyLRU/
 ```bash
 # 实验机（与 Heter-Bench 相同）
 export PYTHONPATH=/path/to/MySglang/python:$PYTHONPATH
-export PY=/root/sl_old/bin/python          # 或 source ../env.sh
+export PY=/root/sl_old/bin/python          # 或 source ../scripts/env.sh
 
 # 本机（没有 sglang/torch 也能验证链路）
 python tests/test_smoke.py

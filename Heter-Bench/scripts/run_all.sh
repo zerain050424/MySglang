@@ -2,18 +2,18 @@
 # Heter-Bench 实验矩阵：policy × max_total_tokens，自动启停 server 并汇总命中率。
 #
 # 用法：
-#   bash run_all.sh
-#   POLICIES="lru heter_cache" TOKENS_LIST="50000 200000" bash run_all.sh
+#   bash scripts/run_all.sh
+#   POLICIES="lru heter_cache" TOKENS_LIST="50000 200000" bash scripts/run_all.sh
 #
 # 输出：Heter-Bench/result/bench_<policy>_<tokens>.json + 终端汇总表
 set -u
 
-BENCH_DIR="$(cd "$(dirname "$0")" && pwd)"
+BENCH_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 # shellcheck source=config.sh
 # shellcheck source=env.sh
-source "$BENCH_DIR/env.sh"
+source "$BENCH_DIR/scripts/env.sh"
 # shellcheck source=config.sh
-source "$BENCH_DIR/config.sh"
+source "$BENCH_DIR/scripts/config.sh"
 
 OUTDIR=${OUTDIR:-$BENCH_DIR/result}
 mkdir -p "$OUTDIR"
@@ -58,7 +58,7 @@ run_one() {
     return 1
   fi
 
-  "$PY" "$BENCH_DIR/bench_hetercache.py" \
+  "$PY" "$BENCH_DIR/scripts/bench_hetercache.py" \
     --data-path "$DATA" \
     --base-url "http://127.0.0.1:${PORT}" \
     --concurrency "$CONC" \

@@ -24,7 +24,7 @@ export CONC=${CONC:-32}
 
 # 混合负载配置（模仿 HeterCache TaskData/Hybrid/*/tasks_config.yaml）。
 # 用 bench_hetercache.py --tasks-config 时生效；每个 task 的 lambda_rate 之比即混合比例。
-export HYBRID_TASKS_CONFIG=${HYBRID_TASKS_CONFIG:-$BENCH_DIR/hybrid_tasks_config.yaml}
+export HYBRID_TASKS_CONFIG=${HYBRID_TASKS_CONFIG:-$BENCH_DIR/configs/hybrid_tasks_config.yaml}
 # 会话到达节奏缩放：1=HeterCache 真实 Poisson 到达；0=全部立即到达（等同单负载并发）。
 export ARRIVAL_SCALE=${ARRIVAL_SCALE:-1.0}
 

@@ -22,7 +22,7 @@ cd "$UB/TaskData/Codeparrot"
 $PY prepare_data.py --input "$RAW" --output Code.json --id-prefix "$ID_PREFIX"
 
 # 2) 转 session_data
-$PY "$UB/prepare_session_data.py" \
+$PY "$UB/tools/prepare_session_data.py" \
     --raw_data_path  "$UB/TaskData/Codeparrot/Code.json" \
     --save_data_path "$OUT_DIR/Code_session_data.jsonl" \
     --tokenizer_path "$TOKENIZER"
