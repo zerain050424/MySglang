@@ -45,56 +45,18 @@ _LOG_READY = _add_path(_LOG_DIR)
 _PROFILE_READY = _add_path(_PROFILE_DIR)
 
 if _LOG_READY:
-    from heter_logger import HeterLogger, heterlog  # noqa: F401, E402
+    # 事件流落盘必须在导入期开启：晚于此刻产生的事件不会被捕获。
+    # 本模块不再向上游暴露 ``heterlog``——sglang 侧已无调用点，
+    # 观测逻辑一律经 CacheTelemetry 转发。
+    from heter_logger import heterlog
 
     if os.environ.get("HETER_STRATEGY_EVENTS"):
         heterlog.start_capture(os.environ["HETER_STRATEGY_EVENTS"])
 else:
-    # 兜底：命名空间 logger，不落盘也不抛错。
-    _log = logging.getLogger("hetercache.strategy")
-    _log.warning(
-        "Heter-Bench/log not found at %s; HeterLogger degraded "
-        "(text log only, no JSONL capture).",
+    logging.getLogger("hetercache.strategy").warning(
+        "Heter-Bench/log not found at %s; no log capture available.",
         _LOG_DIR,
     )
-
-    class _FallbackHeterLogger:
-        """与 HeterLogger 同签名的降级实现：文本日志照打，事件流静默丢弃。
-
-        用 ``__getattr__`` 兜住所有事件方法，这样上游新增事件类型时这里不用跟改；
-        丢弃而非报错，是因为观测失败不该影响淘汰主流程。
-        """
-
-        @property
-        def enabled(self) -> bool:
-            return _log.isEnabledFor(logging.DEBUG)
-
-        @property
-        def capturing(self) -> bool:
-            """降级态永远不会捕获事件流。
-
-            必须显式定义：本类的 ``__getattr__`` 会把任何未定义属性变成一个
-            可调用对象（真值），不写这一行的话 ``heterlog.capturing`` 会假报
-            "正在捕获"，让调用方白构造一份被丢弃的事件。
-            """
-            return False
-
-        def set_level(self, level) -> None:
-            _log.setLevel(str(level).upper())
-
-        def start_capture(self, path: str) -> None:
-            pass
-
-        def end_capture(self) -> None:
-            pass
-
-        def __getattr__(self, name):
-            def _any(*args, **kwargs):
-                _log.debug("[%s] %s", name, args)
-
-            return _any
-
-    heterlog = _FallbackHeterLogger()  # noqa: F811
 
 
 if _PROFILE_READY:
@@ -106,7 +68,7 @@ if _PROFILE_READY:
     )
 else:
     # 兜底：同签名空实现，保证策略与缓存层的导入路径永远成立。
-    _log.warning(
+    logging.getLogger("hetercache.strategy").warning(
         "Heter-Bench/profile not found at %s; profiler and telemetry degraded.",
         _PROFILE_DIR,
     )
