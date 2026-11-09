@@ -521,12 +521,178 @@ class SessionState:
 
 
 logger = logging.getLogger(__name__)
-_D_BREAK_LOG = os.environ.get("SGLANG_SESSION_D_BREAK_LOG", "0") == "1"
-_TRACE_SID = os.environ.get("SGLANG_SESSION_TRACE_SID", "")
-# sweep 耗时采样开关：默认关。一次 sweep 只要两次 perf_counter（约 0.15us），
-# 但 sweep 本身在小会话表上也只有微秒级，默认开会让相对开销变难看；
-# 真正要看时延的场合显式打开即可。
-_SWEEP_PROF = os.environ.get("SGLANG_SESSION_SWEEP_PROFILE", "0") == "1"
+
+
+class SessionProbe:
+    """会话账本的诊断探针：生产态是基类，什么都不做。
+
+    诊断（单会话追踪、缺口越界告警、sweep 耗时采样）全部收在子类里，账本只在
+    关键点回调查询。这样 ``charge`` / ``sweep`` 保持纯算法，排查代码不侵入热路径。
+
+    默认不挂探针（账本里是 ``None``）而不是挂一个空对象：少一次方法调用。
+    基类只作为注入点与类型边界存在。
+    """
+
+    __slots__ = ()
+
+    # 是否需要 sweep 计时。基类不测，账本据此跳过两次 perf_counter。
+    wants_sweep_timing = False
+
+    def on_charge(self, node, state: "SessionState", num_tokens: int) -> None:
+        """节点被逐出、缺口累加之后、截断之前回调。"""
+
+    def on_sweep(self, elapsed_s: float, scanned: int, dead: int) -> None:
+        """一次 sweep 结束后回调。"""
+
+    def sweep_profile(self) -> Dict[str, float]:
+        """sweep 耗时统计；不采样的探针返回全零。"""
+        return {
+            "calls": 0,
+            "avg_us": 0.0,
+            "max_us": 0.0,
+            "last_scan": 0,
+            "last_dead": 0,
+        }
+
+
+class DebugSessionProbe(SessionProbe):
+    """排查用探针：单会话追踪 + 缺口越界告警 + sweep 耗时采样。
+
+    三项各自独立开关，全关时不建实例（见 ``_probe_from_env``）。
+
+    Attributes:
+        trace_sid: 只盯一条会话，逐次打印逐出细节。
+        enable_break_log: 缺口远超链长时告警（通常意味着节点 session_id 归属串标）。
+        enable_sweep_timing: 记录 sweep 耗时与扫描规模。
+    """
+
+    __slots__ = (
+        "trace_sid",
+        "enable_break_log",
+        "wants_sweep_timing",
+        "_calls",
+        "_us_total",
+        "_us_max",
+        "_scan",
+        "_dead",
+    )
+
+    SWEEP_REPORT_EVERY = 64    # 每 N 次 sweep 打一行汇总，太小刷屏、太大漏尖峰
+    SWEEP_WARN_US = 2000.0     # 单次 sweep 超过 2ms 就告警
+    BREAK_SLACK_TOKENS = 32    # 缺口超出链长多少才值得告警
+
+    def __init__(
+        self,
+        trace_sid: str = "",
+        enable_break_log: bool = False,
+        enable_sweep_timing: bool = False,
+    ):
+        self.trace_sid = trace_sid
+        self.enable_break_log = enable_break_log
+        self.wants_sweep_timing = enable_sweep_timing
+        self._calls = 0
+        self._us_total = 0.0
+        self._us_max = 0.0
+        self._scan = 0
+        self._dead = 0
+
+    def on_charge(self, node, state: "SessionState", num_tokens: int) -> None:
+        """打印单会话逐出细节与缺口越界告警。"""
+        session_id = state.session_id
+        if self.trace_sid and session_id == self.trace_sid:
+            logger.warning(
+                "[session trace charge] nid=%s abs_start=%s key=%d val=%d d=%d L=%d",
+                getattr(node, "id", -1),
+                getattr(node, "abs_start", None),
+                len(getattr(node, "key", []) or []),
+                num_tokens,
+                state.d,
+                state.L,
+            )
+        if (
+            self.enable_break_log
+            and state.L
+            and state.d > state.L + self.BREAK_SLACK_TOKENS
+        ):
+            logger.warning(
+                "[session d break] sid=%s d=%d L=%d +%d abs_start=%s "
+                "attached=%d charged=%d live=%d node_count=%d",
+                session_id,
+                state.d,
+                state.L,
+                num_tokens,
+                getattr(node, "abs_start", None),
+                state.attached,
+                state.charged,
+                state.attached - state.charged,
+                state.node_count,
+            )
+
+    def on_sweep(self, elapsed_s: float, scanned: int, dead: int) -> None:
+        """累加一次 sweep 样本，按周期或超阈打印。
+
+        同时记录耗时与扫描规模：单看耗时分不清“表小但慢”还是“表大但正常”，
+        二者的优化手段完全不同。两者相除就是单会话成本，能直接外推到更大规模。
+        """
+        us = elapsed_s * 1e6
+        self._calls += 1
+        self._us_total += us
+        self._scan = scanned
+        self._dead = dead
+        if us > self._us_max:
+            self._us_max = us
+            # 尖峰立即报，不等周期，否则会被均值抹平。
+            if us > self.SWEEP_WARN_US:
+                logger.warning(
+                    "[Session sweep] SLOW %.1fus (scan=%d, dead=%d) 阈%.0fus",
+                    us,
+                    scanned,
+                    dead,
+                    self.SWEEP_WARN_US,
+                )
+        if self._calls % self.SWEEP_REPORT_EVERY == 0:
+            per_session = us / scanned if scanned else 0.0
+            logger.info(
+                "[Session sweep] n=%d last=%.1fus avg=%.1fus max=%.1fus "
+                "scan=%d dead=%d per_session=%.3fus",
+                self._calls,
+                us,
+                self._us_total / self._calls,
+                self._us_max,
+                scanned,
+                dead,
+                per_session,
+            )
+
+    def sweep_profile(self) -> Dict[str, float]:
+        """导出 sweep 耗时统计。"""
+        calls = self._calls
+        return {
+            "calls": calls,
+            "avg_us": self._us_total / calls if calls else 0.0,
+            "max_us": self._us_max,
+            "last_scan": self._scan,
+            "last_dead": self._dead,
+        }
+
+
+def _probe_from_env() -> Optional[SessionProbe]:
+    """按环境变量装配探针；三项都没开时返回 None（零开销）。
+
+    * ``SGLANG_SESSION_TRACE_SID``：只追踪这一条会话的逐出细节；
+    * ``SGLANG_SESSION_D_BREAK_LOG=1``：缺口远超链长时告警；
+    * ``SGLANG_SESSION_SWEEP_PROFILE=1``：记录 sweep 耗时。
+    """
+    trace_sid = os.environ.get("SGLANG_SESSION_TRACE_SID", "")
+    break_log = os.environ.get("SGLANG_SESSION_D_BREAK_LOG", "0") == "1"
+    sweep_prof = os.environ.get("SGLANG_SESSION_SWEEP_PROFILE", "0") == "1"
+    if not (trace_sid or break_log or sweep_prof):
+        return None
+    return DebugSessionProbe(
+        trace_sid=trace_sid,
+        enable_break_log=break_log,
+        enable_sweep_timing=sweep_prof,
+    )
 
 class SessionRegistry:
     """会话KV缺口统计：维护 KV Cache 缺口（d/L 记录）并在线推断会话负载类型。
@@ -565,21 +731,33 @@ class SessionRegistry:
     MULTI_TURN_MIN = 5      # 判定多轮的最小 turn 阈值
     GAP_SPLIT_S = 15.0      # Agent 与 Chat 的间隔判定临界值（秒）
     AGENTIC_CONTEXT_GROWTH_TOKENS = 1500  # 边界兜底：判定上下文持续暴涨的 token 阈值
-    # 以下三个只服务于 sweep 耗时埋点（SGLANG_SESSION_SWEEP_PROFILE=1 时生效）。
-    SWEEP_PROF_EVERY = 64        # 每 N 次 sweep 打一行汇总，太小刷屏、太大漏尖峰
-    SWEEP_WARN_US = 2000.0       # 单次 sweep 超过 2ms 就绪告警
 
-    def __init__(self, idle_ttl: float = 3600.0, empty_grace: float = 60.0):
+    def __init__(
+        self,
+        idle_ttl: float = 3600.0,
+        empty_grace: float = 60.0,
+        probe: Optional[SessionProbe] = None,
+    ):
+        """构造账本。
+
+        Args:
+            idle_ttl: 会话无请求的最大存活时间（秒）。
+            empty_grace: 节点清空后保留分类证据的宽限期（秒）。
+            probe: 诊断探针；``None`` 表示按环境变量装配，全关时不挂探针。
+        """
         self._sessions: Dict[str, SessionState] = {}
         self.idle_ttl = idle_ttl          # 会话无请求的最大存活时间
         self.empty_grace = empty_grace    # 节点清空后保留分类证据的宽限期
         self._touches = 0
-        # sweep 埋点累加器：只在 _SWEEP_PROF 打开时增长。
-        self._sweep_calls = 0
-        self._sweep_us_total = 0.0
-        self._sweep_us_max = 0.0
-        self._sweep_scan = 0              # 最近一次扫描的会话数
-        self._sweep_dead = 0              # 最近一次回收的会话数
+        self._probe = _probe_from_env() if probe is None else probe
+        # 绑定回调而不是每次都判断并调一个空对象：默认态只剩一次 None 判断。
+        self._on_charge = self._probe.on_charge if self._probe is not None else None
+        # 只有需要计时的探针才挂 on_sweep，这样“不测速”连两次 perf_counter 都省了。
+        self._on_sweep = (
+            self._probe.on_sweep
+            if self._probe is not None and self._probe.wants_sweep_timing
+            else None
+        )
 
     # ---- 查询 ----
     def get(self, session_id: Optional[str]) -> Optional[SessionState]:
@@ -736,21 +914,11 @@ class SessionRegistry:
         st.charged += num_tokens
         if st.node_count > 0:
             st.node_count -= 1
-        if _TRACE_SID and session_id == _TRACE_SID:
-            logger.warning(
-                "[session trace charge] nid=%s abs_start=%s key=%d val=%d d=%d L=%d",
-                getattr(node, "id", -1), getattr(node, "abs_start", None),
-                len(getattr(node, "key", []) or []), num_tokens, st.d, st.L,
-            )
-        if _D_BREAK_LOG and st.L and st.d > st.L + 32:
-            # 告警保护：实际被逐出 token 数远超最近注册的链长，通常是节点 session_id 归属串标
-            logger.warning(
-                "[session d break] sid=%s d=%d L=%d +%d abs_start=%s "
-                "attached=%d charged=%d live=%d node_count=%d",
-                session_id, st.d, st.L, num_tokens,
-                getattr(node, "abs_start", None),
-                st.attached, st.charged, st.attached - st.charged, st.node_count,
-            )
+        # 探针在截断之前回调：截断后 d <= L 恒成立，
+        # “d > L + slack”的告警分支会永远进不去。
+        on_charge = self._on_charge
+        if on_charge is not None:
+            on_charge(node, st, num_tokens)
         # 裁剪脏缺口，保证物理含义一致性：d <= L
         if st.L and st.d > st.L:
             st.d = st.L
@@ -778,9 +946,11 @@ class SessionRegistry:
             本次回收的会话数。
         """
         now = time.monotonic() if now is None else now
-        # 计时只包住真正的遍历与删除，不看 ``now`` 的取时钟开销。
-        started = time.perf_counter() if _SWEEP_PROF else 0.0
-        scanned = len(self._sessions) if _SWEEP_PROF else 0
+        # 只有挂了计时探针才取时钟与规模，默认路径不付这个成本。
+        on_sweep = self._on_sweep
+        if on_sweep is not None:
+            started = time.perf_counter()
+            scanned = len(self._sessions)
         dead = [
             sid
             for sid, st in self._sessions.items()
@@ -789,69 +959,22 @@ class SessionRegistry:
         ]
         for sid in dead:
             del self._sessions[sid]
-        if _SWEEP_PROF:
-            self._record_sweep(time.perf_counter() - started, scanned, len(dead))
+        if on_sweep is not None:
+            on_sweep(time.perf_counter() - started, scanned, len(dead))
         return len(dead)
 
-    def _record_sweep(self, elapsed_s: float, scanned: int, dead: int) -> None:
-        """累加一次 sweep 的耗时样本，并按周期或超阈打印。
-
-        同时记录耗时与扫描规模：单看耗时分不清“表小但慢”还是“表大但正常”，
-        二者的优化手段完全不同。两者相除就是单会话本，能直接外推到更大规模。
-
-        Args:
-            elapsed_s: 本次 sweep 的墙钟耗时（秒）。
-            scanned: 本次遍历的会话数。
-            dead: 本次回收的会话数。
-        """
-        us = elapsed_s * 1e6
-        self._sweep_calls += 1
-        self._sweep_us_total += us
-        self._sweep_scan = scanned
-        self._sweep_dead = dead
-        if us > self._sweep_us_max:
-            self._sweep_us_max = us
-            # 爆冷门的那一次立即报，不等周期，否则尖峰会被平均值抹平。
-            if us > self.SWEEP_WARN_US:
-                logger.warning(
-                    "[Session sweep] SLOW %.1fus (scan=%d, dead=%d) 阈%.0fus",
-                    us,
-                    scanned,
-                    dead,
-                    self.SWEEP_WARN_US,
-                )
-        if self._sweep_calls % self.SWEEP_PROF_EVERY == 0:
-            avg = self._sweep_us_total / self._sweep_calls
-            per_session = us / scanned if scanned else 0.0
-            logger.info(
-                "[Session sweep] n=%d last=%.1fus avg=%.1fus max=%.1fus "
-                "scan=%d dead=%d per_session=%.3fus",
-                self._sweep_calls,
-                us,
-                avg,
-                self._sweep_us_max,
-                scanned,
-                dead,
-                per_session,
-            )
-
     def sweep_profile(self) -> Dict[str, float]:
-        """导出 sweep 耗时统计，供 profile 行或压测脚本直接消费。
+        """导出 sweep 耗时统计，供压测脚本直接消费。
 
-        未打开 ``SGLANG_SESSION_SWEEP_PROFILE`` 时返回全零，不区分是“没测”还是
-        “零开销”。
+        样本持有在探针里；没挂探针（默认）时返回全零，不区分“没测”还是“零开销”。
 
         Returns:
             ``calls`` / ``avg_us`` / ``max_us`` / ``last_scan`` / ``last_dead``。
         """
-        calls = self._sweep_calls
-        return {
-            "calls": calls,
-            "avg_us": self._sweep_us_total / calls if calls else 0.0,
-            "max_us": self._sweep_us_max,
-            "last_scan": self._sweep_scan,
-            "last_dead": self._sweep_dead,
-        }
+        probe = self._probe
+        if probe is None:
+            return SessionProbe().sweep_profile()
+        return probe.sweep_profile()
 
     # ---- 监控指标 ----
     def summary(self) -> Dict[str, float]:
