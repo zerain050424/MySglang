@@ -7,12 +7,36 @@
 
 ```
 Heter-Bench/
-  bench_hetercache.py    # 多轮压测 driver（asyncio + aiohttp）
-  config.sh            # 配置（被 run_all.sh source）
-  serve.sh             # 启动单个 server（指定 policy / cache 大小）
-  run_all.sh           # 实验矩阵：policy × cache 大小，自动启停 + 汇总
-  README.md
-  result/              # 结果与 server 日志（运行时生成）
+  README.md               # 本文件：怎么跑
+  docs/                   # 说明与实验报告，索引见 docs/README.md
+  archive/                # 历史配置快照，仅供追溯
+
+  # 运行入口（实验机按路径直接调用，改名/搬动前先改 queue_detect.sh 里的远端命令）
+  bench_hetercache.py     # 多轮压测 driver（asyncio + aiohttp）
+  serve.sh                # 起单个 server（指定 policy / cache 大小）
+  run_all.sh              # 实验矩阵：policy × cache 大小，自动启停 + 汇总
+  run_single.sh           # 单场景驱动
+  run_ShareGPT_first10.py # 冒烟：前 10 个 session
+  queue_detect.sh         # 远端：排队检测 + 分阶段负载
+  config.sh / env.sh      # 配置与环境变量（被上面几个 source）
+
+  # 配置与工具
+  arrival_config.yaml         # 轮间到达间隔，按 session_id 前缀区分负载
+  hybrid_tasks_config.yaml    # 混合负载配比
+  phased_load_prediction*.yaml/.json  # 分阶段负载及其标签
+  prepare_session_data.py     # 原始数据 → session_data.jsonl
+  calibrate.py                # prefill 速率标定（token → ms）
+
+  # 离线评估
+  eval/                   # 节点级 / token 级 / label 口径的离线分析
+
+  # 实验与运行时目录
+  profile/  log/          # 观测实现 / 运行日志
+  classify/               # 会话类型分类器
+  exp/                    # d_i 记账实验
+  tailshot/               # 长尾存活实验
+  RR_VS_TLRU/  W-TinyLRU/ # 对照策略
+  TaskData/               # 会话数据集
 ```
 
 ## 设计要点（为什么这样做）
@@ -159,14 +183,14 @@ source env.sh
 **数据源已下线**：这里原本依赖 server 侧 `SGLANG_QUEUE_OCC_LOG` 打印的 `[QueueOcc]`
 日志。该采样器（策略无关的队列占用日志）已从 `radix_cache` 删除，现在只有
 `[HeterCache profile]`（每 30s 一张按队列的表，含 occ / hit / evicted / target / cap）。
-`evaluate_load_prediction.py` 只认 `[QueueOcc]` 的行格式，喂新日志会直接报「解析不到
+`eval/evaluate_load_prediction.py` 只认 `[QueueOcc]` 的行格式，喂新日志会直接报「解析不到
 任何样本」——要恢复这条评测，得先把采样器加回来或改写解析口径。
 
 实验输出的 CSV 保存真实数据集标签，脚本按 60 秒窗口、30 秒步长和 10% 主导差距
 计算窗口级准确率（需要上面那份日志）：
 
 ```bash
-"$PY" evaluate_load_prediction.py \
+"$PY" eval/evaluate_load_prediction.py \
   --requests-csv result/phased_load_prediction.csv \
   --occ-log result/server_heter_cache_100000.log \
   --output result/phased_load_prediction_accuracy.json

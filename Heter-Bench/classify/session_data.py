@@ -4,7 +4,7 @@
 最后拿生产代码 `SessionRegistry.session_type` 的判定与该会话的语义真值比对。
 
 真值（GT）来自会话语义（session_id 前缀 -> 负载家族），与
-`evaluate_node_labels.py` 的节点级口径保持一致：
+`Heter-Bench/eval/evaluate_node_labels.py` 的节点级口径保持一致：
 
     Code-...              -> struct   (Codeparrot，单轮，跨会话共享同一代码前缀)
     apps_...              -> random   (AgentBank apps，单轮，彼此不共享内容)
@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence
 
-# 真值前缀表（与 Heter-Bench/evaluate_node_labels.py 一致）
+# 真值前缀表（与 Heter-Bench/eval/evaluate_node_labels.py 一致）
 GT_PREFIXES = (
     ("apps_", "random"),
     ("alfred_", "agentic"),

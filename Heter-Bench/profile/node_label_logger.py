@@ -9,7 +9,7 @@
 与 ``[HeterCache profile]`` 的分工：那张表只给聚合占比，这里给**逐节点**的
 (标签, 真实归属 session_id, token 数, 命中次数, 距上次访问时间, 子节点数,
 是否 decode 段, 绝对起始偏移)。数据消费方是 Heter-Bench 的节点级标注准确率
-统计（``evaluate_node_labels.py`` / ``evaluate_node_count.py``）。
+统计（``eval/evaluate_node_labels.py`` / ``eval/evaluate_node_count.py``）。
 
 本模块属于实验脚手架，**不随 sglang 安装分发**：由
 ``sglang/srt/mem_cache/heter_bench_bridge.py`` 按仓库根定位后加载；Heter-Bench

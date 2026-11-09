@@ -24,7 +24,7 @@
     qtrans  -> pending（未判定，不计入 settled 分母）
 
 用法：
-    python evaluate_node_count.py --dump result/node_labels_phased.jsonl \
+    python eval/evaluate_node_count.py --dump result/node_labels_phased.jsonl \
         --views last,cumulative,dedup --output result/node_count_accuracy.json
 """
 

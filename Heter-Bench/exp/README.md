@@ -1,6 +1,6 @@
 # Heter-Bench 实验设计总纲
 
-> 位置：`Heter-Bench/exp/README.md`
+> 位置：`Heter-Bench/exp/README.md`（本文）
 > 范围：本目录收录 HeterCache 在 sglang 上的两个受控实验设计。
 > 状态：Tailshot 已实现并产数（`result/tailshot*`）；Cascade 已设计并完成首次实测（`result/cascade/R3.*`），完整矩阵待跑。
 

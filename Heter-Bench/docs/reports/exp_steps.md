@@ -1,6 +1,6 @@
 # step · `d_i` 的实施步骤
 
-> 配套：`Design1.md`（设计）、`README.md`（实验）。
+> 配套：`design1.md`（设计）、`../../exp/README.md`（实验）。
 > 本文只写"改哪里、按什么顺序、怎么判死"。分两层：**L1 只记账**，**L2 换选择键**。
 
 ---
@@ -133,7 +133,7 @@ S1 是纯观测改动，验收标准是**零回归**；S2、S3 才允许指标�
 
 - 不动 `_reuse_score` / `is_one_shot` / 两带结构 / alpha 控制器。
 - 不动 `TaskData`、`bench_hetercache.py`、`exp/` 下的实验脚本。
-- 不引入 `cost()` 折算（见 `Design1.md` §9）。
+- 不引入 `cost()` 折算（见 `design1.md` §9）。
 - 不做跨 workload 仲裁。
 
 ---

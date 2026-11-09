@@ -1,6 +1,6 @@
 """会话级指标：准确率、混淆矩阵、P/R/F1、收敛轮、可达上限、逐轮精度曲线。
 
-口径约定（与 `evaluate_node_labels.py` 对齐）：
+口径约定（与 `Heter-Bench/eval/evaluate_node_labels.py` 对齐）：
 
 - 单元是「会话」：一条会话最终只贡献一个判定，即它最后一轮结束时的 `session_type`。
 - 类别四桶：struct / random / chat / agentic，其中 `trans` 映射到 random。

@@ -15,7 +15,7 @@
     qtrans  -> 「未判定」（不是 random！非共享内容/尚未复用都停在这里）
 
 用法：
-    python evaluate_node_labels.py --dump result/node_labels_phased.jsonl \
+    python eval/evaluate_node_labels.py --dump result/node_labels_phased.jsonl \
         --output result/node_label_accuracy.json
 """
 

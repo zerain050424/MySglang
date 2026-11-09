@@ -1,7 +1,7 @@
 # 会话级分类准确率评测（classify/）
 
 目标：把「会话类型分类器」（`SessionRegistry.session_type`）的准确率按**会话口径**测出来，
-而不是像 `../evaluate_node_labels.py` 那样按节点口径测。
+而不是像 `../eval/evaluate_node_labels.py` 那样按节点口径测。
 
 - **单元**：一条会话只贡献一个判定——它最后一轮结束时的 `session_type`。
 - **真值**：会话语义（`session_id` 前缀 → 负载家族），与节点级评测共用同一张表：
@@ -29,8 +29,8 @@
 | `dataset_build.py` | CLI 参数与数据集装配 |
 | `run_eval.py` | 主实验，输出 `report.md` + `metrics.json` + `sessions.csv` |
 | `sweep.py` | 阈值与证据口径扫描（单变量） |
-| `SHARE64_SUMMARY.md` | `min_share=64` 的三件套指标实验总结（最终判定 / 逐轮精度 / token 暴露） |
-| `SYSTEM_PROMPT_ABLATION.md` | 去掉公共 Qwen system prompt 后重跑：与抬高 `min_share` 等价性验证 |
+| [`../docs/reports/classify_min_share64.md`](../docs/reports/classify_min_share64.md) | `min_share=64` 的三件套指标实验总结（最终判定 / 逐轮精度 / token 暴露） |
+| [`../docs/reports/classify_system_prompt_ablation.md`](../docs/reports/classify_system_prompt_ablation.md) | 去掉公共 Qwen system prompt 后重跑：与抬高 `min_share` 等价性验证 |
 | `分类器判定逻辑.md` | 判定逻辑全流程：证据 → 状态 → 有序规则 → 队列标签（含判定表与边界情况） |
 | `分类器实验.md` | 面向汇报的完整实验报告（数据准备 / 纯 CPU 模拟设计 / 三件套结果 / 局限），图在 `figs/` |
 | `分类器残差分析.md` | 附录 A：去掉公共 system prompt 后仍有 12 条 chat 被判 struct 的逐条证据 |
