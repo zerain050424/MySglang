@@ -247,23 +247,6 @@ class HeterCacheStrategy(EvictionStrategy):
             return HeterCacheNodeTag.QAGENT
         return HeterCacheNodeTag.coerce(getattr(node, "queue_tag", None))
 
-    def get_priority(self, node: TreeNode) -> Tuple[int, float, float]:
-        """HeterCache 没有单节点全局排序，调用方应当走配额裁决。
-
-        旧实现先按 one-shot 分带、带内按 ``_reuse_score`` 排序。复用分删除后，
-        任何“把 HeterCache 当成优先级堆”的用法都失去语义（配额是按队列与目标
-        占用水填充的，不是按节点打分），所以这里直接失败而不是退回某个默认序。
-
-        Raises:
-            NotImplementedError: 总是抛出。HeterCache 必须搭配 HeterCacheRadixCache
-                使用（它走 ``quota_selector.pick_victim``）；若被挂到统一树上，
-                启动阶段应当被 registry 的守卫拦住。
-        """
-        raise NotImplementedError(
-            "HeterCacheStrategy has no single-node ordering; "
-            "use quota arbitration (quota_selector.pick_victim) instead"
-        )
-
     def is_one_shot(self, node) -> bool:
         """判定节点是否属于 One-shot 带。
 
@@ -328,10 +311,6 @@ class HeterCacheStrategy(EvictionStrategy):
             return now - self._last_reconcile >= self.PROFILE_INTERVAL
         return now - self._last_reconcile >= self._reconcile_interval(available, capacity)
 
-    @property
-    def needs_capacity(self) -> bool:
-        """缓存层每次淘汰都要注入 allocator 容量：配额仲裁不能没有容量。"""
-        return True
 
     def reconcile_occupancy(self, queue_occ: dict, capacity: float) -> None:
         """通过全树快照校准 _occ，吸收运行时标签变更、one-shot 晋升等增量漂移。"""
@@ -392,9 +371,6 @@ class HeterCacheStrategy(EvictionStrategy):
 
     def quota_victim(self, queue: str, leaves, capacity: float):
         """在指定队列内挑选淘汰节点。若无合适候选返回 None（触发上层跳队）。"""
-        # 队列名来自配额层（字符串），先反查成枚举再与节点标签直接比较，
-        # 中间不经过任何字符串投影。random 也反查得到 QTRANS，与旧判定等价；
-        # 未知名字返回 None，直接跳队。
         target = HeterCacheNodeTag.from_queue(queue)
         if target is None:
             return None
@@ -419,8 +395,6 @@ class HeterCacheStrategy(EvictionStrategy):
             picked = self.mt_evict.pick(pool, self.session_registry)
             if picked is not None:
                 return picked
-        # 队内策略弃权（关闭或不接管）时本队列无候选，交由上层跳下一队；
-        # 不再退回复用分排序。
         return None
 
     def _quota_gap(self, queue: str, capacity: float):
