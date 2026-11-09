@@ -64,15 +64,15 @@ def effective_targets(
     total_capacity = max(float(capacity), 0.0)
     if total_capacity <= 0.0:
         return {q: 0.0 for q in QUOTA_QUEUES}
-    cap = {q: params.caps[q] * total_capacity for q in QUOTA_QUEUES}
-    rho = {q: params.reservations.get(q, 0.0) * total_capacity for q in QUOTA_QUEUES}
+    cap = {q: params.caps[q] * total_capacity for q in QUOTA_QUEUES} ## 上限
+    rho = {q: params.reservations.get(q, 0.0) * total_capacity for q in QUOTA_QUEUES} ## 上限
 
-    fixed = [q for q in QUOTA_QUEUES if occ.get(q, 0) <= rho[q]]
-    active = [q for q in QUOTA_QUEUES if q not in fixed]
+    fixed = [q for q in QUOTA_QUEUES if occ.get(q, 0) <= rho[q]] ## 安全队列
+    active = [q for q in QUOTA_QUEUES if q not in fixed] ## 竞争队列
 
     target: Dict[str, float] = {q: float(occ.get(q, 0)) for q in fixed}
-    residual = total_capacity - sum(target.values())
-    residual -= sum(rho[q] for q in active)
+    residual = total_capacity - sum(target.values()) ## 先满足fixed队列的现有占用
+    residual -= sum(rho[q] for q in active) ## 再满足active队列的底线配额
 
     while active:
         weight = sum(params.caps[q] for q in active)
@@ -196,13 +196,13 @@ def pick_victim(
       - Stage 0（无复用价值清理）：One-shot 临时节点由于无跨请求复用收益，优先走内部分段 LRU
         无条件淘汰，不计入配额开销；
       - Stage 1（配额仲裁淘汰）：配额启用时，按 queue_ranking 优先级逐队寻找淘汰候选。
-        若某队列节点全被锁定（Locked）、均为 One-shot 或未命中，则回退遍历下一队列；
-        若均无候选，采用策略私有伪随机策略兜底，确保淘汰指针单调步进，避免死锁（Spin）；
+        若某队列节点全被锁定、均为 One-shot 或未命中，则回退遍历下一队列；
+        若均无候选，采用策略私有伪随机策略兜底，确保淘汰指针单调步进；
       - Stage 2（未启用配额降级）：未开启配额时退化为原有基准路径（全局 victim_key + 改写器链）。
 
     Args:
         strategy: HeterCacheStrategy 策略实例，提供状态与判决接口。
-        leaves: 当前可驱逐的叶子节点集合（已剔除 Locked 节点）。
+        leaves: 当前可驱逐的叶子节点集合。
         capacity: 缓存池总容量（Token），用于配额计算。
         page_size: 内存页大小，用于计算对齐粒度 chunk。
         overrides: 策略改写器链（RR / SLRU / MT 等），仅在 Stage 2 生效。
@@ -253,8 +253,8 @@ def struct_tier(node, share_of, share_min: int) -> Tuple[int, float]:
 
     Args:
         node: 目标缓存节点。
-        share_of: 读取节点共享会话数的函数指针（SlruEvictPolicy.share_of）。
-        share_min: 模板判定的最小共享数阈值（SlruParams.share_min）。
+        share_of: 读取节点共享会话数的函数指针。
+        share_min: 模板判定的最小共享数阈值。
 
     Returns:
         可直接用于 min() 比较的排序元组 (tier, last_access_time)。
