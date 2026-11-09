@@ -157,7 +157,7 @@ def make_cache(cache_cls, strategy, nodes):
     cache.deleted = []
     cache.metrics = []
     hu = sys.modules["sglang.srt.mem_cache.heter_utils"]
-    cache.root_node = FakeNode(None, hu.HeterCacheQueueTag.QTRANS)
+    cache.root_node = FakeNode(None, hu.HeterCacheNodeTag.QTRANS)
     cache.root_node.ckey = "root"
     cache.evictable_leaves = set()
     for n in nodes:
@@ -225,7 +225,7 @@ def test_no_one_shot_leaves_does_not_crash(ep, shc, base):
     hu = sys.modules["sglang.srt.mem_cache.heter_utils"]
     st = _strategy(ep, {"a1": hu.SessionType.AGENTIC})
     nodes = [
-        FakeNode("a1", hu.HeterCacheQueueTag.QAGENT, tokens=t)
+        FakeNode("a1", hu.HeterCacheNodeTag.QAGENT, tokens=t)
         for t in (16, 32, 48)
     ]
     cache = make_cache(shc.HeterCacheRadixCache, st, nodes)
@@ -251,7 +251,7 @@ def test_victim_not_reused_across_rounds(ep, shc, base):
     hu = sys.modules["sglang.srt.mem_cache.heter_utils"]
     st = _strategy(ep, {"a1": hu.SessionType.AGENTIC})
     nodes = [
-        FakeNode("a1", hu.HeterCacheQueueTag.QAGENT, tokens=16) for _ in range(4)
+        FakeNode("a1", hu.HeterCacheNodeTag.QAGENT, tokens=16) for _ in range(4)
     ]
     cache = make_cache(shc.HeterCacheRadixCache, st, nodes)
 
@@ -278,10 +278,10 @@ def test_one_shot_band_first(ep, shc, base):
         {"t1": hu.SessionType.TRANS, "s1": hu.SessionType.STRUCT},
     )
     # 一个未共享的 TRANS 节点（one-shot） + 一个共享的 STRUCT 节点（受保护）
-    shallow = FakeNode("t1", hu.HeterCacheQueueTag.QTRANS, tokens=16, abs_start=0)
-    deep = FakeNode("t1", hu.HeterCacheQueueTag.QTRANS, tokens=16, abs_start=256)
+    shallow = FakeNode("t1", hu.HeterCacheNodeTag.QTRANS, tokens=16, abs_start=0)
+    deep = FakeNode("t1", hu.HeterCacheNodeTag.QTRANS, tokens=16, abs_start=256)
     shared = FakeNode(
-        "s1", hu.HeterCacheQueueTag.QSTRUCT, tokens=16, abs_start=0,
+        "s1", hu.HeterCacheNodeTag.QSTRUCT, tokens=16, abs_start=0,
         share_sessions=st.slru_evict.share_min,
     )
     check(st.is_one_shot(deep) is True, "sanity: trans node is one-shot")
@@ -303,11 +303,11 @@ def test_slru_rewrites_struct_candidate(ep, shc, base):
     st = _strategy(ep, {"s1": hu.SessionType.STRUCT})
     thr = st.slru_evict.share_min
     old = FakeNode(
-        "s1", hu.HeterCacheQueueTag.QSTRUCT, tokens=16,
+        "s1", hu.HeterCacheNodeTag.QSTRUCT, tokens=16,
         last_access=1_000.0, share_sessions=thr,
     )
     new = FakeNode(
-        "s1", hu.HeterCacheQueueTag.QSTRUCT, tokens=16,
+        "s1", hu.HeterCacheNodeTag.QSTRUCT, tokens=16,
         last_access=9_999_999.0, share_sessions=thr,
     )
     cache = make_cache(shc.HeterCacheRadixCache, st, [old, new])
@@ -333,11 +333,11 @@ def test_slru_actually_rewrites_with_tag_off(ep, shc, base):
     thr = st.slru_evict.share_min
     # 位置打分偏向「结束偏移小」的节点 -> 基础候选会挑 deep（offset 越界被截成 0 分）
     old_lru = FakeNode(
-        "s1", hu.HeterCacheQueueTag.QSTRUCT, tokens=16,
+        "s1", hu.HeterCacheNodeTag.QSTRUCT, tokens=16,
         abs_start=0, last_access=1_000.0, share_sessions=thr,
     )
     deep_recent = FakeNode(
-        "s1", hu.HeterCacheQueueTag.QSTRUCT, tokens=16,
+        "s1", hu.HeterCacheNodeTag.QSTRUCT, tokens=16,
         abs_start=8000, last_access=9_999_999.0, share_sessions=thr,
     )
     cache = make_cache(shc.HeterCacheRadixCache, st, [old_lru, deep_recent])

@@ -30,7 +30,7 @@ from sglang.srt.mem_cache.radix_cache import RadixKey  # noqa: E402
 from sglang.srt.mem_cache.heter_cache_radix_cache import (  # noqa: E402
     HeterCacheRadixCache,
 )
-from sglang.srt.mem_cache.heter_utils import HeterCacheQueueTag  # noqa: E402
+from sglang.srt.mem_cache.heter_utils import HeterCacheNodeTag  # noqa: E402
 
 FAILS = []
 
@@ -184,10 +184,10 @@ def test_tags_rebuilt_from_scratch():
     insert(cache, list(range(0, 100)), sid="x")
     # 污染：把某个节点改成 QCHAT，模拟旧 run 的残留
     for n in all_nodes(cache):
-        n.queue_tag = HeterCacheQueueTag.QCHAT
+        n.queue_tag = HeterCacheNodeTag.QCHAT
     cache.reset()
     insert(cache, list(range(0, 100)), sid="y")
-    bad = [n.queue_tag for n in all_nodes(cache) if n.queue_tag is not HeterCacheQueueTag.QAGENT]
+    bad = [n.queue_tag for n in all_nodes(cache) if n.queue_tag is not HeterCacheNodeTag.QAGENT]
     check(not bad, f"with force_agentic every fresh node must be QAGENT, got {bad[:3]}")
 
 

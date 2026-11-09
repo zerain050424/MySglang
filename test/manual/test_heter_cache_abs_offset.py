@@ -39,8 +39,7 @@ from sglang.srt.mem_cache.heter_utils import (  # noqa: E402
     SessionRegistry,
     SessionState,
     SessionType,
-    HeterCacheQueueTag,
-    HeterCacheTaskType,
+    HeterCacheNodeTag,
 )
 
 FAILS = []
@@ -151,25 +150,16 @@ def test_deep_tree_offsets():
     )
 
 
-def _queue_tag_for(task_type):
-    return {
-        HeterCacheTaskType.MULTI_TURN_CHAT: HeterCacheQueueTag.QCHAT,
-        HeterCacheTaskType.MULTI_TURN_AGENTIC: HeterCacheQueueTag.QAGENT,
-        HeterCacheTaskType.STRUCT_SINGLE_TURN: HeterCacheQueueTag.QSTRUCT,
-        HeterCacheTaskType.RANDOM_SINGLE_TURN: HeterCacheQueueTag.QTRANS,
-    }[task_type]
-
-
 def _mk_node(
     n_tokens,
     abs_start,
-    task_type=HeterCacheTaskType.STRUCT_SINGLE_TURN,
+    tag=HeterCacheNodeTag.QSTRUCT,
 ):
     return SimpleNamespace(
         value=[0] * n_tokens,
         key=[0] * n_tokens,
         abs_start=abs_start,
-        queue_tag=_queue_tag_for(task_type),
+        queue_tag=tag,
         is_decode=False,
         last_access_time=time.monotonic(),
         hit_count=0,
@@ -260,28 +250,28 @@ def test_eviction_prefers_deep_single_turn_node():
         )
     )
 
-    def insert(tokens, task_type):
+    def insert(tokens, tag):
         result = cache.insert(
             InsertParams(
                 key=RadixKey(array("q", tokens)),
                 value=torch.tensor(tokens, dtype=torch.int64),
             )
         )
-        result.last_device_node.queue_tag = _queue_tag_for(task_type)
+        result.last_device_node.queue_tag = tag
 
     # deep: [0..1999] then extend to [0..2031] -> 32-token child at abs_start=2000
-    insert(list(range(0, 2000)), HeterCacheTaskType.STRUCT_SINGLE_TURN)
-    insert(list(range(0, 2032)), HeterCacheTaskType.STRUCT_SINGLE_TURN)
+    insert(list(range(0, 2000)), HeterCacheNodeTag.QSTRUCT)
+    insert(list(range(0, 2032)), HeterCacheNodeTag.QSTRUCT)
     # rival: separate 32-token agentic node hanging off the root
-    insert(list(range(5000, 5032)), HeterCacheTaskType.MULTI_TURN_AGENTIC)
+    insert(list(range(5000, 5032)), HeterCacheNodeTag.QAGENT)
 
     deep = rival = None
     for node in cache.evictable_leaves:
         if len(node.value) != 32:
             continue
-        if node.queue_tag == HeterCacheQueueTag.QSTRUCT:
+        if node.queue_tag == HeterCacheNodeTag.QSTRUCT:
             deep = node
-        elif node.queue_tag == HeterCacheQueueTag.QAGENT:
+        elif node.queue_tag == HeterCacheNodeTag.QAGENT:
             rival = node
     check(deep is not None, "expected a 32-token single-turn node")
     check(rival is not None, "expected a 32-token agentic node")
@@ -339,14 +329,14 @@ def test_same_queue_picks_lowest_score():
         )
     )
 
-    def insert(tokens, task_type=HeterCacheTaskType.STRUCT_SINGLE_TURN):
+    def insert(tokens, tag=HeterCacheNodeTag.QSTRUCT):
         result = cache.insert(
             InsertParams(
                 key=RadixKey(array("q", tokens)),
                 value=torch.tensor(tokens, dtype=torch.int64),
             )
         )
-        result.last_device_node.queue_tag = _queue_tag_for(task_type)
+        result.last_device_node.queue_tag = tag
 
     insert(list(range(0, 2000)))          # shallow 2000-token single node
     insert(list(range(0, 2032)))          # splits it: 32-token child at abs_start=2000
@@ -392,19 +382,19 @@ def test_one_shot_still_drained_first():
         )
     )
 
-    def insert(tokens, task_type):
+    def insert(tokens, tag):
         result = cache.insert(
             InsertParams(
                 key=RadixKey(array("q", tokens)),
                 value=torch.tensor(tokens, dtype=torch.int64),
             )
         )
-        result.last_device_node.queue_tag = _queue_tag_for(task_type)
+        result.last_device_node.queue_tag = tag
 
     # random single-turn -> one-shot, low reuse value
-    insert(list(range(0, 100)), HeterCacheTaskType.RANDOM_SINGLE_TURN)
+    insert(list(range(0, 100)), HeterCacheNodeTag.QTRANS)
     # normal single-turn, shallow -> high reuse score
-    insert(list(range(9000, 9032)), HeterCacheTaskType.STRUCT_SINGLE_TURN)
+    insert(list(range(9000, 9032)), HeterCacheNodeTag.QSTRUCT)
 
     result = cache.evict(EvictParams(num_tokens=32))
     print(f"      evicted {result.num_tokens_evicted} tokens")
@@ -416,7 +406,7 @@ def test_one_shot_still_drained_first():
     survivors = [
         n
         for n in cache.evictable_leaves
-        if n.queue_tag == HeterCacheQueueTag.QSTRUCT
+        if n.queue_tag == HeterCacheNodeTag.QSTRUCT
     ]
     check(len(survivors) == 1, "the shallow single-turn node must survive")
 
@@ -643,16 +633,16 @@ def test_workload_and_band_are_orthogonal():
     ):
         reg._sessions[sid] = SessionState(session_id=sid, session_type=stype)
 
-    prompt = _mk_node(32, 0, task_type=HeterCacheTaskType.MULTI_TURN_AGENTIC)
+    prompt = _mk_node(32, 0, tag=HeterCacheNodeTag.QAGENT)
     prompt.session_id = "ag"
-    resp = _mk_node(32, 32, task_type=HeterCacheTaskType.MULTI_TURN_AGENTIC)
+    resp = _mk_node(32, 32, tag=HeterCacheNodeTag.QAGENT)
     resp.is_decode = True
     resp.session_id = "ag"
-    rnd = _mk_node(32, 0, task_type=HeterCacheTaskType.RANDOM_SINGLE_TURN)
+    rnd = _mk_node(32, 0, tag=HeterCacheNodeTag.QTRANS)
     rnd.session_id = "rnd"
-    code = _mk_node(32, 0, task_type=HeterCacheTaskType.STRUCT_SINGLE_TURN)
+    code = _mk_node(32, 0, tag=HeterCacheNodeTag.QSTRUCT)
     code.session_id = "code"
-    shared = _mk_node(32, 0, task_type=HeterCacheTaskType.STRUCT_SINGLE_TURN)
+    shared = _mk_node(32, 0, tag=HeterCacheNodeTag.QSTRUCT)
     shared.session_id = "code"
     # 被 >= share_min 个外部会话命中过：跨会话模板，退出 one-shot 带
     shared.share_sessions = st.slru_evict.share_min
@@ -698,16 +688,16 @@ def test_workload_occ_accounting_adds_up():
                 session_id=session_id,
             )
         )
-        result.last_device_node.queue_tag = _queue_tag_for(task)
+        result.last_device_node.queue_tag = task
         return result.last_device_node
 
-    ins(list(range(0, 1000)), HeterCacheTaskType.MULTI_TURN_AGENTIC,
+    ins(list(range(0, 1000)), HeterCacheNodeTag.QAGENT,
         decode_start=1000, session_id="ag")
-    ins(list(range(0, 2000)), HeterCacheTaskType.MULTI_TURN_AGENTIC,
+    ins(list(range(0, 2000)), HeterCacheNodeTag.QAGENT,
         decode_start=1000, session_id="ag")
-    ins(list(range(5000, 5100)), HeterCacheTaskType.RANDOM_SINGLE_TURN,
+    ins(list(range(5000, 5100)), HeterCacheNodeTag.QTRANS,
         session_id="rnd")
-    shared = ins(list(range(9000, 9100)), HeterCacheTaskType.STRUCT_SINGLE_TURN,
+    shared = ins(list(range(9000, 9100)), HeterCacheNodeTag.QSTRUCT,
                  session_id="code")
     # 把 struct 前缀标记成「已被足够多外部会话复用」：它应退出 one-shot 带
     shared.share_sessions = cache.eviction_strategy.slru_evict.share_min
@@ -741,7 +731,7 @@ def test_record_hit_uses_workload_label():
     print("[20] record_hit: profile 按 workload 记账")
     st = HeterCacheStrategy()
     req = SimpleNamespace(rid="r1", session_id="apps_123", extra_key=None)
-    node = _mk_node(32, 0, task_type=HeterCacheTaskType.RANDOM_SINGLE_TURN)
+    node = _mk_node(32, 0, tag=HeterCacheNodeTag.QTRANS)
     st.record_hit(req, node, 500)
     check(st.profiler._total_hit_tokens.get("random") == 500,
           f"profile 记到 {list(st.profiler._total_hit_tokens)}, expected random=500")
@@ -754,7 +744,7 @@ def test_record_evict_one_shot_scalar():
     """淘汰记账：workload 一本账 + one-shot 一个标量（decode 带可推导）。"""
     print("[21] record_evict: workload 账本 + one-shot 标量")
     st = HeterCacheStrategy()
-    resp = _mk_node(64, 32, task_type=HeterCacheTaskType.MULTI_TURN_AGENTIC)
+    resp = _mk_node(64, 32, tag=HeterCacheNodeTag.QAGENT)
     resp.is_decode = True
     st.record_evict(resp)
     check(st._total_evicted_tokens.get("agentic") == 64,
@@ -762,7 +752,7 @@ def test_record_evict_one_shot_scalar():
     check(st._total_evicted_one_shot == 0,
           f"多轮 response 不算 one-shot，实际={st._total_evicted_one_shot}")
 
-    rnd = _mk_node(32, 0, task_type=HeterCacheTaskType.RANDOM_SINGLE_TURN)
+    rnd = _mk_node(32, 0, tag=HeterCacheNodeTag.QTRANS)
     st.record_evict(rnd)
     check(st._total_evicted_tokens.get("random") == 32,
           f"random 未被单列: {st._total_evicted_tokens}")
@@ -783,15 +773,15 @@ def test_multiturn_decode_is_not_one_shot():
 
     def node(tt, dec):
         return SimpleNamespace(
-            value=[0] * 64, key=[0] * 64, queue_tag=_queue_tag_for(tt), is_decode=dec,
+            value=[0] * 64, key=[0] * 64, queue_tag=tt, is_decode=dec,
             last_access_time=time.monotonic(), hit_count=0,
         )
 
     cases = [
-        (HeterCacheTaskType.MULTI_TURN_AGENTIC, True, "agentic", False),
-        (HeterCacheTaskType.MULTI_TURN_CHAT, True, "chat", False),
-        (HeterCacheTaskType.STRUCT_SINGLE_TURN, True, "struct", True),
-        (HeterCacheTaskType.RANDOM_SINGLE_TURN, False, "random", True),
+        (HeterCacheNodeTag.QAGENT, True, "agentic", False),
+        (HeterCacheNodeTag.QCHAT, True, "chat", False),
+        (HeterCacheNodeTag.QSTRUCT, True, "struct", True),
+        (HeterCacheNodeTag.QTRANS, False, "random", True),
     ]
     for tt, dec, want_q, want_os in cases:
         n = node(tt, dec)
@@ -805,7 +795,7 @@ def test_decode_band_end_to_end():
     """端到端：同一段 response，多轮归本队列，单轮归 one-shot（三处口径一致）。"""
     print("[23] end-to-end: decode band attribution is consistent")
 
-    def build(task_type):
+    def build(tag):
         cache = HeterCacheRadixCache(
             CacheInitParams(
                 disable=False, req_to_token_pool=None,
@@ -818,18 +808,18 @@ def test_decode_band_end_to_end():
             key=RadixKey(array("q", list(range(0, 50)))),
             value=torch.tensor(list(range(0, 50)), dtype=torch.int64),
         ))
-        result.last_device_node.queue_tag = _queue_tag_for(task_type)
+        result.last_device_node.queue_tag = tag
         result = cache.insert(InsertParams(
             key=RadixKey(array("q", list(range(0, 100)))),
             value=torch.tensor(list(range(0, 100)), dtype=torch.int64),
             decode_start=50,
         ))
-        result.last_device_node.queue_tag = _queue_tag_for(task_type)
+        result.last_device_node.queue_tag = tag
         return cache
 
     for tt, label, want_os in (
-        (HeterCacheTaskType.MULTI_TURN_AGENTIC, "agentic", False),
-        (HeterCacheTaskType.STRUCT_SINGLE_TURN, "struct", True),
+        (HeterCacheNodeTag.QAGENT, "agentic", False),
+        (HeterCacheNodeTag.QSTRUCT, "struct", True),
     ):
         cache = build(tt)
         dec_nodes = [n for n in cache.evictable_leaves if getattr(n, "is_decode", False)]

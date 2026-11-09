@@ -121,7 +121,7 @@ def test_radix_cross_session_hit_promotes_short_session_to_struct():
     from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
-    from sglang.srt.mem_cache.heter_utils import HeterCacheQueueTag
+    from sglang.srt.mem_cache.heter_utils import HeterCacheNodeTag
 
     cache = RadixCache(
         CacheInitParams(
@@ -150,7 +150,7 @@ def test_radix_cross_session_hit_promotes_short_session_to_struct():
     )
     state = cache.session_registry.get("short")
     assert state.session_type is SessionType.STRUCT
-    assert result.last_device_node.queue_tag is HeterCacheQueueTag.QSTRUCT
+    assert result.last_device_node.queue_tag is HeterCacheNodeTag.QSTRUCT
 
 
 def test_classified_agentic_session_tags_new_nodes(tmp_path):
@@ -161,7 +161,7 @@ def test_classified_agentic_session_tags_new_nodes(tmp_path):
     from sglang.srt.mem_cache.base_prefix_cache import InsertParams
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
-    from sglang.srt.mem_cache.heter_utils import HeterCacheQueueTag
+    from sglang.srt.mem_cache.heter_utils import HeterCacheNodeTag
 
     cache = RadixCache(
         CacheInitParams(
@@ -185,7 +185,7 @@ def test_classified_agentic_session_tags_new_nodes(tmp_path):
             session_id="agent",
         )
     )
-    assert result.last_device_node.queue_tag is HeterCacheQueueTag.QAGENT
+    assert result.last_device_node.queue_tag is HeterCacheNodeTag.QAGENT
 
     import json
 
@@ -203,7 +203,7 @@ def test_classified_chat_session_tags_new_nodes():
     from sglang.srt.mem_cache.base_prefix_cache import InsertParams
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
-    from sglang.srt.mem_cache.heter_utils import HeterCacheQueueTag
+    from sglang.srt.mem_cache.heter_utils import HeterCacheNodeTag
 
     cache = RadixCache(
         CacheInitParams(
@@ -226,7 +226,7 @@ def test_classified_chat_session_tags_new_nodes():
             session_id="chat",
         )
     )
-    assert result.last_device_node.queue_tag is HeterCacheQueueTag.QCHAT
+    assert result.last_device_node.queue_tag is HeterCacheNodeTag.QCHAT
 
 
 def test_non_heter_cache_preserves_legacy_delta_tags():
@@ -238,7 +238,7 @@ def test_non_heter_cache_preserves_legacy_delta_tags():
 
     from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
     from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
-    from sglang.srt.mem_cache.heter_utils import HeterCacheQueueTag
+    from sglang.srt.mem_cache.heter_utils import HeterCacheNodeTag
 
     cache = RadixCache.create_simulated(page_size=1)
     inserted = cache.insert(
@@ -258,7 +258,7 @@ def test_non_heter_cache_preserves_legacy_delta_tags():
     cache.match_prefix(
         MatchPrefixParams(key=RadixKey(array("q", [30, 31])), req=req)
     )
-    assert inserted.last_device_node.queue_tag is HeterCacheQueueTag.QAGENT
+    assert inserted.last_device_node.queue_tag is HeterCacheNodeTag.QAGENT
 
 
 def test_tokenized_tool_call_round_trips_through_msgpack():

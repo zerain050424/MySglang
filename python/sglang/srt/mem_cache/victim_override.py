@@ -36,14 +36,11 @@ from sglang.srt.mem_cache.heter_utils import (
     SESSION_SHARE_MAX,
     SessionRegistry,
     SessionType,
-    HeterCacheQueueTag,
-    HeterCacheTaskType,
+    HeterCacheNodeTag,
     MultiTurnParams,
-    TASK_CONFIG,
     _cached_lognorm_cdf,
     node_end_offset,
     session_bloom_bits,
-    task_type_of_tag,
 )
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -63,7 +60,7 @@ class VictimOverride(ABC):
 
     name: str = "override"
     # 本改写器管辖的队列；**仅**用于 profile 归类，不得参与仲裁判定。
-    queue: Optional[HeterCacheQueueTag] = None
+    queue: Optional[HeterCacheNodeTag] = None
 
     @abstractmethod
     def applies_to(self, node) -> bool:
@@ -100,7 +97,7 @@ class RrEvictPolicy(VictimOverride):
     """
 
     name = "rr"
-    queue = HeterCacheQueueTag.QAGENT
+    queue = HeterCacheNodeTag.QAGENT
 
     def __init__(self, params: RrParams):
         self.params = params
@@ -136,8 +133,8 @@ class RrEvictPolicy(VictimOverride):
         if not self.params.fair_rr or node is None:
             return False
         return (
-            task_type_of_tag(getattr(node, "queue_tag", None))
-            == HeterCacheTaskType.MULTI_TURN_AGENTIC
+            HeterCacheNodeTag.coerce(getattr(node, "queue_tag", None))
+            is HeterCacheNodeTag.QAGENT
         )
 
     def pick(self, leaves, registry, *, max_deficit=None) -> Optional["TreeNode"]:
@@ -242,7 +239,7 @@ Args:
     share_min: 保护阈值；省略时取 ``DEFAULT_SHARE_MIN``，下限 2。
 """
 
-    queue: Optional[HeterCacheQueueTag] =  HeterCacheQueueTag.QSTRUCT
+    queue: Optional[HeterCacheNodeTag] =  HeterCacheNodeTag.QSTRUCT
 
     def __init__(self, session_registry=None, share_min=None) -> None:
         # 与策略共用同一本会话账（由 HeterCacheStrategy 注入）：is_one_shot 与
@@ -397,7 +394,7 @@ class MultiTurnEvictPolicy(VictimOverride):
 """
 
     name = "mt"
-    queue = HeterCacheQueueTag.QCHAT
+    queue = HeterCacheNodeTag.QCHAT
 
     def __init__(self, params: MultiTurnParams, registry=None) -> None:
         self.params = params
@@ -438,17 +435,17 @@ class MultiTurnEvictPolicy(VictimOverride):
         if not mt_nodes:
             self.mt_fallbacks += 1
             return None
-        # 参数与 _reuse_score 同源（TASK_CONFIG），避免评分为正、改写为负的分歧。
+        # 参数与 _reuse_score 同源（HeterCacheNodeTag.reuse_config），避免评分为正、改写为负的分歧。
         best = None
         for node in mt_nodes:
             st = self.registry.get(getattr(node, "session_id", None))
             stype = st.session_type if st is not None else SessionType.CHAT
             cfg_key = (
-                HeterCacheTaskType.MULTI_TURN_AGENTIC
+                HeterCacheNodeTag.QAGENT
                 if stype == SessionType.AGENTIC
-                else HeterCacheTaskType.MULTI_TURN_CHAT
+                else HeterCacheNodeTag.QCHAT
             )
-            mu, sigma = TASK_CONFIG[cfg_key]
+            mu, sigma = cfg_key.reuse_config
             elapsed = time.monotonic() - node.last_access_time
             weight = _cached_lognorm_cdf(int(elapsed), mu, sigma)  # 1-prob(e)
             # 权重大者先走；同分用 -last_access 让更久未访问的胜出（key 取 max）。

@@ -36,11 +36,8 @@ from sglang.srt.mem_cache.heter_utils import (
     SlruParams,
     QUOTA_QUEUES,
     QuotaParams,
-    TASK_CONFIG,
-    workload_label_of,
-    HeterCacheTaskType,
+    HeterCacheNodeTag,
     _cached_lognorm_cdf,
-    task_type_of_tag,
 )
 from sglang.srt.mem_cache.victim_override import (
     RrEvictPolicy,
@@ -237,27 +234,26 @@ class HeterCacheStrategy(EvictionStrategy):
         for q in QUOTA_QUEUES:
             self._occ[q] = 0.0
 
-    def _task_type_of(self, node) -> HeterCacheTaskType:
-        """获取节点任务类型。force_agentic 开启时强制覆盖为 AGENTIC。"""
+    def _node_tag(self, node) -> HeterCacheNodeTag:
+        """节点的生效标签（已收敛枚举）。force_agentic 开启时统一按 agentic 算。"""
         if self.force_agentic:
-            return HeterCacheTaskType.MULTI_TURN_AGENTIC
-        return task_type_of_tag(getattr(node, "queue_tag", None))
+            return HeterCacheNodeTag.QAGENT
+        return HeterCacheNodeTag.coerce(getattr(node, "queue_tag", None))
 
     def _reuse_score(self, node) -> float:
         """计算节点复用价值分（越低越先淘汰）。
 
         - 多轮（chat / agentic）：1 - CDF(elapsed)，依据对数正态分布预估下一轮复用概率；
         - 单轮（struct）：仅依赖位置项衰减，越靠近 Prompt 尾部复用概率越低；
-        - Random 节点返回 0（属于 Tier 0 优先清理带）。
+        - QTRANS 节点返回 0（属于 Tier 0 优先清理带）。
         """
-        task_type = self._task_type_of(node)
-        elapsed = time.monotonic() - node.last_access_time
-        e = int(elapsed)
-        cfg = TASK_CONFIG.get(task_type)
+        tag = self._node_tag(node)
+        cfg = tag.reuse_config
         if cfg is not None:
+            elapsed = time.monotonic() - node.last_access_time
             mu, sigma = cfg
-            return 1.0 - _cached_lognorm_cdf(e, mu, sigma)
-        if task_type == HeterCacheTaskType.STRUCT_SINGLE_TURN:
+            return 1.0 - _cached_lognorm_cdf(int(elapsed), mu, sigma)
+        if tag is HeterCacheNodeTag.QSTRUCT:
             offset_factor = 1.0 - _node_end_offset(node) / (self.max_offset or 1)
             return max(0.0, min(1.0, offset_factor))
         return 0.0
@@ -291,7 +287,7 @@ class HeterCacheStrategy(EvictionStrategy):
 
     def workload_of(self, node) -> str:
         """获取节点工作负载标签（chat / agentic / struct / random）。"""
-        return workload_label_of(self._task_type_of(node))
+        return self._node_tag(node).workload
 
     def one_shot_key(self, node) -> tuple:
         """One-shot 带内淘汰排序：按访问时间升序（带内 LRU）。"""
@@ -309,12 +305,12 @@ class HeterCacheStrategy(EvictionStrategy):
         if len(self._rid_order) > self.MAX_SEEN_RIDS:
             self._seen_rids.discard(self._rid_order.popleft())
 
-        task_type = self._task_type_of(node)
-        wkey = self.workload_of(node)
+        tag = self._node_tag(node)
+        wkey = tag.workload
         self.profiler.record_hit(wkey, hit_tokens)
         if heterlog.enabled:
             heterlog.hit(workload=wkey,
-                         task_type=task_type,
+                         task_type=tag.value,
                          hit_tokens=hit_tokens,
                          req=rid)
 

@@ -53,8 +53,8 @@ from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.heter_utils import (
     SessionRegistry,
     SessionType,
-    HeterCacheQueueTag,
-    session_type_to_queue_tag,
+    HeterCacheNodeTag,
+    session_type_to_node_tag,
 )
 from sglang.srt.mem_cache.utils import (
     get_eviction_strategy,
@@ -289,7 +289,7 @@ class TreeNode: ## TreeNode 是基数树（RadixTree）的节点，每个节点�
         # 节点回收时条目自动消失），不再内嵌在 TreeNode 上。
 
         self.abs_start = abs_start
-        self.queue_tag = HeterCacheQueueTag.QTRANS ## 负载类型
+        self.queue_tag = HeterCacheNodeTag.QTRANS ## 负载类型
         self.is_decode = False
         # HeterCache：节点归属的会话
         self.session_id: Optional[str] = None
@@ -1034,22 +1034,22 @@ class RadixCache(BasePrefixCache):
         )
         if self.force_agentic:
             # 直达 agentic 队列：跳过 8s 间隔判定与 QSTRUCT 黏性。
-            node.queue_tag = HeterCacheQueueTag.QAGENT
-        elif node.queue_tag != HeterCacheQueueTag.QSTRUCT:
+            node.queue_tag = HeterCacheNodeTag.QAGENT
+        elif node.queue_tag != HeterCacheNodeTag.QSTRUCT:
             if state is not None and state.session_type == SessionType.STRUCT:
-                node.queue_tag = HeterCacheQueueTag.QSTRUCT
+                node.queue_tag = HeterCacheNodeTag.QSTRUCT
             elif (
                 state is not None
                 and node.session_id == session_id
                 and state.session_type in (SessionType.AGENTIC, SessionType.CHAT)
             ):
-                node.queue_tag = session_type_to_queue_tag(state.session_type)
+                node.queue_tag = session_type_to_node_tag(state.session_type)
             elif state is None or session_id is None or node.session_id is None:
                 # Preserve legacy behavior outside the session classifier.
                 node.queue_tag = (
-                    HeterCacheQueueTag.QAGENT
+                    HeterCacheNodeTag.QAGENT
                     if delta < 8.0
-                    else HeterCacheQueueTag.QCHAT
+                    else HeterCacheNodeTag.QCHAT
                 )
         node.last_access_time = access_time
 
@@ -1160,14 +1160,14 @@ class RadixCache(BasePrefixCache):
             state = self.session_registry.get(session_id)
             if self.force_agentic:
                 # 直达 agentic 队列：新节点不再落 QTRANS（否则会被 one-shot 带先清）
-                new_node.queue_tag = HeterCacheQueueTag.QAGENT
+                new_node.queue_tag = HeterCacheNodeTag.QAGENT
             else:
                 # 出生标签只看「谁创建了这段」；跨会话共享的事实由
                 # SlruEvictPolicy 的共享数账本记录，与标签无关。
                 new_node.queue_tag = (
-                    session_type_to_queue_tag(state.session_type)
+                    session_type_to_node_tag(state.session_type)
                     if state is not None
-                    else HeterCacheQueueTag.QTRANS
+                    else HeterCacheNodeTag.QTRANS
                 )
             new_node.is_decode = (
                 decode_start is not None and total_prefix_length >= decode_start
@@ -1187,7 +1187,7 @@ class RadixCache(BasePrefixCache):
                 and len(node.children) >= 2
             ):
                 # 分叉点即「多请求共用前缀」的结构证据，直接标 QSTRUCT。
-                node.queue_tag = HeterCacheQueueTag.QSTRUCT
+                node.queue_tag = HeterCacheNodeTag.QSTRUCT
             self.evictable_size_ += len(key)
             self._update_leaf_status(node)
             self._update_leaf_status(new_node)

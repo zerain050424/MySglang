@@ -26,7 +26,7 @@ from sglang.srt.mem_cache.heter_utils import (  # noqa: E402
     SessionRegistry,
     SessionState,
     SessionType,
-    HeterCacheQueueTag,
+    HeterCacheNodeTag,
 )
 from sglang.srt.mem_cache.victim_override import SlruEvictPolicy  # noqa: E402
 
@@ -43,7 +43,7 @@ def check(cond, msg):
 class FakeNode:
     """TreeNode 的最小替身：只带 one-shot / SLRU 判定读的字段。"""
 
-    def __init__(self, session_id=None, tag=HeterCacheQueueTag.QTRANS, decode=False,
+    def __init__(self, session_id=None, tag=HeterCacheNodeTag.QTRANS, decode=False,
                  share_sessions=0):
         self.value = [0] * 16
         self.key = [0] * 16
@@ -121,18 +121,18 @@ def test_queue_tag_is_irrelevant():
     st, _ = make_strategy({"t1": SessionType.TRANS, "s1": SessionType.STRUCT})
 
     # 方向 A：打了 QSTRUCT 标签的私有 TRANS 节点，仍是一次性内容
-    private = FakeNode(session_id="t1", tag=HeterCacheQueueTag.QSTRUCT)
-    check(private.queue_tag == HeterCacheQueueTag.QSTRUCT, "sanity: tag set")
+    private = FakeNode(session_id="t1", tag=HeterCacheNodeTag.QSTRUCT)
+    check(private.queue_tag == HeterCacheNodeTag.QSTRUCT, "sanity: tag set")
     check(st.is_one_shot(private) is True,
           "a QSTRUCT-tagged but unshared TRANS node is still one-shot")
 
     # 方向 B：打着 QTRANS 标签、已被多次复用的节点，不再是
-    reused = FakeNode(session_id="t1", tag=HeterCacheQueueTag.QTRANS)
+    reused = FakeNode(session_id="t1", tag=HeterCacheNodeTag.QTRANS)
     for i in range(st.slru_evict.share_min):
         st.slru_evict.on_node_hit(reused, f"y{i}")
     check(st.is_one_shot(reused) is False,
           "a QTRANS-tagged but widely reused node must leave the one-shot band")
-    check(reused.queue_tag == HeterCacheQueueTag.QTRANS,
+    check(reused.queue_tag == HeterCacheNodeTag.QTRANS,
           "sanity: the tag itself was never consulted")
 
 
@@ -173,7 +173,7 @@ def test_no_session_is_not_one_shot():
     """无会话证据（未带 session_id / 账本被 sweep）：不判 one-shot。"""
     print("[5] nodes without session evidence are not one-shot")
     st, _ = make_strategy({})
-    n = FakeNode(session_id=None, tag=HeterCacheQueueTag.QTRANS, decode=True)
+    n = FakeNode(session_id=None, tag=HeterCacheNodeTag.QTRANS, decode=True)
     check(st.is_one_shot(n) is False, "no session -> not one-shot")
     ghost = FakeNode(session_id="never-registered", decode=True)
     check(st.is_one_shot(ghost) is False, "swept session -> not one-shot")
@@ -203,7 +203,7 @@ def test_works_under_force_agentic():
         {"force_agentic": True},
     ):
         st, _ = make_strategy({"t1": SessionType.TRANS}, **kwargs)
-        n = FakeNode(session_id="t1", tag=HeterCacheQueueTag.QAGENT)
+        n = FakeNode(session_id="t1", tag=HeterCacheNodeTag.QAGENT)
         check(st.is_one_shot(n) is True, f"{kwargs}: unshared TRANS is one-shot")
         for i in range(st.slru_evict.share_min):
             st.slru_evict.on_node_hit(n, f"w{i}")

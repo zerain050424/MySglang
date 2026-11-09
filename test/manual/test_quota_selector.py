@@ -253,9 +253,9 @@ def _leaf(tag, tokens, ts=0.0, session_id=None):
 
 
 TAG = {
-    "struct": hu.HeterCacheQueueTag.QSTRUCT,
-    "agentic": hu.HeterCacheQueueTag.QAGENT,
-    "chat": hu.HeterCacheQueueTag.QCHAT,
+    "struct": hu.HeterCacheNodeTag.QSTRUCT,
+    "agentic": hu.HeterCacheNodeTag.QAGENT,
+    "chat": hu.HeterCacheNodeTag.QCHAT,
 }
 
 
@@ -300,7 +300,7 @@ def test_random_is_never_counted():
     print("[14b] accounting: random-classified nodes never enter the quota ledger")
     st = _strategy()
     rnd = _leaf(TAG["agentic"], 70)          # 先造一个对象再改标签，保证可弱引用
-    rnd.queue_tag = hu.HeterCacheQueueTag.QTRANS
+    rnd.queue_tag = hu.HeterCacheNodeTag.QTRANS
     check(st.is_one_shot(rnd) is False,
           "precondition: a session-less QTRANS node is not judged one-shot")
     check(st.workload_of(rnd) == "random", f"workload={st.workload_of(rnd)}, want random")

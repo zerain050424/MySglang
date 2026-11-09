@@ -6,7 +6,7 @@
 * ``victim_override``：改写器的作用域、共享数阈值、会话类型；
 * ``quota_selector`` / profile：队列标签与占用口径。
 
-命名约定：``HeterCacheTaskType`` 是**节点级**任务类型（由 ``queue_tag`` 推得），
+命名约定：``HeterCacheNodeTag`` 是**节点级**标签（KV 片段出生时盖章），
 ``SessionType`` 是**会话级**分类（由分类器推得）。两者经常不一致，判定归属时
 必须明确用哪一个（见 ``is_one_shot`` 与 ``MultiTurnEvictPolicy.applies_to``）。
 
@@ -28,19 +28,6 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 # SPDX-License-Identifier: Apache-2.0
 from enum import Enum
 
-class HeterCacheTaskType(str, enum.Enum):
-    """节点级任务类型，由 ``queue_tag`` 推导（见 ``task_type_of_tag``）。
-
-    决定评分模型：多轮用复用概率，单轮用位置项——单轮没有"下一轮"，
-    时间维度上无话可说，只保留位置项。
-    """
-
-    MULTI_TURN_CHAT = "multi_turn_chat"
-    MULTI_TURN_AGENTIC = "multi_turn_agentic"
-    STRUCT_SINGLE_TURN = "struct_single_turn"
-    RANDOM_SINGLE_TURN = "random_single_turn"
-
-
 class SessionType(str, enum.Enum):
     """会话级分类结果，由 ``SessionRegistry._classify`` 依据轮数/工具调用/间隔推出。
 
@@ -54,16 +41,50 @@ class SessionType(str, enum.Enum):
     AGENTIC = "agentic"
 
 
-class HeterCacheQueueTag(str, enum.Enum):
-    """HeterCache 节点状态标签。
+class HeterCacheNodeTag(str, enum.Enum):
+    """节点级标签：KV 片段出生时由会话分类盖章，之后只被少数规则改写。
 
-    标签由会话分类器与 radix 结构证据共同维护；非会话请求保留旧命中间隔规则。
+    与 ``SessionType`` 是两个维度：本枚举回答“这段 KV 是谁创建的”，
+    ``SessionType`` 回答“这个会话现在是什么”。两者会不同步，升级规则见
+    ``RadixCache._record_node_hit``。评分模型、配额分池、profile 列名都只读本枚举。
+
+    值（``qtrans`` 等）随节点标签快照落盘（JSONL 的 ``tag`` 字段），改值等于改
+    数据格式，故保持原样。
     """
 
     QTRANS = "qtrans"
     QSTRUCT = "qstruct"
     QAGENT = "qagent"
     QCHAT = "qchat"
+
+    @classmethod
+    def coerce(cls, tag) -> "HeterCacheNodeTag":
+        """把节点上的原始值收敛成枚举；缺失/未知按多轮 chat 处理。
+
+        回落到 chat 而不是 QTRANS：QTRANS 会被排进 one-shot 带直接清掉，
+        多轮归类最多是多留一段时间。
+        """
+        if isinstance(tag, cls):
+            return tag
+        try:
+            return cls(tag)
+        except (ValueError, TypeError):
+            return cls.QCHAT
+
+    @property
+    def workload(self) -> str:
+        """四类负载标签，既是配额配置的键，也是 profile 的列名。"""
+        return _WORKLOAD_OF[self]
+
+    @property
+    def is_multi_turn(self) -> bool:
+        """是否属于多轮带：只有多轮才有“下一轮复用概率”可言。"""
+        return self in (HeterCacheNodeTag.QCHAT, HeterCacheNodeTag.QAGENT)
+
+    @property
+    def reuse_config(self) -> Optional[Tuple[float, float]]:
+        """复用间隔的 lognormal 参数 ``(mu, sigma)``；无时间维度时返回 None。"""
+        return _REUSE_CONFIG.get(self)
 
 
 def session_bloom_bits(session_id) -> int:
@@ -95,17 +116,17 @@ def session_bloom_bits(session_id) -> int:
 SESSION_SHARE_MAX = 255
 
 
-def session_type_to_queue_tag(session_type: SessionType) -> HeterCacheQueueTag:
-    """把会话分类结果映射成"新写入 KV 该归哪个队列"的标签。
+def session_type_to_node_tag(session_type: SessionType) -> HeterCacheNodeTag:
+    """把会话分类结果映射成“新写入 KV 该归哪个队列”的标签。
 
-    只在节点出生时使用：出生标签回答"谁创建了这段"，之后的复用事实由共享数
+    只在节点出生时使用：出生标签回答“谁创建了这段”，之后的复用事实由共享数
     账本记录，不回写标签。
     """
     return {
-        SessionType.TRANS: HeterCacheQueueTag.QTRANS,
-        SessionType.STRUCT: HeterCacheQueueTag.QSTRUCT,
-        SessionType.AGENTIC: HeterCacheQueueTag.QAGENT,
-        SessionType.CHAT: HeterCacheQueueTag.QCHAT,
+        SessionType.TRANS: HeterCacheNodeTag.QTRANS,
+        SessionType.STRUCT: HeterCacheNodeTag.QSTRUCT,
+        SessionType.AGENTIC: HeterCacheNodeTag.QAGENT,
+        SessionType.CHAT: HeterCacheNodeTag.QCHAT,
     }[session_type]
 
 
@@ -242,7 +263,7 @@ class SlruParams:
 class MultiTurnParams:
     """多轮对话（QCHAT）带内改写器的参数。
 
-    带内权重取 1 - prob(e) = CDF(elapsed; mu, sigma)，mu/sigma 来自TASK_CONFIG
+    带内权重取 1 - prob(e) = CDF(elapsed; mu, sigma)，mu/sigma 来自 HeterCacheNodeTag.reuse_config
     Attributes:
         enabled: 是否启用改写器。
     """
@@ -394,7 +415,7 @@ def _cached_lognorm_cdf(x: float, mu: float, sigma: float) -> float:
 
     Args:
         x: 已经过的秒数。
-        mu, sigma: 分布参数，来自 ``TASK_CONFIG``。
+        mu, sigma: 分布参数，来自 ``HeterCacheNodeTag.reuse_config``。
 
     Returns:
         ``P(reuse_interval <= x)``，即"复用已经发生过"的概率。
@@ -407,27 +428,24 @@ def _cached_lognorm_cdf(x: float, mu: float, sigma: float) -> float:
 
 
 # 多轮任务的复用间隔分布参数 (mu, sigma)，lognormal（UniCache 原机制）。
-# 评分与改写器都必须从这里取值：两边各写一份会让"评分为正、改写为负"。
-TASK_CONFIG = {
-    HeterCacheTaskType.MULTI_TURN_CHAT: (4.77, 1.279),
-    HeterCacheTaskType.MULTI_TURN_AGENTIC: (1.81, 1.092),
+# 评分与改写器都必须从这里取值：两边各写一份会让“评分为正、改写为负”。
+_REUSE_CONFIG = {
+    HeterCacheNodeTag.QCHAT: (4.77, 1.279),
+    HeterCacheNodeTag.QAGENT: (1.81, 1.092),
 }
 
-# profile的四类标签。
+# 节点标签 → 负载标签。既是配额配置（caps / reservations）的键，
+# 也是 profile 的列名，所以只在这里定义一次。
+_WORKLOAD_OF = {
+    HeterCacheNodeTag.QCHAT: "chat",
+    HeterCacheNodeTag.QAGENT: "agentic",
+    HeterCacheNodeTag.QSTRUCT: "struct",
+    HeterCacheNodeTag.QTRANS: "random",
+}
+
+# profile 的四类标签，顺序即打印顺序。
 # random 不参与跨队列配额：它整行都是 one-shot，在阶段 0 就被清掉。
 WORKLOAD_LABELS = ("chat", "agentic", "struct", "random")
-
-
-def workload_label_of(task_type) -> str:
-    """把节点级任务类型映射成四类工作负载标签。
-       未知类型回落到chat
-    """
-    return {
-        HeterCacheTaskType.MULTI_TURN_CHAT: "chat",
-        HeterCacheTaskType.MULTI_TURN_AGENTIC: "agentic",
-        HeterCacheTaskType.STRUCT_SINGLE_TURN: "struct",
-        HeterCacheTaskType.RANDOM_SINGLE_TURN: "random",
-    }.get(task_type, "chat")
 
 
 
@@ -445,14 +463,7 @@ def node_end_offset(node) -> int:
     return abs_start + num_tokens
 
 
-def task_type_of_tag(tag) -> HeterCacheTaskType:
-    """queue_tag 映射到任务类型；未知/缺失标签按多轮 chat 处理。"""
-    return {
-        HeterCacheQueueTag.QTRANS: HeterCacheTaskType.RANDOM_SINGLE_TURN,
-        HeterCacheQueueTag.QSTRUCT: HeterCacheTaskType.STRUCT_SINGLE_TURN,
-        HeterCacheQueueTag.QAGENT: HeterCacheTaskType.MULTI_TURN_AGENTIC,
-        HeterCacheQueueTag.QCHAT: HeterCacheTaskType.MULTI_TURN_CHAT,
-    }.get(tag, HeterCacheTaskType.MULTI_TURN_CHAT)
+
 
 
 @dataclasses.dataclass
