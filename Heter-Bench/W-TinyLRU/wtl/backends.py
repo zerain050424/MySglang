@@ -435,7 +435,7 @@ class RealBackend:
             extra = len(req.output)
             idx, _ = self._alloc_with_evict(extra)
             if idx is not None:
-                self.cache.token_to_kv_pool_allocator.free_segment(idx)
+                self.cache.token_to_kv_pool_allocator.free_segment(idx, start_pos=0)
         self._req_seq += 1
         return AccessResult(
             ok=ok,
