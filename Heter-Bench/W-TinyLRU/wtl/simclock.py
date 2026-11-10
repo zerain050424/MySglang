@@ -38,6 +38,11 @@ _PATCHED_MODULES = (
     "sglang.srt.mem_cache.heter_cache_radix_cache",
     "sglang.srt.mem_cache.victim_override",
     "sglang.srt.mem_cache.heter_utils",
+    # 观测时钟：配额账本的 reconcile 窗口与 profile 采样窗口都读全局
+    # ``time.monotonic()``。不替换的话，整轮回放只过 ~30 秒真实时间，账本
+    # 在校准窗口内只更新一两次 → 配额看到的是漂移后的占用，策略决策随之偏航。
+    "sglang.srt.mem_cache.queue_occupancy",
+    "cache_telemetry",
 )
 
 _EPOCH = 1_700_000_000.0  # 固定墙钟起点：只为了让 time() 看起来合理，不参与排序

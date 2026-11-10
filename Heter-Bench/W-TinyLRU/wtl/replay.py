@@ -187,6 +187,8 @@ def run_replay(
     quiet: bool = True,
     compat: bool = True,
     stable_ties: bool = True,
+    inflight_reserve: int = 0,
+    inflight_ms: float = 0.0,
 ) -> dict:
     t0 = time.perf_counter()
     compat_fixes = apply_compat(compat)
@@ -203,11 +205,21 @@ def run_replay(
     regret = RegretTracker(window_s=regret_window) if regret_window > 0 else None
     retention = RetentionTracker(layers_by_task or {})
 
-    kwargs = dict(pool_tokens=int(pool_tokens), on_evict=on_evict)
+    # 真机的 allocator 容量并不全归缓存：在途请求（prefill 中的 prompt + decode 中的
+    # 输出 + 被 lock_ref 住的前缀）会占掉一部分。离线端把这块显式扣掉，剩下的才是
+    # 缓存可用容量——这是离线/在线命中率差异的主要来源之一（约 3k token）。
+    effective_pool = max(1, int(pool_tokens) - max(0, int(inflight_reserve)))
+    kwargs = dict(pool_tokens=int(effective_pool), on_evict=on_evict)
     if backend_kind in ("real", "auto"):
         kwargs.update(policy=arm.policy, config=arm.config)
+        kwargs["insert_outputs"] = include_outputs
 
     backend = make_backend(backend_kind, **kwargs)
+    if hasattr(backend, "inflight_ms"):
+        backend.inflight_ms = float(inflight_ms)
+    # 观测实现（cache_telemetry / queue_occupancy）是后端构造时才导入的，
+    # 必须在之后重装一次时钟，否则它们的模块级 ``time`` 仍是真实时钟。
+    install_clock(clock)
 
     actual_backend = "fake" if isinstance(backend, FakeBackend) else "real"
     tied = False
@@ -221,15 +233,49 @@ def run_replay(
     oom = 0
     peak_used = 0
 
+    # 在途请求的锁定：在线端 scheduler 会对正在 prefill/decode 的请求
+    # ``inc_lock_ref`` 整条前缀，这些 token 不可淘汰。离线端若只处理「当前这一条」，
+    # agentic 队列会被削到配额目标以下，命中率严重偏低（实测 24% vs 48%）。
+    inflight: list[dict] = []
+
+    def _release_until(now_ts: float) -> None:
+        if not inflight or not hasattr(backend, "cache"):
+            return
+        cache = getattr(backend, "cache", None)
+        if cache is None or not hasattr(cache, "dec_lock_ref"):
+            return
+        keep = []
+        for item in inflight:
+            if item["end"] <= now_ts:
+                try:
+                    cache.dec_lock_ref(item["node"])
+                except Exception:
+                    logger.exception("[wtl] in-flight dec_lock_ref failed")
+            else:
+                keep.append(item)
+        inflight[:] = keep
+
     try:
         for req in requests:
             clock.set(req.ts)
+            _release_until(req.ts)
             if not include_outputs and req.output:
                 req = Request(
                     idx=req.idx, ts=req.ts, sid=req.sid, task=req.task,
                     turn=req.turn, prompt=req.prompt, output=[],
                 )
             res = backend.acquire(req)
+            if inflight_ms > 0:
+                node = getattr(backend, "last_matched_node", None)
+                if node is not None and hasattr(backend.cache, "inc_lock_ref"):
+                    try:
+                        backend.cache.inc_lock_ref(node)
+                        inflight.append({
+                            "end": req.ts + inflight_ms / 1000.0,
+                            "node": node,
+                        })
+                    except Exception:
+                        logger.exception("[wtl] in-flight inc_lock_ref failed")
             prompt_tokens += res.prompt_len
             cached_tokens += res.cached_len
             total_tokens += res.total_len
@@ -356,6 +402,8 @@ def build_requests(args) -> tuple[List[Request], dict]:
             task_name=task_name,
             read_limit=args.read_limit,
             shuffle=not args.no_shuffle,
+            concurrency=args.concurrency,
+            service_ms=args.service_ms,
         )
         label = dpath.stem
         meta = {"source": str(dpath.resolve()), "workload": label}
@@ -376,6 +424,8 @@ def build_requests(args) -> tuple[List[Request], dict]:
             arrival_scale=args.arrival_scale,
             service_ms_per_1k=service,
             num_sessions_override=args.num_sessions,
+            concurrency=args.concurrency,
+            service_ms=args.service_ms,
         )
         cfg = load_tasks_config(args.tasks_config)
         return requests, {
@@ -438,10 +488,16 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
     src.add_argument("--seed", type=int, default=42)
     src.add_argument("--wait-scale", type=float, default=1.0,
                      help="轮间等待缩放（0=不等，1=真实 lognormal）")
+    src.add_argument("--concurrency", type=int, default=0,
+                     help="并发会话上限（0=不限）。对齐 bench_hetercache 的 Semaphore；"
+                          "混合负载回放必须设成与真机相同的值，否则会话重叠度会高一个数量级")
     src.add_argument("--arrival-scale", type=float, default=1.0,
                      help="到达节奏缩放（1=Poisson，0=全部立即）")
     src.add_argument("--service-ms-per-1k", type=float, default=0.0,
                      help="每 1k prompt token 的近似服务时间（补上在线端的轮间间隔）")
+    src.add_argument("--service-ms", type=float, default=0.0,
+                     help="每个请求的固定服务时长（毫秒），对齐真机 e2e_mean_ms；"
+                          "真机下一轮要等上一轮返回才开始")
     src.add_argument("--lambda-rate", type=float, default=1.0)
     src.add_argument("--mu", type=float, default=None)
     src.add_argument("--sigma", type=float, default=None)
@@ -456,6 +512,16 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
                       help="不把 response token 计入 KV（与纯 prompt 口径对照）")
 
     misc = p.add_argument_group("run")
+    misc.add_argument("--policy", default=None,
+                      help="覆盖实验臂的 policy（如 heter_cache / lru），配合 --policy-config")
+    misc.add_argument("--policy-config", default=None,
+                      help="覆盖实验臂的 policy config（JSON 字符串，与 arms.tsv 第三列同格式）")
+    misc.add_argument("--inflight-ms", type=float, default=0.0,
+                      help="单请求在途时长（毫秒）。>0 时对在途请求的命中前缀保持 lock_ref，"
+                           "模拟在线端 scheduler 的不可淘汰语义；建议填真机结果的 e2e_mean_ms")
+    misc.add_argument("--inflight-reserve", type=int, default=0,
+                      help="从 --pool-tokens 里扣掉的在途占用（token）。真机上在途请求的 "
+                           "prompt/decode/locked 前缀不归缓存，混合负载 full 档约 3k")
     misc.add_argument("--backend", default="auto", choices=["auto", "real", "fake"])
     misc.add_argument("--prefix-stats", default=None, help="prefix_stats.json")
     misc.add_argument("--layers", default="256,512,1024,2048,4096,8192")
@@ -478,7 +544,13 @@ def main(argv=None) -> int:
 
     logging.basicConfig(level=logging.WARNING if a.quiet else logging.INFO,
                         format="%(levelname)s %(name)s: %(message)s")
-    arm = get_arm(a.arm)
+    if a.policy:
+        arm = Arm(
+            id=a.arm, label=a.policy, policy=a.policy,
+            config=json.loads(a.policy_config) if a.policy_config else None,
+        )
+    else:
+        arm = get_arm(a.arm)
 
     requests, meta = build_requests(a)
     if not requests:
@@ -544,6 +616,8 @@ def main(argv=None) -> int:
         quiet=a.quiet,
         compat=not a.no_compat,
         stable_ties=not a.unstable_ties,
+        inflight_reserve=a.inflight_reserve,
+        inflight_ms=a.inflight_ms,
     )
     result["dataset"] = meta
     result["seed"] = a.seed
@@ -552,6 +626,9 @@ def main(argv=None) -> int:
     result["shuffle"] = not a.no_shuffle
     result["wait_scale"] = a.wait_scale
     result["arrival_scale"] = a.arrival_scale
+    result["concurrency"] = a.concurrency
+    result["inflight_reserve"] = a.inflight_reserve
+    result["inflight_ms"] = a.inflight_ms
 
     if a.out:
         outp = Path(a.out)

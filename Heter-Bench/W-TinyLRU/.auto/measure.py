@@ -57,10 +57,17 @@ def replay(scale: str, arm: str, spec: dict, inflight_ms: float) -> dict:
            "--num-sessions", "-1",
            "--pool-tokens", str(pool),
            "--concurrency", str(conc),
+           "--inflight-reserve", str(conc * 94),
            "--wait-scale", str(real.get("wait_scale", 1.0)),
            "--arrival-scale", str(real.get("arrival_scale", 1.0)),
            "--inflight-ms", str(inflight_ms if inflight_ms is not None
                                 else (real.get("e2e_mean_ms") or 0.0)),
+           # 注意：轮间等待的 mu/sigma 已经吸收了服务时长，再加一次 e2e 会重复计。
+           "--service-ms", "0",
+           # 真机 cache_finished_req 只把 prompt 段留在树里：多轮数据的下一轮
+           # prompt 含上一轮 response，但实测 cached ≈ 上一轮 prompt，说明 response
+           # 段不驻留（smoke 与 full 两档逐请求都成立）。
+           "--no-outputs",
            "--backend", "real", "--quiet", "--out", str(out)]
     if spec["config"] is not None:
         cmd += ["--policy-config", json.dumps(spec["config"])]

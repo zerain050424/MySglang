@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import heapq
 import json
 import os
 import random
@@ -174,6 +175,25 @@ def load_tasks_config(path: str | Path) -> Dict[str, Any]:
         return yaml.safe_load(f)
 
 
+def resolve_data_path(rel: str | Path, config_path: Path) -> Path:
+    """解析配置里的 ``data_path``。
+
+    在线端 ``bench_hetercache`` 以 **Heter-Bench 根目录** 为基准，而配置文件放在
+    ``mixexp/configs/`` 下，所以不能简单按 ``config_path.parent`` 拼。这里依次尝试
+    当前工作目录、配置目录、以及配置目录的各级祖先，取第一个存在的路径；
+    都不存在时返回按配置目录拼接的结果（让下游报错时能看出找的是哪个位置）。
+    """
+    p = Path(rel)
+    if p.is_absolute():
+        return p
+    bases = [Path.cwd(), config_path.parent, *config_path.parents]
+    for base in bases:
+        cand = base / p
+        if cand.exists():
+            return cand
+    return config_path.parent / p
+
+
 # --------------------------------------------------------------------------
 # 调度
 # --------------------------------------------------------------------------
@@ -188,46 +208,85 @@ def _service_time(req_tokens: int, ms_per_1k: float) -> float:
     return (req_tokens / 1000.0) * (ms_per_1k / 1000.0)
 
 
+def _session_turns(ev: SessionArrival, wait_scale: float, service_ms_per_1k: float,
+                   service_ms: float = 0.0):
+    """展开一条会话的轮次与相对时间偏移（不含绝对起点）。
+
+    轮间间隔用 ``stable_seed_from_str(sid, seed+task_id*1000)`` 采样 lognormal，
+    与在线端逐位一致；因此同一条会话无论被排到时间轴哪一段，轮间节奏都不变。
+    """
+    cfg = ev.cfg
+    mu = float(cfg.get("mu", 0.0) or 0.0)
+    sigma = float(cfg.get("sigma", 0.0) or 0.0)
+    base_seed = int(cfg.get("seed", 42)) + int(cfg.get("task_id", 0)) * 1000
+    rng = random.Random(stable_seed_from_str(ev.session["id"], base_seed=base_seed))
+
+    turns = list(_turns(ev.session))
+    offsets = [0.0]
+    t = 0.0
+    for ti, turn in enumerate(turns):
+        if ti + 1 >= len(turns):
+            break
+        if wait_scale > 0:
+            wait = 0.0 if (mu == 0.0 and sigma == 0.0) else rng.lognormvariate(mu, sigma)
+            t += wait * wait_scale
+        # 下一轮要等上一轮**完成**才开始：真机 bench 的 run_session 是
+        # ``await request(); sleep(wait)``，所以轮间隔 = 服务时长 + 采样等待。
+        t += _service_time(len(turn["input_ids"]), service_ms_per_1k) + service_ms / 1000.0
+        offsets.append(t)
+    return turns, offsets
+
+
 def build_schedule(
     arrivals: Sequence[SessionArrival],
     *,
     wait_scale: float = 1.0,
     arrival_scale: float = 1.0,
     service_ms_per_1k: float = 0.0,
+    service_ms: float = 0.0,
+    concurrency: int = 0,
 ) -> List[Request]:
-    """把 session 到达流展开成逐请求时间线（轮内串行）。
+    """把 session 到达流展开成逐请求时间线（轮内串行、会话间并发）。
 
     ``arrival_scale``：整体缩放到达节奏（1=真实 Poisson，0=全部 t=0）。
     ``wait_scale``：轮间等待缩放（0=不等；1=按各负载 lognormal 采样）。
+    ``concurrency``：并发会话上限（0=不限）。在线端 ``bench_hetercache`` 用
+    ``asyncio.Semaphore(concurrency)`` 限制的正是**会话数**——一条会话从第 1 轮
+    跑到最后一轮才释放名额。离线端若不限，500 条 40 轮的 alfred 会话会全部同时
+    活着抢同一个池子，命中率会低一个数量级；这是离线/在线最大的差异来源。
+
+    限流实现：按到达顺序排队，维护 ``concurrency`` 个 worker 的下次空闲时刻
+    （最小堆）。会话开始 = ``max(到达时刻, 最早空闲时刻)``，占用 worker 直到
+    最后一轮结束。等价于信号量 + FIFO 队列的离散事件形式。
     """
     out: List[Request] = []
     idx = 0
-    for ev in arrivals:
-        cfg = ev.cfg
-        sid = ev.session["id"]
-        task = ev.task
-        mu = float(cfg.get("mu", 0.0) or 0.0)
-        sigma = float(cfg.get("sigma", 0.0) or 0.0)
-        base_seed = int(cfg.get("seed", 42)) + int(cfg.get("task_id", 0)) * 1000
-        rng = random.Random(stable_seed_from_str(sid, base_seed=base_seed))
+    free_at: List[float] = []          # worker 空闲时刻的最小堆
+    limit = max(0, int(concurrency or 0))
 
-        t = ev.ts * arrival_scale
-        turns = list(_turns(ev.session))
+    for ev in arrivals:
+        turns, offsets = _session_turns(ev, wait_scale, service_ms_per_1k, service_ms)
+        if not turns:
+            continue
+        arrive = ev.ts * arrival_scale
+        if limit and len(free_at) >= limit:
+            start = max(arrive, heapq.heappop(free_at))
+        else:
+            start = arrive
+        if limit:
+            heapq.heappush(free_at, start + offsets[-1])
+
+        sid, task = ev.session["id"], ev.task
         for ti, turn in enumerate(turns):
-            prompt = list(turn["input_ids"])
-            output = list(turn.get("response_ids") or [])
             out.append(
                 Request(
-                    idx=idx, ts=t, sid=sid, task=task, turn=ti + 1,
-                    prompt=prompt, output=output,
+                    idx=idx, ts=start + offsets[ti], sid=sid, task=task, turn=ti + 1,
+                    prompt=list(turn["input_ids"]),
+                    output=list(turn.get("response_ids") or []),
                 )
             )
             idx += 1
-            if ti + 1 < len(turns):
-                if wait_scale > 0:
-                    wait = 0.0 if (mu == 0.0 and sigma == 0.0) else rng.lognormvariate(mu, sigma)
-                    t += wait * wait_scale
-                t += _service_time(len(prompt), service_ms_per_1k)
+
     out.sort(key=lambda r: (r.ts, r.idx))
     for i, r in enumerate(out):
         r.idx = i
@@ -249,6 +308,8 @@ def schedule_single_workload(
     task_name: Optional[str] = None,
     read_limit: int = 0,
     shuffle: bool = True,
+    concurrency: int = 0,
+    service_ms: float = 0.0,
 ) -> List[Request]:
     cfg = WORKLOADS.get(workload, {})
     path = Path(data_path).resolve() if data_path else workload_path(workload)
@@ -283,6 +344,8 @@ def schedule_single_workload(
         wait_scale=wait_scale,
         arrival_scale=arrival_scale,
         service_ms_per_1k=service_ms_per_1k,
+        service_ms=service_ms,
+        concurrency=concurrency,
     )
 
 
@@ -294,17 +357,16 @@ def schedule_hybrid(
     arrival_scale: float,
     service_ms_per_1k: float = 0.0,
     num_sessions_override: int = -1,
+    concurrency: int = 0,
+    service_ms: float = 0.0,
 ) -> List[Request]:
     """多负载混合（对齐 bench_hetercache.build_hybrid_arrival_schedule）。"""
     config_path = Path(tasks_config).resolve()
     cfg = load_tasks_config(config_path)
-    base_dir = config_path.parent
     arrivals: List[SessionArrival] = []
     counter = 0
     for task in cfg.get("tasks", []):
-        data_path = Path(task["data_path"])
-        if not data_path.is_absolute():
-            data_path = base_dir / data_path
+        data_path = resolve_data_path(task["data_path"], config_path)
         max_record = int(task.get("max_record", -1))
         if num_sessions_override and num_sessions_override > 0:
             max_record = min(max_record, num_sessions_override) if max_record > 0 else num_sessions_override
@@ -327,6 +389,8 @@ def schedule_hybrid(
         wait_scale=wait_scale,
         arrival_scale=arrival_scale,
         service_ms_per_1k=service_ms_per_1k,
+        service_ms=service_ms,
+        concurrency=concurrency,
     )
 
 

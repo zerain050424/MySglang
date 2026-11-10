@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import dataclasses
 import importlib
+import types
 import logging
 from typing import Callable, Dict, List, Optional, Sequence
 
@@ -104,6 +105,8 @@ class RealBackend:
         on_evict: Optional[EvictCb] = None,
         device: str = "cpu",
         dtype: str = "float16",
+        lifecycle: str = "legacy",
+        insert_outputs: bool = True,
     ) -> None:
         try:
             import torch  # noqa: F401
@@ -155,7 +158,7 @@ class RealBackend:
         # req_to_token 在本回放路径里不被使用（只用 tree + allocator），
         # 但 CacheInitParams 要求非空；给小一点以免 12 路并发吃掉内存。
         req_pool = pool_mod.ReqToTokenPool(
-            size=8, max_context_len=1 << 16, device=device, enable_memory_saver=False
+            size=64, max_context_len=1 << 16, device=device, enable_memory_saver=False
         )
         init_params = params_mod.CacheInitParams(
             disable=False,
@@ -208,11 +211,120 @@ class RealBackend:
         )
         self._req_seq = 0
         self.pool_tokens = int(pool_tokens)
+        self.lifecycle = lifecycle
+        self.inflight_ms = 0.0
+        # 真机 decode 期间 response token 会占用池子（触发淘汰），但
+        # cache_finished_req 只把 prompt 段留在树里（实测下一轮 cached ≈ 上一轮
+        # prompt 即可证明）。这里把「占用但不驻留」显式建模。
+        self.insert_outputs = insert_outputs
+        self._row_seq = 0
+        # 真机 --chunked-prefill-size 默认 4096：超过它的 prompt 会被拆成多块，
+        # 每块触发一次 cache_unfinished_req（touch + 转移锁 + 插入）。
+        self._chunk_tokens = 4096
 
     # ------------------------------------------------------------------
-    def acquire(self, req: Request) -> AccessResult:
+    # ------------------------------------------------------------------
+    # 真机生命周期回放：match → 分块 prefill → cache_unfinished_req →
+    # cache_finished_req。在线端由 scheduler 调用的就是这几个入口，回放走同一份
+    # 代码，才能复现 touch/inc_lock_ref/insert/free_kv_row 的真实顺序。
+    # ------------------------------------------------------------------
+    def _alloc_with_evict(self, take: int):
+        """按真机顺序拿 KV：先 alloc，失败则 evict 后再 alloc。"""
+        alloc = self.cache.token_to_kv_pool_allocator
+        idx = alloc.alloc(take)
+        if idx is not None:
+            return idx, 0
+        avail = self._available()
+        want = take - avail
+        evicted = 0
+        if want > 0:
+            before = self._available()
+            self.cache.evict(self._EvictParams(num_tokens=want))
+            evicted = max(0, self._available() - before)
+        idx = alloc.alloc(take)
+        return idx, evicted
+
+    def _acquire_lifecycle(self, req: Request) -> AccessResult:
         torch = self._torch
         tokens = req.prompt + req.output
+        prompt_len = len(req.prompt)
+        key = self._RadixKey(_array(tokens))
+        duck = _LifecycleReq(req, tokens, prompt_len)
+
+        res = self.cache.match_prefix(self._MatchPrefixParams(key=key, req=duck))
+        cached = int(res.device_indices.numel())
+        need = len(tokens) - cached
+        duck.last_node = getattr(res, "last_device_node", None)
+        duck.prefix_indices = res.device_indices
+        duck.kv.cache_protected_len = cached
+
+        alloc = self.cache.token_to_kv_pool_allocator
+        # 行 0 是 padding 行（ReqToTokenPool 的 free_slots 从 1 开始），
+        # 必须走 alloc_rows 拿真实行，否则读到的全是 0。
+        rows = self.cache.req_to_token_pool.alloc_rows(1)
+        if rows is None:
+            self._req_seq += 1
+            return AccessResult(ok=False, cached_len=cached, prompt_len=prompt_len,
+                                total_len=len(tokens), evicted_tokens=0, oom=True)
+        row = rows[0]
+        duck.kv.req_pool_idx = row
+        duck.kv.kv_allocated_len = len(tokens)
+        duck.kv.kv_committed_len = len(tokens)
+        self._row_seq += 1
+
+        # 命中前缀先落行、再上锁：与 scheduler 的 prefix_indices + inc_lock_ref 同序
+        if cached:
+            self.cache.req_to_token_pool.write(
+                (row, slice(0, cached)), res.device_indices
+            )
+            if duck.last_node is not None and hasattr(self.cache, "inc_lock_ref"):
+                self.cache.inc_lock_ref(duck.last_node)
+
+        evicted = 0
+        oom = False
+        pos = cached
+        chunk = self._chunk_tokens
+        while pos < len(tokens):
+            take = min(chunk, len(tokens) - pos)
+            idx, ev = self._alloc_with_evict(take)
+            evicted += ev
+            if idx is None:
+                oom = True
+                break
+            self.cache.req_to_token_pool.write((row, slice(pos, pos + take)), idx)
+            pos += take
+            duck.filled = pos
+            try:
+                if pos < len(tokens):
+                    # 分块 prefill：插入已填充部分并转移锁
+                    self.cache.cache_unfinished_req(duck, chunked=True)
+                else:
+                    # 请求结束：插入完整序列、释放本请求自有 KV、解除锁
+                    self.cache.cache_finished_req(duck, owned_kv_len=pos)
+            except Exception:
+                logger.exception("[wtl] lifecycle call failed")
+                oom = True
+                break
+
+        if duck.last_node is not None:
+            try:
+                self.cache.dec_lock_ref(duck.last_node)
+            except Exception:
+                pass
+        self.cache.req_to_token_pool.free_rows([row])
+        del alloc
+        self._req_seq += 1
+        return AccessResult(
+            ok=not oom, cached_len=cached, prompt_len=prompt_len,
+            total_len=len(tokens), evicted_tokens=evicted, oom=oom,
+        )
+
+    def acquire(self, req: Request) -> AccessResult:
+        if self.lifecycle == "chunked":
+            return self._acquire_lifecycle(req)
+        torch = self._torch
+        full_tokens = req.prompt + req.output
+        tokens = full_tokens if self.insert_outputs else req.prompt
         key = self._RadixKey(_array(tokens))
         duck = _DuckReq(req)
         res = self.cache.match_prefix(
@@ -222,6 +334,20 @@ class RealBackend:
         # device_indices 的长度就是命中的前缀长度（与 scheduler 同口径）。
         cached = int(res.device_indices.numel())
         need = len(tokens) - cached
+
+        # 匹配到的前缀必须在「淘汰 + 重插」期间上锁：在线端由 scheduler 的
+        # inc_lock_ref/dec_lock_ref 保证，否则 evict 会把刚命中、马上要重插的
+        # 节点删掉，随后 insert 用已释放的池索引重建节点，造成树里同一段索引
+        # 出现在多个节点上（实测树内 token 数可以涨到池容量的 4 倍，命中率虚高）。
+        matched_node = getattr(res, "last_device_node", None)
+        self.last_matched_node = matched_node if cached > 0 else None
+        locked = False
+        if matched_node is not None and cached > 0 and hasattr(self.cache, "inc_lock_ref"):
+            try:
+                self.cache.inc_lock_ref(matched_node)
+                locked = True
+            except Exception:  # 观测/锁定失败不应改变回放语义
+                logger.exception("[wtl] inc_lock_ref failed")
 
         evicted = 0
         oom = False
@@ -235,6 +361,16 @@ class RealBackend:
                     oom = True
 
         ok = not oom
+        # 在线端这一步在 ``RadixCache._adopt`` 里：请求写入时重设会话链长 L 并把
+        # 缺口 d 清零。缺了它，RR 的 ``loss_cap`` 会一直读到 L=0 / 陈旧的 d，
+        # 于是所有会话都被判定「已达上限」，轮询拿不出候选 → 全部落到
+        # quota:fallback（实测 fallback 从 2.4% 涨到 68%，agentic 命中率虚高 10pp）。
+        if ok and hasattr(self.cache, "session_registry"):
+            try:
+                self.cache.session_registry.touch(req.sid, req.rid, len(tokens))
+            except Exception:
+                logger.exception("[wtl] session touch failed")
+
         if ok and need > 0:
             new_idx = self.cache.token_to_kv_pool_allocator.alloc(need)
             if new_idx is None:
@@ -250,6 +386,34 @@ class RealBackend:
                         decode_start=req.prompt_len if req.output else None,
                     )
                 )
+                # 对齐 ``_adopt(split_prompt=True)``：再插一次「仅 prompt」的键，
+                # 把叶子在 prompt 边界切开。切开后 prompt 半边拿到新的
+                # last_access_time，response 半边保留旧时间戳 —— 于是淘汰时
+                # 先掉 response 尾巴、保住 prompt。少了这一步，回放会把
+                # prompt+response 当成一个整体节点，response 跟着一起被保住。
+                # 真机在 cache_finished_req 里做 split_prompt：此刻 response 段已经
+                # 写完整条 decode，prompt 边界节点是**完成时**才裂出来的。于是
+                # response 叶子的 last_access_time 比 prompt 半边早一个 e2e，
+                # 淘汰时先掉尾巴。回放里两者同一瞬间创建，必须显式还原这个时间差。
+                if req.output and 0 < req.prompt_len < len(tokens) and self.inflight_ms > 0:
+                    probe = self.cache.match_prefix(
+                        self._MatchPrefixParams(key=key)
+                    )
+                    leaf = getattr(probe, "last_device_node", None)
+                    if leaf is not None and not leaf.children:
+                        leaf.last_access_time -= self.inflight_ms / 1000.0
+                if req.output and 0 < req.prompt_len < len(tokens):
+                    prompt_key = self._RadixKey(_array(tokens[: req.prompt_len]))
+                    self.cache.insert(
+                        self._InsertParams(
+                            key=prompt_key,
+                            value=value[: req.prompt_len],
+                            priority=1,
+                            chunked=True,
+                            session_id=req.sid,
+                            decode_start=req.prompt_len,
+                        )
+                    )
         elif ok and need == 0:
             # 全命中：仍要 insert 一次（对齐真机 cache_finished_req 的 _adopt 行为，
             # 它会让路径上的 hit_count 再 +1，从而影响 SLRU/LFU 一类策略）
@@ -262,6 +426,16 @@ class RealBackend:
                     decode_start=req.prompt_len if req.output else None,
                 )
             )
+        if locked:
+            try:
+                self.cache.dec_lock_ref(matched_node)
+            except Exception:
+                logger.exception("[wtl] dec_lock_ref failed")
+        if not self.insert_outputs and req.output:
+            extra = len(req.output)
+            idx, _ = self._alloc_with_evict(extra)
+            if idx is not None:
+                self.cache.token_to_kv_pool_allocator.free_segment(idx)
         self._req_seq += 1
         return AccessResult(
             ok=ok,
@@ -319,6 +493,47 @@ class RealBackend:
 
     def close(self) -> None:
         self.cache = None
+
+
+class _LifecycleReq:
+    """``cache_unfinished_req`` / ``cache_finished_req`` 需要的最小 Req 视图。
+
+    这些入口在真机上拿的是完整 ``Req``；观测/统计只用到下面这几个字段，
+    用鸭子对象即可，避免构造整个调度对象。
+    """
+
+    __slots__ = ("rid", "session_id", "origin_input_ids", "output_ids", "extra_key",
+                 "cache_salt", "priority", "last_node", "prefix_indices", "kv", "filled")
+
+    def __init__(self, req: Request, tokens, prompt_len: int) -> None:
+        self.rid = req.rid
+        self.session_id = req.sid
+        # RadixKey.match 断言两侧容器类型一致；树里的 key 是 array.array，
+        # 这里必须同样用 array，否则 list + array 会触发断言。
+        self.origin_input_ids = _array(tokens[:prompt_len])
+        self.output_ids = _array(tokens[prompt_len:])
+        self.extra_key = None
+        self.cache_salt = None
+        self.priority = 0
+        self.last_node = None
+        self.prefix_indices = None
+        self.filled = 0
+        # 用真机的 ReqKvInfo：``free_kv_row`` / ``unpin`` 会读
+        # get_evicted_seqlen / kv_allocated_len，自造 namespace 会对不上。
+        try:
+            from sglang.srt.managers.schedule_batch import ReqKvInfo
+            self.kv = ReqKvInfo()
+        except Exception:  # 退化路径：只保留回放真正读到的字段
+            self.kv = types.SimpleNamespace(
+                req_pool_idx=None, cache_protected_len=0,
+                kv_committed_len=0, kv_allocated_len=0,
+                component_evicted_seqlens={},
+                holds_kv=False,
+                get_evicted_seqlen=lambda _c: 0,
+            )
+
+    def get_fill_ids(self):
+        return self.origin_input_ids + self.output_ids[: max(0, self.filled - len(self.origin_input_ids))]
 
 
 class _DuckReq:

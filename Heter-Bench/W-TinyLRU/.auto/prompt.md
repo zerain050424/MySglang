@@ -56,23 +56,49 @@
 
 | # | 改动 | max_dev_pp | 判定 |
 |---|---|---|---|
-| 0 | 基线（无限并发 + 手工 match/insert） | 无明显意义（lru 51.7pp） | — |
-| 1 | `--concurrency`：信号量会话调度（对齐 bench 的 `asyncio.Semaphore`） | lru 4.3 → 0.07 | keep |
-| 2 | `--inflight-reserve`：扣掉在途请求占用的 allocator 容量 | lru +0.07 | keep |
-| 3 | 命中前缀 `inc_lock_ref`：修复"匹配后被淘汰→用已释放索引重建"的重复占位 | 修复死缺陷（树内 token 涨到池容量 4×） | keep |
-| 4 | 插入前 `session_registry.touch`：对齐 `_adopt` 的 L/d 重置 | hc_full 23.9%（fallback 从 68% 降回千分之三） | keep |
-| 5 | `--inflight-ms`：在途请求保持 lock_ref | hc_full 32.7%（真机 48.3） | 方向对，量不够 |
+| 0 | 基线（无限并发 + 手工 match/insert + 全量插 response） | 33.4（smoke/ShareGPT） | — |
+| 1 | `--concurrency`：信号量会话调度（对齐 bench 的 `asyncio.Semaphore`） | lru full 7.49 → 63.5 | keep |
+| 2 | `--inflight-reserve`：扣掉在途请求占用的 allocator 容量 | lru full +0.07 | keep |
+| 3 | 命中前缀 `inc_lock_ref`：修复「匹配后被淘汰 → 用已释放索引重建」 | 修复死缺陷（树内 token 曾涨到池容量 4×） | keep |
+| 4 | 插入前 `session_registry.touch`：对齐 `_adopt` 的 L/d 重置 | hc_full fallback 68% → 0.5% | keep |
+| 5 | **观测时钟纳入仿真**（`queue_occupancy` / `cache_telemetry`） | agentic q_occ 15.7k → 26.6k（真机 32.1k） | keep |
+| 6 | **response 段不驻留，只做临时占用** | **smoke 33.44 → 0.25** | keep |
+| 7 | `--service-ms`（每请求 e2e） | 变差（52.6 vs 59.2） | discard：mu/sigma 已含服务时长 |
+| 8 | `split_prompt` 二次插入 + 叶子时间戳偏移 | 无变化（同一仿真时刻创建，时间戳相同） | discard |
 
-### 已知缺口（下一轮的靶心）
+### 当前状态
 
-真机 hc_full 的 agentic 队列 `q_occ` 长期停在 32k（cap 18k，1.8×），回放里会被削到
-18.9k。淘汰总量：真机 15.6M，回放 29.8M —— 回放**淘汰得太狠**，命中率被正反馈放大。
-可疑的未建模路径（按优先级）：
+| case | 模拟 | 真机 | Δ |
+|---|---|---|---|
+| smoke / lru | 94.20 | 94.44 | −0.25（逐 task ≤0.25） |
+| full / lru | 61.7? | 59.17 | 见 measure 输出（Codeparrot +2.5 是主要来源） |
+| full / hc_full | ~28 | 48.29 | **−20.5（靶心）** |
 
-1. `cache_finished_req` / `_adopt` 的真实生命周期（分配 → 插入 → `free_kv_row` → `unpin`），
-   回放目前是手工 `match + alloc + insert`，`touch` 还是我补的。
-2. 请求自身的 KV 行在 decode 期间不可淘汰（属于 `req.kv`，不只是命中前缀）。
-3. `Req` 元数据（`tool_call` / `origin_input_ids`）没传，分类器只能靠间隔判定，
-   `tool_call_count` 恒 0。
-4. 在途请求的持续时间：真机 e2e 均值 1.41s，但 `unpin` 发生在完成时刻，
-   回放用的是固定窗口。
+### 已知缺口（hc_full / agentic）
+
+逐轮对比（`full_hc_full.csv` vs 回放 rows）显示：**第 1–6 轮几乎完全一致**
+（Δ ≤ 2pp），之后随轮次线性扩大：t20 −13pp、t30 −17pp、t40 −25pp。
+即短会话已经复现，长会话的**链保留率**偏低。
+
+回放 vs 真机的终局账本：
+
+| 指标 | 回放 | 真机 |
+|---|---|---|
+| agentic occ 中位 | 26.6k | 32.4k |
+| struct 累计命中 | 0.73M | **8.49M** |
+| struct 终局 occ（其中 one-shot） | 1.1k | 23.4k（23.0k） |
+| chat 终局 occ | 5.4k | 17 |
+| agentic 累计淘汰 | 32.4M | 22.5M |
+| sessions（账本存活） | 37 | **586** |
+
+三个方向（按可疑度）：
+
+1. **struct 的标签归属**：真机 struct 命中 8.49M 远超 apps+code 的理论上限
+   （约 1.2M），说明大量命中被 `fork → QSTRUCT 黏性` 规则吸到 struct 名下；
+   回放只有 0.73M，说明回放的**分叉拓扑**和真机不同（同一批 token 在回放里
+   没有形成多分支）。
+2. **会话账本存活数 37 vs 586**：`sweep` 在回放里把会话删得太干净
+   （`empty_grace=60` + 节点被清空）。账本消失会让 `is_one_shot` 保守返回
+   False，同时 RR 的候选集变化。
+3. **长会话的保留率**：RR 的 `loss_cap = 0.5L` 上限解释不了 25% 的保留率，
+   说明还有别的路径在削 agentic（需要按 session 统计淘汰量归因）。
