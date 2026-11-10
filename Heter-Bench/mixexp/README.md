@@ -146,6 +146,116 @@ result/mixexp/server_<scale>_<arm>.log  server 日志（含 [HeterCache profile]
 
 ---
 
+## 五·补、exp3：四类混合负载（独立 struct + 大流量冲刷 + 周期性突发）
+
+exp3 换了一套负载：四类，各类彼此独立。会话结构上有三处与 exp1/exp2 不同，
+分别对应缓存行为里最容易分化的三个条件。
+
+### 负载组成
+
+| 类别 | 数据源 | 会话数 | 轮数结构 | token 占比 |
+|---|---|---|---|---|
+| chat | ShareGPT `gt5` | 800 | 6–8 轮为主，20% 取 10–15 轮 | ~22% |
+| agentic | AgentBank_alfred | 96 | 30 条 60+ 轮长尾，其余 6–10 轮 | ~35% |
+| **apps** | AgentBank_apps + 合成冲刷会话 | 15 000 | 单轮，彼此无共享 | ~22% |
+| **struct** | 独立构造（长前缀链） | 2 600 | 单轮，链内共用 2 000 token 前缀 | ~22% |
+| 合计 | | 18 496 | | ≈25 M prompt token |
+
+apps 是主导冲刷的流量：15 000 条单轮请求占请求总数 **61%**，全部彼此无共享，
+每条请求都要真实占一段 capacity，因此对 struct / chat 的前缀形成持续挤压。
+真实 apps 会话只有 5 390 条，超出部分由 `build_exp3_data.py` 按**真实 prompt 长度分布**
+补合成会话（正文为独立随机 token，互不重复），所以冲刷强度不受原始数据量限制：
+
+```bash
+# 冲刷更强 / 更弱，只改这一个数
+python mixexp/tools/build_exp3_data.py --only apps --apps-sessions 25000
+```
+
+改完同步 `mix_full.yaml` 里 `AgentBank_apps` 的 `max_record` 与 `lambda_rate`
+（`lambda_rate = 会话数 / 12000`）。
+
+三处结构差异：
+
+1. **struct 独立成一类**。struct 不与其他负载混用：chat / agentic / apps
+   保持原始文本，不拼任何公共前缀。struct 由 `build_exp3_data.py` 单独构造——
+   8 条前缀链，每条链上的 325 条会话逐轮共用同一段 2 000 token 的前缀，私有正文
+   每会话唯一，所以除前缀外没有别的共享节点。
+   **要调 struct 的占比，只动它自己的两个旋钮**：前缀长度与会话数，
+
+   ```bash
+   # 前缀拉到 4 000 token → struct 占比约翻倍（不动其他四类）
+   python mixexp/tools/build_exp3_data.py --only struct --struct-prefix-tokens 4000
+   # 或者只加会话数
+   python mixexp/tools/build_exp3_data.py --only struct --struct-sessions 4000
+   ```
+
+   改完记得同步 `configs/exp3/mix_full.yaml` 里 `Struct` 的 `max_record`（该值等于
+   会话数）。
+2. **长尾会话**。agentic 里 30 条会话跑 60 轮以上，其余只有 6–10 轮；chat 有两成是
+   10–15 轮。会话长度呈长尾，短会话与大会话争夺同一份容量。
+3. **周期性突发**。相位排程为 40 个 300 秒周期（合计 3.3 h），每周期 280 秒基线 +
+   20 秒突发，突发窗口内到达率放大 10 倍。
+
+另外，`lambda_rate` 按 `会话数 / 12000 s` 逐类设定，四类同时收尾，混合组成不随时间漂移
+（此前一律填 1 会让长尾任务拖在后面，后段组成偏向单类）。
+
+### 运行参数
+
+| 项 | 值 | 说明 |
+|---|---|---|
+| 池容量 | `--mem-fraction-static 0.85` + `--kv-cache-dtype fp8_e4m3` | 约 198 k token；bf16 只有 99 k，0.9 会 OOM |
+| 并发 | 32 | |
+| wait-scale | 1.0 | 轮间不压缩，保持复用间隔与 `reuse_config` 标定一致 |
+| 配额 | struct 0.20 / agentic 0.50 / chat 0.30 | `arms_exp3.tsv`；apps 走一次性队列，占剩余 |
+| 方案 | `lru`、`hc_full`（`hc_norr` 备用） | 同参数成对，缺一不可 |
+
+### 怎么跑
+
+```bash
+cd Heter-Bench
+
+# 1) 构造数据（幂等；产出 TaskData/exp3/*.nosys.jsonl 与 manifest.json）
+bash mixexp/run_exp3.sh --build-data --dry-run     # 只打印计划
+bash mixexp/run_exp3.sh --build-data               # 真跑前先构造
+
+# 2) 稳态：单方案约 3.3 h，两个方案约 6.6 h（建议 tmux）
+tmux new -s exp3
+bash mixexp/run_exp3.sh
+
+# 3) 相位模式（含 20 秒突发窗口）
+bash mixexp/run_exp3.sh --mode drift
+
+# 4) 只汇总
+python mixexp/analyze.py --dir mixexp/result/exp3 --scale full --tokens 198000
+```
+
+数据构造细节：
+
+```bash
+python mixexp/tools/build_exp3_data.py --dry-run          # 看各类别规模与 struct 前缀
+python mixexp/tools/build_exp3_data.py --only struct --dry-run
+python mixexp/tools/build_exp3_data.py --only apps --apps-sessions 500 --out-dir /tmp/demo
+python mixexp/tools/tests/test_build_exp3_data.py         # 自测：分桶/struct 共享与隔离/字段保留
+```
+
+脚本会打印每类的会话数、请求数、轮数区间与 token 占比，并写 `manifest.json`。
+若某一桶的会话不足，会用剩余会话补足目标条数。
+
+### 跑起来先看这四个数
+
+| 指标 | 目标区间 | 偏离怎么办 |
+|---|---|---|
+| `token usage` 峰值 | 0.60–0.90 | 长期 ≥0.95 → 减 `max_record` 或加大池；长期 ≤0.75 → 提高 `--conc` |
+| apps 占比（请求数） | 55–65% | 低于 50% 说明冲刷不够，调 `--apps-sessions` |
+| chat 命中率 | 25–40% | 明显偏低时先查 `MULTI_TURN_MIN` 与数据轮数是否匹配 |
+| `share≥2` 节点占可调度比例 | 15% 以上 | 偏低说明 struct 没被识别成结构性节点，检查 `manifest.json` 里 struct 的 `prefix_tokens` 与变体数 |
+| 突发后 30 秒的命中率 | 与基线相差 ≤20pp | 掉得更多说明容量不足，按第一条调整 |
+
+`analyze.py` 的五项判据照旧适用；`--tokens` 请传实际池容量（启动日志里的
+`max_total_num_tokens`），不是命令行的 200000。
+
+---
+
 ## 六、已知限制（写在前面，避免误读）
 
 1. **`per_task` 是数据集维度，不是队列维度。** 队列由运行期状态机动态判定

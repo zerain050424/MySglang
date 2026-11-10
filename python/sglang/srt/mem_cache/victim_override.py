@@ -354,11 +354,11 @@ class MultiTurnEvictPolicy(VictimOverride):
 
     w = 1 - reuse_prob = CDF(elapsed; mu, sigma)
 
-权重取对数正态的 ``CDF(elapsed)``：``1 - CDF`` 才是"还没被复用"的概率，
-所以这里**越大越先淘汰**。同权重时退化为段内 LRU。
+权重取对数正态的CDF(elapsed)：1 - CDF才是"还没被复用"的概率，
+所以这里越大越先淘汰。同权重时退化为段内 LRU。
 
-带内归属按 **SessionType ∈ {CHAT, AGENTIC}** 判定，而不是节点标签：分类器产出
-的是会话类型，``queue_tag`` 不一定与之对齐。本类只处理传入的池，绝不跨带取点。
+带内归属按SessionType ∈ {CHAT, AGENTIC}判定，而不是节点标签：分类器产出
+的是会话类型，queue_tag不一定与之对齐。本类只处理传入的池，绝不跨带取点。
 """
 
     name = "mt"
@@ -436,17 +436,17 @@ class MultiTurnEvictPolicy(VictimOverride):
 class MultiAgenticEvict(VictimOverride):
     """AGENTIC 队列的复用分改写器：按复用分升序淘汰。
 
-    复用分沿用旧版 ``HeterCacheStrategy._reuse_score`` 的多轮分支口径（不是
+    复用分沿用旧版HeterCacheStrategy._reuse_score的多轮分支口径（不是
     跨队列的全局价值分，只在本队内排序）：
 
         reuse_score(node) = 1 - CDF(elapsed; mu, sigma)
 
-    ``CDF`` 是 lognormal 的 ``P(复用间隔 <= elapsed)``，因此 ``1 - CDF`` 是
-    “到此刻还没被复用”的概率：**越小越先淘汰**（复用窗口已经过去）。
-    ``(mu, sigma)`` 取自 ``HeterCacheNodeTag.reuse_config``——agentic 节点即
-    ``QAGENT:(1.81, 1.092)``，与 ``MultiTurnEvictPolicy`` 的 chat 分支同源。
+    CDF是 lognormal 的P(复用间隔 <= elapsed)，因此1 - CDF是
+    到此刻还没被复用的概率：越小越先淘汰（复用窗口已经过去）。
+    (mu, sigma) 取自HeterCacheNodeTag.reuse_config——agentic 节点即
+    QAGENT:(1.81, 1.092)，与MultiTurnEvictPolicy的 chat 分支同源。
 
-    与 RR 的分工：RR 保证会话间公平（避免单会话被连续削），本类只按复用分
+    与RR的分工：RR 保证会话间公平（避免单会话被连续削），本类只按复用分
     排序，不做会话级的缺口上限与轮询。两者互斥且本类优先，开关是
     ``MultiAgenticParams.enabled``；关闭时策略侧不构造本类，agentic 队回落到
     RR / 兜底。

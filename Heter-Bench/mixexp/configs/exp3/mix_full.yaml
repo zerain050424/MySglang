@@ -1,0 +1,59 @@
+# exp3 · full 档：四类混合负载（稳态）
+#
+# 负载组成（四类彼此独立，各自的 token 占比只由自身规模决定）
+#   chat     ShareGPT 多轮（6–8 轮为主，20% 取 10–15 轮）      800 会话  ~5.4 M tok
+#   agentic  AgentBank alfred（30 条 60+ 轮长尾，其余 6–10 轮）   96 会话  ~8.6 M tok
+#   apps     AgentBank_apps 单轮 + 同长度分布的合成冲刷会话     15 000 会话  ~5.6 M tok
+#   struct   独立构造：8 条长前缀链，链内共用 2000 token 前缀
+#                                                              2 600 会话  ~5.4 M tok
+#
+# apps 是主要的冲刷来源：全部单轮、彼此无共享、数量占请求总数的六成以上。
+# 真实 apps 会话用尽后由 build_exp3_data.py 按真实长度分布补合成会话
+# （`--apps-sessions` 可调总量），因此冲刷强度不受原始数据量限制。
+#
+# struct 之外的类别保持原始文本，不拼任何公共前缀。想提高 struct 的 token 占比，
+# 只调它的两个旋钮：--struct-prefix-tokens（前缀长度）与 --struct-sessions（会话数）：
+#     python mixexp/tools/build_exp3_data.py --only struct --struct-prefix-tokens 4000
+#
+# lambda_rate = 会话数 / 12000s，四类同时收尾，混合组成不随时间漂移。
+# 池容量与并发由 run_exp3.sh 传入（mem-fraction 0.85 + fp8 KV，约 198k token）。
+tasks:
+  - name: AgentBank_apps
+    task_id: 0
+    data_path: TaskData/exp3/apps_exp3.nosys.jsonl
+    lambda_rate: 1.2500
+    mu: 0
+    sigma: 0
+    seed: 42
+    max_record: 15000
+    shuffle: true
+
+  - name: ShareGPT
+    task_id: 2
+    data_path: TaskData/exp3/chat_exp3.nosys.jsonl
+    lambda_rate: 0.0667
+    mu: 4.15
+    sigma: 0.971
+    seed: 42
+    max_record: 800
+    shuffle: true
+
+  - name: AgentBank_alfred
+    task_id: 3
+    data_path: TaskData/exp3/agentic_exp3.nosys.jsonl
+    lambda_rate: 0.0080
+    mu: 1.81
+    sigma: 1.092
+    seed: 42
+    max_record: 96
+    shuffle: true
+
+  - name: Struct
+    task_id: 4
+    data_path: TaskData/exp3/struct_exp3.nosys.jsonl
+    lambda_rate: 0.2167
+    mu: 0
+    sigma: 0
+    seed: 42
+    max_record: 2600
+    shuffle: true

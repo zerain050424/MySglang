@@ -1,0 +1,1160 @@
+# exp3 · 相位排程：稳态基线 + 周期性突发窗口
+#
+# 40 个 300 秒周期（合计 3 小时），每周期 280 秒基线 + 20 秒突发：
+#   基线期各类按各自到达率均匀投放；
+#   突发期同一批会话在 20 秒内集中到达（到达率放大 10 倍），随后回到基线。
+#
+# 会话总数与 mix_full.yaml 一致（apps 15 000 / chat 800 / agentic 96 / struct 2 600）。
+# 用法：bash mixexp/run_mixexp.sh --scale full --mode drift ...
+#       （--mode drift 即相位模式，读取本目录下的 drift_phases.yaml）
+#
+# data_path 相对 Heter-Bench 根目录解析。
+tasks:
+  - name: AgentBank_alfred
+    task_id: 3
+    data_path: TaskData/exp3/agentic_exp3.nosys.jsonl
+    mu: 1.81
+    sigma: 1.092
+    seed: 42
+
+  - name: ShareGPT
+    task_id: 2
+    data_path: TaskData/exp3/chat_exp3.nosys.jsonl
+    mu: 4.15
+    sigma: 0.971
+    seed: 42
+
+  - name: AgentBank_apps
+    task_id: 0
+    data_path: TaskData/exp3/apps_exp3.nosys.jsonl
+    mu: 0
+    sigma: 0
+    seed: 42
+
+  - name: Struct
+    task_id: 4
+    data_path: TaskData/exp3/struct_exp3.nosys.jsonl
+    mu: 0
+    sigma: 0
+    seed: 42
+
+phases:
+  # ── 周期 01 · baseline ──
+  - name: c01_baseline
+    duration_s: 280
+    lambda_rate:
+      ShareGPT: 0.0643
+      AgentBank_apps: 1.2071
+      Struct: 0.2107
+      AgentBank_alfred: 0.0071
+    max_record:
+      ShareGPT: 18
+      AgentBank_apps: 338
+      Struct: 59
+      AgentBank_alfred: 2
+
+  # ── 周期 01 · burst ──
+  - name: c01_burst
+    duration_s: 20
+    lambda_rate:
+      ShareGPT: 1.0000
+      AgentBank_apps: 18.5000
+      Struct: 3.0000
+      AgentBank_alfred: 0.0000
+    max_record:
+      ShareGPT: 2
+      AgentBank_apps: 37
+      Struct: 6
+      AgentBank_alfred: 0
+
+  # ── 周期 02 · baseline ──
+  - name: c02_baseline
+    duration_s: 280
+    lambda_rate:
+      ShareGPT: 0.0643
+      AgentBank_apps: 1.2071
+      Struct: 0.2107
+      AgentBank_alfred: 0.0071
+    max_record:
+      ShareGPT: 18
+      AgentBank_apps: 338
+      Struct: 59
+      AgentBank_alfred: 2
+
+  # ── 周期 02 · burst ──
+  - name: c02_burst
+    duration_s: 20
+    lambda_rate:
+      ShareGPT: 1.0000
+      AgentBank_apps: 18.5000
+      Struct: 3.0000
+      AgentBank_alfred: 0.0000
+    max_record:
+      ShareGPT: 2
+      AgentBank_apps: 37
+      Struct: 6
+      AgentBank_alfred: 0
+
+  # ── 周期 03 · baseline ──
+  - name: c03_baseline
+    duration_s: 280
+    lambda_rate:
+      ShareGPT: 0.0643
+      AgentBank_apps: 1.2071
+      Struct: 0.2107
+      AgentBank_alfred: 0.0071
+    max_record:
+      ShareGPT: 18
+      AgentBank_apps: 338
+      Struct: 59
+      AgentBank_alfred: 2
+
+  # ── 周期 03 · burst ──
+  - name: c03_burst
+    duration_s: 20
+    lambda_rate:
+      ShareGPT: 1.0000
+      AgentBank_apps: 18.5000
+      Struct: 3.0000
+      AgentBank_alfred: 0.0000
+    max_record:
+      ShareGPT: 2
+      AgentBank_apps: 37
+      Struct: 6
+      AgentBank_alfred: 0
+
+  # ── 周期 04 · baseline ──
+  - name: c04_baseline
+    duration_s: 280
+    lambda_rate:
+      ShareGPT: 0.0643
+      AgentBank_apps: 1.2071
+      Struct: 0.2107
+      AgentBank_alfred: 0.0071
+    max_record:
+      ShareGPT: 18
+      AgentBank_apps: 338
+      Struct: 59
+      AgentBank_alfred: 2
+
+  # ── 周期 04 · burst ──
+  - name: c04_burst
+    duration_s: 20
+    lambda_rate:
+      ShareGPT: 1.0000
+      AgentBank_apps: 18.5000
+      Struct: 3.0000
+      AgentBank_alfred: 0.0000
+    max_record:
+      ShareGPT: 2
+      AgentBank_apps: 37
+      Struct: 6
+      AgentBank_alfred: 0
+
+  # ── 周期 05 · baseline ──
+  - name: c05_baseline
+    duration_s: 280
+    lambda_rate:
+      ShareGPT: 0.0643
+      AgentBank_apps: 1.2071
+      Struct: 0.2107
+      AgentBank_alfred: 0.0071
+    max_record:
+      ShareGPT: 18
+      AgentBank_apps: 338
+      Struct: 59
+      AgentBank_alfred: 2
+
+  # ── 周期 05 · burst ──
+  - name: c05_burst
+    duration_s: 20
+    lambda_rate:
+      ShareGPT: 1.0000
+      AgentBank_apps: 18.5000
+      Struct: 3.0000
+      AgentBank_alfred: 0.0000
+    max_record:
+      ShareGPT: 2
+      AgentBank_apps: 37
+      Struct: 6
+      AgentBank_alfred: 0
+
+  # ── 周期 06 · baseline ──
+  - name: c06_baseline
+    duration_s: 280
+    lambda_rate:
+      ShareGPT: 0.0643
+      AgentBank_apps: 1.2071
+      Struct: 0.2107
+      AgentBank_alfred: 0.0071
+    max_record:
+      ShareGPT: 18
+      AgentBank_apps: 338
+      Struct: 59
+      AgentBank_alfred: 2
+
+  # ── 周期 06 · burst ──
+  - name: c06_burst
+    duration_s: 20
+    lambda_rate:
+      ShareGPT: 1.0000
+      AgentBank_apps: 18.5000
+      Struct: 3.0000
+      AgentBank_alfred: 0.0000
+    max_record:
+      ShareGPT: 2
+      AgentBank_apps: 37
+      Struct: 6
+      AgentBank_alfred: 0
+
+  # ── 周期 07 · baseline ──
+  - name: c07_baseline
+    duration_s: 280
+    lambda_rate:
+      ShareGPT: 0.0643
+      AgentBank_apps: 1.2071
+      Struct: 0.2107
+      AgentBank_alfred: 0.0071
+    max_record:
+      ShareGPT: 18
+      AgentBank_apps: 338
+      Struct: 59
+      AgentBank_alfred: 2
+
+  # ── 周期 07 · burst ──
+  - name: c07_burst
+    duration_s: 20
+    lambda_rate:
+      ShareGPT: 1.0000
+      AgentBank_apps: 18.5000
+      Struct: 3.0000
+      AgentBank_alfred: 0.0000
+    max_record:
+      ShareGPT: 2
+      AgentBank_apps: 37
+      Struct: 6
+      AgentBank_alfred: 0
+
+  # ── 周期 08 · baseline ──
+  - name: c08_baseline
+    duration_s: 280
+    lambda_rate:
+      ShareGPT: 0.0643
+      AgentBank_apps: 1.2071
+      Struct: 0.2107
+      AgentBank_alfred: 0.0071
+    max_record:
+      ShareGPT: 18
+      AgentBank_apps: 338
+      Struct: 59
+      AgentBank_alfred: 2
+
+  # ── 周期 08 · burst ──
+  - name: c08_burst
+    duration_s: 20
+    lambda_rate:
+      ShareGPT: 1.0000
+      AgentBank_apps: 18.5000
+      Struct: 3.0000
+      AgentBank_alfred: 0.0000
+    max_record:
+      ShareGPT: 2
+      AgentBank_apps: 37
+      Struct: 6
+      AgentBank_alfred: 0
+
+  # ── 周期 09 · baseline ──
+  - name: c09_baseline
+    duration_s: 280
+    lambda_rate:
+      ShareGPT: 0.0643
+      AgentBank_apps: 1.2071
+      Struct: 0.2107
+      AgentBank_alfred: 0.0071
+    max_record:
+      ShareGPT: 18
+      AgentBank_apps: 338
+      Struct: 59
+      AgentBank_alfred: 2
+
+  # ── 周期 09 · burst ──
+  - name: c09_burst
+    duration_s: 20
+    lambda_rate:
+      ShareGPT: 1.0000
+      AgentBank_apps: 18.5000
+      Struct: 3.0000
+      AgentBank_alfred: 0.0000
+    max_record:
+      ShareGPT: 2
+      AgentBank_apps: 37
+      Struct: 6
+      AgentBank_alfred: 0
+
+  # ── 周期 10 · baseline ──
+  - name: c10_baseline
+    duration_s: 280
+    lambda_rate:
+      ShareGPT: 0.0643
+      AgentBank_apps: 1.2071
+      Struct: 0.2107
+      AgentBank_alfred: 0.0071
+    max_record:
+      ShareGPT: 18
+      AgentBank_apps: 338
+      Struct: 59
+      AgentBank_alfred: 2
+
+  # ── 周期 10 · burst ──
+  - name: c10_burst
+    duration_s: 20
+    lambda_rate:
+      ShareGPT: 1.0000
+      AgentBank_apps: 18.5000
+      Struct: 3.0000
+      AgentBank_alfred: 0.0000
+    max_record:
+      ShareGPT: 2
+      AgentBank_apps: 37
+      Struct: 6
+      AgentBank_alfred: 0
+
+  # ── 周期 11 · baseline ──
+  - name: c11_baseline
+    duration_s: 280
+    lambda_rate:
+      ShareGPT: 0.0643
+      AgentBank_apps: 1.2071
+      Struct: 0.2107
+      AgentBank_alfred: 0.0071
+    max_record:
+      ShareGPT: 18
+      AgentBank_apps: 338
+      Struct: 59
+      AgentBank_alfred: 2
+
+  # ── 周期 11 · burst ──
+  - name: c11_burst
+    duration_s: 20
+    lambda_rate:
+      ShareGPT: 1.0000
+      AgentBank_apps: 18.5000
+      Struct: 3.0000
+      AgentBank_alfred: 0.0000
+    max_record:
+      ShareGPT: 2
+      AgentBank_apps: 37
+      Struct: 6
+      AgentBank_alfred: 0
+
+  # ── 周期 12 · baseline ──
+  - name: c12_baseline
+    duration_s: 280
+    lambda_rate:
+      ShareGPT: 0.0643
+      AgentBank_apps: 1.2071
+      Struct: 0.2107
+      AgentBank_alfred: 0.0071
+    max_record:
+      ShareGPT: 18
+      AgentBank_apps: 338
+      Struct: 59
+      AgentBank_alfred: 2
+
+  # ── 周期 12 · burst ──
+  - name: c12_burst
+    duration_s: 20
+    lambda_rate:
+      ShareGPT: 1.0000
+      AgentBank_apps: 18.5000
+      Struct: 3.0000
+      AgentBank_alfred: 0.0000
+    max_record:
+      ShareGPT: 2
+      AgentBank_apps: 37
+      Struct: 6
+      AgentBank_alfred: 0
+
+  # ── 周期 13 · baseline ──
+  - name: c13_baseline
+    duration_s: 280
+    lambda_rate:
+      ShareGPT: 0.0643
+      AgentBank_apps: 1.2071
+      Struct: 0.2107
+      AgentBank_alfred: 0.0071
+    max_record:
+      ShareGPT: 18
+      AgentBank_apps: 338
+      Struct: 59
+      AgentBank_alfred: 2
+
+  # ── 周期 13 · burst ──
+  - name: c13_burst
+    duration_s: 20
+    lambda_rate:
+      ShareGPT: 1.0000
+      AgentBank_apps: 18.5000
+      Struct: 3.0000
+      AgentBank_alfred: 0.0000
+    max_record:
+      ShareGPT: 2
+      AgentBank_apps: 37
+      Struct: 6
+      AgentBank_alfred: 0
+
+  # ── 周期 14 · baseline ──
+  - name: c14_baseline
+    duration_s: 280
+    lambda_rate:
+      ShareGPT: 0.0643
+      AgentBank_apps: 1.2071
+      Struct: 0.2107
+      AgentBank_alfred: 0.0071
+    max_record:
+      ShareGPT: 18
+      AgentBank_apps: 338
+      Struct: 59
+      AgentBank_alfred: 2
+
+  # ── 周期 14 · burst ──
+  - name: c14_burst
+    duration_s: 20
+    lambda_rate:
+      ShareGPT: 1.0000
+      AgentBank_apps: 18.5000
+      Struct: 3.0000
+      AgentBank_alfred: 0.0000
+    max_record:
+      ShareGPT: 2
+      AgentBank_apps: 37
+      Struct: 6
+      AgentBank_alfred: 0
+
+  # ── 周期 15 · baseline ──
+  - name: c15_baseline
+    duration_s: 280
+    lambda_rate:
+      ShareGPT: 0.0643
+      AgentBank_apps: 1.2071
+      Struct: 0.2107
+      AgentBank_alfred: 0.0071
+    max_record:
+      ShareGPT: 18
+      AgentBank_apps: 338
+      Struct: 59
+      AgentBank_alfred: 2
+
+  # ── 周期 15 · burst ──
+  - name: c15_burst
+    duration_s: 20
+    lambda_rate:
+      ShareGPT: 1.0000
+      AgentBank_apps: 18.5000
+      Struct: 3.0000
+      AgentBank_alfred: 0.0000
+    max_record:
+      ShareGPT: 2
+      AgentBank_apps: 37
+      Struct: 6
+      AgentBank_alfred: 0
+
+  # ── 周期 16 · baseline ──
+  - name: c16_baseline
+    duration_s: 280
+    lambda_rate:
+      ShareGPT: 0.0643
+      AgentBank_apps: 1.2071
+      Struct: 0.2107
+      AgentBank_alfred: 0.0071
+    max_record:
+      ShareGPT: 18
+      AgentBank_apps: 338
+      Struct: 59
+      AgentBank_alfred: 2
+
+  # ── 周期 16 · burst ──
+  - name: c16_burst
+    duration_s: 20
+    lambda_rate:
+      ShareGPT: 1.0000
+      AgentBank_apps: 18.5000
+      Struct: 3.0000
+      AgentBank_alfred: 0.0000
+    max_record:
+      ShareGPT: 2
+      AgentBank_apps: 37
+      Struct: 6
+      AgentBank_alfred: 0
+
+  # ── 周期 17 · baseline ──
+  - name: c17_baseline
+    duration_s: 280
+    lambda_rate:
+      ShareGPT: 0.0643
+      AgentBank_apps: 1.2071
+      Struct: 0.2107
+      AgentBank_alfred: 0.0071
+    max_record:
+      ShareGPT: 18
+      AgentBank_apps: 338
+      Struct: 59
+      AgentBank_alfred: 2
+
+  # ── 周期 17 · burst ──
+  - name: c17_burst
+    duration_s: 20
+    lambda_rate:
+      ShareGPT: 1.0000
+      AgentBank_apps: 18.5000
+      Struct: 3.0000
+      AgentBank_alfred: 0.0000
+    max_record:
+      ShareGPT: 2
+      AgentBank_apps: 37
+      Struct: 6
+      AgentBank_alfred: 0
+
+  # ── 周期 18 · baseline ──
+  - name: c18_baseline
+    duration_s: 280
+    lambda_rate:
+      ShareGPT: 0.0643
+      AgentBank_apps: 1.2071
+      Struct: 0.2107
+      AgentBank_alfred: 0.0071
+    max_record:
+      ShareGPT: 18
+      AgentBank_apps: 338
+      Struct: 59
+      AgentBank_alfred: 2
+
+  # ── 周期 18 · burst ──
+  - name: c18_burst
+    duration_s: 20
+    lambda_rate:
+      ShareGPT: 1.0000
+      AgentBank_apps: 18.5000
+      Struct: 3.0000
+      AgentBank_alfred: 0.0000
+    max_record:
+      ShareGPT: 2
+      AgentBank_apps: 37
+      Struct: 6
+      AgentBank_alfred: 0
+
+  # ── 周期 19 · baseline ──
+  - name: c19_baseline
+    duration_s: 280
+    lambda_rate:
+      ShareGPT: 0.0643
+      AgentBank_apps: 1.2071
+      Struct: 0.2107
+      AgentBank_alfred: 0.0071
+    max_record:
+      ShareGPT: 18
+      AgentBank_apps: 338
+      Struct: 59
+      AgentBank_alfred: 2
+
+  # ── 周期 19 · burst ──
+  - name: c19_burst
+    duration_s: 20
+    lambda_rate:
+      ShareGPT: 1.0000
+      AgentBank_apps: 18.5000
+      Struct: 3.0000
+      AgentBank_alfred: 0.0000
+    max_record:
+      ShareGPT: 2
+      AgentBank_apps: 37
+      Struct: 6
+      AgentBank_alfred: 0
+
+  # ── 周期 20 · baseline ──
+  - name: c20_baseline
+    duration_s: 280
+    lambda_rate:
+      ShareGPT: 0.0643
+      AgentBank_apps: 1.2071
+      Struct: 0.2107
+      AgentBank_alfred: 0.0071
+    max_record:
+      ShareGPT: 18
+      AgentBank_apps: 338
+      Struct: 59
+      AgentBank_alfred: 2
+
+  # ── 周期 20 · burst ──
+  - name: c20_burst
+    duration_s: 20
+    lambda_rate:
+      ShareGPT: 1.0000
+      AgentBank_apps: 18.5000
+      Struct: 3.0000
+      AgentBank_alfred: 0.0000
+    max_record:
+      ShareGPT: 2
+      AgentBank_apps: 37
+      Struct: 6
+      AgentBank_alfred: 0
+
+  # ── 周期 21 · baseline ──
+  - name: c21_baseline
+    duration_s: 280
+    lambda_rate:
+      ShareGPT: 0.0643
+      AgentBank_apps: 1.2071
+      Struct: 0.2107
+      AgentBank_alfred: 0.0071
+    max_record:
+      ShareGPT: 18
+      AgentBank_apps: 338
+      Struct: 59
+      AgentBank_alfred: 2
+
+  # ── 周期 21 · burst ──
+  - name: c21_burst
+    duration_s: 20
+    lambda_rate:
+      ShareGPT: 1.0000
+      AgentBank_apps: 18.5000
+      Struct: 3.0000
+      AgentBank_alfred: 0.0000
+    max_record:
+      ShareGPT: 2
+      AgentBank_apps: 37
+      Struct: 6
+      AgentBank_alfred: 0
+
+  # ── 周期 22 · baseline ──
+  - name: c22_baseline
+    duration_s: 280
+    lambda_rate:
+      ShareGPT: 0.0643
+      AgentBank_apps: 1.2071
+      Struct: 0.2107
+      AgentBank_alfred: 0.0071
+    max_record:
+      ShareGPT: 18
+      AgentBank_apps: 338
+      Struct: 59
+      AgentBank_alfred: 2
+
+  # ── 周期 22 · burst ──
+  - name: c22_burst
+    duration_s: 20
+    lambda_rate:
+      ShareGPT: 1.0000
+      AgentBank_apps: 18.5000
+      Struct: 3.0000
+      AgentBank_alfred: 0.0000
+    max_record:
+      ShareGPT: 2
+      AgentBank_apps: 37
+      Struct: 6
+      AgentBank_alfred: 0
+
+  # ── 周期 23 · baseline ──
+  - name: c23_baseline
+    duration_s: 280
+    lambda_rate:
+      ShareGPT: 0.0643
+      AgentBank_apps: 1.2071
+      Struct: 0.2107
+      AgentBank_alfred: 0.0071
+    max_record:
+      ShareGPT: 18
+      AgentBank_apps: 338
+      Struct: 59
+      AgentBank_alfred: 2
+
+  # ── 周期 23 · burst ──
+  - name: c23_burst
+    duration_s: 20
+    lambda_rate:
+      ShareGPT: 1.0000
+      AgentBank_apps: 18.5000
+      Struct: 3.0000
+      AgentBank_alfred: 0.0000
+    max_record:
+      ShareGPT: 2
+      AgentBank_apps: 37
+      Struct: 6
+      AgentBank_alfred: 0
+
+  # ── 周期 24 · baseline ──
+  - name: c24_baseline
+    duration_s: 280
+    lambda_rate:
+      ShareGPT: 0.0643
+      AgentBank_apps: 1.2071
+      Struct: 0.2107
+      AgentBank_alfred: 0.0071
+    max_record:
+      ShareGPT: 18
+      AgentBank_apps: 338
+      Struct: 59
+      AgentBank_alfred: 2
+
+  # ── 周期 24 · burst ──
+  - name: c24_burst
+    duration_s: 20
+    lambda_rate:
+      ShareGPT: 1.0000
+      AgentBank_apps: 18.5000
+      Struct: 3.0000
+      AgentBank_alfred: 0.0000
+    max_record:
+      ShareGPT: 2
+      AgentBank_apps: 37
+      Struct: 6
+      AgentBank_alfred: 0
+
+  # ── 周期 25 · baseline ──
+  - name: c25_baseline
+    duration_s: 280
+    lambda_rate:
+      ShareGPT: 0.0643
+      AgentBank_apps: 1.2071
+      Struct: 0.2107
+      AgentBank_alfred: 0.0107
+    max_record:
+      ShareGPT: 18
+      AgentBank_apps: 338
+      Struct: 59
+      AgentBank_alfred: 3
+
+  # ── 周期 25 · burst ──
+  - name: c25_burst
+    duration_s: 20
+    lambda_rate:
+      ShareGPT: 1.0000
+      AgentBank_apps: 18.5000
+      Struct: 3.0000
+      AgentBank_alfred: 0.0000
+    max_record:
+      ShareGPT: 2
+      AgentBank_apps: 37
+      Struct: 6
+      AgentBank_alfred: 0
+
+  # ── 周期 26 · baseline ──
+  - name: c26_baseline
+    duration_s: 280
+    lambda_rate:
+      ShareGPT: 0.0643
+      AgentBank_apps: 1.2071
+      Struct: 0.2107
+      AgentBank_alfred: 0.0107
+    max_record:
+      ShareGPT: 18
+      AgentBank_apps: 338
+      Struct: 59
+      AgentBank_alfred: 3
+
+  # ── 周期 26 · burst ──
+  - name: c26_burst
+    duration_s: 20
+    lambda_rate:
+      ShareGPT: 1.0000
+      AgentBank_apps: 18.5000
+      Struct: 3.0000
+      AgentBank_alfred: 0.0000
+    max_record:
+      ShareGPT: 2
+      AgentBank_apps: 37
+      Struct: 6
+      AgentBank_alfred: 0
+
+  # ── 周期 27 · baseline ──
+  - name: c27_baseline
+    duration_s: 280
+    lambda_rate:
+      ShareGPT: 0.0643
+      AgentBank_apps: 1.2071
+      Struct: 0.2107
+      AgentBank_alfred: 0.0107
+    max_record:
+      ShareGPT: 18
+      AgentBank_apps: 338
+      Struct: 59
+      AgentBank_alfred: 3
+
+  # ── 周期 27 · burst ──
+  - name: c27_burst
+    duration_s: 20
+    lambda_rate:
+      ShareGPT: 1.0000
+      AgentBank_apps: 18.5000
+      Struct: 3.0000
+      AgentBank_alfred: 0.0000
+    max_record:
+      ShareGPT: 2
+      AgentBank_apps: 37
+      Struct: 6
+      AgentBank_alfred: 0
+
+  # ── 周期 28 · baseline ──
+  - name: c28_baseline
+    duration_s: 280
+    lambda_rate:
+      ShareGPT: 0.0643
+      AgentBank_apps: 1.2071
+      Struct: 0.2107
+      AgentBank_alfred: 0.0107
+    max_record:
+      ShareGPT: 18
+      AgentBank_apps: 338
+      Struct: 59
+      AgentBank_alfred: 3
+
+  # ── 周期 28 · burst ──
+  - name: c28_burst
+    duration_s: 20
+    lambda_rate:
+      ShareGPT: 1.0000
+      AgentBank_apps: 18.5000
+      Struct: 3.0000
+      AgentBank_alfred: 0.0000
+    max_record:
+      ShareGPT: 2
+      AgentBank_apps: 37
+      Struct: 6
+      AgentBank_alfred: 0
+
+  # ── 周期 29 · baseline ──
+  - name: c29_baseline
+    duration_s: 280
+    lambda_rate:
+      ShareGPT: 0.0643
+      AgentBank_apps: 1.2071
+      Struct: 0.2107
+      AgentBank_alfred: 0.0107
+    max_record:
+      ShareGPT: 18
+      AgentBank_apps: 338
+      Struct: 59
+      AgentBank_alfred: 3
+
+  # ── 周期 29 · burst ──
+  - name: c29_burst
+    duration_s: 20
+    lambda_rate:
+      ShareGPT: 1.0000
+      AgentBank_apps: 18.5000
+      Struct: 3.0000
+      AgentBank_alfred: 0.0000
+    max_record:
+      ShareGPT: 2
+      AgentBank_apps: 37
+      Struct: 6
+      AgentBank_alfred: 0
+
+  # ── 周期 30 · baseline ──
+  - name: c30_baseline
+    duration_s: 280
+    lambda_rate:
+      ShareGPT: 0.0643
+      AgentBank_apps: 1.2071
+      Struct: 0.2107
+      AgentBank_alfred: 0.0107
+    max_record:
+      ShareGPT: 18
+      AgentBank_apps: 338
+      Struct: 59
+      AgentBank_alfred: 3
+
+  # ── 周期 30 · burst ──
+  - name: c30_burst
+    duration_s: 20
+    lambda_rate:
+      ShareGPT: 1.0000
+      AgentBank_apps: 18.5000
+      Struct: 3.0000
+      AgentBank_alfred: 0.0000
+    max_record:
+      ShareGPT: 2
+      AgentBank_apps: 37
+      Struct: 6
+      AgentBank_alfred: 0
+
+  # ── 周期 31 · baseline ──
+  - name: c31_baseline
+    duration_s: 280
+    lambda_rate:
+      ShareGPT: 0.0643
+      AgentBank_apps: 1.2071
+      Struct: 0.2107
+      AgentBank_alfred: 0.0107
+    max_record:
+      ShareGPT: 18
+      AgentBank_apps: 338
+      Struct: 59
+      AgentBank_alfred: 3
+
+  # ── 周期 31 · burst ──
+  - name: c31_burst
+    duration_s: 20
+    lambda_rate:
+      ShareGPT: 1.0000
+      AgentBank_apps: 18.5000
+      Struct: 3.0000
+      AgentBank_alfred: 0.0000
+    max_record:
+      ShareGPT: 2
+      AgentBank_apps: 37
+      Struct: 6
+      AgentBank_alfred: 0
+
+  # ── 周期 32 · baseline ──
+  - name: c32_baseline
+    duration_s: 280
+    lambda_rate:
+      ShareGPT: 0.0643
+      AgentBank_apps: 1.2071
+      Struct: 0.2107
+      AgentBank_alfred: 0.0107
+    max_record:
+      ShareGPT: 18
+      AgentBank_apps: 338
+      Struct: 59
+      AgentBank_alfred: 3
+
+  # ── 周期 32 · burst ──
+  - name: c32_burst
+    duration_s: 20
+    lambda_rate:
+      ShareGPT: 1.0000
+      AgentBank_apps: 18.5000
+      Struct: 3.0000
+      AgentBank_alfred: 0.0000
+    max_record:
+      ShareGPT: 2
+      AgentBank_apps: 37
+      Struct: 6
+      AgentBank_alfred: 0
+
+  # ── 周期 33 · baseline ──
+  - name: c33_baseline
+    duration_s: 280
+    lambda_rate:
+      ShareGPT: 0.0643
+      AgentBank_apps: 1.2071
+      Struct: 0.2107
+      AgentBank_alfred: 0.0107
+    max_record:
+      ShareGPT: 18
+      AgentBank_apps: 338
+      Struct: 59
+      AgentBank_alfred: 3
+
+  # ── 周期 33 · burst ──
+  - name: c33_burst
+    duration_s: 20
+    lambda_rate:
+      ShareGPT: 1.0000
+      AgentBank_apps: 18.5000
+      Struct: 3.0000
+      AgentBank_alfred: 0.0000
+    max_record:
+      ShareGPT: 2
+      AgentBank_apps: 37
+      Struct: 6
+      AgentBank_alfred: 0
+
+  # ── 周期 34 · baseline ──
+  - name: c34_baseline
+    duration_s: 280
+    lambda_rate:
+      ShareGPT: 0.0643
+      AgentBank_apps: 1.2071
+      Struct: 0.2107
+      AgentBank_alfred: 0.0107
+    max_record:
+      ShareGPT: 18
+      AgentBank_apps: 338
+      Struct: 59
+      AgentBank_alfred: 3
+
+  # ── 周期 34 · burst ──
+  - name: c34_burst
+    duration_s: 20
+    lambda_rate:
+      ShareGPT: 1.0000
+      AgentBank_apps: 18.5000
+      Struct: 3.0000
+      AgentBank_alfred: 0.0000
+    max_record:
+      ShareGPT: 2
+      AgentBank_apps: 37
+      Struct: 6
+      AgentBank_alfred: 0
+
+  # ── 周期 35 · baseline ──
+  - name: c35_baseline
+    duration_s: 280
+    lambda_rate:
+      ShareGPT: 0.0643
+      AgentBank_apps: 1.2071
+      Struct: 0.2107
+      AgentBank_alfred: 0.0107
+    max_record:
+      ShareGPT: 18
+      AgentBank_apps: 338
+      Struct: 59
+      AgentBank_alfred: 3
+
+  # ── 周期 35 · burst ──
+  - name: c35_burst
+    duration_s: 20
+    lambda_rate:
+      ShareGPT: 1.0000
+      AgentBank_apps: 18.5000
+      Struct: 3.0000
+      AgentBank_alfred: 0.0000
+    max_record:
+      ShareGPT: 2
+      AgentBank_apps: 37
+      Struct: 6
+      AgentBank_alfred: 0
+
+  # ── 周期 36 · baseline ──
+  - name: c36_baseline
+    duration_s: 280
+    lambda_rate:
+      ShareGPT: 0.0643
+      AgentBank_apps: 1.2071
+      Struct: 0.2107
+      AgentBank_alfred: 0.0107
+    max_record:
+      ShareGPT: 18
+      AgentBank_apps: 338
+      Struct: 59
+      AgentBank_alfred: 3
+
+  # ── 周期 36 · burst ──
+  - name: c36_burst
+    duration_s: 20
+    lambda_rate:
+      ShareGPT: 1.0000
+      AgentBank_apps: 18.5000
+      Struct: 3.0000
+      AgentBank_alfred: 0.0000
+    max_record:
+      ShareGPT: 2
+      AgentBank_apps: 37
+      Struct: 6
+      AgentBank_alfred: 0
+
+  # ── 周期 37 · baseline ──
+  - name: c37_baseline
+    duration_s: 280
+    lambda_rate:
+      ShareGPT: 0.0643
+      AgentBank_apps: 1.2071
+      Struct: 0.2107
+      AgentBank_alfred: 0.0107
+    max_record:
+      ShareGPT: 18
+      AgentBank_apps: 338
+      Struct: 59
+      AgentBank_alfred: 3
+
+  # ── 周期 37 · burst ──
+  - name: c37_burst
+    duration_s: 20
+    lambda_rate:
+      ShareGPT: 1.0000
+      AgentBank_apps: 18.5000
+      Struct: 3.0000
+      AgentBank_alfred: 0.0000
+    max_record:
+      ShareGPT: 2
+      AgentBank_apps: 37
+      Struct: 6
+      AgentBank_alfred: 0
+
+  # ── 周期 38 · baseline ──
+  - name: c38_baseline
+    duration_s: 280
+    lambda_rate:
+      ShareGPT: 0.0643
+      AgentBank_apps: 1.2071
+      Struct: 0.2107
+      AgentBank_alfred: 0.0107
+    max_record:
+      ShareGPT: 18
+      AgentBank_apps: 338
+      Struct: 59
+      AgentBank_alfred: 3
+
+  # ── 周期 38 · burst ──
+  - name: c38_burst
+    duration_s: 20
+    lambda_rate:
+      ShareGPT: 1.0000
+      AgentBank_apps: 18.5000
+      Struct: 3.0000
+      AgentBank_alfred: 0.0000
+    max_record:
+      ShareGPT: 2
+      AgentBank_apps: 37
+      Struct: 6
+      AgentBank_alfred: 0
+
+  # ── 周期 39 · baseline ──
+  - name: c39_baseline
+    duration_s: 280
+    lambda_rate:
+      ShareGPT: 0.0643
+      AgentBank_apps: 1.2071
+      Struct: 0.2107
+      AgentBank_alfred: 0.0107
+    max_record:
+      ShareGPT: 18
+      AgentBank_apps: 338
+      Struct: 59
+      AgentBank_alfred: 3
+
+  # ── 周期 39 · burst ──
+  - name: c39_burst
+    duration_s: 20
+    lambda_rate:
+      ShareGPT: 1.0000
+      AgentBank_apps: 18.5000
+      Struct: 3.0000
+      AgentBank_alfred: 0.0000
+    max_record:
+      ShareGPT: 2
+      AgentBank_apps: 37
+      Struct: 6
+      AgentBank_alfred: 0
+
+  # ── 周期 40 · baseline ──
+  - name: c40_baseline
+    duration_s: 280
+    lambda_rate:
+      ShareGPT: 0.0643
+      AgentBank_apps: 1.2071
+      Struct: 0.2107
+      AgentBank_alfred: 0.0107
+    max_record:
+      ShareGPT: 18
+      AgentBank_apps: 338
+      Struct: 59
+      AgentBank_alfred: 3
+
+  # ── 周期 40 · burst ──
+  - name: c40_burst
+    duration_s: 20
+    lambda_rate:
+      ShareGPT: 1.0000
+      AgentBank_apps: 18.5000
+      Struct: 3.0000
+      AgentBank_alfred: 0.0000
+    max_record:
+      ShareGPT: 2
+      AgentBank_apps: 37
+      Struct: 6
+      AgentBank_alfred: 0
