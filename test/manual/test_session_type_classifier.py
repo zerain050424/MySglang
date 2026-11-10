@@ -306,7 +306,8 @@ def test_bench_passes_only_completed_tool_calls(monkeypatch):
     import asyncio
     from argparse import Namespace
 
-    bench_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "Heter-Bench"))
+    # cbd6614 把 bench_hetercache.py 归入 scripts/，路径基准随之更新
+    bench_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "Heter-Bench", "scripts"))
     sys.path.insert(0, bench_path)
     import bench_hetercache
 

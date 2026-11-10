@@ -33,6 +33,13 @@ GPU = "0"                                  # 配对比较在同一张卡上
 PY = "/root/sl_old/bin/python"
 MODEL = "/root/autodl-tmp/model/Qwen2.5-7B-Instruct"
 
+# 远端语义单测（完整 sglang 导入链，本机环境跑不了、远端 sl_old 可以）。
+REMOTE_TESTS = [
+    "test/manual/test_session_type_classifier.py",
+    "test/manual/test_heter_cache_abs_offset.py",
+    "test/manual/test_cache_reset_isolation.py",
+]
+
 # 预登记上传清单：策略/测量链路的全部文件，每次全量覆盖。
 UPLOAD = [
     "python/sglang/srt/mem_cache/evict_policy.py",
@@ -242,6 +249,19 @@ def main() -> int:
     cli = connect()
     try:
         sync_files(cli)
+
+        # 远端语义单测（sl_old 环境；失败立即停，不进入基准）。
+        test_cmd = (
+            f"cd {REPO} && source Heter-Bench/scripts/env.sh && "
+            f"PYTHONPATH={REPO}/python {PY} -m pytest -q "
+            + " ".join(REMOTE_TESTS)
+            + " 2>&1 | tail -5"
+        )
+        if run_remote(cli, test_cmd, timeout=900, quiet=True) != 0:
+            print("METRIC status=remote_tests_failed")
+            return 1
+        print("[remote tests] PASSED", flush=True)
+
         for r in runs:
             scale, mode = r["scale"], r["mode"]
             tokens, conc, wait = r["tokens"], r["conc"], r["wait"]
