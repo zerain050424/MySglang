@@ -13,6 +13,7 @@
 import importlib.util
 import os
 import sys
+import time
 import types
 
 _ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
@@ -447,6 +448,56 @@ def test_stage1_fallback_is_seeded_random():
     check(_random.getstate() == state_before, "fallback must not touch global random")
 
 
+def test_multi_agentic_orders_by_reuse_score():
+    """MultiAgenticEvict：agentic 队内按复用分升序淘汰。
+
+    口径与已删除的 ``_reuse_score`` 一致：``1 - CDF(elapsed)``，越小越先淘汰；
+    同分时大片段先走（一次腾更多空间）。
+    """
+    print("[21] multi_agentic: agentic pool ordered by reuse score")
+    caps = {"caps": {"struct": 0.2, "agentic": 0.5, "chat": 0.3}}
+    st = ep.HeterCacheStrategy(multi_agentic={"enabled": True}, quota=caps)
+    check(st.multi_agentic_evict is not None, "multi_agentic.enabled must build the picker")
+
+    now = time.monotonic()
+    expired = _leaf(TAG["agentic"], 100, ts=now - 3600)  # 复用窗口已过期
+    fresh = _leaf(TAG["agentic"], 400, ts=now - 1)       # 刚写入，仍可能被复用
+    chat = _leaf(TAG["chat"], 10, ts=now - 3600)         # 不归本队
+    check(st.multi_agentic_evict.pick([expired, fresh, chat]) is expired,
+          "lowest reuse score (oldest elapsed) must be evicted first")
+
+    small = _leaf(TAG["agentic"], 10, ts=now - 3600)
+    large = _leaf(TAG["agentic"], 90, ts=now - 3600)
+    check(st.multi_agentic_evict.pick([small, large]) is large,
+          "same reuse score must prefer the larger segment")
+
+    check(st.multi_agentic_evict.pick([]) is None, "empty pool must yield None")
+
+    # 关闭时整个改写器不构造：agentic 仍走 RR / 兜底，行为与升级前一致
+    off = ep.HeterCacheStrategy(quota=caps)
+    check(off.multi_agentic_evict is None, "multi_agentic must be opt-in")
+
+    # force_agentic：所有标签都归 agentic，且复用分必须用 QAGENT 的分布
+    # （沿用旧 _reuse_score 的 _node_tag 口径；直接读 queue_tag 会得到 0 分）
+    fa = ep.HeterCacheStrategy(
+        force_agentic=True, multi_agentic={"enabled": True}, quota=caps)
+    struct_expired = _leaf(TAG["struct"], 100, ts=now - 3600)
+    check(fa.multi_agentic_evict.reuse_score(struct_expired) < 0.05,
+          "force_agentic must score every node with the QAGENT distribution")
+    check(fa.multi_agentic_evict.pick([struct_expired]) is struct_expired,
+          "force_agentic must pool every tag into the agentic band")
+
+    # 接线：配额点名 agentic 时确实由本改写器出候选
+    st.occupancy.reconcile({"struct": {"total": 0, "one_shot": 0},
+                            "agentic": {"total": 900, "one_shot": 0},
+                            "chat": {"total": 0, "one_shot": 0}}, capacity=1000)
+    victim, source = qs.pick_victim(
+        strategy=st, leaves=[expired, fresh], occ=st.occupancy.occ,
+        capacity=1000, page_size=1)
+    check(victim is expired and source == "quota:agentic",
+          f"quota:agentic must use the reuse score, got {source}")
+
+
 def test_quota_is_mandatory():
     """配额必填：不给 caps 直接报错，不会静默退回另一套淘汰语义。"""
     print("[20] quota is mandatory: missing caps raises, never degrades")
@@ -494,6 +545,7 @@ def main():
         test_stage1_quota_labels_and_skip,
         test_stage1_fallback_is_seeded_random,
         test_quota_is_mandatory,
+        test_multi_agentic_orders_by_reuse_score,
     ]
     for t in tests:
         try:

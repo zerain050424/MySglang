@@ -130,6 +130,7 @@ def install(
                         cache.session_registry.summary(),
                         slru_policy=strategy.slru_evict,
                         mt_policy=strategy.mt_evict,
+                        multi_agentic_policy=strategy.multi_agentic_evict,
                     )
                 except Exception:
                     rec["profile"] = None

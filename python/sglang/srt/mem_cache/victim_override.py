@@ -18,7 +18,8 @@
    属于 ``quota_selector``。
 
 内置实现：``RrEvictPolicy``（会话轮询）、``SlruEvictPolicy``（分段 LRU + 共享数
-账本）、``MultiTurnEvictPolicy``（多轮带内 1-prob(e) 排序）。
+账本）、``MultiTurnEvictPolicy``（多轮带内 1-prob(e) 排序）、
+``MultiAgenticEvict``（agentic 带内复用分排序）。
 """
 
 from __future__ import annotations
@@ -37,6 +38,7 @@ from sglang.srt.mem_cache.heter_utils import (
     MultiTurnParams,
     _cached_lognorm_cdf,
     node_end_offset,
+    node_num_tokens,
     session_bloom_bits,
 )
 
@@ -426,6 +428,109 @@ class MultiTurnEvictPolicy(VictimOverride):
         """只清计数器；1-prob 权重无状态，无需清理。"""
         self.mt_picks = 0
         self.mt_fallbacks = 0
+
+    def __repr__(self) -> str:  # pragma: no cover - 调试用
+        return f"<{type(self).__name__} name={self.name}>"
+
+
+class MultiAgenticEvict(VictimOverride):
+    """AGENTIC 队列的复用分改写器：按复用分升序淘汰。
+
+    复用分沿用旧版 ``HeterCacheStrategy._reuse_score`` 的多轮分支口径（不是
+    跨队列的全局价值分，只在本队内排序）：
+
+        reuse_score(node) = 1 - CDF(elapsed; mu, sigma)
+
+    ``CDF`` 是 lognormal 的 ``P(复用间隔 <= elapsed)``，因此 ``1 - CDF`` 是
+    “到此刻还没被复用”的概率：**越小越先淘汰**（复用窗口已经过去）。
+    ``(mu, sigma)`` 取自 ``HeterCacheNodeTag.reuse_config``——agentic 节点即
+    ``QAGENT:(1.81, 1.092)``，与 ``MultiTurnEvictPolicy`` 的 chat 分支同源。
+
+    与 RR 的分工：RR 保证会话间公平（避免单会话被连续削），本类只按复用分
+    排序，不做会话级的缺口上限与轮询。两者互斥且本类优先，开关是
+    ``MultiAgenticParams.enabled``；关闭时策略侧不构造本类，agentic 队回落到
+    RR / 兜底。
+
+    Args:
+        tag_of: 节点→生效标签的解析器。由策略注入 ``_node_tag``，这样
+            ``force_agentic`` 实验下所有节点都按 QAGENT 的分布算分，与旧版
+            ``_reuse_score`` 完全一致；省略时直接读 ``node.queue_tag``。
+    """
+
+    name = "multi_agentic"
+    queue = HeterCacheNodeTag.QAGENT
+
+    def __init__(self, tag_of=None) -> None:
+        self._tag_of = tag_of or (
+            lambda node: HeterCacheNodeTag.coerce(getattr(node, "queue_tag", None))
+        )
+        # ---- 观测 ----
+        self.ma_picks = 0      # 实际给出的 agentic 候选数
+        self.ma_fallbacks = 0  # 管辖带内无可淘汰叶子
+
+    # ------------------------------------------------------------ 复用分
+
+    def reuse_score(self, node, now: Optional[float] = None) -> float:
+        """节点的复用分（越小越先淘汰）。
+
+        无时间维度的标签（如 QSTRUCT）旧口径返回 0，即最不保值；本类只处理
+        agentic 池，那条分支仅作为口径兜底（仅非 ``force_agentic`` 的手工调用
+        才能碰到）。
+
+        Args:
+            node: 待排序节点。
+            now: 当前单调时钟；省略时现取（批量排序时传入同一个 now）。
+
+        Returns:
+            复用分，值域约 [0, 1]。
+        """
+        cfg = self._tag_of(node).reuse_config
+        if cfg is None:
+            return 0.0
+        mu, sigma = cfg
+        elapsed = int(
+            (time.monotonic() if now is None else now) - node.last_access_time
+        )
+        return 1.0 - _cached_lognorm_cdf(elapsed, mu, sigma)
+
+    def victim_key(self, node, now: Optional[float] = None) -> Tuple[float, int]:
+        """队内排序键：复用分升序，同分时大片段先走（一次腾更多空间）。"""
+        return (self.reuse_score(node, now), -node_num_tokens(node))
+
+    # ------------------------------------------------------------ 插件接口
+
+    def pick(self, leaves, registry=None) -> Optional["TreeNode"]:
+        """在 agentic 池内挑复用分最低的节点；带内无候选时返回 None。
+
+        Args:
+            leaves: 当前可淘汰叶子集合。
+            registry: 未使用；保留基类签名。
+
+        Returns:
+            选中的叶子；无 agentic 叶子时返回 None 并累加 fallback 计数。
+        """
+        agentic = [node for node in (leaves or ()) if self._tag_of(node) is self.queue]
+        if not agentic:
+            self.ma_fallbacks += 1
+            return None
+        # 一次取时钟：同一轮里所有节点必须用同一个 elapsed 基准，否则顺序会
+        # 随遍历位置漂移，同 seed 的对照实验无法复现。
+        now = time.monotonic()
+        self.ma_picks += 1
+        return min(agentic, key=lambda node: self.victim_key(node, now))
+
+    # ------------------------------------------------------------ 观测
+
+    def stats(self) -> Dict[str, float]:
+        return {
+            "ma_picks": self.ma_picks,
+            "ma_fallbacks": self.ma_fallbacks,
+        }
+
+    def reset(self) -> None:
+        """只清计数器；复用分无状态，无需清理。"""
+        self.ma_picks = 0
+        self.ma_fallbacks = 0
 
     def __repr__(self) -> str:  # pragma: no cover - 调试用
         return f"<{type(self).__name__} name={self.name}>"

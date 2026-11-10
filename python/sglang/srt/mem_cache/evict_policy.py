@@ -7,6 +7,10 @@ chat 三个配额队列，按配额序列挑队，再把队内细节委托给 ``
 与它的全局排序键 ``victim_key`` 已整体删除：配额现在必填，候选一律由队列仲裁产生，
 没有任何路径需要“跨队列先算一个全局价值分”。
 
+复用分本身还在，但只作为 **agentic 队内**的排序键（``MultiAgenticEvict``，
+``multi_agentic.enabled`` 显式打开）：它不参与跨队列比较，也抢不了配额仲裁的
+话语权——队列先由水填充点名，队内才按 ``1 - CDF(elapsed)`` 排序。
+
 其余 ``get_priority`` 实现（LRU / LFU / TLRU / SLRU 等）依旧服务原生策略，
 共同契约：**返回值越小越先被淘汰**。
 """
@@ -26,6 +30,7 @@ from sglang.srt.mem_cache.quota_selector import (
 from sglang.srt.mem_cache.heter_utils import (
     node_num_tokens,
     RrParams,
+    MultiAgenticParams,
     MultiTurnParams,
     SessionRegistry,
     SessionType,
@@ -38,6 +43,7 @@ from sglang.srt.mem_cache.queue_occupancy import QueueOccupancyTracker
 from sglang.srt.mem_cache.victim_override import (
     RrEvictPolicy,
     SlruEvictPolicy,
+    MultiAgenticEvict,
     MultiTurnEvictPolicy,
 )
 from sglang.srt.mem_cache.heter_bench_bridge import (
@@ -179,8 +185,8 @@ class HeterCacheStrategy(EvictionStrategy):
 
     两层决策：
     1. 分带过滤：One-shot 节点（无跨轮复用价值）优先清理，不计入配额账本。
-    2. 配额仲裁：先按配额承压情况排出候选队列，再由队内策略（RR / SLRU / MT）
-       决出具体牺牲节点。
+    2. 配额仲裁：先按配额承压情况排出候选队列，再由队内策略（RR / SLRU / MT /
+       MultiAgentic）决出具体牺牲节点。
 
     没有全局价值分：早期版本用 ``reuse_score`` 给每个节点打分、跨队列比较后再竞争，
     在配额为主的用法下已无意义，已整体删除。
@@ -195,11 +201,13 @@ class HeterCacheStrategy(EvictionStrategy):
         rr: Union[RrParams, dict, None] = None,
         slru: Union[SlruParams, dict, None] = None,
         mt: Union[MultiTurnParams, dict, None] = None,
+        multi_agentic: Union[MultiAgenticParams, dict, None] = None,
         quota: Union[QuotaParams, dict, None] = None,
     ):
         self.rr = RrParams.from_any(rr)
         self.slru = SlruParams.from_any(slru)
         self.mt = MultiTurnParams.from_any(mt)
+        self.multi_agentic = MultiAgenticParams.from_any(multi_agentic)
         self.quota = QuotaParams.from_any(quota)
         self.force_agentic = bool(force_agentic)
 
@@ -217,6 +225,13 @@ class HeterCacheStrategy(EvictionStrategy):
             self.session_registry, self.slru.share_min
         )
         self.mt_evict = MultiTurnEvictPolicy(self.mt, self.session_registry) if self.mt.enabled else None
+        # agentic 的复用分排序：与 RR 互斥且优先（multi_agentic.enabled 显式打开）。
+        # 注入 _node_tag：force_agentic 下所有节点都按 QAGENT 分布算分。
+        self.multi_agentic_evict = (
+            MultiAgenticEvict(self._node_tag)
+            if self.multi_agentic.enabled
+            else None
+        )
 
         self.node_observers = (self.slru_evict,)
 
@@ -317,15 +332,19 @@ class HeterCacheStrategy(EvictionStrategy):
             return min(
                 pool, key=lambda n: struct_tier(n, share_of, share_min)
             )
-        if queue == "agentic" and self.rr_evict is not None:
-            # RR 轮询调度，受配额超额缺口上限约束
-            picked = self.rr_evict.pick(
-                pool,
-                self.session_registry,
-                max_deficit=self._quota_gap("agentic", occ, capacity),
-            )
-            if picked is not None:
-                return picked
+        if queue == "agentic":
+            # 两个改写器互斥：显式打开 multi_agentic 时按复用分排序，否则 RR。
+            if self.multi_agentic_evict is not None:
+                return self.multi_agentic_evict.pick(pool, self.session_registry)
+            if self.rr_evict is not None:
+                # RR 轮询调度，受配额超额缺口上限约束
+                picked = self.rr_evict.pick(
+                    pool,
+                    self.session_registry,
+                    max_deficit=self._quota_gap("agentic", occ, capacity),
+                )
+                if picked is not None:
+                    return picked
         if queue == "chat" and self.mt_evict is not None:
             picked = self.mt_evict.pick(pool, self.session_registry)
             if picked is not None:

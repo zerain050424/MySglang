@@ -87,6 +87,7 @@ class HeterProfiler:
                 session_summary=None,
                 slru_policy=None,
                 mt_policy=None,
+                multi_agentic_policy=None,
                 quota_occ=None,
                 quota_targets=None,
                 quota_caps=None) -> str:
@@ -158,6 +159,13 @@ class HeterProfiler:
             lines.append(
                 f"  mt: picks={s['mt_picks']:.0f} "
                 f"fallback={s['mt_fallbacks']:.0f}"
+            )
+        if multi_agentic_policy is not None:
+            # agentic 带内复用分改写器：picks=0 说明窗口内没有 QAGENT victim。
+            s = multi_agentic_policy.stats()
+            lines.append(
+                f"  multi_agentic: picks={s['ma_picks']:.0f} "
+                f"fallback={s['ma_fallbacks']:.0f}"
             )
         if session_summary:
             # 会话级缺口：d_sum 与淘汰总量同量纲，可互相校验

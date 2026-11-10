@@ -101,6 +101,7 @@ class HeterCacheRadixCache(RadixCache):
             self.session_registry.summary(),
             slru_policy=strategy.slru_evict,
             mt_policy=strategy.mt_evict,
+            multi_agentic_policy=strategy.multi_agentic_evict,
             quota_occ=tracker.occ,
             quota_targets=strategy.quota_targets(tracker.occ, tracker.capacity),
             quota_caps=queue_capacities(strategy.quota, tracker.capacity),

@@ -2,8 +2,9 @@
 
 三个消费者都依赖这里，所以口径必须单点定义，避免"策略算一套、指标算一套"：
 
-* ``evict_policy``：评分（lognormal 复用概率 / 位置项）与 one-shot 判定；
-* ``victim_override``：改写器的作用域、共享数阈值、会话类型；
+* ``evict_policy``：跨队列仲裁与 one-shot 判定；
+* ``victim_override``：改写器的作用域、共享数阈值、会话类型，以及 agentic
+  队内的复用分（lognormal 生存概率，``MultiAgenticEvict``）；
 * ``quota_selector`` / profile：队列标签与占用口径。
 
 命名约定：``HeterCacheNodeTag`` 是**节点级**标签（KV 片段出生时盖章），
@@ -143,15 +144,18 @@ def session_type_to_node_tag(session_type: SessionType) -> HeterCacheNodeTag:
 # HeterCache 的可调参数组
 #
 # 用 dataclass 而非裸 kwargs：让 eviction_policy_config 有层级、可校验、可整体
-# 传递。配置只接受分组形式 {"rr":{...},"slru":{...},"mt":{...},"quota":{...}}，
+# 传递。配置只接受分组形式
+# {"rr":{...},"slru":{...},"mt":{...},"multi_agentic":{...},"quota":{...}}，
 # 拼错的键会在构造处报错——实验配置静默失效比启动失败更难查。
 #
-#   RrParams        : Agentic 会话级轮询配额（跨会话公平）
-#   SlruParams      : SLRU 的共享会话数阈值（决定 one-shot 分界与保护范围）
-#   MultiTurnParams : 多轮对话（QCHAT）带内权重
-#   QuotaParams     : 跨队列配额（下限 + 上限，分母为池容量）
+#   RrParams           : Agentic 会话级轮询配额（跨会话公平）
+#   SlruParams         : SLRU 的共享会话数阈值（决定 one-shot 分界与保护范围）
+#   MultiTurnParams    : 多轮对话（QCHAT）带内权重
+#   MultiAgenticParams : Agentic 带内复用分排序（与 RR 互斥）
+#   QuotaParams        : 跨队列配额（下限 + 上限，分母为池容量）
 # 用 dataclass 而不是裸 kwargs，是为了让 `eviction_policy_config` 有层级、能校验、能整体
-# 配置只接受 {"rr":{...},"slru":{...},"mt":{...},"quota":{...}} 分组形式。
+# 配置只接受 {"rr":{...},"slru":{...},"mt":{...},"multi_agentic":{...},"quota":{...}}
+# 分组形式。
 # ---------------------------------------------------------------------------
 
 
@@ -286,6 +290,36 @@ class MultiTurnParams:
     @classmethod
     def from_any(cls, value=None) -> "MultiTurnParams":
         return _coerce_params(cls, value, name="multi-turn")
+
+    def as_dict(self) -> dict:
+        return dataclasses.asdict(self)
+
+
+@dataclasses.dataclass
+class MultiAgenticParams:
+    """Agentic 队列的复用分排序改写器（``MultiAgenticEvict``）参数。
+
+    打开后 agentic 队内选点改用复用分升序（``1 - CDF(elapsed)``，QAGENT 的
+    lognormal 参数），不再走会话轮询 ``RrEvictPolicy``；两者互斥，本开关优先。
+
+    默认关闭。这是一条新增的实验臂，未显式打开时 agentic 的淘汰序列与之前
+    完全一致（RR 或随机兜底），避免升级后静默改变已有对照结果。
+
+    Attributes:
+        enabled: 是否启用复用分排序。
+    """
+
+    enabled: bool = False
+
+    def __post_init__(self):
+        if not isinstance(self.enabled, bool):
+            raise ValueError(
+                f"multi_agentic.enabled must be bool, got {self.enabled!r}"
+            )
+
+    @classmethod
+    def from_any(cls, value=None) -> "MultiAgenticParams":
+        return _coerce_params(cls, value, name="multi-agentic")
 
     def as_dict(self) -> dict:
         return dataclasses.asdict(self)
