@@ -310,3 +310,6 @@ PLAN.md
 
 # graphify 工具输出（本地缓存，不入库）
 graphify-out/
+
+# Uni-Bench 整个实验目录不入库（数据/结果/脚本产物）
+Uni-Bench/
