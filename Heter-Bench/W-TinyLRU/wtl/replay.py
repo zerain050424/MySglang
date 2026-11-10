@@ -403,7 +403,7 @@ def build_requests(args) -> tuple[List[Request], dict]:
             read_limit=args.read_limit,
             shuffle=not args.no_shuffle,
             concurrency=args.concurrency,
-            service_ms=args.service_ms,
+            service_ms=args.hold_ms,
         )
         label = dpath.stem
         meta = {"source": str(dpath.resolve()), "workload": label}
@@ -425,7 +425,7 @@ def build_requests(args) -> tuple[List[Request], dict]:
             service_ms_per_1k=service,
             num_sessions_override=args.num_sessions,
             concurrency=args.concurrency,
-            service_ms=args.service_ms,
+            service_ms=args.hold_ms,
         )
         cfg = load_tasks_config(args.tasks_config)
         return requests, {
@@ -495,6 +495,9 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
                      help="到达节奏缩放（1=Poisson，0=全部立即）")
     src.add_argument("--service-ms-per-1k", type=float, default=0.0,
                      help="每 1k prompt token 的近似服务时间（补上在线端的轮间间隔）")
+    src.add_argument("--hold-ms", type=float, default=0.0,
+                     help="会话占用并发槽的额外时长（毫秒），对齐真机 e2e：bench 在最后一轮"
+                          "返回后才释放信号量")
     src.add_argument("--service-ms", type=float, default=0.0,
                      help="每个请求的固定服务时长（毫秒），对齐真机 e2e_mean_ms；"
                           "真机下一轮要等上一轮返回才开始")

@@ -274,7 +274,9 @@ def build_schedule(
         else:
             start = arrive
         if limit:
-            heapq.heappush(free_at, start + offsets[-1])
+            # 会话占用信号量直到**最后一轮返回**：真机 run_session 在
+            # ``await request()`` 之后才 exit，所以还要加一个服务时长。
+            heapq.heappush(free_at, start + offsets[-1] + service_ms / 1000.0)
 
         sid, task = ev.session["id"], ev.task
         for ti, turn in enumerate(turns):
