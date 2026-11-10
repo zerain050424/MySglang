@@ -313,3 +313,6 @@ graphify-out/
 
 # Uni-Bench 整个实验目录不入库（数据/结果/脚本产物）
 Uni-Bench/
+
+# mixexp 实验产物与归档（含逐请求 csv 与 server 日志，体积大）
+Heter-Bench/mixexp/result/

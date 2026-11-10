@@ -31,6 +31,10 @@ CONC_OVERRIDE=""
 WAIT_OVERRIDE=""
 OUTDIR="${OUTDIR:-$BENCH_DIR/result/mixexp}"
 PORT="${PORT:-30000}"
+ARMS_FILE="${ARMS_FILE:-$HERE/arms.tsv}"          # 方案清单，可换成本实验专用的一份
+CONFIGS_DIR="${CONFIGS_DIR:-$HERE/configs}"       # 配置目录，可换成本实验专用的一组
+MEM_FRACTION="${MEM_FRACTION:-}"                  # sglang --mem-fraction-static，空=不给
+ACTUAL_TOKENS=""                                  # server 实际分配到的池容量（可能被显存钳制）
 
 usage() {
   sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
@@ -46,6 +50,9 @@ while [ $# -gt 0 ]; do
     --conc)   CONC_OVERRIDE="$2"; shift 2 ;;
     --wait-scale) WAIT_OVERRIDE="$2"; shift 2 ;;
     --out)    OUTDIR="$2"; shift 2 ;;
+    --arms-file)    ARMS_FILE="$2"; shift 2 ;;
+    --configs-dir)  CONFIGS_DIR="$2"; shift 2 ;;
+    --mem-fraction) MEM_FRACTION="$2"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "未知参数：$1" >&2; usage >&2; exit 2 ;;
@@ -68,17 +75,17 @@ CONC=${CONC_OVERRIDE:-$DEF_CONC}
 WAIT_SCALE=${WAIT_OVERRIDE:-$DEF_WAIT}
 
 if [ "$MODE" = "drift" ]; then
-  CFG="$HERE/configs/drift_phases.yaml"
+  CFG="$CONFIGS_DIR/drift_phases.yaml"
   CFG_FLAG="--phases-config"
 else
-  CFG="$HERE/configs/mix_${SCALE}.yaml"
+  CFG="$CONFIGS_DIR/mix_${SCALE}.yaml"
   CFG_FLAG="--tasks-config"
 fi
 [ -f "$CFG" ] || { echo "缺少配置：$CFG" >&2; exit 1; }
-[ -f "$HERE/arms.tsv" ] || { echo "缺少 $HERE/arms.tsv" >&2; exit 1; }
+[ -f "$ARMS_FILE" ] || { echo "缺少方案清单：$ARMS_FILE" >&2; exit 1; }
 
 if [ "$ARMS" = "all" ]; then
-  SELECTED=$(awk -F'\t' '!/^#/ && NF>=2 {print $1}' "$HERE/arms.tsv")
+  SELECTED=$(awk -F'\t' '!/^#/ && NF>=2 {print $1}' "$ARMS_FILE")
 else
   SELECTED=$(printf '%s' "$ARMS" | tr ',' '\n')
 fi
@@ -137,7 +144,7 @@ echo "=================================================="
 
 FAILED=""
 for arm in $SELECTED; do
-  LINE=$(awk -F'\t' -v a="$arm" '!/^#/ && $1==a {print; exit}' "$HERE/arms.tsv")
+  LINE=$(awk -F'\t' -v a="$arm" '!/^#/ && $1==a {print; exit}' "$ARMS_FILE")
   [ -n "$LINE" ] || { echo "!! 未定义的臂：$arm" >&2; FAILED="$FAILED $arm"; continue; }
 
   POLICY=$(printf '%s' "$LINE" | cut -f2)
@@ -147,6 +154,7 @@ for arm in $SELECTED; do
 
   SERVER_ARGS=(--model-path "$MODEL" --radix-eviction-policy "$POLICY"
                --enable-metrics --max-total-tokens "$TOKENS" --port "$PORT")
+  [ -n "$MEM_FRACTION" ] && SERVER_ARGS+=(--mem-fraction-static "$MEM_FRACTION")
   [ "$POLICY" = "heter_cache" ] && SERVER_ARGS+=(--enable-heter-cache)
   [ -n "$PCFG" ] && SERVER_ARGS+=(--radix-eviction-policy-config "$PCFG")
 
@@ -183,6 +191,12 @@ for arm in $SELECTED; do
       continue
     fi
 
+    # 实际池容量可能被显存钳制，与 --max-total-tokens 不一致，必须记下来
+    ACTUAL_TOKENS=$(grep -oE 'max_total_num_tokens=[0-9]+' "$SLOG" 2>/dev/null | tail -1 | cut -d= -f2)
+    if [ -n "$ACTUAL_TOKENS" ] && [ "$ACTUAL_TOKENS" != "$TOKENS" ]; then
+      echo "!! 池容量被钳制：请求 $TOKENS token，实际 $ACTUAL_TOKENS token（显存限制）" >&2
+    fi
+
     "$PY" "$BENCH_DIR/scripts/bench_hetercache.py" \
       "$CFG_FLAG" "$CFG" \
       --base-url "http://127.0.0.1:${PORT}" \
@@ -207,4 +221,4 @@ if [ "$DRY_RUN" = "1" ]; then
 fi
 
 echo
-"$PY" "$HERE/analyze.py" --dir "$OUTDIR" --scale "$SCALE" --tokens "$TOKENS" || true
+"$PY" "$HERE/analyze.py" --dir "$OUTDIR" --scale "$SCALE" --tokens "${ACTUAL_TOKENS:-$TOKENS}" || true

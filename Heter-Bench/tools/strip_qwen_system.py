@@ -29,6 +29,9 @@ Qwen 的默认 system prompt 只有 24 个 token，却足以让
     # 先看会剥掉多少，不落盘
     python tools/strip_qwen_system.py --in <path> --dry-run
 
+输入格式：每行一个 ``{session_id: session}`` 对象，session 内含 ``num_turns``
+与 ``turn_1..turn_N``（``turn_N.input_ids`` 才是运行时真正发送的 prompt）。
+
 ``--mode qwen``（默认）只剥 Qwen 默认 system 段；``--mode all`` 连数据集自带的
 领域 system prompt（如 Codeparrot 的）一起剥——后者会降低结构复用，
 仅在专门验证「无 system 前缀」假设时使用。
@@ -83,7 +86,7 @@ def main() -> int:
         description="去掉 session_data.jsonl 中每轮 prompt 开头的 ChatML system 段"
     )
     parser.add_argument("--in", dest="src", required=True, help="输入 session_data.jsonl")
-    parser.add_argument("--out", dest="dst", help="输出路径；缺省为 <输入>.nosys.jsonl")
+    parser.add_argument("--out", help="输出路径；缺省为 <输入>.nosys.jsonl")
     parser.add_argument("--in-place", action="store_true", help="原地改写输入文件")
     parser.add_argument("--mode", choices=MODES, default="qwen", help="剥离范围，默认 qwen")
     parser.add_argument("--dry-run", action="store_true", help="只统计，不写文件")
@@ -106,18 +109,23 @@ def main() -> int:
             if not line:
                 continue
             try:
-                record = json.loads(line)
+                obj = json.loads(line)
             except json.JSONDecodeError as exc:
                 print(f"{src}:{line_no} 不是合法 JSON：{exc}", file=sys.stderr)
                 return 1
-            changed, removed, emptied = strip_session(record, args.mode)
-            sessions += 1
-            turns_total += int(record.get("num_turns") or 0)
-            turns_changed += changed
-            tokens_removed += removed
-            emptied_sessions += int(emptied)
+            # 每行是 {session_id: session}，num_turns / turn_N 在内层。
+            if not isinstance(obj, dict) or not all(isinstance(v, dict) for v in obj.values()):
+                print(f"{src}:{line_no} 不是 {{session_id: session}} 结构", file=sys.stderr)
+                return 1
+            for sess in obj.values():
+                changed, removed, emptied = strip_session(sess, args.mode)
+                sessions += 1
+                turns_total += int(sess.get("num_turns") or 0)
+                turns_changed += changed
+                tokens_removed += removed
+                emptied_sessions += int(emptied)
             if not args.dry_run:
-                records.append(json.dumps(record, ensure_ascii=False))
+                records.append(json.dumps(obj, ensure_ascii=False))
 
     print(f"会话 {sessions}，轮次 {turns_total}")
     print(f"改写轮次 {turns_changed}，去掉 {tokens_removed} token "
@@ -129,13 +137,16 @@ def main() -> int:
     if args.dry_run:
         print("dry-run：未写入")
         return 0
-    if not turns_changed:
-        print("未写入：无变化", file=sys.stderr)
-        return 1
+
+    # 无变化（数据已剥过 system 段）不算失败：--in-place 时没必要重写文件，
+    # 生成副本时仍要落盘，否则下游按约定找 *.nosys.jsonl 会扑空。
+    if not turns_changed and dst == src:
+        print("无变化：原地模式，文件未改动")
+        return 0
 
     dst.parent.mkdir(parents=True, exist_ok=True)
     dst.write_text("\n".join(records) + "\n", encoding="utf-8")
-    print(f"已写入 {dst}")
+    print(f"已写入 {dst}" if turns_changed else f"无变化，已原样写出 {dst}")
     return 0
 
 

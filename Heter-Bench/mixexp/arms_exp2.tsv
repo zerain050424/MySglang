@@ -1,0 +1,6 @@
+# exp2 方案清单：池容量 0.9 + ShareGPT 全部 >5 轮
+# 相对 exp1 的 `hc_full`，`hc_full_v2` 只改 quota.caps（agentic 0.5→0.6，struct 0.2→0.1）
+# arm	policy	policy_config	desc
+lru	lru	-	基线：全局单一顺序，与新数据配合作为对照
+hc_full	heter_cache	{"quota":{"caps":{"struct":0.2,"agentic":0.5,"chat":0.3},"reservations":{"struct":0.05,"agentic":0.2,"chat":0.1}},"rr":{"fair_rr":true,"kappa":0.5,"min_retain_tokens":512,"min_retain_frac":0.3},"slru":{"share_min":2},"mt":{"enabled":true}}	原配额（agentic 0.5），跑新数据，用于区分「数据变了」与「配额变了」
+hc_full_v2	heter_cache	{"quota":{"caps":{"struct":0.1,"agentic":0.6,"chat":0.3},"reservations":{"struct":0.05,"agentic":0.2,"chat":0.1}},"rr":{"fair_rr":true,"kappa":0.5,"min_retain_tokens":512,"min_retain_frac":0.3},"slru":{"share_min":2},"mt":{"enabled":true}}	新配额：agentic 上限 0.6，struct 降到 0.1

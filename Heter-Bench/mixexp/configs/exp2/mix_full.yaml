@@ -1,0 +1,53 @@
+# exp2 · full 规模（池容量 mem-fraction 0.85、ShareGPT 全部 >5 轮、caps.agentic=0.6）
+#
+# 与 exp1 的差异只有两处：
+#   1) ShareGPT 换成 num_turns > 5 的子集（让 chat 队列真正有活干）；
+#   2) heter_cache 的 caps.agentic 由 0.5 提到 0.6（struct 相应降到 0.1）。
+# 池容量由启动参数 --mem-fraction-static 0.85 决定（实测 99036 token），不在本文件里。
+# 混合负载 · 全量规模（1800/1800/500/500 = 4600 sessions）
+#
+# 与其它 mix_*.yaml 的唯一差异是各 task 的 max_record。
+# 改规模只改 max_record，别动比例，否则不同规模之间不可比。
+# data_path 相对 Heter-Bench 根目录解析。
+#
+# 用途：与 Heter-Bench 既有混合实验同规模，用于最终数字。
+tasks:
+  - name: AgentBank_apps
+    task_id: 0
+    data_path: TaskData/AgentBankData/Qwen2.5-7B-Instruct/AgentBank_apps_session_data.nosys.jsonl
+    lambda_rate: 1
+    mu: 0
+    sigma: 0
+    seed: 42
+    max_record: 1800
+    shuffle: true
+
+  - name: Codeparrot
+    task_id: 1
+    data_path: TaskData/Codeparrot/Qwen2.5-7B-Instruct/Code_session_data.nosys.jsonl
+    lambda_rate: 1
+    mu: 0
+    sigma: 0
+    seed: 42
+    max_record: 1800
+    shuffle: true
+
+  - name: ShareGPT
+    task_id: 2
+    data_path: TaskData/SharedGPT-multi-turn/Qwen2.5-7B-Instruct/ShareGPT_cleaned_valid_deduplicated_gt5_session_data.nosys.jsonl
+    lambda_rate: 1
+    mu: 4.15
+    sigma: 0.971
+    seed: 42
+    max_record: 500
+    shuffle: true
+
+  - name: AgentBank_alfred
+    task_id: 3
+    data_path: TaskData/AgentBankData/Qwen2.5-7B-Instruct/AgentBank_alfred_scale_5000_session_data.nosys.jsonl
+    lambda_rate: 1
+    mu: 1.81
+    sigma: 1.092
+    seed: 42
+    max_record: 500
+    shuffle: true

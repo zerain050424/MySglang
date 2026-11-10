@@ -45,6 +45,34 @@ for rel in "${DATA[@]}"; do
   "$PYTHON" "$TOOL" --in "$src" --mode qwen || missing=1
 done
 
+# 附加步骤：构造「全部 >5 轮」的多轮会话子集。
+# 动机：chat 队列的判定阈值是 MULTI_TURN_MIN=5，原始 ShareGPT 里 76% 的会话
+# 不足 5 轮，全部落进 struct，导致 chat 队列全程空转。子集供 exp2 使用。
+GT5="$BENCH_DIR/TaskData/SharedGPT-multi-turn/Qwen2.5-7B-Instruct/ShareGPT_cleaned_valid_deduplicated_gt5_session_data.nosys.jsonl"
+SRC5="$BENCH_DIR/TaskData/SharedGPT-multi-turn/Qwen2.5-7B-Instruct/ShareGPT_cleaned_valid_deduplicated_session_data.nosys.jsonl"
+if [ -f "$SRC5" ] && { [ ! -f "$GT5" ] || [ "$FORCE" = "1" ]; }; then
+  echo "构造 >5 轮子集：${GT5#$BENCH_DIR/}"
+  "$PYTHON" - "$SRC5" "$GT5" <<'PYGT5'
+import json, sys
+src, dst = sys.argv[1], sys.argv[2]
+kept = total = 0
+with open(src, encoding="utf-8") as fi, open(dst, "w", encoding="utf-8") as fo:
+    for line in fi:
+        line = line.strip()
+        if not line:
+            continue
+        obj = json.loads(line)
+        total += len(obj)
+        keep = {sid: s for sid, s in obj.items() if int(s.get("num_turns") or 0) > 5}
+        if keep:
+            fo.write(json.dumps(keep, ensure_ascii=False) + "\n")
+            kept += len(keep)
+print(f"  保留 {kept}/{total} 个会话（num_turns > 5）")
+PYGT5
+elif [ -f "$GT5" ]; then
+  echo "跳过（已存在）：${GT5#$BENCH_DIR/}"
+fi
+
 if [ "$missing" = "1" ]; then
   echo
   echo "有数据未就绪，mixexp 无法开跑。" >&2

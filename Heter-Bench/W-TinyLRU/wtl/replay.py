@@ -30,6 +30,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import logging
 import os
@@ -472,11 +473,49 @@ def resolve_pool(args, requests, key_builder_kwargs) -> tuple[int, Optional[int]
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+def apply_timeline_csv(requests, csv_path) -> tuple[list, int]:
+    """用真机 bench 的逐请求时间戳覆盖模型生成的到达时刻。
+
+    bench 的 CSV 里一行一个请求（session_id, turn, ts）。命中率对**谁和谁同时
+    在池子里**极其敏感，而到达模型（Poisson + 信号量 + lognormal 轮间等待）
+    只是近似：实测回放的 makespan 比真机短 7%，末尾 apps/code 段与 alfred 段的
+    重叠因此不同。这里直接把真机时间线当 trace 的一部分喂进来，用于把
+    「缓存/策略模型」与「调度模型」的误差分开度量。
+    """
+    import csv as _csv
+
+    from pathlib import Path as _Path
+
+    path = _Path(csv_path)
+    rows = list(_csv.DictReader(open(path, encoding="utf-8")))
+    if not rows:
+        return requests, 0
+    t0 = min(float(r["ts"]) for r in rows)
+    stamp = {
+        (r["session_id"], int(r["turn"])): float(r["ts"]) - t0 for r in rows
+    }
+    out, hit = [], 0
+    for r in requests:
+        ts = stamp.get((r.sid, int(r.turn)))
+        if ts is None:
+            out.append(r)
+            continue
+        hit += 1
+        out.append(dataclasses.replace(r, ts=ts))
+    out.sort(key=lambda r: r.ts)
+    for i, r in enumerate(out):
+        r.idx = i
+    return out, hit
+
+
 def add_common_args(p: argparse.ArgumentParser) -> None:
     src = p.add_argument_group("trace")
     src.add_argument("--workload", default="sharegpt", choices=sorted(WORKLOADS))
     src.add_argument("--data-path", default=None, help="直接指定 session_data.jsonl")
     src.add_argument("--tasks-config", default=None, help="混合负载 yaml")
+    src.add_argument("--timeline-csv", default=None,
+                     help="用真机 bench 的逐请求时间戳覆盖到达时刻（把调度误差从"
+                          "缓存模型误差里分离出来）")
     src.add_argument("--synth-meta", default=None, help="wtl.synth 生成的 meta.json")
     src.add_argument("--task-name", default=None,
                      help="自定义 trace 的 task 标签（默认取父目录名；需与 prefix_stats 的 --task 一致）")
@@ -556,6 +595,10 @@ def main(argv=None) -> int:
         arm = get_arm(a.arm)
 
     requests, meta = build_requests(a)
+    if a.timeline_csv:
+        requests, hit = apply_timeline_csv(requests, a.timeline_csv)
+        logger.warning("[wtl] 时间线覆盖：%d/%d 个请求使用 %s 的真实 ts",
+                       hit, len(requests), a.timeline_csv)
     if not requests:
         print("[wtl] 空 trace：检查 --data-path / --num-sessions / --tasks-config", file=sys.stderr)
         return 2
@@ -630,6 +673,7 @@ def main(argv=None) -> int:
     result["wait_scale"] = a.wait_scale
     result["arrival_scale"] = a.arrival_scale
     result["concurrency"] = a.concurrency
+    result["timeline_csv"] = a.timeline_csv
     result["inflight_reserve"] = a.inflight_reserve
     result["inflight_ms"] = a.inflight_ms
 
