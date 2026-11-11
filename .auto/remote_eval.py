@@ -99,6 +99,46 @@ def connect() -> paramiko.SSHClient:
     return cli
 
 
+def run_remote_script(cli: paramiko.SSHClient, script: str, timeout: int = 7200,
+                      quiet: bool = False) -> int:
+    """通过 stdin 向远端 bash -s 传多行脚本：绕开单行拼接的引号/语法问题。"""
+    transport = cli.get_transport()
+    chan = transport.open_session()
+    chan.settimeout(timeout)
+    chan.set_combine_stderr(True)
+    chan.exec_command("bash -s")
+    chan.sendall(script.encode("utf-8"))
+    chan.shutdown_write()
+    t0 = time.time()
+    buf = []
+    while True:
+        drained = False
+        while chan.recv_ready():
+            data = chan.recv(65536)
+            text = data.decode("utf-8", "replace")
+            buf.append(text)
+            if not quiet:
+                sys.stdout.write(text)
+                sys.stdout.flush()
+            drained = True
+        if chan.exit_status_ready():
+            while chan.recv_ready():
+                buf.append(chan.recv(65536).decode("utf-8", "replace"))
+            break
+        if not drained:
+            time.sleep(1.0)
+        if time.time() - t0 > timeout:
+            print(f"[remote timeout {timeout}s]", file=sys.stderr)
+            chan.close()
+            return 124
+    rc = chan.recv_exit_status()
+    chan.close()
+    if rc != 0:
+        tail = "".join(buf)[-4000:]
+        print(f"[remote rc={rc}] ...{tail}", file=sys.stderr)
+    return rc
+
+
 def run_remote(cli: paramiko.SSHClient, cmd: str, timeout: int = 7200,
                quiet: bool = False) -> int:
     """流式执行远端命令，stdout/stderr 直通本地。返回 exit code。
@@ -264,26 +304,32 @@ def run_cell(cli: paramiko.SSHClient, r: Dict[str, Any], args) -> int:
         )
 
     # 端口占用则直接失败（不杀别人的进程）；结束后按 done_<arm> 汇总退出码。
-    script = [
-        f"cd {REPO}/Heter-Bench",
-        "source scripts/env.sh",
-        f"mkdir -p {outdir}",
-        "ports_free=1; "
-        + " ".join(
-            f"(echo > /dev/tcp/127.0.0.1/{PORT + (i % 2)}) 2>/dev/null && ports_free=0;"
-            for i in range(len(arm_list))
-        )
-        + " [ $ports_free -eq 1 ] || { echo 'PORT occupied, refusing to start' >&2; exit 9; }",
-        " ".join(jobs),
-        # 心跳轮询代替裸 wait：每 60s 报告本批臂的 done 计数。
-        f"for i in $(seq 1 240); do sleep 60; "
-        f"n=0; for a in {' '.join(arm_list)}; do [ -s {outdir}/done_$a ] && n=$((n+1)); done; "
-        f'echo "[poll $i] done=$n/{len(arm_list)}"; '
-        f'[ "$n" -ge {len(arm_list)} ] && break; done',
-        "for f in " + outdir + "/done_*; do echo \"$f=$(cat $f)\"; done",
-        "for f in " + outdir + "/done_*; do [ \"$(cat $f)\" = \"0\" ] || exit 1; done",
-    ]
-    rc = run_remote(cli, " && ".join(script), timeout=10800)
+    script = f'''#!/bin/bash
+set -u
+cd {REPO}/Heter-Bench
+source scripts/env.sh
+mkdir -p {outdir}
+ports_free=1
+for port in {" ".join(str(PORT + (i % 2)) for i in range(len(arm_list)))}; do
+  (echo > /dev/tcp/127.0.0.1/$port) 2>/dev/null && ports_free=0
+done
+if [ "$ports_free" -ne 1 ]; then
+  echo "PORT occupied, refusing to start" >&2
+  exit 9
+fi
+{chr(10).join(jobs)}
+# 心跳轮询代替裸 wait：每 60s 报告本批臂的 done 计数。
+for i in $(seq 1 240); do
+  sleep 60
+  n=0
+  for a in {" ".join(arm_list)}; do [ -s {outdir}/done_$a ] && n=$((n+1)); done
+  echo "[poll $i] done=$n/{len(arm_list)}"
+  [ "$n" -ge {len(arm_list)} ] && break
+done
+for f in {outdir}/done_*; do echo "$f=$(cat $f)"; done
+for f in {outdir}/done_*; do [ "$(cat $f)" = "0" ] || exit 1; done
+'''
+    rc = run_remote_script(cli, script, timeout=10800)
     return rc
 
 
