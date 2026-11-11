@@ -211,6 +211,62 @@ def report(arms_res: Dict[str, Optional[Dict[str, float]]], cell: str,
     return 0
 
 
+# ---------------------------------------------------------------- cell 执行
+def run_cell(cli: paramiko.SSHClient, r: Dict[str, Any], args) -> int:
+    """一个 cell：双臂并行到两张卡（各独立端口/进程/输出），同一张卡内完成配对。
+
+    禁分布式：每个臂是独立单卡 server（CUDA_VISIBLE_DEVICES 显式绑定），
+    两臂只是两个并行实验槽，不是同一个服务的两张卡。
+    """
+    scale, mode = r["scale"], r["mode"]
+    tokens, conc, wait = r["tokens"], r["conc"], r["wait"]
+    outdir = f"{EXP}/mixexp/result/auto/{r['name']}"
+    arm_list = args.arms.split(",")
+
+    jobs = []
+    for i, arm in enumerate(arm_list):
+        gpu = i % 2
+        port = PORT + (i % 2)
+        env = (
+            f"export PY={PY} MODEL={MODEL} PORT={port} "
+            f"CUDA_VISIBLE_DEVICES={gpu} "
+            f"PYTHONPATH={REPO}/python:${{PYTHONPATH:-}} "
+            f"ARMS_FILE={EXP}/mixexp/arms_exp3.tsv "
+            f"CONFIGS_DIR={EXP}/mixexp/configs OUTDIR={outdir} "
+            f"SKIP_EXISTING=0; "
+        )
+        bench = (
+            f"bash mixexp/run_mixexp.sh --scale {scale} --mode {mode} "
+            f"--arms '{arm}' --tokens {tokens} --conc {conc} "
+            f"--wait-scale {wait} --reps {args.reps} --out {outdir} "
+            f"--mem-fraction 0.85 "
+            f"--server-arg --kv-cache-dtype --server-arg fp8_e4m3 "
+            f"--arms-file {EXP}/mixexp/arms_exp3.tsv"
+        )
+        jobs.append(
+            f"( {env} {bench} > {outdir}/launch_{arm}.log 2>&1; "
+            f"echo $? > {outdir}/done_{arm} ) &"
+        )
+
+    # 端口占用则直接失败（不杀别人的进程）；结束后按 done_<arm> 汇总退出码。
+    script = [
+        f"cd {REPO}/Heter-Bench",
+        "source scripts/env.sh",
+        f"mkdir -p {outdir}",
+        "ports_free=1; "
+        + " ".join(
+            f"(echo > /dev/tcp/127.0.0.1/{PORT + (i % 2)}) 2>/dev/null && ports_free=0;"
+            for i in range(len(arm_list))
+        )
+        + " [ $ports_free -eq 1 ] || { echo 'PORT occupied, refusing to start' >&2; exit 9; }",
+        " ".join(jobs) + " wait",
+        "for f in " + outdir + "/done_*; do echo \"$f=$(cat $f)\"; done",
+        "for f in " + outdir + "/done_*; do [ \"$(cat $f)\" = \"0\" ] || exit 1; done",
+    ]
+    rc = run_remote(cli, " && ".join(script), timeout=10800)
+    return rc
+
+
 # ---------------------------------------------------------------- 主流程
 def main() -> int:
     ap = argparse.ArgumentParser()
@@ -263,32 +319,7 @@ def main() -> int:
         print("[remote tests] PASSED", flush=True)
 
         for r in runs:
-            scale, mode = r["scale"], r["mode"]
-            tokens, conc, wait = r["tokens"], r["conc"], r["wait"]
-            cfg = r.get("cfg") or "exp3/mix_full.yaml" if mode == "drift" or scale == "full" \
-                else None
-            outdir = f"{EXP}/mixexp/result/auto/{r['name']}"
-            arms = args.arms.replace(",", " ")
-            env = (
-                f"export PY={PY} MODEL={MODEL} PORT={PORT} "
-                f"CUDA_VISIBLE_DEVICES={GPU} "
-                f"ARMS='{arms}' ARMS_FILE={EXP}/mixexp/arms_exp3.tsv "
-                f"CONFIGS_DIR={EXP}/mixexp/configs OUTDIR={outdir} "
-                f"SKIP_EXISTING=0; "
-            )
-            cmd = [
-                f"cd {REPO}/Heter-Bench",
-                "source scripts/env.sh",
-                "mkdir -p " + outdir,
-                env + f"bash mixexp/run_mixexp.sh --scale {scale} --mode {mode} "
-                      f"--arms '{arms}' "
-                      f"--tokens {tokens} --conc {conc} --wait-scale {wait} "
-                      f"--reps {args.reps} --out {outdir} "
-                      f"--mem-fraction 0.85 "
-                      f"--server-arg --kv-cache-dtype --server-arg fp8_e4m3 "
-                      f"--arms-file {EXP}/mixexp/arms_exp3.tsv",
-            ]
-            rc = run_remote(cli, " && ".join(cmd), timeout=7200)
+            rc = run_cell(cli, r, args)
             if rc != 0:
                 print(f"METRIC status=remote_fail cell={r['name']}")
                 return rc
