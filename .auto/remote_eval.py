@@ -274,6 +274,7 @@ def run_cell(cli: paramiko.SSHClient, r: Dict[str, Any], args) -> int:
             for i in range(len(arm_list))
         )
         + " [ $ports_free -eq 1 ] || { echo 'PORT occupied, refusing to start' >&2; exit 9; }",
+        " ".join(jobs),
         # 心跳轮询代替裸 wait：每 60s 报告本批臂的 done 计数。
         f"for i in $(seq 1 240); do sleep 60; "
         f"n=0; for a in {' '.join(arm_list)}; do [ -s {outdir}/done_$a ] && n=$((n+1)); done; "
