@@ -392,6 +392,8 @@ def main() -> int:
                 return rc
 
             # 拉结果（run_mixexp 的命名：<scale>_<arm>[_rN].json）
+            outdir = f"{EXP}/mixexp/result/auto/{r['name']}"
+            scale = r["scale"]
             sftp = cli.open_sftp()
             arms_res: Dict[str, Optional[Dict[str, float]]] = {}
             for arm in args.arms.split(","):
