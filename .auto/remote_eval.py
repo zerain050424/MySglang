@@ -343,6 +343,7 @@ def main() -> int:
     ap.add_argument("--wait", type=float)
     ap.add_argument("--arms", default=",".join(ARMS_DEFAULT))
     ap.add_argument("--skip-run", default="", help="不执行、只复用已有结果的臂名（逗号分隔）")
+    ap.add_argument("--label", default="", help="覆盖输出目录名（同 cell 协议、不同代码版本的运行分开存档）")
     ap.add_argument("--reps", type=int, default=1)
     ap.add_argument("--list-cells", action="store_true")
     args = ap.parse_args()
@@ -360,7 +361,7 @@ def main() -> int:
             if c is None:
                 print(f"未知 cell：{name}", file=sys.stderr)
                 return 2
-            runs.append(dict(c, name=name))
+            runs.append(dict(c, name=args.label or name))
     else:
         runs.append(dict(
             scale="mid", mode=args.mode or "hybrid",
