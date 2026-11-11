@@ -72,18 +72,14 @@ SCAN_TASKS = ["AgentBank_apps", "Codeparrot"]
 CELLS: Dict[str, Dict[str, Any]] = {
     # 冒烟：验证链路，只看不判
     "smoke": dict(scale="smoke", mode="hybrid", tokens=30000, conc=8, wait=0.1, rep=None),
-    # 快速迭代档（mid 规模、压缩轮间等待）
-    "fast_mid": dict(scale="mid", mode="hybrid", tokens=120000, conc=24, wait=0.3, rep=None),
-    # exp3 全规模稳态，压缩 0.1（arrivals 与 waits 同比压缩）
-    "exp3_low": dict(scale="full", mode="hybrid", tokens=180000, conc=32, wait=0.1, rep=None,
-                     cfg="exp3/mix_full.yaml", arrival=0.1),
-    "exp3_mid": dict(scale="full", mode="hybrid", tokens=120000, conc=32, wait=0.1, rep=None,
-                     cfg="exp3/mix_full.yaml", arrival=0.1),
-    "exp3_high": dict(scale="full", mode="hybrid", tokens=70000, conc=32, wait=0.1, rep=None,
-                      cfg="exp3/mix_full.yaml", arrival=0.1),
-    # exp3 相位漂移（burst 窗口），压缩 0.1 —— 预登记确认档
-    "exp3_drift": dict(scale="full", mode="drift", tokens=120000, conc=32, wait=0.1, rep=None,
-                       arrival=0.1),
+    # 快速迭代档：quick 规模 + 真实节奏（wait=1.0）。
+    # 注意：wait 压缩会把 chat 的轮间间隔压到 GAP_SPLIT_S=15s 以下，会话被误分类为
+    # agentic（hc_full/fast_mid 已实证），所以正式 cell 一律 wait=1.0。
+    "quick_wt1": dict(scale="quick", mode="hybrid", tokens=60000, conc=16, wait=1.0, rep=None),
+    "mid_wt1": dict(scale="mid", mode="hybrid", tokens=120000, conc=24, wait=1.0, rep=None),
+    # exp3 全保真档（真实节奏，3.3h/臂）——只做最终 holdout 验证，不进迭代。
+    "exp3_mid": dict(scale="full", mode="hybrid", tokens=120000, conc=32, wait=1.0, rep=None),
+    "exp3_drift": dict(scale="full", mode="drift", tokens=120000, conc=32, wait=1.0, rep=None),
 }
 
 ARMS_DEFAULT = ["lru", "hc_full"]
