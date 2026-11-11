@@ -105,22 +105,38 @@ def connect() -> paramiko.SSHClient:
 
 def run_remote(cli: paramiko.SSHClient, cmd: str, timeout: int = 7200,
                quiet: bool = False) -> int:
-    """流式执行远端命令，stdout/stderr 直通本地。返回 exit code。"""
+    """流式执行远端命令，stdout/stderr 直通本地。返回 exit code。
+
+    用 exit_status_ready() 轮询而非 recv EOF：sglang server 的残留子进程
+    可能长期持有通道 stdout 导致 EOF 永不到来（已实际发生两次 1h 挂起）。
+    """
     transport = cli.get_transport()
     chan = transport.open_session()
     chan.settimeout(timeout)
     chan.set_combine_stderr(True)
     chan.exec_command(cmd)
+    t0 = time.time()
     buf = []
     while True:
-        data = chan.recv(65536)
-        if not data:
+        drained = False
+        while chan.recv_ready():
+            data = chan.recv(65536)
+            text = data.decode("utf-8", "replace")
+            buf.append(text)
+            if not quiet:
+                sys.stdout.write(text)
+                sys.stdout.flush()
+            drained = True
+        if chan.exit_status_ready():
+            while chan.recv_ready():
+                buf.append(chan.recv(65536).decode("utf-8", "replace"))
             break
-        text = data.decode("utf-8", "replace")
-        buf.append(text)
-        if not quiet:
-            sys.stdout.write(text)
-            sys.stdout.flush()
+        if not drained:
+            time.sleep(1.0)
+        if time.time() - t0 > timeout:
+            print(f"[remote timeout {timeout}s]", file=sys.stderr)
+            chan.close()
+            return 124
     rc = chan.recv_exit_status()
     chan.close()
     if rc != 0:
@@ -222,9 +238,12 @@ def run_cell(cli: paramiko.SSHClient, r: Dict[str, Any], args) -> int:
     tokens, conc, wait = r["tokens"], r["conc"], r["wait"]
     outdir = f"{EXP}/mixexp/result/auto/{r['name']}"
     arm_list = args.arms.split(",")
+    skip_run = set(filter(None, (args.skip_run or "").split(",")))
 
     jobs = []
     for i, arm in enumerate(arm_list):
+        if arm in skip_run:
+            continue  # 复用 outdir 里已有结果（同代码同 seed 的既有基线）
         gpu = i % 2
         port = PORT + (i % 2)
         env = (
@@ -259,7 +278,11 @@ def run_cell(cli: paramiko.SSHClient, r: Dict[str, Any], args) -> int:
             for i in range(len(arm_list))
         )
         + " [ $ports_free -eq 1 ] || { echo 'PORT occupied, refusing to start' >&2; exit 9; }",
-        " ".join(jobs) + " wait",
+        # 心跳轮询代替裸 wait：每 60s 报告本批臂的 done 计数。
+        f"for i in $(seq 1 240); do sleep 60; "
+        f"n=0; for a in {' '.join(arm_list)}; do [ -s {outdir}/done_$a ] && n=$((n+1)); done; "
+        f'echo "[poll $i] done=$n/{len(arm_list)}"; '
+        f'[ "$n" -ge {len(arm_list)} ] && break; done',
         "for f in " + outdir + "/done_*; do echo \"$f=$(cat $f)\"; done",
         "for f in " + outdir + "/done_*; do [ \"$(cat $f)\" = \"0\" ] || exit 1; done",
     ]
@@ -276,6 +299,7 @@ def main() -> int:
     ap.add_argument("--conc", type=int)
     ap.add_argument("--wait", type=float)
     ap.add_argument("--arms", default=",".join(ARMS_DEFAULT))
+    ap.add_argument("--skip-run", default="", help="不执行、只复用已有结果的臂名（逗号分隔）")
     ap.add_argument("--reps", type=int, default=1)
     ap.add_argument("--list-cells", action="store_true")
     args = ap.parse_args()
