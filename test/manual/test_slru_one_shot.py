@@ -2,8 +2,8 @@
 
 钉住四件事：
 
-1. **一次性判定只看「会话类型 + 跨会话共享数」**：
-   `one_shot = type ∈ {TRANS, STRUCT} and share_sessions < share_min`
+1. **一次性判定只看「会话类型 + 跨会话共享数 + 是否被匹配过」**：
+   `one_shot = type ∈ {TRANS, STRUCT} and share_sessions < share_min and hit_count == 0`
 2. **共享数达到阈值就退出一次性带**，即使创建者当初被判成 TRANS。
 3. **`queue_tag` 不参与判定**：QSTRUCT 标签救不了私有的 TRANS 节点，
    QTRANS 标签也不会把已被多次复用的节点拉回一次性带。
@@ -44,7 +44,7 @@ class FakeNode:
     """TreeNode 的最小替身：只带 one-shot / SLRU 判定读的字段。"""
 
     def __init__(self, session_id=None, tag=HeterCacheNodeTag.QTRANS, decode=False,
-                 share_sessions=0):
+                 share_sessions=0, hit_count=0):
         self.value = [0] * 16
         self.key = [0] * 16
         self.session_id = session_id
@@ -54,6 +54,7 @@ class FakeNode:
         self.session_bloom = 0
         self.abs_start = 0
         self.last_access_time = 0.0
+        self.hit_count = hit_count
 
 
 def _in_slru_scope(strategy, node) -> bool:
@@ -268,6 +269,41 @@ def test_share_min_is_single_knob():
         check(False, "share_min=1 must be rejected")
 
 
+def test_once_read_leaves_one_shot_band():
+    """F1：hit_count>=1 的 TRANS/STRUCT 节点离开 one-shot 带。
+
+    机制背景：会话前 MULTI_TURN_MIN 轮创建的节点也带 TRANS/STRUCT 标签，
+    仅凭类型+共享数判定会让它们在创建者下一轮重读到来之前就被扫描流清掉。
+    上游 SLRU 的 hit_count>=2 晋升同理（创建者自己的重读是合法证据）。
+    """
+    print("[9] F1: once-read nodes leave the one-shot band")
+    st, _ = make_strategy({"t1": SessionType.TRANS, "s1": SessionType.STRUCT})
+
+    # TRANS share=0：未被匹配过 -> one-shot；被匹配过一次 -> 不再是
+    fresh = FakeNode(session_id="t1", hit_count=0)
+    check(st.is_one_shot(fresh) is True, "TRANS hit_count=0 must stay one-shot")
+    read = FakeNode(session_id="t1", hit_count=1)
+    check(st.is_one_shot(read) is False,
+          "TRANS node matched once must leave the one-shot band")
+    read2 = FakeNode(session_id="t1", hit_count=3)
+    check(st.is_one_shot(read2) is False, "multiple matches also promote")
+
+    # STRUCT share=0：同样被一次匹配拯救（跨会话共享内容不再因带内冲刷早死）
+    s_fresh = FakeNode(session_id="s1", tag=HeterCacheNodeTag.QSTRUCT, hit_count=0)
+    check(st.is_one_shot(s_fresh) is True,
+          "STRUCT hit_count=0 share=0 must stay one-shot")
+    s_read = FakeNode(session_id="s1", tag=HeterCacheNodeTag.QSTRUCT, hit_count=1)
+    check(st.is_one_shot(s_read) is False,
+          "STRUCT node matched once must leave the one-shot band")
+
+    # hit_count 不得推翻其它豁免：共享数达标的节点本来就不在带内
+    shared = FakeNode(session_id="t1", hit_count=0)
+    st.slru_evict.on_node_hit(shared, "other-0")
+    st.slru_evict.on_node_hit(shared, "other-1")
+    check(st.is_one_shot(shared) is False,
+          "share>=min exemption must survive the hit_count rule")
+
+
 def main():
     tests = [
         test_trans_unshared_vs_shared,
@@ -279,6 +315,7 @@ def main():
         test_is_one_shot_and_pick_scope_agree,
         test_works_under_force_agentic,
         test_share_min_is_single_knob,
+        test_once_read_leaves_one_shot_band,
     ]
     for t in tests:
         try:

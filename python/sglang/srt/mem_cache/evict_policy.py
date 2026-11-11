@@ -250,11 +250,28 @@ class HeterCacheStrategy(EvictionStrategy):
     def is_one_shot(self, node) -> bool:
         """判定节点是否属于 One-shot 带。
 
-        标准：属于 TRANS/STRUCT 且跨会话共享数未达到 share_min。
+        标准：属于 TRANS/STRUCT 且跨会话共享数未达到 share_min，
+        **且从未被任何请求匹配过**（``hit_count == 0``）。
+
+        hit_count 条件（F1，机制依据）：会话前 MULTI_TURN_MIN 轮创建的节点
+        也带 TRANS/STRUCT 标签，若仅凭类型+共享数判定，创建者自己的下一轮
+        重读救不了它——它在重读到来之前就被扫描流从 one-shot 带清掉，
+        造成所有多轮负载的均匀命中率损失（实测 LRU 与 hc 相差 ~20pp，
+        ShareGPT turn-1 39.7%→7.5%）。被匹配过一次 = 内容有复用证据，
+        与上游 SLRU 的 hit_count>=2 晋升同理。
+
+        hit_count 的两个增长点都是「内容被再次用到」的合法证据：
+        读命中（``_record_node_hit``）与 insert 路径前缀匹配
+        （``_inc_hit_count``）；自膨胀已有防护（chunked 插入不 bump）。
+
         注：若节点无会话元数据，保守返回 False 防止误删热前缀。
         """
         st = self.session_registry.get(getattr(node, "session_id", None))
         if st is None:
+            return False
+        if getattr(node, "hit_count", 0) != 0:
+            # 内容已被再次用到：离开优先淘汰带（晋升后的记账漂移由
+            # 全树快照 reconcile 吸收，见 record_evict 注释）。
             return False
         if self.slru_evict.share_of(node) >= self.slru_evict.share_min:
             return False
@@ -275,7 +292,14 @@ class HeterCacheStrategy(EvictionStrategy):
         )
 
     def record_evict(self, node) -> None:
-        """记录节点淘汰事件并扣减配额占用（支持级联删除逐点触发）。"""
+        """记录节点淘汰事件并扣减配额占用（支持级联删除逐点触发）。
+
+        记账口径说明（F1）：晋升（hit_count 0→1）会把节点从 one-shot
+        带挪进其标签队列，而该队列可能从未收到过对应的 insert 计入
+        （one-shot 时 insert 跳过）——evict 会扣一个负项，直到下一次
+        全树快照 reconcile 吸收。random 行仅作展示、不参与配额仲裁；
+        struct 行的短暂低估方向是「少淘汰、多保留」，与目标同向。
+        """
         tokens = _node_num_tokens(node)
         tag = self._node_tag(node)
         queue = tag.queue_name
