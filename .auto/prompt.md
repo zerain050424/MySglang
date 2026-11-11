@@ -85,4 +85,25 @@ TTFT：命中率带来的性能提升报告 p10/p50/p90。
 
 ## What's Been Tried
 
-（空——新会话，基线 e51973b 尚未跑任何配对测量。）
+| # | cell / 改动 | 结果 | 判定 |
+|---|---|---|---|
+| 1 | smoke（链路验证） | 双臂跑通，0 错误 | keep（非优化） |
+| 2 | fast_mid 基线：hc_full 缺省 vs LRU | 可复用 57.48 vs 84.75（-27.3pp），TTFT p99 801 vs 119ms | keep（基线） |
+| 3 | quick_wt1 基线（真实节奏、分类正确）：hc_full vs LRU | 59.90 vs 84.10（-24.2pp）——均匀税复现，排除分类伪影解释 | keep（基线） |
+| 4 | fast_mid 归因消融：hc_demandcap（caps 按需求对齐） | 54.31，比 hc_full 还差 → 证伪「cap 错配主导」 | keep（消融） |
+
+### 已定位机制（双重现）
+1. **均匀税**：hc 下所有多轮 task 每个 turn 桶均匀掉 ~20pp；ShareGPT t1（跨会话共享）
+   39.7→7.5、codeparrot 68→36 —— 被杀的是跨会话共享 + 会话早期内容。
+2. **M1 早期轮死亡螺旋**：前 4 轮节点（turn_count<MULTI_TURN_MIN=5）标 QTRANS/one-shot，
+   活不过创建者下次重读；victim_src one_shot=157k(quick)/993k(mid)。
+3. **M2 cap 硬上限**：quota:agentic=445k(quick)/4009k(mid)，同时 chat 队列大量闲置、
+   targets 合计 < pool —— 有空闲却强拆主类。
+4. **测量协议教训**：wait 压缩会把 chat 轮间隔压到 GAP_SPLIT_S=15s 以下 → 会话误分类为
+   agentic；正式 cell 一律 wait=1.0；exp3 压缩档已移除。
+5. **公平性教训**：sl_old venv 的 sglang 指向 /root/sg-unicache，必须
+   PYTHONPATH=实验 clone 才能测到策略改动（已修）。
+
+### 下一轮（8h 预算耗尽，留给后续会话）
+F1（once-read 离开 one-shot 带）与 F2（cap 仅跨队列饥饿时强制），完整设计与
+记账分析见 `.auto/ideas.md`。LRU 参照结果可复用（同代码同 seed，--skip-run lru）。
