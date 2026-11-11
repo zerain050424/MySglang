@@ -268,20 +268,20 @@ def main() -> int:
             cfg = r.get("cfg") or "exp3/mix_full.yaml" if mode == "drift" or scale == "full" \
                 else None
             outdir = f"{EXP}/mixexp/result/auto/{r['name']}"
-            tag = f"auto_{r['name']}"
             arms = args.arms.replace(",", " ")
             env = (
                 f"export PY={PY} MODEL={MODEL} PORT={PORT} "
                 f"CUDA_VISIBLE_DEVICES={GPU} "
                 f"ARMS='{arms}' ARMS_FILE={EXP}/mixexp/arms_exp3.tsv "
                 f"CONFIGS_DIR={EXP}/mixexp/configs OUTDIR={outdir} "
-                f"SKIP_EXISTING=0 "
+                f"SKIP_EXISTING=0; "
             )
             cmd = [
                 f"cd {REPO}/Heter-Bench",
                 "source scripts/env.sh",
                 "mkdir -p " + outdir,
                 env + f"bash mixexp/run_mixexp.sh --scale {scale} --mode {mode} "
+                      f"--arms '{arms}' "
                       f"--tokens {tokens} --conc {conc} --wait-scale {wait} "
                       f"--reps {args.reps} --out {outdir} "
                       f"--mem-fraction 0.85 "
@@ -293,13 +293,13 @@ def main() -> int:
                 print(f"METRIC status=remote_fail cell={r['name']}")
                 return rc
 
-            # 拉结果
+            # 拉结果（run_mixexp 的命名：<scale>_<arm>[_rN].json）
             sftp = cli.open_sftp()
             arms_res: Dict[str, Optional[Dict[str, float]]] = {}
             for arm in args.arms.split(","):
                 for rep in range(1, args.reps + 1):
                     suffix = f"_r{rep}" if args.reps > 1 else ""
-                    remote = f"{outdir}/{tag}_{scale}_{arm}{suffix}.json"
+                    remote = f"{outdir}/{scale}_{arm}{suffix}.json"
                     local = f"/tmp/het_{r['name']}_{arm}{suffix}.json"
                     try:
                         sftp.get(remote, local)
