@@ -238,6 +238,23 @@ class RrParams:
 #   * HeterCacheStrategy.is_one_shot : 是否退出 one-shot 带
 DEFAULT_SHARE_MIN = 2
 
+# 一次性带的时间豁免窗口（秒）。
+#
+# 语义：TRANS/STRUCT、未被匹配过（hit_count == 0）且共享数未达标的节点，
+# 若其归属会话仍活跃——最近一次请求（session.last_active）或节点最近一次被
+# 访问（node.last_access_time）距今不足该窗口——不判 one-shot。
+#
+# 机制依据（quick_wt1 / fast_mid 双重复现）：Stage 0 的清理节奏是秒级，而
+# 多轮会话的重访间隔是 6.1s（alfred）到 30~63s（chat）；仅凭 hit_count==0
+# 判定时，「创建者自己的下一轮重读」来不及发生，hit_count 证据永远立不起来
+# （实测 ShareGPT turn-1 命中 39.7%→7.5%，victim_src one_shot=157k）。
+# 取值覆盖实测重访间隔 p95：中位 30s、p90 44s、最大 63s → 90s。
+#
+# 消费方：HeterCacheStrategy.is_one_shot（淘汰裁决与全树快照口径共用，见
+# RadixCache._per_queue_token_count）；记账增量不读它（判据随时间翻转的
+# 漂移由 QueueOccupancyTracker.reconcile 吸收）。
+ONE_SHOT_IDLE_S = 90.0
+
 
 @dataclasses.dataclass
 class SlruParams:

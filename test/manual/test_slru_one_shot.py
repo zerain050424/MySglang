@@ -9,6 +9,8 @@
    QTRANS 标签也不会把已被多次复用的节点拉回一次性带。
 4. **阈值同源**：`is_one_shot` 与 SLRU 的保护范围用同一个
    `share_min`，且共用同一本会话账。
+5. **时间豁免（轴一）**：归属会话仍活跃（最近请求或节点最近访问不足
+   `ONE_SHOT_IDLE_S`）的未匹配节点不进带；搁置满窗口后原判据生效。
 
     python test/manual/test_slru_one_shot.py
 """
@@ -23,6 +25,7 @@ sys.path.insert(
 from sglang.srt.mem_cache.evict_policy import HeterCacheStrategy  # noqa: E402
 from sglang.srt.mem_cache.heter_utils import (  # noqa: E402
     DEFAULT_SHARE_MIN,
+    ONE_SHOT_IDLE_S,
     SessionRegistry,
     SessionState,
     SessionType,
@@ -72,11 +75,17 @@ def _in_slru_scope(strategy, node) -> bool:
     )
 
 
-def make_strategy(session_types, *, force_agentic=False, **slru):
-    """构造策略 + 私有会话账（不污染进程级单例）。"""
+def make_strategy(session_types, *, force_agentic=False, now=None, **slru):
+    """构造策略 + 私有会话账（不污染进程级单例）。
+
+    now: 时间源注入（轴一的时间豁免用假时钟控制窗口推进）；缺省用真实时钟，
+    此时测试里的 SessionState.last_active 与 FakeNode.last_access_time 都是
+    0.0，锚点为 0，豁免窗口天然满足，旧用例行为不变。
+    """
     st = HeterCacheStrategy(
         slru=slru or None,
         force_agentic=force_agentic,
+        now=now,
         quota={"caps": {"struct": 0.3, "agentic": 0.4, "chat": 0.3}},
     )
     reg = SessionRegistry()
@@ -304,6 +313,57 @@ def test_once_read_leaves_one_shot_band():
           "share>=min exemption must survive the hit_count rule")
 
 
+def test_active_session_exempt_until_idle():
+    """轴一：活跃会话的未匹配节点不进 one-shot 带，搁置满窗口后才进。
+
+    机制依据：hit_count 证据的成立前提是节点先活过一个完整重访间隔，而
+    Stage 0 的清理节奏是秒级、重访间隔是 6.1s（alfred）到 30~63s（chat）——
+    仅凭 F1 的 hit_count==0 豁免，latch 在扫描流下几乎永不发生。
+    """
+    print("[10] idle exemption: live sessions keep unread nodes out of the band")
+    clock = {"t": 1000.0}
+    st, reg = make_strategy(
+        {"t1": SessionType.TRANS, "s1": SessionType.STRUCT},
+        now=lambda: clock["t"],
+    )
+    reg._sessions["t1"].last_active = 980.0
+    reg._sessions["s1"].last_active = 980.0
+
+    n = FakeNode(session_id="t1", hit_count=0)
+    check(st.is_one_shot(n) is False,
+          "a live session's unread node must be exempt from the band")
+    clock["t"] = 980.0 + ONE_SHOT_IDLE_S - 1
+    check(st.is_one_shot(n) is False, "still inside the idle window")
+    clock["t"] = 980.0 + ONE_SHOT_IDLE_S
+    check(st.is_one_shot(n) is True,
+          "past the window the node re-enters the band")
+
+    # 锚点取 max(session.last_active, node.last_access_time)：请求间隙里
+    # 新建的节点比会话账本新，由节点自身时间兜底。
+    m = FakeNode(session_id="t1", hit_count=0)
+    m.last_access_time = 1050.0
+    clock["t"] = 1050.0 + ONE_SHOT_IDLE_S - 1
+    check(st.is_one_shot(m) is False,
+          "anchor must follow the newer of session/node timestamps")
+    clock["t"] = 1050.0 + ONE_SHOT_IDLE_S
+    check(st.is_one_shot(m) is True, "node-side anchor expires too")
+
+    # 豁免只延缓不推翻：过窗后原判据照常生效（F1 与共享豁免不变）
+    reg._sessions["s1"].last_active = 0.0
+    clock["t"] = 10_000.0
+    r = FakeNode(session_id="s1", tag=HeterCacheNodeTag.QSTRUCT, hit_count=0)
+    check(st.is_one_shot(r) is True,
+          "idle STRUCT share=0 hit=0 is one-shot again")
+    r.hit_count = 1
+    check(st.is_one_shot(r) is False,
+          "hit evidence still overrides after expiry (F1 unchanged)")
+    shared = FakeNode(session_id="t1", hit_count=0)
+    for i in range(st.slru_evict.share_min):
+        st.slru_evict.on_node_hit(shared, f"other-{i}")
+    check(st.is_one_shot(shared) is False,
+          "share exemption still overrides after expiry")
+
+
 def main():
     tests = [
         test_trans_unshared_vs_shared,
@@ -316,6 +376,7 @@ def main():
         test_works_under_force_agentic,
         test_share_min_is_single_knob,
         test_once_read_leaves_one_shot_band,
+        test_active_session_exempt_until_idle,
     ]
     for t in tests:
         try:

@@ -281,8 +281,10 @@ def test_accounting_insert_and_evict():
     check(st.occupancy.occ["agentic"] == 70, f"after evict agentic={st.occupancy.occ['agentic']}, want 70")
 
     # TRANS 会话 + share < share_min -> one-shot，插入与淘汰两侧都不进账
+    # （now=0.0：会话早已搁置，超过 ONE_SHOT_IDLE_S 时间豁免窗口，
+    #   否则活跃会话的未匹配节点会被时间豁免挡在带外）
     trans = _leaf(TAG["struct"], 50, session_id="t1")
-    st.session_registry.touch("t1", "r1", prompt_len=50)
+    st.session_registry.touch("t1", "r1", prompt_len=50, now=0.0)
     st.session_registry.get("t1").session_type = hu.SessionType.TRANS
     check(st.is_one_shot(trans), "precondition: a TRANS node with share 0 is one-shot")
     before = st.occupancy.occ["struct"]
@@ -376,7 +378,8 @@ def test_stage0_one_shot_preempts_quota():
     # struct 严重超配额；但同时存在一个 one-shot 叶子
     struct_node = _leaf(TAG["struct"], 100, ts=1.0)
     one = _leaf(TAG["struct"], 40, ts=99.0, session_id="s1")
-    st.session_registry.touch("s1", "r1", prompt_len=40)
+    # now=0.0：会话早已搁置，超过 ONE_SHOT_IDLE_S 时间豁免窗口
+    st.session_registry.touch("s1", "r1", prompt_len=40, now=0.0)
     st.session_registry.get("s1").session_type = hu.SessionType.TRANS
     check(st.is_one_shot(one), "precondition: TRANS node is one-shot")
     victim, source = qs.pick_victim(

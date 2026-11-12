@@ -20,7 +20,8 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 import logging
 import random
-from typing import TYPE_CHECKING, Tuple, Union
+import time
+from typing import TYPE_CHECKING, Callable, Optional, Tuple, Union
 from sglang.srt.mem_cache.quota_selector import (
     effective_targets,
     queue_ranking,
@@ -29,6 +30,7 @@ from sglang.srt.mem_cache.quota_selector import (
 )
 from sglang.srt.mem_cache.heter_utils import (
     node_num_tokens,
+    ONE_SHOT_IDLE_S,
     RrParams,
     MultiAgenticParams,
     MultiTurnParams,
@@ -184,7 +186,8 @@ class HeterCacheStrategy(EvictionStrategy):
     默认序都是假语义。
 
     两层决策：
-    1. 分带过滤：One-shot 节点（无跨轮复用价值）优先清理，不计入配额账本。
+    1. 分带过滤：One-shot 节点（无跨轮复用价值）优先清理，不计入配额账本；
+       归属会话仍活跃的未匹配节点受时间豁免（ONE_SHOT_IDLE_S）保护，不进带。
     2. 配额仲裁：先按配额承压情况排出候选队列，再由队内策略（RR / SLRU / MT /
        MultiAgentic）决出具体牺牲节点。
 
@@ -203,7 +206,10 @@ class HeterCacheStrategy(EvictionStrategy):
         mt: Union[MultiTurnParams, dict, None] = None,
         multi_agentic: Union[MultiAgenticParams, dict, None] = None,
         quota: Union[QuotaParams, dict, None] = None,
+        now: Optional[Callable[[], float]] = None,
     ):
+        # 时间源可注入（单测用假时钟控制 one-shot 豁免窗口的推进）。
+        self._now = now if now is not None else time.monotonic
         self.rr = RrParams.from_any(rr)
         self.slru = SlruParams.from_any(slru)
         self.mt = MultiTurnParams.from_any(mt)
@@ -251,7 +257,8 @@ class HeterCacheStrategy(EvictionStrategy):
         """判定节点是否属于 One-shot 带。
 
         标准：属于 TRANS/STRUCT 且跨会话共享数未达到 share_min，
-        **且从未被任何请求匹配过**（``hit_count == 0``）。
+        **且从未被任何请求匹配过**（``hit_count == 0``），
+        **且归属会话已搁置超过 ONE_SHOT_IDLE_S**。
 
         hit_count 条件（F1，机制依据）：会话前 MULTI_TURN_MIN 轮创建的节点
         也带 TRANS/STRUCT 标签，若仅凭类型+共享数判定，创建者自己的下一轮
@@ -259,6 +266,15 @@ class HeterCacheStrategy(EvictionStrategy):
         造成所有多轮负载的均匀命中率损失（实测 LRU 与 hc 相差 ~20pp，
         ShareGPT turn-1 39.7%→7.5%）。被匹配过一次 = 内容有复用证据，
         与上游 SLRU 的 hit_count>=2 晋升同理。
+
+        时间豁免（轴一，机制依据）：hit_count 证据的成立前提是节点先活过
+        一个完整重访间隔，而 Stage 0 的清理节奏是秒级、重访间隔是 6.1s
+        （alfred）到 30~63s（chat）——扫描流下这个前提不成立，latch 几乎
+        永不发生（quick_wt1 victim_src one_shot=157k 即直接证据）。因此
+        会话仍活跃（最近一次请求或节点最近一次被访问不足 ONE_SHOT_IDLE_S）
+        时，内容仍在可能的重访窗口内，不判 one-shot。锚点取
+        ``max(session.last_active, node.last_access_time)``：会话账本只在
+        请求边界更新，请求间隙内新建的节点由节点自身时间兜底。
 
         hit_count 的两个增长点都是「内容被再次用到」的合法证据：
         读命中（``_record_node_hit``）与 insert 路径前缀匹配
@@ -272,6 +288,10 @@ class HeterCacheStrategy(EvictionStrategy):
         if getattr(node, "hit_count", 0) != 0:
             # 内容已被再次用到：离开优先淘汰带（晋升后的记账漂移由
             # 全树快照 reconcile 吸收，见 record_evict 注释）。
+            return False
+        # 时间豁免：会话还没凉，它的内容就还在可能的重访窗口内。
+        anchor = max(st.last_active, getattr(node, "last_access_time", 0.0))
+        if self._now() - anchor < ONE_SHOT_IDLE_S:
             return False
         if self.slru_evict.share_of(node) >= self.slru_evict.share_min:
             return False
@@ -299,6 +319,11 @@ class HeterCacheStrategy(EvictionStrategy):
         （one-shot 时 insert 跳过）——evict 会扣一个负项，直到下一次
         全树快照 reconcile 吸收。random 行仅作展示、不参与配额仲裁；
         struct 行的短暂低估方向是「少淘汰、多保留」，与目标同向。
+
+        时间豁免引入反向漂移（轴一）：insert 时会话活跃被计入、evict 时
+        已过搁置窗口进入带内被跳过 → 占用短暂虚高，方向是「多淘汰」，
+        同样由 reconcile 吸收；承压时校准窗口为 quota.pressure_window_s
+        （默认 3s），漂移窗口有界。
         """
         tokens = _node_num_tokens(node)
         tag = self._node_tag(node)
