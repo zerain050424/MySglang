@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # 混合负载实验：规模阶梯 × 实验臂。
 #
-# 前置：bash mixexp/prepare_data.sh 生成 *.nosys.jsonl（去掉 Qwen 公共 system 段）
+# 前置：bash mixexp/prepare_data.sh 生成数据（步 1 剥 Qwen 公共 system 段 →
+# *.nosys.jsonl；步 2 剔掉多轮源里轮数 < MULTI_TURN_MIN 的会话 →
+# *.nosys.mt5.jsonl。否则那些会话终身判 TRANS，抢 one-shot 带）
 #
 # 用法：
 #   bash mixexp/run_mixexp.sh --scale smoke                 # 冒烟：全臂跑通

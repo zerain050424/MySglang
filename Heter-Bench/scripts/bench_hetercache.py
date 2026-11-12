@@ -96,6 +96,44 @@ def load_sessions(path: str, num_sessions: int, seed: Optional[int] = None,
 
 
 # --------------------------------------------------------------------------
+# 会话轮数口径校验
+# --------------------------------------------------------------------------
+def assert_turn_policy(task: Dict[str, Any], sessions: List[Dict[str, Any]],
+                       data_path: str) -> None:
+    """校验选中的会话都长过 TRANS 带：``num_turns >= 配置里的 min_turns``。
+
+    依据：分类器（``SessionRegistry._classify``）对 ``turn_count < MULTI_TURN_MIN``
+    的会话判 TRANS。多轮源里这类会话**终身**是 TRANS，会以「一次性流量」身份
+    抢 one-shot 带，把自己正在复用的前缀一起清掉——这是多轮负载均匀命中率
+    损失的主要来源。数据侧的剔除由 ``tools/drop_short_sessions.py`` 完成
+    （``mixexp/prepare_data.sh`` 会调），这里只拦截，防的是换了 data_path、
+    或者旧数据没重新生成时，静默跑出一组不可比较的数字。
+
+    配置里没写 ``min_turns`` 的 task 不校验（单轮负载本来就是 1 轮）。
+    """
+    min_turns = task.get("min_turns")
+    if not min_turns:
+        return
+    min_turns = int(min_turns)
+    max_turns = task.get("max_turns")
+    if max_turns and int(max_turns) < min_turns:
+        raise ValueError(
+            f"task {task.get('name')!r}: max_turns={max_turns} 会把手里的会话截到 "
+            f"< min_turns={min_turns}，截完就全判 TRANS 了"
+        )
+    short = [s for s in sessions if int(s.get("num_turns") or 0) < min_turns]
+    if short:
+        turns = sorted(int(s.get("num_turns") or 0) for s in short)
+        raise ValueError(
+            f"task {task.get('name')!r}: {len(short)}/{len(sessions)} 条会话轮数 "
+            f"< {min_turns}（{turns[0]}–{turns[-1]}），会终身判 TRANS。\n"
+            f"  数据：{data_path}\n"
+            f"  先生成过滤后数据：bash mixexp/prepare_data.sh，"
+            f"data_path 指向 *.mt{min_turns}.jsonl"
+        )
+
+
+# --------------------------------------------------------------------------
 # 到达间隔配置（模仿 HeterCache TaskData/*/tasks_config.yaml + vllm/simulator/simulator.py）
 # --------------------------------------------------------------------------
 def load_arrival_config(path: Optional[str]) -> Dict[str, Dict[str, Any]]:
@@ -262,6 +300,7 @@ def build_hybrid_arrival_schedule(tasks_config: Dict[str, Any],
 
         # 读 session（保持文件原序），再由该 task 独立 RNG 打乱（对齐 HeterCache rng.shuffle）
         sessions = load_sessions(data_path, max_record, seed=None, shuffle=False)
+        assert_turn_policy(task, sessions, data_path)
         rng = random.Random(seed + task_id)
         if shuffle:
             rng.shuffle(sessions)
@@ -320,6 +359,7 @@ def build_phased_arrival_schedule(
                     f"phase {phase['name']!r} needs {count} sessions from "
                     f"{task_name!r}, but only {len(pool)} are available"
                 )
+            assert_turn_policy(task, pool, data_path)
             task_offsets[task_name] += count
 
             seed = task.get("seed", 42) + task.get("task_id", 0) + counter

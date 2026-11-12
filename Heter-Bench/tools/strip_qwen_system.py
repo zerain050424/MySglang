@@ -93,10 +93,12 @@ def main() -> int:
     if not src.is_file():
         print(f"输入不存在：{src}", file=sys.stderr)
         return 2
-    if args.in_place and args.out:
+    if args.in_place and args.dst:
         print("--in-place 与 --out 互斥", file=sys.stderr)
         return 2
-    dst = src if args.in_place else Path(args.out) if args.out else src.with_suffix(".nosys.jsonl")
+    # dest="dst"：argparse 的 dest 是 --out，不是 args.out（后者不存在，曾让整个
+    # prepare_data.sh 在第一条数据上就 AttributeError 崩掉）。
+    dst = src if args.in_place else Path(args.dst) if args.dst else src.with_suffix(".nosys.jsonl")
 
     sessions = turns_total = turns_changed = tokens_removed = emptied_sessions = 0
     records = []
@@ -106,9 +108,22 @@ def main() -> int:
             if not line:
                 continue
             try:
-                record = json.loads(line)
+                obj = json.loads(line)
             except json.JSONDecodeError as exc:
                 print(f"{src}:{line_no} 不是合法 JSON：{exc}", file=sys.stderr)
+                return 1
+            # 数据格式是 {session_id: session}（与 bench_hetercache.load_sessions /
+            # prepare_session_data.py 一致）。直接把整行当 session 用会让 num_turns
+            # 恒为 0、改写轮次恒为 0——上一版就是这么静默失效的。
+            if not isinstance(obj, dict) or len(obj) != 1:
+                print(
+                    f"{src}:{line_no} 期望 {{session_id: session}} 形式的一行一会话",
+                    file=sys.stderr,
+                )
+                return 1
+            sid, record = next(iter(obj.items()))
+            if not isinstance(record, dict):
+                print(f"{src}:{line_no} 的值不是会话对象", file=sys.stderr)
                 return 1
             changed, removed, emptied = strip_session(record, args.mode)
             sessions += 1
@@ -117,7 +132,7 @@ def main() -> int:
             tokens_removed += removed
             emptied_sessions += int(emptied)
             if not args.dry_run:
-                records.append(json.dumps(record, ensure_ascii=False))
+                records.append(json.dumps({sid: record}, ensure_ascii=False))
 
     print(f"会话 {sessions}，轮次 {turns_total}")
     print(f"改写轮次 {turns_changed}，去掉 {tokens_removed} token "
@@ -137,7 +152,6 @@ def main() -> int:
     dst.write_text("\n".join(records) + "\n", encoding="utf-8")
     print(f"已写入 {dst}")
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

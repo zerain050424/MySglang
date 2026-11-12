@@ -30,6 +30,7 @@ Heter-Bench/
     prepare_session_data.py              # 原始数据 → session_data.jsonl
     calibrate.py                         # prefill 速率标定（token → ms）
     strip_qwen_system.py                 # 剥掉每轮开头的 Qwen system 段（见 mixexp/README）
+    drop_short_sessions.py               # 剔掉轮数 < MULTI_TURN_MIN 的会话，让 TRANS 只来自单轮负载
 
   mixexp/                 # 混合负载实验：规模阶梯 × 实验臂，见 mixexp/README.md
   eval/                   # 离线评估：节点级 / token 级 / label 口径

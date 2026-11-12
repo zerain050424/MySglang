@@ -12,6 +12,9 @@
 # 规模杠杆同样在 max_record：每段 60 条主导 + 3×10 条陪衬 = 90 条，
 # 四段合计 360 条。要放大就把上面两个数一起乘。
 # data_path 相对 Heter-Bench 根目录解析。
+# 多轮 task（ShareGPT / AgentBank_alfred）读 prepare_data.sh 步 2 过滤后的
+# *.nosys.mt5.jsonl，并带 min_turns: 5（= MULTI_TURN_MIN）做跑前校验：
+# 轮数 < 5 的会话终身判 TRANS，会抢 one-shot 带。单轮 task 不写 min_turns。
 tasks:
   - name: Codeparrot
     task_id: 1
@@ -22,14 +25,16 @@ tasks:
 
   - name: AgentBank_alfred
     task_id: 3
-    data_path: TaskData/AgentBankData/Qwen2.5-7B-Instruct/AgentBank_alfred_scale_5000_session_data.nosys.jsonl
+    data_path: TaskData/AgentBankData/Qwen2.5-7B-Instruct/AgentBank_alfred_scale_5000_session_data.nosys.mt5.jsonl
+    min_turns: 5
     mu: 1.81
     sigma: 1.092
     seed: 42
 
   - name: ShareGPT
     task_id: 2
-    data_path: TaskData/SharedGPT-multi-turn/Qwen2.5-7B-Instruct/ShareGPT_cleaned_valid_deduplicated_session_data.nosys.jsonl
+    data_path: TaskData/SharedGPT-multi-turn/Qwen2.5-7B-Instruct/ShareGPT_cleaned_valid_deduplicated_session_data.nosys.mt5.jsonl
+    min_turns: 5
     mu: 4.15
     sigma: 0.971
     seed: 42

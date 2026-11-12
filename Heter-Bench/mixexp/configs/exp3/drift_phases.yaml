@@ -9,10 +9,13 @@
 #       （--mode drift 即相位模式，读取本目录下的 drift_phases.yaml）
 #
 # data_path 相对 Heter-Bench 根目录解析。
+# chat / agentic 两类带 min_turns: 5（= MULTI_TURN_MIN），bench 起跑前校验
+# 选中会话都活得到非 TRANS 轮次；chat 的源是 prepare_data.sh 步 2 的 *.mt5.jsonl。
 tasks:
   - name: AgentBank_alfred
     task_id: 3
     data_path: TaskData/exp3/agentic_exp3.nosys.jsonl
+    min_turns: 5
     mu: 1.81
     sigma: 1.092
     seed: 42
@@ -20,6 +23,7 @@ tasks:
   - name: ShareGPT
     task_id: 2
     data_path: TaskData/exp3/chat_exp3.nosys.jsonl
+    min_turns: 5
     mu: 4.15
     sigma: 0.971
     seed: 42

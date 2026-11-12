@@ -74,3 +74,24 @@ def test_system_only_turn_is_skipped_not_emptied():
     assert changed == 0 and removed == 0
     assert emptied is True
     assert record["turn_1"]["input_ids"] == QWEN_PREFIX
+
+
+def test_cli_writes_nosys_file(tmp_path, monkeypatch):
+    """CLI 端到端：输入是 ``{sid: session}`` 每行一会话。
+
+    两个曾经的硬伤都在这里守卫：argparse 的 dest 写成 args.out（一跑就崩），
+    以及没拆开外层 dict（num_turns 恒为 0、静默「无变化」）。
+    """
+
+    import json
+    import sys
+
+    src = tmp_path / "ShareGPT_x_session_data.jsonl"
+    record = _session("ShareGPT_a", [QWEN_PREFIX + BODY])
+    src.write_text(json.dumps({record["session_id"]: record}) + "\n", encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["strip_qwen_system.py", "--in", str(src)])
+
+    assert strip_tool.main() == 0
+    dst = tmp_path / "ShareGPT_x_session_data.nosys.jsonl"
+    written = json.loads(dst.read_text(encoding="utf-8"))
+    assert list(written.values())[0]["turn_1"]["input_ids"] == BODY

@@ -11,6 +11,19 @@
 
 ## 零、准备数据（必须先做）
 
+两步串行，都由 `mixexp/prepare_data.sh` 一次做完：
+
+| 步 | 工具 | 作用 | 产物 |
+|---|---|---|---|
+| 1 | `tools/strip_qwen_system.py` | 去掉 Qwen 默认 system 段 | `<name>.nosys.jsonl` |
+| 2 | `tools/drop_short_sessions.py` | **多轮源**剔掉轮数 < `MULTI_TURN_MIN` 的会话 | `<name>.nosys.mt5.jsonl` |
+
+```bash
+bash mixexp/prepare_data.sh     # 幂等：已存在则跳过；FORCE=1 重生成
+```
+
+### 步 1：为什么必须剥 system 段
+
 Qwen 的默认 system prompt 只有 24 token，但运行时判定「跨会话共享」时**没有 token 门槛**：
 任一单轮会话只要命中过别人拥有的这段前缀，就会被标成 `STRUCT`。后果是标签分布严重偏斜。
 
@@ -22,17 +35,37 @@ Qwen 的默认 system prompt 只有 24 token，但运行时判定「跨会话共
 | C | **只去 Qwen system** | **0.7697** | **0.993** | 0.240 |
 
 也就是说：不剥这一段，实验里根本看不到 `random` 队列，`apps` 全被算进 `struct`。
-本套件因此统一读去掉该段之后的副本：
 
-```bash
-bash mixexp/prepare_data.sh     # 生成 *.nosys.jsonl（幂等）
-```
+### 步 2：为什么必须剔掉短会话
 
-`mix_*.yaml` 与 `drift_phases.yaml` 的 `data_path` 已全部指向 `*.nosys.jsonl`。
+分类器（`heter_utils.py` 的 `SessionRegistry._classify`）对
+`turn_count < MULTI_TURN_MIN(=5)` 的会话判 `TRANS`。这条规则对真正的单轮负载是对的，
+但对 ShareGPT / alfred 里那些**总共只有 1–4 轮**的会话意味着：**它们终身都是 TRANS**。
+它们每轮都在复用自己上一轮的前缀，却被 one-shot 带当成一次性流量优先清掉——
+这正是多轮负载均匀命中率损失的主要来源。
+
+所以多轮源只保留 `num_turns >= MULTI_TURN_MIN` 的会话，**单轮源（apps / Codeparrot）
+不做这一步**（它们本来就该是 TRANS，是 TRANS 带的合法来源）。阈值不在脚本里写死，
+由 `drop_short_sessions.py --print-min-turns` 从 `heter_utils.py` 读取。
+
+口径边界（别误读成效用范围）：过滤只能保证**没有任何会话的终身类型是 TRANS**；
+6 轮会话的第 1–4 轮照样判 TRANS，活到第 5 轮才切走。要做到逐请求口径，必须让
+分类器提前知道会话总轮数（`GenerateReqInput` 带元数据 → `SessionRegistry` 记录 →
+`_classify` 用总轮数判 TRANS），那是分类器改动，不在数据侧。
+
+### 产物与校验
+
+`mix_*.yaml`、`drift_phases.yaml`、`configs/exp3/*.yaml` 里，多轮 task 的 `data_path`
+指向 `*.nosys.mt5.jsonl`，并带 `min_turns: 5`；单轮 task 指向 `*.nosys.jsonl`。
+
+`min_turns` 由 `bench_hetercache.py` 的 `assert_turn_policy()` 在起跑前校验：选中的会话
+只要有一条轮数不够，直接报错退出，而不是静默跑出一组不可比的数字。`prepare_data.sh`
+也会在过滤后核对保留条数是否够 full 档的 `max_record`（不足会警告）。
+
 `run_mixexp.sh` 会在起 server 之前预检这些文件，缺失直接退出并提示上面这条命令。
 
-注意 `chat` 召回仍是 0.240——那是另一个原因（76% 的 ShareGPT 会话轮数 <5，
-结构上不可能判成 CHAT），剥 system prompt 解决不了。见第六节。
+> 过滤前的历史数字（例如 -24.2pp / -27.3pp 那两轮）用的是**未过滤**数据，它们的
+> chat/alfred 组成里含大量 1–4 轮会话；过滤后的数字不能与它们直接对比。
 
 ---
 
@@ -155,7 +188,7 @@ exp3 换了一套负载：四类，各类彼此独立。会话结构上有三处
 
 | 类别 | 数据源 | 会话数 | 轮数结构 | token 占比 |
 |---|---|---|---|---|
-| chat | ShareGPT `gt5` | 800 | 6–8 轮为主，20% 取 10–15 轮 | ~22% |
+| chat | ShareGPT `mt5`（`prepare_data.sh` 步 2 产出） | 800 | 6–8 轮为主，20% 取 10–15 轮 | ~22% |
 | agentic | AgentBank_alfred | 96 | 30 条 60+ 轮长尾，其余 6–10 轮 | ~35% |
 | **apps** | AgentBank_apps + 合成冲刷会话 | 15 000 | 单轮，彼此无共享 | ~22% |
 | **struct** | 独立构造（长前缀链） | 2 600 | 单轮，链内共用 2 000 token 前缀 | ~22% |
@@ -247,7 +280,7 @@ python mixexp/tools/tests/test_build_exp3_data.py         # 自测：分桶/stru
 |---|---|---|
 | `token usage` 峰值 | 0.60–0.90 | 长期 ≥0.95 → 减 `max_record` 或加大池；长期 ≤0.75 → 提高 `--conc` |
 | apps 占比（请求数） | 55–65% | 低于 50% 说明冲刷不够，调 `--apps-sessions` |
-| chat 命中率 | 25–40% | 明显偏低时先查 `MULTI_TURN_MIN` 与数据轮数是否匹配 |
+| chat 命中率 | 25–40% | 明显偏低时先查 `MULTI_TURN_MIN` 与数据轮数是否匹配（`chat_exp3` 由 `build_exp3_data.py` 从 `*.nosys.mt5.jsonl` 按 6–8 / 10–15 轮分桶构造） |
 | `share≥2` 节点占可调度比例 | 15% 以上 | 偏低说明 struct 没被识别成结构性节点，检查 `manifest.json` 里 struct 的 `prefix_tokens` 与变体数 |
 | 突发后 30 秒的命中率 | 与基线相差 ≤20pp | 掉得更多说明容量不足，按第一条调整 |
 
@@ -264,8 +297,13 @@ python mixexp/tools/tests/test_build_exp3_data.py         # 自测：分桶/stru
    去 server 日志里的 `[HeterCache profile]`。
 2. **本仓库不含数据集**。`TaskData/` 下只有生成脚本，`*_session_data.jsonl`
    需要在实验机上由 `tools/prepare_session_data.py` 生成，再经
-   `mixexp/prepare_data.sh` 剥掉 Qwen 公共 system 段；本地跑会直接报找不到文件。
+   `mixexp/prepare_data.sh` 处理（剥掉 Qwen 公共 system 段，多轮源再剔掉
+   `num_turns < MULTI_TURN_MIN` 的会话）；本地跑会直接报找不到文件。
 3. **本机无法执行**：这套脚本需要 GPU + 模型 + 数据。提交前只做了静态校验
    （`bash -n`、YAML schema + 调度构建、`HeterCacheStrategy` 参数构造、`analyze.py`
    合成数据自测、`--dry-run`）。
 4. **单次运行方差**：同一臂单跑一次的数字含噪声。要写进结论，`--reps 3` 起。
+5. **过滤解决的是「会话终身 TRANS」，不是「请求级 TRANS」。** 长会话的第 1–4 轮
+   仍被判 TRANS（活到第 5 轮才切走），所以「均匀命中率损失里多少来自短会话、
+   多少来自长会话早期轮」这类归因，靠现有数据仍分不开；要分开就必须让分类器
+   拿到会话总轮数（见第二节末的口径边界）。

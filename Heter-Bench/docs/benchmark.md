@@ -307,7 +307,14 @@ tasks:
     seed: 42
     max_record: 500         # 最多加载 session 数
     shuffle: true           # 是否打乱该负载自身 session 顺序
+    min_turns: 5            # 可选：选中会话的 num_turns 下限（多轮源设 5 = MULTI_TURN_MIN）
 ```
+
+`min_turns` 只对多轮负载写，由 `assert_turn_policy()` 解码前校验：任一选中会话
+`num_turns` 低于它就报错退出。依据是分类器对 `turn_count < MULTI_TURN_MIN` 的会话
+判 `TRANS`：这类会话终身是 TRANS，会以一次性流量身份模 one-shot 带，把自己正在复用
+的前缀一起清掉。数据侧的剔除用 `tools/drop_short_sessions.py`（`mixexp/prepare_data.sh`
+已接入，产物为 `*.nosys.mt5.jsonl`）。单轮负载不要写这个字段——它们本来就是 1 轮。
 
 ### 4.4 结果解读
 

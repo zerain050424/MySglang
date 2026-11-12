@@ -17,6 +17,8 @@
 #
 # lambda_rate = 会话数 / 12000s，四类同时收尾，混合组成不随时间漂移。
 # 池容量与并发由 run_exp3.sh 传入（mem-fraction 0.85 + fp8 KV，约 198k token）。
+# chat / agentic 两类带 min_turns: 5（= MULTI_TURN_MIN），bench 起跑前校验
+# 选中会话都活得到非 TRANS 轮次；chat 的源是 prepare_data.sh 步 2 的 *.mt5.jsonl。
 tasks:
   - name: AgentBank_apps
     task_id: 0
@@ -31,6 +33,7 @@ tasks:
   - name: ShareGPT
     task_id: 2
     data_path: TaskData/exp3/chat_exp3.nosys.jsonl
+    min_turns: 5
     lambda_rate: 0.0667
     mu: 4.15
     sigma: 0.971
@@ -41,6 +44,7 @@ tasks:
   - name: AgentBank_alfred
     task_id: 3
     data_path: TaskData/exp3/agentic_exp3.nosys.jsonl
+    min_turns: 5
     lambda_rate: 0.0080
     mu: 1.81
     sigma: 1.092

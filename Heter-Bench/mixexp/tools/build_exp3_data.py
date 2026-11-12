@@ -90,11 +90,13 @@ class TaskSpec:
 
 
 SPECS: Dict[str, TaskSpec] = {
-    # chat：8 轮均值，其中 20% 取 10–15 轮
+    # chat：8 轮均值，其中 20% 取 10–15 轮。
+    # 源用 prepare_data.sh 产出的 mt5（已剔除轮数 < MULTI_TURN_MIN 的会话）——
+    # 否则那些 1–4 轮会话终身判 TRANS，会挤占 one-shot 带、把 chat 的命中率压下去。
     "chat": TaskSpec(
         name="chat",
         source="SharedGPT-multi-turn/Qwen2.5-7B-Instruct/"
-               "ShareGPT_cleaned_valid_deduplicated_gt5_session_data.nosys.jsonl",
+               "ShareGPT_cleaned_valid_deduplicated_session_data.nosys.mt5.jsonl",
         target=800,
         buckets=[(6, 8, 0.80), (10, 15, 0.20)],
     ),

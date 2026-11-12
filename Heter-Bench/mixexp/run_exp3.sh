@@ -8,7 +8,7 @@
 #   输出     mixexp/result/exp3/
 #
 # 用法：
-#   bash mixexp/run_exp3.sh --build-data            # 先构造四类数据，再跑
+#   bash mixexp/run_exp3.sh --build-data            # 先准备数据（prepare_data.sh）再构造四类数据，再跑
 #   bash mixexp/run_exp3.sh --dry-run               # 只打印命令
 #   bash mixexp/run_exp3.sh --arms lru,hc_full      # 显式指定方案
 #   bash mixexp/run_exp3.sh --mode drift            # 相位模式（含 20 秒突发窗口）
@@ -44,6 +44,15 @@ done
 
 if [ "$BUILD" = "1" ]; then
   PY_BUILD="${PY:-python3}"
+  # 先走 prepare_data.sh：剥 Qwen system 段，并剔掉多轮源里轮数 < MULTI_TURN_MIN
+  # 的会话（否则这些会话终身判 TRANS，会以单轮流量身份挤占 one-shot 带）。
+  # 幂等：已存在的产物直接跳过。
+  echo ">>> 准备数据（剥 Qwen system + 剔除多轮源的短会话）"
+  if [ "$DRY" = "1" ]; then
+    echo "    bash $HERE/prepare_data.sh（幂等，已存在则跳过）"
+  else
+    bash "$HERE/prepare_data.sh" || exit 1
+  fi
   echo ">>> 构造 exp3 数据（TaskData/exp3）"
   if [ "$DRY" = "1" ]; then
     "$PY_BUILD" "$HERE/tools/build_exp3_data.py" --dry-run || exit 1

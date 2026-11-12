@@ -257,28 +257,8 @@ class HeterCacheStrategy(EvictionStrategy):
         """判定节点是否属于 One-shot 带。
 
         标准：属于 TRANS/STRUCT 且跨会话共享数未达到 share_min，
-        **且从未被任何请求匹配过**（``hit_count == 0``），
-        **且归属会话已搁置超过 ONE_SHOT_IDLE_S**。
-
-        hit_count 条件（F1，机制依据）：会话前 MULTI_TURN_MIN 轮创建的节点
-        也带 TRANS/STRUCT 标签，若仅凭类型+共享数判定，创建者自己的下一轮
-        重读救不了它——它在重读到来之前就被扫描流从 one-shot 带清掉，
-        造成所有多轮负载的均匀命中率损失（实测 LRU 与 hc 相差 ~20pp，
-        ShareGPT turn-1 39.7%→7.5%）。被匹配过一次 = 内容有复用证据，
-        与上游 SLRU 的 hit_count>=2 晋升同理。
-
-        时间豁免（轴一，机制依据）：hit_count 证据的成立前提是节点先活过
-        一个完整重访间隔，而 Stage 0 的清理节奏是秒级、重访间隔是 6.1s
-        （alfred）到 30~63s（chat）——扫描流下这个前提不成立，latch 几乎
-        永不发生（quick_wt1 victim_src one_shot=157k 即直接证据）。因此
-        会话仍活跃（最近一次请求或节点最近一次被访问不足 ONE_SHOT_IDLE_S）
-        时，内容仍在可能的重访窗口内，不判 one-shot。锚点取
-        ``max(session.last_active, node.last_access_time)``：会话账本只在
-        请求边界更新，请求间隙内新建的节点由节点自身时间兜底。
-
-        hit_count 的两个增长点都是「内容被再次用到」的合法证据：
-        读命中（``_record_node_hit``）与 insert 路径前缀匹配
-        （``_inc_hit_count``）；自膨胀已有防护（chunked 插入不 bump）。
+        且从未被任何请求匹配过
+        且归属会话已搁置超过 ONE_SHOT_IDLE_S
 
         注：若节点无会话元数据，保守返回 False 防止误删热前缀。
         """
