@@ -34,10 +34,11 @@ from sglang.srt.mem_cache.heter_utils import (
     SESSION_SHARE_MAX,
     SessionRegistry,
     HeterCacheNodeTag,
+    MultiAgenticParams,
     MultiTurnParams,
-    _cached_lognorm_cdf,
     node_end_offset,
     node_num_tokens,
+    reuse_window_probability,
     session_bloom_bits,
 )
 
@@ -317,14 +318,14 @@ class SlruEvictPolicy(VictimOverride):
 
 
 class MultiTurnEvictPolicy(VictimOverride):
-    """AGENTIC 队列的带内改写器：用 lognormal 生存概率挑最冷的节点。
+    """AGENTIC 队列的带内改写器：挑未来窗口内最不可能被复用的节点。
 
-    权重取复用已经过期的概率：
+    分数取条件生存概率（H = ``reuse_window_s``）：
 
-        w = 1 - reuse_prob = CDF(elapsed; mu, sigma)
+        p = P(reuse in (a, a+H] | not reused by a) = 1 - S(a+H)/S(a)
 
-    权重取对数正态的CDF(elapsed)：1 - CDF才是还没被复用的概率，
-    所以这里越大越先淘汰。同权重时退化为段内 LRU。
+    a 是距上次访问的秒数，S = 1 - CDF（lognormal，参数来自
+    ``HeterCacheNodeTag.reuse_config``）。p 越小越先淘汰；同分退化为段内 LRU。
     """
 
     name = "mt"
@@ -345,10 +346,12 @@ class MultiTurnEvictPolicy(VictimOverride):
 
 
     def pick(self, leaves, registry=None) -> Optional["TreeNode"]:
-        """在 agentic 带内挑过期概率最高的节点；带内无候选时返回 None。
+        """在 agentic 带内挑未来窗口内复用概率最低的节点；无候选时返回 None。
+
         Args:
             leaves: 配额层筛过的候选池（已限定在 agentic 队列）。
             registry: 未使用；保留基类签名。
+
         Returns:
             选中的叶子；带内无候选时返回 None 并累加 fallback 计数。
         """
@@ -367,10 +370,16 @@ class MultiTurnEvictPolicy(VictimOverride):
         now = time.monotonic()
         best = None
         for node, (mu, sigma) in candidates:
-            weight = _cached_lognorm_cdf(int(now - node.last_access_time), mu, sigma)
-            # 权重大者先走；同分用 -last_access 让更久未访问的胜出（key 取 max）。
-            key = (weight, -node.last_access_time)
-            if best is None or key > best[0]:
+            score = reuse_window_probability(
+                int(now - node.last_access_time),
+                self.params.reuse_window_s,
+                mu,
+                sigma,
+            )
+            # 分数 = 未来 H 秒内被复用的概率：越小越先走；
+            # 同分取更久未访问的（last_access 小者），保住段内 LRU 语义。
+            key = (score, node.last_access_time)
+            if best is None or key < best[0]:
                 best = (key, node)
         self.mt_picks += 1
         return best[1]
@@ -393,15 +402,27 @@ class MultiTurnEvictPolicy(VictimOverride):
 
 class MultiAgenticEvict(VictimOverride):
     """AGENTIC 队列的复用分改写器：按复用分升序淘汰。
-        reuse_score(node) = 1 - CDF(elapsed; mu, sigma)
-    CDF是 lognormal 的P(复用间隔 <= elapsed)，因此1 - CDF是
-    到此刻还没被复用的概率：越小越先淘汰（复用窗口已经过去）。
+
+    复用分只在本队内排序（不是跨队列的全局价值分）：
+
+        reuse_score(node) = P(reuse in (a, a+H] | not reused by a)
+                          = 1 - S(a+H)/S(a)
+
+    a 是节点距上次访问的秒数，(mu, sigma) 取自
+    HeterCacheNodeTag.reuse_config（agentic 节点即 QAGENT:(1.81, 1.092)）。
+    分数越高说明未来 H 秒越可能被复用，越该保留；淘汰取最低分。
+
+    与MT的分工：MT 用同一个分数，同分时退化为段内 LRU；本类同分时优先
+    弃大片段（一次腾更多空间）。两者互斥且本类优先，开关是
+    ``MultiAgenticParams.enabled``；关闭时策略侧不构造本类，agentic 队回落到
+    MT / 兜底。
     """
 
     name = "multi_agentic"
     queue = HeterCacheNodeTag.QAGENT
 
-    def __init__(self, tag_of=None) -> None:
+    def __init__(self, params: MultiAgenticParams, tag_of=None) -> None:
+        self.params = params
         self._tag_of = tag_of or (
             lambda node: HeterCacheNodeTag.coerce(getattr(node, "queue_tag", None))
         )
@@ -412,12 +433,10 @@ class MultiAgenticEvict(VictimOverride):
     # ------------------------------------------------------------ 复用分
 
     def reuse_score(self, node, now: Optional[float] = None) -> float:
-        """节点的复用分数
-        Args:
-            node: 待排序节点。
-            now: 当前单调时钟；省略时现取（批量排序时传入同一个 now）。
-        Returns:
-            复用分，值域约 [0, 1]。
+        """节点的复用分：未来 H 秒内被复用的条件概率，值域 [0, 1]。
+
+        无时间维度的标签（如 QSTRUCT）返回 0，即最不保值；本类只处理 agentic
+        池，那条分支仅作为口径兜底（仅非 ``force_agentic`` 的手工调用才能碰到）。
         """
         cfg = self._tag_of(node).reuse_config
         if cfg is None:
@@ -426,19 +445,23 @@ class MultiAgenticEvict(VictimOverride):
         elapsed = int(
             (time.monotonic() if now is None else now) - node.last_access_time
         )
-        return 1.0 - _cached_lognorm_cdf(elapsed, mu, sigma)
+        return reuse_window_probability(
+            elapsed, self.params.reuse_window_s, mu, sigma
+        )
 
     def victim_key(self, node, now: Optional[float] = None) -> Tuple[float, int]:
-        """队内排序键：复用分升序，同分时大片段先走（一次腾更多空间）。"""
+        """队内排序键：复用分升序（低分先走），同分时大片段先走。"""
         return (self.reuse_score(node, now), -node_num_tokens(node))
 
     # ------------------------------------------------------------ 插件接口
 
     def pick(self, leaves, registry=None) -> Optional["TreeNode"]:
         """在 agentic 池内挑复用分最低的节点；带内无候选时返回 None。
+
         Args:
             leaves: 当前可淘汰叶子集合。
             registry: 未使用；保留基类签名。
+
         Returns:
             选中的叶子；无 agentic 叶子时返回 None 并累加 fallback 计数。
         """

@@ -4,7 +4,7 @@
 
 * ``evict_policy``：跨队列仲裁与 one-shot 判定；
 * ``victim_override``：改写器的作用域、共享数阈值、会话类型，以及 agentic
-  队内的复用分（lognormal 生存概率，``MultiAgenticEvict``）；
+  队内的复用分（lognormal 条件生存概率，``MultiAgenticEvict``）；
 * ``quota_selector`` / profile：队列标签与占用口径。
 
 命名约定：``HeterCacheNodeTag`` 是**节点级**标签（KV 片段出生时盖章），
@@ -255,6 +255,11 @@ DEFAULT_SHARE_MIN = 2
 # 漂移由 QueueOccupancyTracker.reconcile 吸收）。
 ONE_SHOT_IDLE_S = 90.0
 
+# 队内复用分的预测窗口 H（秒）：P(reuse in (a, a+H] | not reused by a)。
+# 与 ONE_SHOT_IDLE_S 同值（见上：它已经是实测重访间隔 p95 的覆盖窗口），
+# 但两者语义不同，改一个不会自动改另一个。
+DEFAULT_REUSE_WINDOW_S = 90.0
+
 
 @dataclasses.dataclass
 class SlruParams:
@@ -293,16 +298,23 @@ class SlruParams:
 class MultiTurnParams:
     """AGENTIC 队列带内改写器的参数。
 
-    带内权重取 1 - prob(e) = CDF(elapsed; mu, sigma)，mu/sigma 来自 HeterCacheNodeTag.reuse_config
+    分数取 ``P(reuse in (elapsed, elapsed+H] | not reused by elapsed)``，
+    mu/sigma 来自 HeterCacheNodeTag.reuse_config。
     Attributes:
         enabled: 是否启用改写器。
+        reuse_window_s: 预测窗口 H（秒），即“未来 H 秒内会不会被复用”。
     """
 
     enabled: bool = True
+    reuse_window_s: float = DEFAULT_REUSE_WINDOW_S
 
     def __post_init__(self):
         if not isinstance(self.enabled, bool):
             raise ValueError(f"mt.enabled must be bool, got {self.enabled!r}")
+        if self.reuse_window_s <= 0:
+            raise ValueError(
+                f"mt.reuse_window_s must be > 0, got {self.reuse_window_s}"
+            )
 
     @classmethod
     def from_any(cls, value=None) -> "MultiTurnParams":
@@ -325,14 +337,21 @@ class MultiAgenticParams:
 
     Attributes:
         enabled: 是否启用复用分排序。
+        reuse_window_s: 预测窗口 H（秒），与 ``mt.reuse_window_s`` 同义。
     """
 
     enabled: bool = False
+    reuse_window_s: float = DEFAULT_REUSE_WINDOW_S
 
     def __post_init__(self):
         if not isinstance(self.enabled, bool):
             raise ValueError(
                 f"multi_agentic.enabled must be bool, got {self.enabled!r}"
+            )
+        if self.reuse_window_s <= 0:
+            raise ValueError(
+                "multi_agentic.reuse_window_s must be > 0, "
+                f"got {self.reuse_window_s}"
             )
 
     @classmethod
@@ -480,6 +499,25 @@ def _cached_lognorm_cdf(x: float, mu: float, sigma: float) -> float:
     mu, sigma, denom = _cached_lognorm_params(mu, sigma)
     z = (math.log(x) - mu) / denom
     return 0.5 * (1.0 + math.erf(z))
+
+
+def reuse_window_probability(
+    elapsed_s: float, horizon_s: float, mu: float, sigma: float
+) -> float:
+    """P(reuse in (elapsed, elapsed+horizon] | not reused by elapsed).
+
+    队内淘汰要最小化的是“接下来 H 秒还会不会被复用”，而不是“到此刻复用
+    过没有”：后者（CDF(elapsed)）会把“刚写入”和“已彻底过期”混在两个端点。
+
+    分母 S(elapsed) 在极老节点上会下溢到 0（erf 已饱和），此时返回 0：
+    视作不会再被复用，而不是把 0/0 抛出去。
+    """
+    elapsed_s = max(float(elapsed_s), 0.0)
+    survived = 1.0 - _cached_lognorm_cdf(elapsed_s, mu, sigma)
+    if survived <= 0.0:
+        return 0.0
+    survived_after = 1.0 - _cached_lognorm_cdf(elapsed_s + horizon_s, mu, sigma)
+    return max(0.0, 1.0 - survived_after / survived)
 
 
 # 多轮任务的复用间隔分布参数 (mu, sigma)，lognormal（UniCache 原机制）。

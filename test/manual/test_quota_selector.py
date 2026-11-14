@@ -454,7 +454,7 @@ def test_stage1_fallback_is_seeded_random():
 def test_multi_agentic_orders_by_reuse_score():
     """MultiAgenticEvict：agentic 队内按复用分升序淘汰。
 
-    口径与已删除的 ``_reuse_score`` 一致：``1 - CDF(elapsed)``，越小越先淘汰；
+    口径：``P(reuse in (a, a+H] | not reused by a)``，越小越先淘汰；
     同分时大片段先走（一次腾更多空间）。
     """
     print("[21] multi_agentic: agentic pool ordered by reuse score")
@@ -480,12 +480,15 @@ def test_multi_agentic_orders_by_reuse_score():
     off = ep.HeterCacheStrategy(quota=caps)
     check(off.multi_agentic_evict is None, "multi_agentic must be opt-in")
 
-    # force_agentic：所有标签都归 agentic，且复用分必须用 QAGENT 的分布
-    # （沿用旧 _reuse_score 的 _node_tag 口径；直接读 queue_tag 会得到 0 分）
+    # force_agentic：所有标签都归 agentic，评分必须用 QAGENT 的分布而不是
+    # 节点自己的 queue_tag（QSTRUCT 没有复用分布，会恒得 0 分）。
     fa = ep.HeterCacheStrategy(
         force_agentic=True, multi_agentic={"enabled": True}, quota=caps)
     struct_expired = _leaf(TAG["struct"], 100, ts=now - 3600)
-    check(fa.multi_agentic_evict.reuse_score(struct_expired) < 0.05,
+    expected = hu.reuse_window_probability(
+        3600, hu.DEFAULT_REUSE_WINDOW_S, *hu.HeterCacheNodeTag.QAGENT.reuse_config
+    )
+    check(abs(fa.multi_agentic_evict.reuse_score(struct_expired) - expected) < 1e-9,
           "force_agentic must score every node with the QAGENT distribution")
     check(fa.multi_agentic_evict.pick([struct_expired]) is struct_expired,
           "force_agentic must pool every tag into the agentic band")
@@ -499,6 +502,48 @@ def test_multi_agentic_orders_by_reuse_score():
         capacity=1000, page_size=1)
     check(victim is expired and source == "quota:agentic",
           f"quota:agentic must use the reuse score, got {source}")
+
+
+def test_reuse_window_probability():
+    """复用分 = P(reuse in (a, a+H] | not reused by a)，不是 1 - CDF(a)。
+
+    两者的区别在尾部：1 - CDF 在 erf 饱和后把所有“很老”节点抹成同一分，
+    条件概率则保持单调（越老越不可能在下一个窗口被复用）。
+    """
+    print("[23] reuse score is the conditional window probability")
+    mu, sigma = hu.HeterCacheNodeTag.QAGENT.reuse_config
+    H = hu.DEFAULT_REUSE_WINDOW_S
+
+    # a=0 时条件概率就是 CDF(H)：分母 S(0)=1
+    check(abs(hu.reuse_window_probability(0, H, mu, sigma)
+              - hu._cached_lognorm_cdf(H, mu, sigma)) < 1e-9,
+          "at age 0 the conditional probability must equal CDF(H)")
+
+    # 窗口越长，未来被复用的概率不能变小
+    p90 = hu.reuse_window_probability(10, H, mu, sigma)
+    p180 = hu.reuse_window_probability(10, 2 * H, mu, sigma)
+    check(p90 < p180, f"longer horizon must not lower the score: {p90} vs {p180}")
+
+    # 老节点仍严格有序，且都不会被抹成 0
+    p600 = hu.reuse_window_probability(600, H, mu, sigma)
+    p3600 = hu.reuse_window_probability(3600, H, mu, sigma)
+    check(0.0 < p3600 < p600 < 1.0,
+          f"stale nodes must keep decreasing: p600={p600}, p3600={p3600}")
+
+    # 极端老节点：S(a) 下溢到 0 时返回 0，不能抛 ZeroDivisionError
+    check(hu.reuse_window_probability(10 ** 9, H, mu, sigma) == 0.0,
+          "underflowed survival must score 0, not raise")
+
+    # MT 的排序方向：取分数最低者（未来窗口内最不可能被复用）
+    st = ep.HeterCacheStrategy(mt={"enabled": True}, quota={
+        "caps": {"struct": 0.2, "agentic": 0.5, "chat": 0.3}})
+    now = time.monotonic()
+    young = _leaf(TAG["agentic"], 100, ts=now - 2)
+    stale = _leaf(TAG["agentic"], 100, ts=now - 3600)
+    check(st.mt_evict.pick([young, stale], st.session_registry) is stale,
+          "MT must evict the node with the lowest future-reuse probability")
+    check(st.mt_evict.pick([young], st.session_registry) is young,
+          "a single candidate must still be picked")
 
 
 def test_queue_policy_swap():
@@ -599,6 +644,7 @@ def main():
         test_quota_is_mandatory,
         test_multi_agentic_orders_by_reuse_score,
         test_queue_policy_swap,
+        test_reuse_window_probability,
     ]
     for t in tests:
         try:
