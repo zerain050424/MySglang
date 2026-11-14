@@ -10,6 +10,7 @@
 #   bash mixexp/run_mixexp.sh --scale quick --arms lru,hc_full
 #   bash mixexp/run_mixexp.sh --scale full                  # 全量（耗时长）
 #   bash mixexp/run_mixexp.sh --scale mid --mode drift      # 组成漂移
+#   bash mixexp/run_mixexp.sh --config TaskData/exp3/chat/tasks.yaml --scale full
 #   bash mixexp/run_mixexp.sh --scale smoke --dry-run       # 只打印命令
 #
 # 每个臂独占一次 server：起 server → 等 /health → 跑 bench → 停 server。
@@ -35,6 +36,7 @@ OUTDIR="${OUTDIR:-$BENCH_DIR/result/mixexp}"
 PORT="${PORT:-30000}"
 ARMS_FILE="${ARMS_FILE:-$HERE/arms.tsv}"
 CONFIGS_DIR="${CONFIGS_DIR:-$HERE/configs}"
+CONFIG_OVERRIDE=""
 MEM_FRACTION="${MEM_FRACTION:-}"
 EXTRA_SERVER_ARGS=()
 ACTUAL_TOKENS=""
@@ -56,6 +58,7 @@ while [ $# -gt 0 ]; do
     --out)    OUTDIR="$2"; shift 2 ;;
     --arms-file)    ARMS_FILE="$2"; shift 2 ;;
     --configs-dir)  CONFIGS_DIR="$2"; shift 2 ;;
+    --config)       CONFIG_OVERRIDE="$2"; shift 2 ;;
     --mem-fraction) MEM_FRACTION="$2"; shift 2 ;;
     --server-arg)   EXTRA_SERVER_ARGS+=("$2"); shift 2 ;;
     --skip-existing) SKIP_EXISTING=1; shift ;;
@@ -80,7 +83,12 @@ TOKENS=${TOKENS_OVERRIDE:-$DEF_TOKENS}
 CONC=${CONC_OVERRIDE:-$DEF_CONC}
 WAIT_SCALE=${WAIT_OVERRIDE:-$DEF_WAIT}
 
-if [ "$MODE" = "drift" ]; then
+# --config 直接指定任务配置（exp3 的四个主导 cell 用它指向生成的 tasks.yaml，
+# 那些文件里的 max_record/lambda_rate 是由数据构造器反解出来的，不能手改）。
+if [ -n "$CONFIG_OVERRIDE" ]; then
+  CFG="$CONFIG_OVERRIDE"
+  CFG_FLAG="--tasks-config"
+elif [ "$MODE" = "drift" ]; then
   CFG="$CONFIGS_DIR/drift_phases.yaml"
   CFG_FLAG="--phases-config"
 else

@@ -149,6 +149,84 @@ def check_struct(tmp: Path, failures) -> None:
         failures.append("私有正文应每会话唯一，避免产生额外的共享节点")
 
 
+def check_dominant_cells(tmp: Path, failures) -> None:
+    """四个主导 cell：份额按 token 计 ≥60%，且与会话数无关。"""
+    taskdata, outdir = tmp / "TaskData", tmp / "cells"
+    write_source(
+        taskdata / b3.SPECS["apps"].source,
+        [make_session(f"apps-{i}", 1, tokens=120) for i in range(40)],
+    )
+    write_source(
+        taskdata / b3.SPECS["agentic"].source,
+        [make_session(f"alfred-{i}", 8, tokens=400) for i in range(40)],
+    )
+    write_source(
+        taskdata / b3.SPECS["chat"].source,
+        [make_session(f"chat-{i}", 7, tokens=200) for i in range(60)],
+    )
+
+    args = type("A", (), dict(
+        taskdata=str(taskdata), out_dir=str(outdir), limit=0,
+        struct_prefix_tokens=64, struct_variants=4,
+        dominant_share=0.60, total_tokens=2e5, duration_s=1200.0,
+    ))
+    tokenizer = FakeTokenizer()
+
+    for cell in b3.CELLS:
+        with redirect_stdout(io.StringIO()):
+            info = b3.build_cell(cell, args, tokenizer)
+        dominant = b3.CELLS[cell]
+        shares = {name: task["share"] for name, task in info["tasks"].items()}
+        counts = {name: task["sessions"] for name, task in info["tasks"].items()}
+
+        if shares.get(dominant, 0.0) < args.dominant_share:
+            failures.append(
+                f"[{cell}] 主导类 {dominant} 份额 {shares.get(dominant, 0):.1%} < 60%"
+            )
+        if len(info["tasks"]) != 4:
+            failures.append(f"[{cell}] 应保留四类负载，实际 {sorted(info['tasks'])}")
+
+        # 份额口径必须是 token，不是会话数：本用例里 chat 单条 ~1.4k token、
+        # apps 单条 120 token，所以 chat 主导时它的**会话数**反而少于 apps。
+        if cell == "chat":
+            if shares["chat"] <= shares["apps"]:
+                failures.append("[chat] chat 的 token 份额必须高于 apps")
+            if counts["chat"] >= counts["apps"]:
+                failures.append(
+                    f"[chat] 会话数 chat={counts['chat']} apps={counts['apps']}："
+                    "主导只由 token 决定，不能用会话数排序"
+                )
+
+        tasks_yaml = outdir / cell / "tasks.yaml"
+        if not tasks_yaml.is_file():
+            failures.append(f"[{cell}] 没生成 tasks.yaml")
+            continue
+        text = tasks_yaml.read_text(encoding="utf-8")
+        for name, task in info["tasks"].items():
+            if f"max_record: {task['sessions']}" not in text:
+                failures.append(f"[{cell}] tasks.yaml 的 max_record 与 manifest 不一致（{name}）")
+            lam = task["sessions"] / args.duration_s
+            if f"lambda_rate: {lam:.4f}" not in text:
+                failures.append(f"[{cell}] tasks.yaml 的 lambda_rate 不等于 会话数/时长（{name}）")
+        if "min_turns: 5" not in text:
+            failures.append(f"[{cell}] tasks.yaml 缺少多轮类的 min_turns: 5")
+
+        # 落盘的 token 占比必须与 manifest 一致（写文件没丢轮次）
+        total = sum(
+            len(turn.get("input_ids") or [])
+            for path in sorted((outdir / cell).glob("*_exp3.nosys.jsonl"))
+            for line in path.read_text(encoding="utf-8").splitlines()
+            for session in [next(iter(json.loads(line).values()))]
+            for turn in [session.get(f"turn_{i}") for i in
+                         range(1, int(session.get("num_turns") or 0) + 1)]
+            if isinstance(turn, dict)
+        )
+        if total != info["prompt_tokens"]:
+            failures.append(
+                f"[{cell}] 落盘 token {total} 与 manifest {info['prompt_tokens']} 不一致"
+            )
+
+
 def run_case() -> int:
     failures: list[str] = []
     with tempfile.TemporaryDirectory() as tmp:
@@ -156,6 +234,7 @@ def run_case() -> int:
         check_chat(tmp, failures)
         check_apps(tmp, failures)
         check_struct(tmp, failures)
+        check_dominant_cells(tmp, failures)
 
     if failures:
         print("失败：")
@@ -163,7 +242,7 @@ def run_case() -> int:
             print("  -", item)
         return 1
     print("自测通过：分桶、apps 合成冲刷补足、struct 前缀共享/变体隔离、其他类别无前缀、"
-          "字段保留、输出格式")
+          "字段保留、输出格式、四个主导 cell 的 token 份额与 tasks.yaml 一致性")
     return 0
 
 
