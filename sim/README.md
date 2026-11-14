@@ -1,0 +1,71 @@
+# sim · HeterCache 离线前缀缓存仿真器
+
+在 **CPU** 上还原 sglang 的 radix 前缀缓存与 HeterCache 策略（三队列 + one-shot 带 +
+按权重跨队列淘汰 + 队内改写器）。目标不是「另写一个缓存」，而是**让生产代码原样跑**：
+树、标签、仲裁、账本全部 `import python/sglang/srt/mem_cache/`，本目录只做装配与驱动。
+
+> 现状：仓库正在被并行修改。本目录**不改 `python/sglang/`**；等改动收敛后再统一搬运
+> 回仓库测试。当前只实现逻辑。
+
+## 快速开始
+
+```bash
+cd /home/rain/MySglang
+python -m sim              # M0 自检：装载 + 最小 match/insert/evict 回路
+python -m sim --import-only
+```
+
+从其它目录跑需要 `PYTHONPATH=/home/rain/MySglang`。
+
+## 为什么能在 CPU 上跑
+
+只有两处重依赖挡路，且都**不是运行时需要**的：
+
+| 模块 | 谁导入、为什么 | 处理 |
+|---|---|---|
+| `sglang.srt.mem_cache.memory_pool` | `base_prefix_cache.py:23`，只服务 `:58` 的 `ReqToTokenPool` 注解，却把 `memory_pool → srt.configs → transformers` 拉起来 | 替身 `ReqToTokenPool`（实例化即报错） |
+| `sglang.srt.observability.metrics_collector` | `base_prefix_cache.py:25-30`，四个符号只在 `init_metrics_collector()` 里用 | 替身（调用即报错，`enable_metrics` 必须 False） |
+
+`sim/bootstrap.py` 的策略是**真模块优先**：实测能导入就不替换，只有 `ImportError` 才装
+替身并记录原因（`python -m sim` 会打印）。所以环境修好后替身自动退场，不会出现
+「以为在跑真代码，其实跑的是空壳」。
+
+节点 `value` 用 CPU `torch.int64` tensor 承载（生产 `insert` 需要 `.clone()`/切片，
+`match_prefix` 需要 `torch.cat`），内容无语义，只占长度。1M token ≈ 8MB。
+
+## 里程碑
+
+| # | 内容 | 状态 |
+|---|---|---|
+| **M0** | 装载层：CPU 上导入生产模块并跑通 match/insert/evict | ✅ 已完成（`bootstrap.py` + `__main__.py`） |
+| M1 | 时钟单点化：`CacheInitParams.now` → `TreeNode` / `match` / `insert` / `QueueOccupancyTracker` / `CacheTelemetry` / `MultiAgenticEvict` 全部走同一虚拟时钟 | 待做；需要改 `python/sglang/`（搬运后） |
+| M2 | `TokenAllocator` + `create_simulated(eviction_policy=...)` | 待做 |
+| M3 | 请求驱动：`SimReq` + `FakeReqToTokenPool` + `cache._adopt()` + 短缺即淘汰 + 指标 | 待做 |
+| M4 | 保真对拍：树不变量 / 同 seed 复现 / TTL 边界 / （可选）与真 server 比命中率 | 待做 |
+
+### 为什么 M1 不能省
+
+策略的 `HeterCacheStrategy(now=...)` 已经能注入时钟，但节点时间戳写死在
+`radix_cache.py`（`TreeNode.__init__:272`、`match:821`、`insert:961`）。注入假时钟后
+`is_aged` / `is_one_shot` 会算成「假 now − 真时间戳」，结果是所有节点立刻老化或永不
+老化——TTL（120/180/300s）、`ONE_SHOT_IDLE_S=90`、`reuse_window=90`、承压窗口 3s 全部
+失真。M0 的自检里这些规则**没有**被推进过，所以现在只能验「结构与仲裁」，不能验
+「时间相关淘汰」。
+
+## 建模规则（M3 会强制遵守）
+
+1. `SimReq.origin_input_ids` 只放 **prompt**，不含 output（否则分类器 prompt_len 偏大）。
+2. 每请求 `rid` 唯一（`CacheTelemetry.on_hit` 按 rid 去重，重复则命中计数恒 0）。
+3. `match_prefix` 必须在 `_adopt` 之前（出生标签取 registry 里的 session_type）。
+4. 每次 run 前 `SessionRegistry.reset_global()` 再建 cache（进程级单例）。
+5. 分配量 = `len(page_aligned(key)) - hit`，不要用 insert 返回值推断（分裂是净零）。
+6. `page_size=1` 起步（>1 会截断 prompt 尾 token）。
+
+自检不变量（自检里已生效）：`alloc.used == cache.evictable_size() + cache.protected_size()`。
+
+## 边界（写清楚，避免以后误用）
+
+- **顺序模型**：不模拟并发 racing / 在飞请求 `lock_ref` / chunked prefill / retraction /
+  page sharding / HiCache 多级 / 多副本。
+- 因此与真 server 对拍时只期望「同量级」，不期望逐 token 相同。
+- 不复制策略：本目录出现第二份仲裁或标签逻辑就是 bug。
