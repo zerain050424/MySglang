@@ -63,7 +63,11 @@ class _Leaf:
     WeakKeyDictionary，需要节点可弱引用。
     """
 
+    _next_id = 0
+
     def __init__(self, tag, tokens, ts=None, session_id=None):
+        _Leaf._next_id += 1
+        self.id = _Leaf._next_id          # 平局判据（one_shot_key / struct_tier 末尾）
         self.queue_tag = tag
         self.value = [0] * tokens
         self.key = [0] * tokens
@@ -109,7 +113,11 @@ def test_struct_tier():
     print("[2] struct tiers: share==min first, then share>min, LRU inside a tier")
 
     class Node:
+        _next_id = 0
+
         def __init__(self, share, ts):
+            Node._next_id += 1
+            self.id = Node._next_id   # 平局判据：同档同 ts 时用它保持稳定
             self.share = share
             self.last_access_time = ts
 

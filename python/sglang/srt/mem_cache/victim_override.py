@@ -289,6 +289,10 @@ class SlruEvictPolicy(VictimOverride):
         self.share_counted = 0
         self.share_dedup = 0
         self.aged_evicted = 0
+        # 共享数侧表按节点弱引用：节点被回收时条目自动消失，但被快照/观测句柄
+        # 临时持住的旧节点会活过 reset（/flush_cache 跨 run 复用同一进程时）。
+        # reset 的语义就是「上一次 run 的状态清空」，所以这里显式清掉。
+        _SLRU_META.clear()
 
     def __repr__(self) -> str:  # pragma: no cover - 调试用
         return f"<{type(self).__name__} name={self.name}>"
@@ -385,14 +389,23 @@ class MultiAgenticEvict(VictimOverride):
     name = "multi_agentic"
     queue = HeterCacheNodeTag.QAGENT
 
-    def __init__(self, params: MultiAgenticParams, tag_of=None) -> None:
+    def __init__(self, params: MultiAgenticParams, tag_of=None, now=None) -> None:
         self.params = params
+        self._now = now if now is not None else time.monotonic
         self._tag_of = tag_of or (
             lambda node: HeterCacheNodeTag.coerce(getattr(node, "queue_tag", None))
         )
         # ---- 观测 ----
         self.ma_picks = 0      # 实际给出的 agentic 候选数
         self.ma_fallbacks = 0  # 管辖带内无可淘汰叶子
+
+    def use_clock(self, now) -> None:
+        """接管时间源（默认墙钟下等价于无操作）。
+
+        复用分是 ``now - node.last_access_time`` 的差，节点时间戳由缓存盖；
+        两边不同源时注入的假时钟会让分数整段失真。
+        """
+        self._now = now
 
     # ------------------------------------------------------------ 复用分
 
@@ -403,7 +416,7 @@ class MultiAgenticEvict(VictimOverride):
             return 0.0
         mu, sigma = cfg
         elapsed = int(
-            (time.monotonic() if now is None else now) - node.last_access_time
+            (self._now() if now is None else now) - node.last_access_time
         )
         return reuse_window_probability(
             elapsed, self.params.reuse_window_s, mu, sigma
@@ -430,7 +443,7 @@ class MultiAgenticEvict(VictimOverride):
             return None
         # 一次取时钟：同一轮里所有节点必须用同一个 elapsed 基准，否则顺序会
         # 随遍历位置漂移，同 seed 的对照实验无法复现。
-        now = time.monotonic()
+        now = self._now()
         self.ma_picks += 1
         return min(agentic, key=lambda node: self.victim_key(node, now))
 

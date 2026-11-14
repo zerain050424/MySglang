@@ -1,18 +1,3 @@
-"""按权重的跨队列淘汰决策。
-
-HeterCache 把 KV 池按业务类型切成三个队列（struct / agentic / chat）。配额机制
-（caps / reservations / 充水 target / deadzone / chunk）已整体删除：淘汰顺序现在
-只由一个量决定——**归一化占用** ``occ_q / w_q``。``w_q`` 越大，该队列越晚被削。
-
-两层结构保持不变：
-1. Stage 0：one-shot 带（含按类型老化的节点）无条件先清，不计入权重账本；
-2. Stage 1：按 ``occ_q / w_q`` 从大到小逐队取 victim；某队弃权就跳下一队，全部
-   弃权时用策略私有的伪随机兜底。
-
-本模块只做纯计算（排序 + 决策），不碰树、不读时钟；队内选点仍由
-``victim_override`` 的改写器负责。
-"""
-
 from __future__ import annotations
 
 from typing import Dict, List, Tuple
@@ -21,9 +6,9 @@ from sglang.srt.mem_cache.heter_utils import WEIGHT_QUEUES
 
 
 def queue_pressure(occ: Dict[str, float], weights: Dict[str, float]) -> List[str]:
-    """按 ``occ_q / w_q`` 降序返回需要优先削减的队列。
+    """按occ_q / w_q降序返回需要优先削减的队列。
 
-    用比值而不是 ``occ_q - w_q * C``：权重是比例语义，池容量不参与排序，
+    用比值而不是occ_q - w_q * C：权重是比例语义，池容量不参与排序，
     队列大小量级不同时也不会被绝对值主导。占用为 0 的队列不会进入候选。
 
     Args:
@@ -68,21 +53,16 @@ def pick_victim(*, strategy, leaves):
 
 def struct_tier(node, share_of, share_min: int) -> Tuple[int, float]:
     """生成 STRUCT（结构化/模板）队列的淘汰优先级 Key：优先逐出低复用模板，保护高复用模板。
-
-    进入可调度集合的结构化节点满足 share >= share_min（更低复用度已被 Stage 0 过滤），
-    因此只需划分两档保护梯队：
-      - Tier 0（低度复用）：share == share_min，仅达到准入门槛，置换成本最低，优先逐出；
-      - Tier 1（深度复用）：share > share_min，已被多次跨会话复用，置换代价极高，延迟淘汰。
-
-    同阶梯内按 last_access_time 升序排列（最久未访问者优先），保持段内 LRU 语义。
-
     Args:
         node: 目标缓存节点。
         share_of: 读取节点共享会话数的函数指针。
         share_min: 模板判定的最小共享数阈值。
 
     Returns:
-        可直接用于 min() 比较的排序元组 (tier, last_access_time)。
+        可直接用于 min() 比较的排序元组 (tier, last_access_time, id)。
+
+    末尾的 ``node.id`` 是平局判据：虚拟时钟下同一 tick 写入的节点时间戳全等，
+    而 ``min()`` 在完全同分时取迭代顺序（set 的 id 哈希序，跨进程不稳定）。
     """
     tier = 0 if share_of(node) <= share_min else 1
-    return (tier, node.last_access_time)
+    return (tier, node.last_access_time, node.id)

@@ -14,7 +14,7 @@
 from __future__ import annotations
 
 import time
-from typing import Dict
+from typing import Callable, Dict, Optional
 
 from sglang.srt.mem_cache.heter_utils import WEIGHT_QUEUES
 
@@ -31,12 +31,19 @@ class QueueOccupancyTracker:
     不再判断 one-shot；``reconcile`` 用全树快照的 ``total - one_shot`` 对齐。
     """
 
-    __slots__ = ("_occ", "_capacity", "_last_reconcile")
+    __slots__ = ("_occ", "_capacity", "_last_reconcile", "_now")
 
-    def __init__(self) -> None:
+    def __init__(self, now: Optional[Callable[[], float]] = None) -> None:
         self._occ: Dict[str, float] = {q: 0.0 for q in WEIGHT_QUEUES}
         self._capacity = 0.0
-        self._last_reconcile = 0.0
+        self._now = now if now is not None else time.monotonic
+        # -inf 而不是 0：首次淘汰必须校准（真时钟下 now-0 本来就巨大，
+        # 而虚拟时钟从 0 起算时 now-0=0 会让第一次淘汰漏掉校准）。
+        self._last_reconcile = float("-inf")
+
+    def use_clock(self, now: Callable[[], float]) -> None:
+        """接管时间源（默认墙钟下等价于无操作）；不重置上一行校准时刻。"""
+        self._now = now
 
     @property
     def occ(self) -> Dict[str, float]:
@@ -90,7 +97,7 @@ class QueueOccupancyTracker:
             normal_window_s: 常规校准窗口（秒）。
             has_capacity: 调用方是否真的拿到了可用量。
         """
-        now = time.monotonic()
+        now = self._now()
         if not has_capacity or capacity <= 0:
             return now - self._last_reconcile >= normal_window_s
         if available / capacity < PRESSURE_AVAILABLE_RATIO:
@@ -111,10 +118,10 @@ class QueueOccupancyTracker:
             self._occ[q] = max(0.0, total - one_shot)
         if capacity > 0:
             self._capacity = float(capacity)
-        self._last_reconcile = time.monotonic()
+        self._last_reconcile = self._now()
 
     def reset(self) -> None:
         """清空账本（缓存 flush / 跨 run 复用同一进程时调用）。"""
         for q in WEIGHT_QUEUES:
             self._occ[q] = 0.0
-        self._last_reconcile = 0.0
+        self._last_reconcile = float("-inf")

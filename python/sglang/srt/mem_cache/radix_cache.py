@@ -319,6 +319,9 @@ class RadixCache(BasePrefixCache):
         self.page_size = params.page_size
         self.is_eagle = params.is_eagle
         self.eviction_policy = params.eviction_policy.lower()
+        # 时间源由缓存层单点持有，见 CacheInitParams.now：节点时间戳在这里盖，
+        # 策略侧的判据时钟也必须同源（策略装配完后由 use_clock 推过去）。
+        self._now = params.now if params.now is not None else time.monotonic
 
         self.kv_events = KVCacheEventRecorder(
             enabled=params.enable_kv_cache_events, page_size=self.page_size
@@ -350,6 +353,9 @@ class RadixCache(BasePrefixCache):
         )
         self._heter = heter
         if heter is not None:
+            # 策略的时间源由缓存接管：节点时间戳（TreeNode 创建 / match / insert）
+            # 由本类盖，策略只做差值判断。两边不同源就是拿假 now 减真时间戳。
+            heter.use_clock(self._now)
             # 账本归驱动层持有：驱逐循环与权重仲裁读的是同一份，
             # 但仲裁只拿只读投影（occ），不持有 tracker。
             self.occupancy = heter.occupancy
@@ -419,6 +425,17 @@ class RadixCache(BasePrefixCache):
         )
         return RadixCache(params)
 
+    def _stamp(self, node: TreeNode) -> None:
+        """给新建节点盖时间戳。
+
+        ``TreeNode.__init__`` 自己取 ``time.monotonic()``，那是给不持有缓存的调用方
+        留的默认值；一旦缓存持有时间源（``CacheInitParams.now``），节点的创建/访问
+        时间必须来自同一个时钟，否则注入假时钟后 aging 与 one-shot 豁免全部失真。
+        """
+        now = self._now()
+        node.last_access_time = now
+        node.creation_time = now
+
     ##### Public API #####
 
     def reset(self):
@@ -438,6 +455,7 @@ class RadixCache(BasePrefixCache):
             self.telemetry.reset()
         # Initialize root with minimum priority so any real priority overrides it
         self.root_node = TreeNode(priority=-sys.maxsize)
+        self._stamp(self.root_node)
         self.root_node.key = RadixKey(token_ids=array("q"), extra_key=None)
         self.root_node.value = []
         self.root_node.lock_ref = 1
@@ -818,7 +836,7 @@ class RadixCache(BasePrefixCache):
     def _match_prefix_helper(
         self, node: TreeNode, key: RadixKey, rid=None, session_id=None
     ): ## node：当前节点，key：要匹配的RadixKey
-        access_time = time.monotonic()
+        access_time = self._now()
         node.last_access_time = access_time
 
         child_key = key.child_key(self.page_size) 
@@ -898,6 +916,7 @@ class RadixCache(BasePrefixCache):
            decode_start: Optional[int] = None,
        ):
            new_node = TreeNode(priority=child.priority)
+           self._stamp(new_node)
            # HeterCache：前缀一半继承原偏移，后缀一半整体后移 split_len。
            # 必须在覆盖 child.abs_start 之前把旧值读出来。
            new_node.abs_start = child.abs_start
@@ -958,7 +977,7 @@ class RadixCache(BasePrefixCache):
         # Convert None priority to 0
         if priority is None:
             priority = 0
-        access_time = time.monotonic()
+        access_time = self._now()
         node.last_access_time = access_time
         # Update priority along the path (take max to propagate higher priority)
         node.priority = max(node.priority, priority)
@@ -990,6 +1009,7 @@ class RadixCache(BasePrefixCache):
         if len(key): ## 如果还有剩余的key,说明没有匹配到子节点,需要创建新的子节点
             # HeterCache：新片段从已匹配长度处开始（绝对偏移）。
             new_node = TreeNode(priority=priority, abs_start=total_prefix_length)
+            self._stamp(new_node)
             new_node.parent = node
             new_node.key = key
             new_node.value = value.clone()

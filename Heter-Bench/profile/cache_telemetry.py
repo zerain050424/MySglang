@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import time
 from collections import deque
+from typing import Callable, Optional
 
 from heter_logger import heterlog
 
@@ -49,16 +50,19 @@ class CacheTelemetry:
     PROFILE_INTERVAL = 30.0
     MAX_SEEN_RIDS = 100_000
 
-    __slots__ = ("profiler", "_last_profile", "_seen_rids", "_rid_order")
+    __slots__ = ("profiler", "_last_profile", "_seen_rids", "_rid_order", "_now")
 
-    def __init__(self, profiler):
+    def __init__(self, profiler, now: Optional[Callable[[], float]] = None):
         """绑定账本。
 
         Args:
             profiler: HeterProfiler 实例；策略侧同时保留引用（外部消费者直接读它）。
+            now: 时间源；``None`` 表示 ``time.monotonic``。仿真器注入虚拟时钟后，
+                profile 间隔按虚拟秒推进，而不是墙钟。
         """
         self.profiler = profiler
-        self._last_profile = time.monotonic()
+        self._now = now if now is not None else time.monotonic
+        self._last_profile = self._now()
         # 每请求只归因一次命中的去重账本：同一 rid 的多次 chunked prefill 只算一次。
         self._seen_rids: set = set()
         self._rid_order: deque = deque()
@@ -110,9 +114,18 @@ class CacheTelemetry:
         if self._emitting():
             heterlog.victim_source(source, tokens)
 
+    def use_clock(self, now: Callable[[], float]) -> None:
+        """接管时间源，并以当前时钟重新起算打印间隔。
+
+        重建起点而不是保留旧值：旧值来自另一个时钟（墙钟或更早的虚拟起点），
+        与新 ``now()`` 不同量级，留着会让第一行 profile 立刻到期或被无限推迟。
+        """
+        self._now = now
+        self._last_profile = now()
+
     def wants_profile(self) -> bool:
         """profile 打印时钟是否到期。与账本校准时钟完全独立。"""
-        return time.monotonic() - self._last_profile >= self.PROFILE_INTERVAL
+        return self._now() - self._last_profile >= self.PROFILE_INTERVAL
 
     def observe_profile(
         self,
@@ -128,7 +141,7 @@ class CacheTelemetry:
 
         只做渲染：可调度占用与权重由调用方传入，这里不做任何仲裁数学。
         """
-        self._last_profile = time.monotonic()
+        self._last_profile = self._now()
         rendered = self.profiler.summary(
             queue_occ,
             session_summary,

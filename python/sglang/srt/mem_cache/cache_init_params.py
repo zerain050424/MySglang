@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import torch
 
@@ -50,6 +50,14 @@ class CacheInitParams:
 
     # Time-to-live for cache entries in seconds. If None, TTL is disabled.
     cache_ttl_seconds: Optional[float] = None
+
+    # 时间源；None 表示 time.monotonic。
+    #
+    # 必须由缓存层单点持有：节点时间戳由缓存盖（TreeNode 创建 / match / insert），
+    # 而 one-shot 豁免、老化 TTL、承压校准窗口、profile 时钟都拿它做差。任何一处
+    # 仍读墙钟，注入假时钟后算出的就是「假 now − 真时间戳」，全部阈值失真。
+    # 离线回放（仿真器 / 单测）注入步进时钟即可让 TTL 以虚拟秒推进。
+    now: Optional[Callable[[], float]] = None
 
     tree_components: Optional[tuple[ComponentType, ...]] = None
     component_registry_override: Optional[dict[ComponentType, type[TreeComponent]]] = (

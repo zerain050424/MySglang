@@ -149,6 +149,22 @@ class HeterCacheStrategy(EvictionStrategy):
 
         self.node_observers = (self.slru_evict,)
 
+    def use_clock(self, now: Callable[[], float]) -> None:
+        """接管缓存层的时间源（默认墙钟下等价于无操作）。
+
+        节点时间戳由 ``RadixCache`` 盖（``CacheInitParams.now``），所以策略与它
+        持有的三个读时钟协作者必须与缓存同源；否则 ``is_aged`` / one-shot 豁免 /
+        承压校准窗口会拿假 now 去减真时间戳，阈值全部失真。
+
+        Args:
+            now: 返回秒数的单调时钟。
+        """
+        self._now = now
+        self.occupancy.use_clock(now)
+        self.telemetry.use_clock(now)
+        if self.multi_agentic_evict is not None:
+            self.multi_agentic_evict.use_clock(now)
+
     def _node_tag(self, node) -> HeterCacheNodeTag:
         if self.force_agentic:
             return HeterCacheNodeTag.QAGENT
@@ -198,8 +214,13 @@ class HeterCacheStrategy(EvictionStrategy):
         return st.session_type in (SessionType.TRANS, SessionType.STRUCT)
 
     def one_shot_key(self, node) -> tuple:
-        """One-shot 带内淘汰排序：老化节点最优先，其余按访问时间升序。"""
-        return (0 if self.is_aged(node) else 1, node.last_access_time)
+        """One-shot 带内淘汰排序：老化节点最优先，其余按访问时间升序。
+
+        末尾的 ``node.id`` 是平局判据：虚拟时钟下同一 tick 写入的节点时间戳全等，
+        而 ``min()`` 在完全同分时取迭代顺序（set 的 id 哈希序，跨进程不稳定），
+        同 seed 就不可复现了。``id`` 按创建顺序递增，能给出稳定顺序。
+        """
+        return (0 if self.is_aged(node) else 1, node.last_access_time, node.id)
 
     # ---- 命中/淘汰记账 ----
 
@@ -277,8 +298,12 @@ class HeterCacheStrategy(EvictionStrategy):
         return None
 
     def fallback(self, leaves):
-        """所有队列均弃权时的均匀随机淘汰。"""
-        pool = list(leaves)
+        """所有队列均弃权时的均匀随机淘汰。
+
+        候选先按 ``node.id`` 排序再抽：``leaves`` 是 set，迭代序取决于对象地址，
+        直接 ``choice`` 会让同一个 seed 在两次进程里抽出不同节点。
+        """
+        pool = sorted(leaves, key=lambda n: n.id)
         if not pool:
             return None
         return self._fallback_rng.choice(pool)

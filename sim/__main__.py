@@ -1,12 +1,14 @@
-"""M0 自检：``python -m sim``。
+"""自检：``python -m sim``。
 
-分两级，任一级失败都以非 0 退出：
+分三段，任一段失败都以非 0 退出：
 
-1. **装载**：两个重依赖替身就位后，生产模块能导入，符号表齐全；
-2. **可运行**：用一次最小的 match → insert → evict 证明导入的不是空壳
-   （树、标签、权重仲裁、账本 reconcile 都真的在动）。
+1. **装载**（M0）：两个重依赖替身就位后，生产模块能导入，符号表齐全；
+2. **可运行**（M0）：一次最小的 match → insert → evict 证明导入的不是空壳
+   （树、标签、权重仲裁、账本 reconcile 都真的在动）；
+3. **虚拟时钟**（M1）：节点时间戳、老化 TTL、one-shot 豁免、承压校准窗口、
+   profile 间隔全部由注入的时钟推进，且精确在边界翻转。
 
-第 2 级里的 ``_CheckAllocator`` 只是自检用的最小分配器，M2 会被
+第 2/3 段里的 ``_CheckAllocator`` 只是自检用的最小分配器，M2 会被
 ``sim/allocator.py`` 的 ``TokenAllocator`` 取代，不要在这里加功能。
 """
 
@@ -17,6 +19,9 @@ import sys
 from array import array
 
 from sim import bootstrap
+from sim.clock import VirtualClock
+
+WEIGHTS = {"struct": 0.2, "agentic": 0.5, "chat": 0.3}
 
 
 class _CheckAllocator:
@@ -42,6 +47,39 @@ class _CheckReq:
         self.session_id = session_id
         self.origin_input_ids = tokens
         self.tool_call = None
+
+
+def _build(sym, capacity: int = 1200, now=None):
+    """按仿真口径建一个 HeterCache 缓存（page_size=1，权重三队齐全）。"""
+
+    alloc = _CheckAllocator(capacity)
+    cache = sym["HeterCacheRadixCache"](
+        sym["CacheInitParams"](
+            disable=False,
+            req_to_token_pool=None,  # 自检不走 _adopt（M3 才需要假池）
+            token_to_kv_pool_allocator=alloc,
+            page_size=1,
+            eviction_policy="heter_cache",
+            eviction_policy_config={"weight": {"weights": dict(WEIGHTS)}},
+            now=now,
+        )
+    )
+    return cache, alloc
+
+
+def _insert(sym, cache, tokens, session_id: str):
+    """只插入（不 match / 不 touch），返回落盘的叶子节点。"""
+
+    torch = __import__("torch")
+    result = cache.insert(
+        sym["InsertParams"](
+            key=sym["RadixKey"](array("q", tokens)),
+            value=torch.arange(len(tokens), dtype=torch.int64),
+            decode_start=len(tokens),
+            session_id=session_id,
+        )
+    )
+    return result.last_device_node
 
 
 def _check_import(sym) -> list:
@@ -86,26 +124,16 @@ def _check_run(sym) -> list:
     torch = __import__("torch")
     fails = []
 
-    alloc = _CheckAllocator(capacity=1200)
-    cache = sym["HeterCacheRadixCache"](
-        sym["CacheInitParams"](
-            disable=False,
-            req_to_token_pool=None,  # 本自检不走 _adopt（M3 才需要假池）
-            token_to_kv_pool_allocator=alloc,
-            page_size=1,
-            eviction_policy="heter_cache",
-            eviction_policy_config={
-                "weight": {"weights": {"struct": 0.2, "agentic": 0.5, "chat": 0.3}}
-            },
-        )
+    cache, alloc = _build(sym, capacity=1200)
+    print(
+        f"    built     : {type(cache).__name__} / "
+        f"{type(cache.eviction_strategy).__name__} / now={cache._now.__name__}"
     )
-    print(f"    built     : {type(cache).__name__} / {type(cache.eviction_strategy).__name__}")
 
-    RadixKey = sym["RadixKey"]
     shared = list(range(1000, 1300))
 
     def request(rid: str, sid: str, tokens: list) -> tuple:
-        key = RadixKey(array("q", tokens))
+        key = sym["RadixKey"](array("q", tokens))
         result = cache.match_prefix(
             sym["MatchPrefixParams"](key=key, req=_CheckReq(rid, sid, tokens))
         )
@@ -114,7 +142,7 @@ def _check_run(sym) -> list:
         cache.session_registry.touch(sid, rid, len(tokens))
         cache.insert(
             sym["InsertParams"](
-                key=RadixKey(array("q", tokens)),
+                key=sym["RadixKey"](array("q", tokens)),
                 value=torch.arange(len(tokens), dtype=torch.int64),
                 decode_start=len(tokens),
                 session_id=sid,
@@ -164,10 +192,139 @@ def _check_run(sym) -> list:
     return fails
 
 
+def _check_clock(sym) -> list:
+    """M1 验收：所有时间判据都由注入的时钟推进，且精确在边界翻转。"""
+
+    print("[3] 虚拟时钟（M1）")
+    fails = []
+    Tag = sym["HeterCacheNodeTag"]
+
+    # ---- 3.1 节点时间戳来自缓存持有的时钟，而不是墙钟 ----
+    clock = VirtualClock(0.0)
+    cache, _ = _build(sym, capacity=4096, now=clock)
+    leaf = _insert(sym, cache, list(range(0, 64)), "ShareGPT-a")
+    stamps = (leaf.last_access_time, leaf.creation_time)
+    ok = stamps == (0.0, 0.0)
+    print(f"    node ts   : last/creation={stamps} (want (0.0, 0.0)){'  <-- 墙钟' if not ok else ''}")
+    if not ok:
+        fails.append(f"新节点时间戳没走虚拟时钟：{stamps}")
+
+    # match 也必须盖同一个时钟
+    clock.advance_to(5.0)
+    cache.match_prefix(
+        sym["MatchPrefixParams"](
+            key=sym["RadixKey"](array("q", list(range(0, 64)))),
+            req=_CheckReq("r-touch", "ShareGPT-a", list(range(0, 64))),
+        )
+    )
+    ok = leaf.last_access_time == 5.0
+    print(f"    match ts  : {leaf.last_access_time} (want 5.0){'' if ok else '  <-- 墙钟'}")
+    if not ok:
+        fails.append(f"match 没走虚拟时钟：{leaf.last_access_time}")
+
+    # ---- 3.2 老化 TTL 在边界翻转 ----
+    chat_ttl = cache.eviction_strategy.slru.ageing_ttl_s["chat"]
+    agent_ttl = cache.eviction_strategy.slru.ageing_ttl_s["agentic"]
+    strategy = cache.eviction_strategy
+
+    leaf.queue_tag = Tag.QCHAT
+    chat_base = leaf.last_access_time   # match 在 t=5 刷过访问时间
+    clock.advance_to(chat_base + chat_ttl - 0.1)
+    before = strategy.is_aged(leaf)
+    clock.advance_to(chat_base + chat_ttl)
+    after = strategy.is_aged(leaf)
+    ok = (not before) and after
+    print(f"    aging chat {chat_ttl:>5.1f}s: t-0.1 aged={before} t aged={after}{'' if ok else '  <-- 边界错'}")
+    if not ok:
+        fails.append(f"chat 老化边界错：{before} -> {after}")
+
+    leaf2 = _insert(sym, cache, list(range(5000, 5064)), "alfred-a")
+    leaf2.queue_tag = Tag.QAGENT
+    base = leaf2.last_access_time
+    clock.advance_to(base + agent_ttl - 0.1)
+    before = strategy.is_aged(leaf2)
+    clock.advance_to(base + agent_ttl)
+    after = strategy.is_aged(leaf2)
+    ok = (not before) and after
+    print(f"    aging agt  {agent_ttl:>5.1f}s: t-0.1 aged={before} t aged={after}{'' if ok else '  <-- 边界错'}")
+    if not ok:
+        fails.append(f"agentic 老化边界错：{before} -> {after}")
+
+    # ---- 3.3 one-shot 时间豁免（ONE_SHOT_IDLE_S=90s）----
+    clock = VirtualClock(0.0)
+    cache, _ = _build(sym, capacity=4096, now=clock)
+    strategy = cache.eviction_strategy   # 新缓存新策略，时钟也跟着换了
+    # 单轮、无跨会话共享 -> TRANS；observe_request 只建分类证据，
+    # last_active 由 touch 设置，这里两者都停在 0。
+    cache.session_registry.observe_request("apps-1", "r-one", 400, now=clock())
+    one = _insert(sym, cache, list(range(2000, 2100)), "apps-1")
+    one.queue_tag = Tag.QTRANS
+    one.hit_count = 0
+
+    clock.advance_to(89.9)
+    before = strategy.is_one_shot(one)
+    clock.advance_to(90.0)
+    after = strategy.is_one_shot(one)
+    ok = (not before) and after
+    print(f"    one-shot  : t=89.9 {before} / t=90.0 {after} (want False/True){'' if ok else '  <-- 边界错'}")
+    if not ok:
+        fails.append(f"one-shot 豁免边界错：{before} -> {after}")
+
+    # 未达 share_min 的 struct 不参与老化（文档里的 protection guard）
+    one.queue_tag = Tag.QSTRUCT
+    guarded = not strategy.is_aged(one)
+    print(f"    struct 无共享不老化: is_aged={not guarded and 'True' or 'False'}{'' if guarded else '  <-- 保护失效'}")
+    if not guarded:
+        fails.append("未达 share_min 的 struct 被判定老化")
+
+    # ---- 3.4 承压校准窗口（3s）与 profile 间隔（30s）按虚拟秒推进 ----
+    clock = VirtualClock(0.0)
+    cache, _ = _build(sym, capacity=1024, now=clock)
+    tracker = cache.eviction_strategy.occupancy
+    telemetry = cache.eviction_strategy.telemetry
+    first = telemetry._last_profile == 0.0
+
+    tracker.reconcile({}, 1024.0)  # 把上一行校准时刻钉在 t=0
+    clock.advance_to(2.9)
+    pressure_early = tracker.wants_reconcile(
+        0.0, 1024.0, normal_window_s=telemetry.PROFILE_INTERVAL, has_capacity=True
+    )
+    clock.advance_to(3.0)
+    pressure_due = tracker.wants_reconcile(
+        0.0, 1024.0, normal_window_s=telemetry.PROFILE_INTERVAL, has_capacity=True
+    )
+    relaxed = tracker.wants_reconcile(
+        512.0, 1024.0, normal_window_s=telemetry.PROFILE_INTERVAL, has_capacity=True
+    )
+    clock.advance_to(30.0)
+    profile_due = telemetry.wants_profile()
+
+    ok = (
+        first
+        and not pressure_early
+        and pressure_due
+        and not relaxed
+        and profile_due
+    )
+    print(
+        f"    windows   : 承压 t=2.9 {pressure_early} / t=3.0 {pressure_due} / "
+        f"非承压 {relaxed} / profile t=30 {profile_due}{'' if ok else '  <-- 窗口错'}"
+    )
+    if not ok:
+        fails.append(
+            f"虚拟窗口错：first={first} pressure={pressure_early}/{pressure_due} "
+            f"relaxed={relaxed} profile={profile_due}"
+        )
+    return fails
+
+
 def main(argv: list) -> int:
-    parser = argparse.ArgumentParser(prog="python -m sim", description="M0 自检")
+    parser = argparse.ArgumentParser(prog="python -m sim", description="M0/M1 自检")
     parser.add_argument(
         "--import-only", action="store_true", help="只验证装载，不构造缓存"
+    )
+    parser.add_argument(
+        "--skip-clock", action="store_true", help="跳过 M1 虚拟时钟检查"
     )
     args = parser.parse_args(argv)
 
@@ -182,12 +339,14 @@ def main(argv: list) -> int:
         return 1 if fails else 0
 
     fails += _check_run(sym)
+    if not args.skip_clock:
+        fails += _check_clock(sym)
     if fails:
-        print("\nM0 FAIL")
+        print("\nFAIL")
         for item in fails:
             print(f"  - {item}")
         return 1
-    print("\nM0 OK")
+    print("\nOK")
     return 0
 
 
