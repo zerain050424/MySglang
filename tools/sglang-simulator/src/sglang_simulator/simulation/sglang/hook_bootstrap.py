@@ -12,6 +12,7 @@ from sglang_simulator.simulation.sglang import (
     mem_cache_allocator,
     mem_pool_host,
     model_runner,
+    radix_cache,
     scheduler,
     sgl_kernel_hook,
     unified_radix_cache,
@@ -42,6 +43,8 @@ def install_simulator_hooks() -> None:
             scheduler.C_SchedulerRequestReceiver,
             model_runner.C_ModelRunnerHook,
             model_runner.C_KVCacheConfiguratorHook,
+            # 虚拟时钟注入：缓存的时间判据改读模拟器的全局逻辑时钟
+            radix_cache.C_RadixCacheClockHook,
             hicache_storage.C_StorageBackendFactory,
             cache_controller.C_HiCacheController,
             cache_controller.C_HybridCacheController,

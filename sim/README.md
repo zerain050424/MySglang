@@ -173,6 +173,34 @@ result = Simulator(SimConfig(capacity=100_000)).run_scheduled(
 是分块边写，所以本模型让前缀可见的时间略晚；这会使并发命中略低、`duplicate`
 略高。方向是保守的（不虚高命中率）。
 
+### 上游 simulator 的时钟注入（已落地）
+
+`tools/sglang-simulator` 的 OFFLINE 模式不推进真墙钟（只把预测延迟记进 stats），
+而 sglang 缓存的秒级判据读 `time.monotonic()`，所以必须接线。注入点是
+`CacheInitParams.now`（M1 留的口子），实现为一个 class hook：
+
+```
+tools/sglang-simulator/src/sglang_simulator/simulation/sglang/radix_cache.py
+  C_RadixCacheClockHook  ->  RadixCache.__init__ 里 params.now = StateManager.get_global_clock
+```
+
+* 选 `RadixCache.__init__` 而不是 `build_kv_cache`：后者内部就地构造 `params` 并**立刻**
+  `create_tree_cache(...)`，函数返回时缓存已建好，事后注入太晚。
+* `HeterCacheRadixCache` / `PureSWARadixCache` 不定义自己的 `__init__`，继承同一个，
+  所以一次覆盖整个家族；显式传入的 `now`（离线仿真 / 单测）不会被覆盖。
+* **不覆盖 `UnifiedRadixCache`**：它是独立实现，内部读的不是 `_now`，需要另行接线。
+
+两个已知边界（都写进测试）：
+
+| 边界 | 影响 |
+|---|---|
+| `StateManager` 的 `cpu_overhead = time.time() - last_real_time`（`scheduler.py:507-513`）与 `add()` 里的 `time.sleep(0.05)` | 虚拟时钟带真实抖动 → 同输入两次 run 不逐字相同；要确定性得把这两处定值 |
+| `aiconfigurator` 是**硬依赖**（`simulation/utils.py:5`），README 说是可选 | 不装它连 `StateManager` 都 import 不了；测试里用惰性桩绕开 |
+
+验收：`test/manual/test_sim_clock_injection.py`（6 passed）——hook 按模块名/类名命中、
+启动路径确实注册、真实 `HeterCacheRadixCache` 的三处时钟都等于 `StateManager`、
+老化 TTL 在 179.9/180.0 精确翻转、显式 clock 不被覆盖、hook 幂等。
+
 ### 数据集接入（R1）：`session_data.jsonl → List[Session]`
 
 `sim/session_data.py` 逐字段对齐 `bench_heap.py` 的读取口径：
