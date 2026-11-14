@@ -131,7 +131,7 @@ def test_radix_cross_session_hit_promotes_short_session_to_struct():
             page_size=1,
             eviction_policy="heter_cache",
             eviction_policy_config={
-                "weight": {"weights": {"struct": 0.3, "agentic": 0.4, "chat": 0.3}}
+                "value": {"tau_s": 120.0, "floor_tokens": 2048.0}
             },
         )
     )
@@ -174,7 +174,7 @@ def test_classified_agentic_session_tags_new_nodes(tmp_path):
             page_size=1,
             eviction_policy="heter_cache",
             eviction_policy_config={
-                "weight": {"weights": {"struct": 0.3, "agentic": 0.4, "chat": 0.3}}
+                "value": {"tau_s": 120.0, "floor_tokens": 2048.0}
             },
         )
     )
@@ -222,7 +222,7 @@ def test_classified_chat_session_tags_new_nodes():
             page_size=1,
             eviction_policy="heter_cache",
             eviction_policy_config={
-                "weight": {"weights": {"struct": 0.3, "agentic": 0.4, "chat": 0.3}}
+                "value": {"tau_s": 120.0, "floor_tokens": 2048.0}
             },
         )
     )

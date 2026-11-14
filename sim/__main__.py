@@ -4,7 +4,7 @@
 
 1. **装载**（M0）：两个重依赖替身就位后，生产模块能导入，符号表齐全；
 2. **可运行**（M0）：一次最小的 match → insert → evict 证明导入的不是空壳
-   （树、标签、权重仲裁、账本 reconcile 都真的在动）；
+   （树、标签、VD 仲裁、账本 reconcile 都真的在动）；
 3. **虚拟时钟**（M1）：节点时间戳、老化 TTL、one-shot 豁免、承压校准窗口、
    profile 间隔全部由注入的时钟推进，且精确在边界翻转。
 
@@ -23,7 +23,7 @@ from sim import bootstrap
 from sim.allocator import OutOfTokens, TokenAllocator, tree_tokens
 from sim.clock import VirtualClock
 
-WEIGHTS = {"struct": 0.2, "agentic": 0.5, "chat": 0.3}
+VALUE = {"tau_s": 120.0, "floor_tokens": 2048.0}
 
 
 class _CheckAllocator:
@@ -52,14 +52,14 @@ class _CheckReq:
 
 
 def _build(sym, capacity: int = 1200, now=None):
-    """按仿真口径建一个 HeterCache 缓存（page_size=1，权重三队齐全）。"""
+    """按仿真口径建一个 HeterCache 缓存（page_size=1，VD 三队齐全）。"""
 
     alloc = TokenAllocator(capacity)
     cache = sym["HeterCacheRadixCache"].create_simulated(
         mock_allocator=alloc,
         page_size=1,
         eviction_policy="heter_cache",
-        eviction_policy_config={"weight": {"weights": dict(WEIGHTS)}},
+        eviction_policy_config={"value": dict(VALUE)},
         now=now,
     )
     return cache, alloc
@@ -103,7 +103,7 @@ def _check_import(sym) -> list:
             "HeterCacheStrategy",
             "QueueOccupancyTracker",
             "SessionRegistry",
-            "WEIGHT_QUEUES",
+            "VALUE_QUEUES",
         )
         if key not in sym
     ]
@@ -113,7 +113,7 @@ def _check_import(sym) -> list:
 
     print(f"    cache     : {sym['HeterCacheRadixCache'].__name__}")
     print(f"    strategy  : {sym['HeterCacheStrategy'].__name__}")
-    print(f"    queues    : {list(sym['WEIGHT_QUEUES'])}")
+    print(f"    queues    : {list(sym['VALUE_QUEUES'])}")
     return []
 
 

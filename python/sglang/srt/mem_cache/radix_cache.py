@@ -360,8 +360,9 @@ class RadixCache(BasePrefixCache):
             # 但仲裁只拿只读投影（occ），不持有 tracker。
             self.occupancy = heter.occupancy
             self.telemetry = heter.telemetry
+            self.realized = heter.realized
             self._hit_recorder = heter.record_hit
-            # 权重仲裁要 allocator 的可用量/容量判断承压；其它策略不碰 allocator，
+            # VD 仲裁要 allocator 的可用量/容量判断承压；其它策略不碰 allocator，
             # 测试里的极简替身因此仍能跑。
             self._needs_capacity = True
             self.force_agentic = heter.force_agentic
@@ -374,6 +375,7 @@ class RadixCache(BasePrefixCache):
         else:
             self.occupancy = None
             self.telemetry = None
+            self.realized = None
             self._hit_recorder = None
             self._needs_capacity = False
             self.force_agentic = False
@@ -480,6 +482,9 @@ class RadixCache(BasePrefixCache):
             self.occupancy.reset()
         if self.telemetry is not None:
             self.telemetry.reset()
+        if self.realized is not None:
+            # flush 之后旧 run 的命中质量不能继续给队列抬权重。
+            self.realized.reset()
         # Initialize root with minimum priority so any real priority overrides it
         self.root_node = TreeNode(priority=-sys.maxsize)
         self._stamp(self.root_node)
@@ -562,7 +567,7 @@ class RadixCache(BasePrefixCache):
                 len(prompt_ids) if prompt_ids is not None else len(key),
                 tool_call=getattr(req, "tool_call", None),
             )
-        value, last_node = self._match_prefix_helper(
+        value, last_node, by_queue = self._match_prefix_helper(
             self.root_node, key, rid, session_id
         )
         if value:
@@ -571,7 +576,7 @@ class RadixCache(BasePrefixCache):
             value = self._empty_match_result.device_indices
 
         if self._hit_recorder is not None and params.req is not None:
-            self._hit_recorder(params.req, last_node, value.numel())
+            self._hit_recorder(params.req, last_node, value.numel(), by_queue)
         return MatchResult(
             device_indices=value,
             last_device_node=last_node,
@@ -869,27 +874,34 @@ class RadixCache(BasePrefixCache):
         child_key = key.child_key(self.page_size) 
         ##获取当前key的前page_size个逻辑单位作为child_key，从offset=0开始
         value = []
+        # 命中量按节点标签分队列累计：跨队列的请求（共享 struct 前缀 + chat 尾巴）
+        # 归因到单个 tag 会把 VD 算偏，必须逐节点拆分。
+        by_queue = {}
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key] ## 获取匹配的子节点
             prefix_len = child.key.match(key, page_size=self.page_size) ##计算当前节点的key与子节点的key的匹配长度，返回匹配的逻辑单位数量，向下取整为page_size的整数倍
             if prefix_len < len(child.key): ## 如果匹配长度小于子节点的key长度，说明匹配结束在子节点的中间，需要将子节点拆分为两个节点，一个表示匹配的前缀，一个表示剩余的后缀
                 new_node = self._split_node(child.key, child, prefix_len)
                 self._record_cross_session_hit(session_id, new_node)
-                self._record_node_hit(new_node, access_time, rid, session_id)
+                self._record_node_hit(
+                    new_node, access_time, rid, session_id, by_queue
+                )
                 value.append(new_node.value) ## 追加KV张量
                 node = new_node ## 将当前节点更新为新创建的节点
                 break
             else:
                 value.append(child.value) ## 完全匹配追加全量张量
                 self._record_cross_session_hit(session_id, child)
-                self._record_node_hit(child, access_time, rid, session_id)
+                self._record_node_hit(
+                    child, access_time, rid, session_id, by_queue
+                )
                 node = child ## 将当前节点更新为子节点
                 key = key[prefix_len:] ## 将key截断为剩余未匹配的部分
 
                 if len(key): ## 如果还有剩余的key,以page_size为单位获取child_key，用于下一轮匹配
                     child_key = key.child_key(self.page_size)
 
-        return value, node
+        return value, node, by_queue
 
     def _record_cross_session_hit(self, session_id, node: TreeNode) -> None:
         if self._hit_recorder is None or not session_id:
@@ -899,7 +911,12 @@ class RadixCache(BasePrefixCache):
         )
 
     def _record_node_hit(
-        self, node: TreeNode, access_time: float, rid=None, session_id=None
+        self,
+        node: TreeNode,
+        access_time: float,
+        rid=None,
+        session_id=None,
+        by_queue=None,
     ) -> None:
         """Apply the session's type to owned nodes; keep fork/shared tags sticky."""
         delta = access_time - node.last_access_time
@@ -933,6 +950,11 @@ class RadixCache(BasePrefixCache):
                     else HeterCacheNodeTag.QCHAT
                 )
         node.last_access_time = access_time
+        if by_queue is not None:
+            # 按追认后的 tag 记：occ 账本在下次 reconcile 也按新 tag 分区，
+            # 分子分母同源，才不会在标签迁移的那一轮把 VD 算偏。
+            queue = HeterCacheNodeTag.coerce(node.queue_tag).queue_name
+            by_queue[queue] = by_queue.get(queue, 0) + len(node.value)
 
     def _split_node(
            self,

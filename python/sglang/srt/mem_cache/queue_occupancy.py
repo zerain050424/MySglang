@@ -8,7 +8,7 @@
 
 为什么单独成对象：占用是唯一被"记账方"与"决策方"同时需要的状态。放在策略里，
 策略就同时扮演账本与决策器；放在缓存层，又会让驱逐循环直接摸账本内部。抽出来
-之后，谁写（缓存层）、谁读（权重仲裁）在类型层面就分开了。
+之后，谁写（缓存层）、谁读（VD 仲裁）在类型层面就分开了。
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from __future__ import annotations
 import time
 from typing import Callable, Dict, Optional
 
-from sglang.srt.mem_cache.heter_utils import WEIGHT_QUEUES
+from sglang.srt.mem_cache.heter_utils import VALUE_QUEUES
 
 # 承压判据：可用容量占池容量的比例低于它，就把校准窗口缩短到
 # ``PRESSURE_WINDOW_S``。承压时水位变化最快，旧窗口会让仲裁按过期占用点名。
@@ -34,7 +34,7 @@ class QueueOccupancyTracker:
     __slots__ = ("_occ", "_capacity", "_last_reconcile", "_now")
 
     def __init__(self, now: Optional[Callable[[], float]] = None) -> None:
-        self._occ: Dict[str, float] = {q: 0.0 for q in WEIGHT_QUEUES}
+        self._occ: Dict[str, float] = {q: 0.0 for q in VALUE_QUEUES}
         self._capacity = 0.0
         self._now = now if now is not None else time.monotonic
         # -inf 而不是 0：首次淘汰必须校准（真时钟下 now-0 本来就巨大，
@@ -63,7 +63,7 @@ class QueueOccupancyTracker:
         """新节点挂载时增量计入。
 
         Args:
-            queue: 队列名；不在 WEIGHT_QUEUES 内时忽略（random 不参与权重）。
+            queue: 队列名；不在 VALUE_QUEUES 内时忽略（random 不参与 VD 仲裁）。
             tokens: 该节点的 token 数。
         """
         if queue in self._occ:
@@ -111,7 +111,7 @@ class QueueOccupancyTracker:
             snapshot: ``{queue: {"total": t, "one_shot": o}}``，来自全树遍历。
             capacity: 本次拿到的池容量（Token）；拿不到时传 0，容量保持不变。
         """
-        for q in WEIGHT_QUEUES:
+        for q in VALUE_QUEUES:
             rec = snapshot.get(q) or {}
             total = float(rec.get("total", 0.0))
             one_shot = float(rec.get("one_shot", 0.0))
@@ -122,6 +122,6 @@ class QueueOccupancyTracker:
 
     def reset(self) -> None:
         """清空账本（缓存 flush / 跨 run 复用同一进程时调用）。"""
-        for q in WEIGHT_QUEUES:
+        for q in VALUE_QUEUES:
             self._occ[q] = 0.0
         self._last_reconcile = float("-inf")

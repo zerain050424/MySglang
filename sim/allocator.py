@@ -3,7 +3,7 @@
 生产环境的 allocator 管的是 KV 槽位（分配、回收、页对齐、跨 rank 分片），
 但前缀缓存只从它身上读四样东西：
 
-    size               池容量（evict() 用来判承压、profile 用来算权重占比）
+    size               池容量（evict() 用来判承压、profile 用来算占用占比）
     device             折成 torch.device
     available_size()   当前可用 token（_observe_occupancy 用）
     free_segment()     节点被淘汰时归还

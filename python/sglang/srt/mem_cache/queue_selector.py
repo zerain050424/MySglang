@@ -2,41 +2,56 @@ from __future__ import annotations
 
 from typing import Dict, List, Tuple
 
-from sglang.srt.mem_cache.heter_utils import WEIGHT_QUEUES
+from sglang.srt.mem_cache.heter_utils import VALUE_QUEUES
 
 
-def queue_pressure(occ: Dict[str, float], weights: Dict[str, float]) -> List[str]:
-    """按occ_q / w_q降序返回需要优先削减的队列。
+def queue_order(
+    occ: Dict[str, float], value_density: Dict[str, float]
+) -> List[str]:
+    """按 ``occ_q / (1 + VD_q)`` 降序返回候选队列，最前的先削。
 
-    用比值而不是occ_q - w_q * C：权重是比例语义，池容量不参与排序，
-    队列大小量级不同时也不会被绝对值主导。占用为 0 的队列不会进入候选。
+    比值语义：每单位已兑现价值对应的驻留量，越大越应该削。用 ``1 + VD`` 而不是
+    ``VD`` 做分母有两个原因：
+
+    * VD=0 表示"τ 内没有命中证据"，不等于"没有价值"。裸用 ``argmin VD`` 会把
+      刚写入、还没来得及复用的前缀排到最前，造成写入即淘汰的抖动；这里退化为
+      按占用降序（与旧的等权份额同形）。
+    * 分母恒 ≥ 1，不需要为除零加特判。
+
+    占用为 0 的队列不进入候选；同比值按占用降序，再按 ``VALUE_QUEUES`` 声明
+    顺序（确定性）。
 
     Args:
-        occ: 各队列可调度占用（Token，来自 QueueOccupancyTracker，只读）。
-        weights: ``{queue: w}``，键必须覆盖 ``WEIGHT_QUEUES``。
+        occ: 各队列可调度占用（Token），来自 ``QueueOccupancyTracker`` 只读投影。
+        value_density: 各队列的已兑现价值密度（VD），来自 ``QueueValueTracker``。
 
     Returns:
-        队列名列表；压力相同保持 ``WEIGHT_QUEUES`` 的声明顺序（确定性）。
+        队列名列表。
     """
     ranked = [
-        (occ.get(q, 0.0) / weights[q], q)
-        for q in WEIGHT_QUEUES
+        (
+            -(occ[q] / (1.0 + value_density.get(q, 0.0))),
+            -occ[q],
+            index,
+            q,
+        )
+        for index, q in enumerate(VALUE_QUEUES)
         if occ.get(q, 0.0) > 0.0
     ]
-    ranked.sort(key=lambda item: item[0], reverse=True)
-    return [q for _, q in ranked]
+    ranked.sort()
+    return [q for *_, q in ranked]
 
 
 def pick_victim(*, strategy, leaves):
-    """两级淘汰决策：Stage 0 one-shot → Stage 1 权重队列 → 兜底。
+    """两级淘汰决策：Stage 0 one-shot → Stage 1 VD 仲裁 → 兜底。
 
     Args:
-        strategy: HeterCacheStrategy，提供 one-shot 判据、权重排序与队内选点。
+        strategy: HeterCacheStrategy，提供 one-shot 判据、队列排序与队内选点。
         leaves: 当前可驱逐叶子节点集合。
 
     Returns:
-        ``(victim, source)``；source ∈ {"one_shot", "weight:<queue>",
-        "weight:fallback"}。无候选时返回 ``(None, None)``。
+        ``(victim, source)``；source ∈ {"one_shot", "value:<queue>",
+        "value:fallback"}。无候选时返回 ``(None, None)``。
     """
     one_shot = [n for n in leaves if strategy.is_one_shot(n)]
     if one_shot:
@@ -44,11 +59,11 @@ def pick_victim(*, strategy, leaves):
     if not leaves:
         return None, None
 
-    for queue in strategy.pressure_ranking():
+    for queue in strategy.queue_order():
         victim = strategy.queue_victim(queue, leaves)
         if victim is not None:
-            return victim, f"weight:{queue}"
-    return strategy.fallback(leaves), "weight:fallback"
+            return victim, f"value:{queue}"
+    return strategy.fallback(leaves), "value:fallback"
 
 
 def struct_tier(node, share_of, share_min: int) -> Tuple[int, float]:

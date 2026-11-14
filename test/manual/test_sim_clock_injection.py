@@ -88,8 +88,6 @@ from sglang_simulator.simulation.sglang.radix_cache import (  # noqa: E402
     C_RadixCacheClockHook,
 )
 
-WEIGHTS = {"struct": 0.2, "agentic": 0.5, "chat": 0.3}
-
 
 @pytest.fixture(autouse=True)
 def _clean_hooks():
@@ -106,7 +104,7 @@ def _build(sym, *, now=None):
         mock_allocator=TokenAllocator(4096),
         page_size=1,
         eviction_policy="heter_cache",
-        eviction_policy_config={"weight": {"weights": dict(WEIGHTS)}},
+        eviction_policy_config={"value": {"tau_s": 120.0, "floor_tokens": 2048.0}},
         now=now,
     )
 

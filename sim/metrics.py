@@ -5,7 +5,7 @@
 * **请求侧**：``match_prefix`` 返回的命中长度（= 生产 ``meta_info.cached_tokens``
   的口径），以及驱动层算出的 shortfall / 淘汰量 / 水位；
 * **策略侧**：``eviction_strategy.profiler`` 的累计量——按队列的 hit / evicted 与
-  victim 来源（``one_shot`` / ``weight:<queue>`` / ``weight:fallback``）。
+  victim 来源（``one_shot`` / ``value:<queue>`` / ``value:fallback``）。
   ``CacheTelemetry.on_hit`` 会按 rid 去重，所以记录里的 rid 必须唯一。
 """
 

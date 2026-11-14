@@ -5,7 +5,7 @@
 * ``evict_policy``：跨队列仲裁与 one-shot 判定；
 * ``victim_override``：改写器的作用域、共享数阈值、会话类型，以及 agentic
   队内的复用分（lognormal 条件生存概率，``MultiAgenticEvict``）；
-* ``queue_selector`` / profile：队列标签、占用口径与跨队列权重。
+* ``queue_selector`` / profile：队列标签、占用口径与已兑现价值密度（VD）。
 
 命名约定：``HeterCacheNodeTag`` 是**节点级**标签（KV 片段出生时盖章），
 ``SessionType`` 是**会话级**分类（由分类器推得）。两者经常不一致，判定归属时
@@ -74,7 +74,7 @@ class HeterCacheNodeTag(str, enum.Enum):
 
     @property
     def queue_name(self) -> str:
-        """归属队列名（权重配置的键、profile 的列名）。
+        """归属队列名（``VALUE_QUEUES`` 的键、profile 的列名）。
 
         把枚举投影成字符串只是为了对接 CLI 配置（`caps` / `reservations` 的键
         必须是字符串）与日志列名；判定一律用枚举本身。
@@ -86,7 +86,7 @@ class HeterCacheNodeTag(str, enum.Enum):
         """队列名反查枚举；没有对应关系时返回 None。
 
         反向表包含全部四项（含 ``QTRANS`` ↔ ``random``），因此与旧的"队列名
-        等于字符串"判定逐字等价。权重层只会传入 ``WEIGHT_QUEUES`` 里的三个
+        等于字符串"判定逐字等价。仲裁层只会传入 ``VALUE_QUEUES`` 里的三个
         名字，其余名字走 None 分支。
         """
         return _QUEUE_TO_TAG.get(name)
@@ -145,16 +145,16 @@ def session_type_to_node_tag(session_type: SessionType) -> HeterCacheNodeTag:
 #
 # 用 dataclass 而非裸 kwargs：让 eviction_policy_config 有层级、可校验、可整体
 # 传递。配置只接受分组形式
-# {"rr":{...},"slru":{...},"mt":{...},"multi_agentic":{...},"weight":{...}}，
+# {"rr":{...},"slru":{...},"mt":{...},"multi_agentic":{...},"value":{...}}，
 # 拼错的键会在构造处报错——实验配置静默失效比启动失败更难查。
 #
 #   RrParams           : CHAT 会话级轮询（跨会话公平）
 #   SlruParams         : SLRU 的共享会话数阈值（决定 one-shot 分界与保护范围）
 #   MultiTurnParams    : AGENTIC 带内复用间隔权重
 #   MultiAgenticParams : AGENTIC 带内复用分排序（与 MT 互斥）
-#   QueueWeightParams  : 跨队列权重（occ/w 决定淘汰顺序，无硬上限）
+#   QueueValueParams   : 已兑现价值密度（VD）的时间尺度与统计下限
 # 用 dataclass 而不是裸 kwargs，是为了让 `eviction_policy_config` 有层级、能校验、能整体
-# 配置只接受 {"rr":{...},"slru":{...},"mt":{...},"multi_agentic":{...},"weight":{...}}
+# 配置只接受 {"rr":{...},"slru":{...},"mt":{...},"multi_agentic":{...},"value":{...}}
 # 分组形式。
 # ---------------------------------------------------------------------------
 
@@ -165,7 +165,7 @@ def _coerce_params(cls, value, *, name: str):
     Args:
         cls: 参数组类。
         value: None（取默认值）、dict（按关键字展开）或已有实例。
-        name: 错误消息里的配置分组名（如 ``"weight"``）。
+        name: 错误消息里的配置分组名（如 ``"value"``）。
 
     Returns:
         参数组实例。
@@ -379,54 +379,50 @@ class MultiAgenticParams:
         return dataclasses.asdict(self)
 
 
-# 参与跨队列权重仲裁的三级队列。`random` 不在此列：它整行都是 one-shot，
-# 在 Stage 0 就被清掉，永远不会计入权重账本。
-WEIGHT_QUEUES = ("struct", "agentic", "chat")
+# 参与跨队列仲裁的三级队列。`random` 不在此列：它整行都是 one-shot，
+# 在 Stage 0 就被清掉，永远不会计入 VD 账本。
+VALUE_QUEUES = ("struct", "agentic", "chat")
 
-# 默认权重（越大的队列越晚被削，等价于旧 cap 的份额语义，但没有任何硬上限）。
-DEFAULT_QUEUE_WEIGHTS = {"struct": 0.2, "agentic": 0.5, "chat": 0.3}
+# VD 的时间常数：chat 的复用间隔中位数约 118s（_REUSE_CONFIG 的 e^4.77），
+# 取 120s 让"最近被复用过"在 chat 的一个典型间隔内可见；同时是 profile
+# 间隔（30s）的 4 倍，校准抖动不足以翻转排名。
+DEFAULT_VALUE_TAU_S = 120.0
+
+# VD 分母的统计下限：低于这个驻留量时，一次命中的密度没有统计意义
+# （会把 1 token 的队列算成高价值）。它是估值下限，不是保留量。
+DEFAULT_VALUE_FLOOR_TOKENS = 2048.0
 
 
 @dataclasses.dataclass
-class QueueWeightParams:
-    """按权重的跨队列淘汰参数。
+class QueueValueParams:
+    """已兑现价值密度（VD）的参数。
 
-    没有 cap / reservation / deadzone / chunk：淘汰只由「归一化占用」决定，
-    队列 q 的压力是 ``occ_q / w_q``，每轮从压力最大的队列里取一个 victim，
-    队内仍交给该队列的改写器。权重只影响跨队列顺序，不参与队内排序。
+    跨队列仲裁只读 VD（``queue_selector.queue_order`` 的 ``occ/(1+VD)``），
+    没有权重、没有 cap / reservation / deadzone / chunk。
 
     Attributes:
-        weights: 三个队列的权重，必须全部给出且 > 0；比例等价，无需归一化。
+        tau_s: 命中质量的时间常数（秒），越大越记得久。
+        floor_tokens: VD 分母的统计下限（token），不是保留量。
         seed: 兜底随机抽样的种子（同 seed 可复现）。
     """
 
-    weights: Dict[str, float] = dataclasses.field(
-        default_factory=lambda: dict(DEFAULT_QUEUE_WEIGHTS)
-    )
+    tau_s: float = DEFAULT_VALUE_TAU_S
+    floor_tokens: float = DEFAULT_VALUE_FLOOR_TOKENS
     seed: int = 0
 
     def __post_init__(self):
-        unknown = set(self.weights) - set(WEIGHT_QUEUES)
-        if unknown:
+        if self.tau_s <= 0:
+            raise ValueError(f"value.tau_s must be > 0, got {self.tau_s}")
+        if self.floor_tokens <= 0:
             raise ValueError(
-                f"weight.weights has unknown queues {sorted(unknown)}; "
-                f"expected exactly {list(WEIGHT_QUEUES)}."
+                f"value.floor_tokens must be > 0, got {self.floor_tokens}"
             )
-        missing = set(WEIGHT_QUEUES) - set(self.weights)
-        if missing:
-            raise ValueError(
-                f"weight.weights is missing {sorted(missing)}; give all of "
-                f"{list(WEIGHT_QUEUES)} (a missing queue would never be drained)."
-            )
-        for queue, w in self.weights.items():
-            if w <= 0:
-                raise ValueError(f"weight.weights[{queue!r}] must be > 0, got {w}")
         if not isinstance(self.seed, int) or isinstance(self.seed, bool):
-            raise ValueError(f"weight.seed must be int, got {self.seed!r}")
+            raise ValueError(f"value.seed must be int, got {self.seed!r}")
 
     @classmethod
-    def from_any(cls, value=None) -> "QueueWeightParams":
-        return _coerce_params(cls, value, name="weight")
+    def from_any(cls, value=None) -> "QueueValueParams":
+        return _coerce_params(cls, value, name="value")
 
     def as_dict(self) -> dict:
         return dataclasses.asdict(self)
@@ -503,7 +499,7 @@ _QUEUE_NAME = {
 _QUEUE_TO_TAG = {name: tag for tag, name in _QUEUE_NAME.items()}
 
 # profile 的四列，顺序即打印顺序。
-# random 不参与跨队列权重：它整行都是 one-shot，在阶段 0 就被清掉。
+# random 不参与跨队列仲裁：它整行都是 one-shot，在阶段 0 就被清掉。
 QUEUE_NAMES = ("chat", "agentic", "struct", "random")
 
 

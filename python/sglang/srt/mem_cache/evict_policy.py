@@ -5,7 +5,8 @@ import logging
 import random
 import time
 from typing import TYPE_CHECKING, Callable, Optional, Tuple, Union
-from sglang.srt.mem_cache.queue_selector import queue_pressure, struct_tier
+from sglang.srt.mem_cache.queue_selector import queue_order as _queue_order
+from sglang.srt.mem_cache.queue_selector import struct_tier
 from sglang.srt.mem_cache.heter_utils import (
     node_num_tokens,
     ONE_SHOT_IDLE_S,
@@ -15,11 +16,11 @@ from sglang.srt.mem_cache.heter_utils import (
     SessionRegistry,
     SessionType,
     SlruParams,
-    QueueWeightParams,
-    WEIGHT_QUEUES,
+    QueueValueParams,
     HeterCacheNodeTag,
 )
 from sglang.srt.mem_cache.queue_occupancy import QueueOccupancyTracker
+from sglang.srt.mem_cache.queue_value import QueueValueTracker
 from sglang.srt.mem_cache.victim_override import (
     RrEvictPolicy,
     SlruEvictPolicy,
@@ -104,10 +105,11 @@ class SLRUStrategy(EvictionStrategy):
 
 class HeterCacheStrategy(EvictionStrategy):
     """HeterCache 多队列缓存淘汰策略。
+
     两层决策：
-    1. 分带过滤：One-shot 节点优先清理，不计入权重账本；
+    1. 分带过滤：One-shot 节点优先清理，不计入 VD 账本；
        归属会话仍活跃的未匹配节点受时间豁免（ONE_SHOT_IDLE_S）保护，不进带。
-    2. 权重仲裁：按 occ_q / w_q 从大到小排出候选队列，再由队内策略决出具体牺牲节点
+    2. VD 仲裁：按 ``occ_q / (1 + VD_q)`` 排出候选队列，再由队内策略决出牺牲节点。
     """
 
     def __init__(
@@ -118,7 +120,7 @@ class HeterCacheStrategy(EvictionStrategy):
         slru: Union[SlruParams, dict, None] = None,
         mt: Union[MultiTurnParams, dict, None] = None,
         multi_agentic: Union[MultiAgenticParams, dict, None] = None,
-        weight: Union[QueueWeightParams, dict, None] = None,
+        value: Union[QueueValueParams, dict, None] = None,
         now: Optional[Callable[[], float]] = None,
     ):
         # 时间源可注入（单测用假时钟控制 one-shot 豁免窗口的推进）。
@@ -127,12 +129,17 @@ class HeterCacheStrategy(EvictionStrategy):
         self.slru = SlruParams.from_any(slru)
         self.mt = MultiTurnParams.from_any(mt)
         self.multi_agentic = MultiAgenticParams.from_any(multi_agentic)
-        self.weight = QueueWeightParams.from_any(weight)
+        self.value = QueueValueParams.from_any(value)
         self.force_agentic = bool(force_agentic)
 
         self.occupancy = QueueOccupancyTracker()
+        self.realized = QueueValueTracker(
+            tau_s=self.value.tau_s,
+            floor_tokens=self.value.floor_tokens,
+            now=self._now,
+        )
 
-        self._fallback_rng = random.Random(self.weight.seed)
+        self._fallback_rng = random.Random(self.value.seed)
         self.profiler = HeterProfiler()
         self.telemetry = CacheTelemetry(self.profiler)
 
@@ -163,6 +170,7 @@ class HeterCacheStrategy(EvictionStrategy):
         self._now = now
         self.occupancy.use_clock(now)
         self.telemetry.use_clock(now)
+        self.realized.use_clock(now)
         self.session_registry.use_clock(now)
         if self.multi_agentic_evict is not None:
             self.multi_agentic_evict.use_clock(now)
@@ -226,13 +234,28 @@ class HeterCacheStrategy(EvictionStrategy):
 
     # ---- 命中/淘汰记账 ----
 
-    def record_hit(self, req, node, hit_tokens: int) -> None:
-        """记录缓存命中指标。"""
-        self.telemetry.on_hit(
+    def record_hit(self, req, node, hit_tokens: int, by_queue: dict) -> None:
+        """记录一次命中：telemetry 按 rid 去重，VD 只吃首次命中的分队列命中量。
+
+        同一 rid 的 chunked prefill 会重复进入，去重由 telemetry 负责（它已按
+        MAX_SEEN_RIDS 限长）；只有它判定"首次见到"时才更新 VD，否则一个 32k
+        prompt 的 4 个 chunk 会被记 4 遍。
+
+        Args:
+            req: 请求对象（取 rid）。
+            node: 最深命中节点（telemetry 的单事件归因口径，保持历史可比）。
+            hit_tokens: 本次命中的总 token 数。
+            by_queue: ``{queue: tokens}``，按命中节点的标签拆分，供 VD 归因。
+        """
+        first = self.telemetry.on_hit(
             tag=self._node_tag(node),
             hit_tokens=hit_tokens,
             req_id=getattr(req, "rid", None),
         )
+        if not first:
+            return
+        for queue, tokens in by_queue.items():
+            self.realized.on_hit(queue, tokens)
 
     def record_evict(self, node) -> None:
         """记录节点淘汰事件并扣减队列占用。
@@ -240,7 +263,7 @@ class HeterCacheStrategy(EvictionStrategy):
         晋升（hit_count 0→1）会把节点从 one-shot
         带挪进其标签队列，而该队列可能从未收到过对应的 insert 计入
         （one-shot 时 insert 跳过）——evict 会扣一个负项，直到下一次
-        全树快照 reconcile 吸收。random 行仅作展示、不参与权重仲裁；
+        全树快照 reconcile 吸收。random 行仅作展示、不参与 VD 仲裁；
         struct 行的短暂低估方向是少淘汰、多保留，与目标同向。
 
         时间豁免引入反向漂移（轴一）：insert 时会话活跃被计入、evict 时
@@ -272,11 +295,12 @@ class HeterCacheStrategy(EvictionStrategy):
             return
         self.occupancy.insert(self._node_tag(node).queue_name, _node_num_tokens(node))
 
-    # ---- 跨队列权重 ----
+    # ---- 跨队列仲裁（VD） ----
 
-    def pressure_ranking(self) -> list:
-        """按 ``occ_q / w_q`` 降序返回队列；越靠前越先削。"""
-        return queue_pressure(self.occupancy.occ, self.weight.weights)
+    def queue_order(self) -> list:
+        """按 ``occ_q / (1 + VD_q)`` 降序返回队列；越靠前越先削。"""
+        occ = self.occupancy.occ
+        return _queue_order(occ, self.realized.densities(occ))
 
     def queue_victim(self, queue: str, leaves):
         """在指定队列内挑一个淘汰节点；无合适候选返回 None（上层跳队）。"""

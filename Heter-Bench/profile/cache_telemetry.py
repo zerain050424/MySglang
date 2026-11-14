@@ -72,16 +72,19 @@ class CacheTelemetry:
         """是否值得进入事件构造函数。"""
         return heterlog.capturing or heterlog.enabled
 
-    def on_hit(self, tag, hit_tokens: int, req_id=None) -> None:
+    def on_hit(self, tag, hit_tokens: int, req_id=None) -> bool:
         """一次前缀命中；同一 rid 只记一次（chunked prefill 会重复进入）。
 
         Args:
             tag: 节点标签。
             hit_tokens: 本次命中的 token 数。
             req_id: 请求 id；为空时直接忽略（与旧行为一致）。
+
+        Returns:
+            是否为该 rid 的首次命中。VD 账本据此去重，避免同一请求被记多次。
         """
         if req_id is None or req_id in self._seen_rids:
-            return
+            return False
         self._seen_rids.add(req_id)
         self._rid_order.append(req_id)
         if len(self._rid_order) > self.MAX_SEEN_RIDS:
@@ -95,6 +98,7 @@ class CacheTelemetry:
                 hit_tokens=hit_tokens,
                 req=req_id,
             )
+        return True
 
     def on_evict(self, node_id: int, tag, tokens: int, one_shot: bool) -> None:
         """一次节点逐出（级联删除时逐点上报）。"""
@@ -135,11 +139,11 @@ class CacheTelemetry:
         slru_policy,
         multi_agentic_policy=None,
         sched_occ: dict = None,
-        weights: dict = None,
+        values: dict = None,
     ) -> None:
         """渲染并输出一行 profile，同时推进打印时钟。
 
-        只做渲染：可调度占用与权重由调用方传入，这里不做任何仲裁数学。
+        只做渲染：可调度占用与已兑现价值密度由调用方传入，这里不做任何仲裁数学。
         """
         self._last_profile = self._now()
         rendered = self.profiler.summary(
@@ -148,7 +152,7 @@ class CacheTelemetry:
             slru_policy=slru_policy,
             multi_agentic_policy=multi_agentic_policy,
             sched_occ=sched_occ,
-            weights=weights,
+            values=values,
         )
         heterlog.info("Profile", f"[HeterCache profile]\n{rendered}")
 

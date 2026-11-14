@@ -1,12 +1,13 @@
 """按权重的跨队列淘汰：纯函数与策略接线单测（不需要 GPU / torch）。
 
 被测对象：`python/sglang/srt/mem_cache/queue_selector.py`
-  queue_pressure  —— occ_q / w_q 降序
-  pick_victim     —— Stage 0 one-shot → 权重队列 → 兜底
+  queue_order     —— occ_q / (1 + VD_q) 降序
+  pick_victim     —— Stage 0 one-shot → VD 仲裁 → 兜底
   struct_tier     —— STRUCT 两遍降级键
 
-配额机制（caps / reservations / target / deadzone / chunk）已删除，对应的
-水填充与门限测试一并移除；账本记账仍在 QueueOccupancyTracker。
+权重（weights）已整体删除：仲裁只看已兑现价值密度 VD。配额机制（caps /
+reservations / target / deadzone / chunk）同样不在；账本记账仍在
+QueueOccupancyTracker，VD 记账在 QueueValueTracker。
 """
 
 import importlib.util
@@ -39,12 +40,11 @@ for _pkg in ("sglang", "sglang.srt", "sglang.srt.mem_cache"):
 hu = _load("sglang.srt.mem_cache.heter_utils", os.path.join(_CACHE_DIR, "heter_utils.py"))
 # 占用账本已独立成模块，evict_policy 直接依赖它
 _load("sglang.srt.mem_cache.queue_occupancy", os.path.join(_CACHE_DIR, "queue_occupancy.py"))
+_load("sglang.srt.mem_cache.queue_value", os.path.join(_CACHE_DIR, "queue_value.py"))
 qs = _load("sglang.srt.mem_cache.queue_selector", os.path.join(_CACHE_DIR, "queue_selector.py"))
 _load("sglang.srt.mem_cache.victim_override", os.path.join(_CACHE_DIR, "victim_override.py"))
 _load("sglang.srt.mem_cache.heter_bench_bridge", os.path.join(_CACHE_DIR, "heter_bench_bridge.py"))
 ep = _load("sglang.srt.mem_cache.evict_policy", os.path.join(_CACHE_DIR, "evict_policy.py"))
-
-WEIGHTS = dict(hu.DEFAULT_QUEUE_WEIGHTS)
 
 FAILS = []
 
@@ -87,25 +87,31 @@ TAG = {
 
 
 def _strategy(**kw):
-    return ep.HeterCacheStrategy(weight={"weights": dict(WEIGHTS)}, **kw)
+    return ep.HeterCacheStrategy(**kw)
 
 
-def test_pressure_orders_by_weighted_occupancy():
-    """occ/w 降序：权重越大越晚被削；占用为 0 的队列不进入候选。"""
-    print("[1] pressure = occ/w, zero-occupancy queues are skipped")
+def test_queue_order_by_value_density():
+    """occ/(1+VD) 降序：驻留量相对已兑现价值越大越先削；占用为 0 的队列不进入候选。"""
+    print("[1] order = occ/(1+VD), zero-occupancy queues are skipped")
     occ = {"struct": 200, "agentic": 500, "chat": 300}
-    check(qs.queue_pressure(occ, WEIGHTS) == ["struct", "agentic", "chat"],
-          f"occ/w = 1000/1000/1000 must tie in WEIGHT_QUEUES order, "
-          f"got {qs.queue_pressure(occ, WEIGHTS)}")
-    occ = {"struct": 400, "agentic": 400, "chat": 200}
-    check(qs.queue_pressure(occ, WEIGHTS) == ["struct", "agentic", "chat"],
-          f"got {qs.queue_pressure(occ, WEIGHTS)}")
-    check(qs.queue_pressure({"struct": 0, "agentic": 10, "chat": 0}, WEIGHTS) == ["agentic"],
+    # 没有 VD 证据时退化为按占用降序（旧等权份额的形状）
+    check(qs.queue_order(occ, {}) == ["agentic", "chat", "struct"],
+          f"got {qs.queue_order(occ, {})}")
+    check(qs.queue_order({"struct": 0, "agentic": 10, "chat": 0}, {}) == ["agentic"],
           "empty queues must not be candidates")
-    # 权重是比例语义：整体缩放不改变顺序
-    scaled = {q: w * 10 for q, w in WEIGHTS.items()}
-    check(qs.queue_pressure(occ, scaled) == qs.queue_pressure(occ, WEIGHTS),
-          "weights are ratios; scaling them must not change the order")
+    # 相同占用下，VD 高的队列被保护
+    even = {"struct": 400, "agentic": 400, "chat": 400}
+    vd = {"struct": 1.0, "agentic": 0.0, "chat": 0.0}
+    check(qs.queue_order(even, vd) == ["agentic", "chat", "struct"],
+          f"highest VD must be protected, got {qs.queue_order(even, vd)}")
+    # VD 足够大时能翻转 10 倍占用差
+    big = {"struct": 4000, "agentic": 400, "chat": 400}
+    check(qs.queue_order(big, {"struct": 20.0}) == ["agentic", "chat", "struct"],
+          f"VD must flip a 10x occupancy gap, got {qs.queue_order(big, {'struct': 20.0})}")
+    # 同比值按占用降序，再按 VALUE_QUEUES 声明顺序（确定性）
+    tie = {"struct": 800, "agentic": 400, "chat": 400}
+    check(qs.queue_order(tie, {}) == ["struct", "agentic", "chat"],
+          f"ties break by occupancy then declaration order, got {qs.queue_order(tie, {})}")
 
 
 def test_struct_tier():
@@ -207,7 +213,7 @@ def test_snapshot_heals_drift():
           f"chat={st.occupancy.occ['chat']}, want 0 (整行 one-shot)")
 
 
-def test_stage0_one_shot_preempts_weights():
+def test_stage0_one_shot_preempts_arbitration():
     """Stage 0：one-shot 带永远先清，即使别的队列压力更大。"""
     print("[7] stage 0: one-shot drains first even when another queue is heavier")
     st = _strategy()
@@ -225,21 +231,20 @@ def test_stage0_one_shot_preempts_weights():
 
 
 def test_stage1_labels_and_skip():
-    """Stage 1：按权重点名队列，出候选时标 weight:<queue>，无候选则跳队。"""
-    print("[8] stage 1: weighted queues, labels and skip-on-empty")
-    st = ep.HeterCacheStrategy(
-        multi_agentic={"enabled": True}, weight={"weights": dict(WEIGHTS)})
+    """Stage 1：按 VD 排序点名队列，出候选时标 value:<queue>，无候选则跳队。"""
+    print("[8] stage 1: VD-ordered queues, labels and skip-on-empty")
+    st = ep.HeterCacheStrategy(multi_agentic={"enabled": True})
     st.occupancy.reconcile({"struct": {"total": 900, "one_shot": 0},
                             "agentic": {"total": 600, "one_shot": 0},
                             "chat": {"total": 0, "one_shot": 0}}, capacity=1000)
-    rank = st.pressure_ranking()
+    rank = st.queue_order()
     check(rank[0] == "struct",
-          f"struct has the highest occ/w (4500 vs 1200), got {rank}")
+          f"struct has the highest occ/(1+VD) (900 vs 600), got {rank}")
 
     # 第一名 struct 无候选（一个 struct 叶子都没给）-> 跳到 agentic
     agentic_node = _leaf(TAG["agentic"], 100)
     victim, source = qs.pick_victim(strategy=st, leaves=[agentic_node])
-    check(victim is agentic_node and source == "weight:agentic",
+    check(victim is agentic_node and source == "value:agentic",
           f"must skip the empty struct queue, got {source}")
 
     victim, source = qs.pick_victim(strategy=st, leaves=[])
@@ -257,7 +262,7 @@ def test_fallback_is_seeded_random():
     index = {id(n): i for i, n in enumerate(leaves)}
 
     def run(seed):
-        st = ep.HeterCacheStrategy(weight={"weights": dict(WEIGHTS), "seed": seed})
+        st = ep.HeterCacheStrategy(value={"seed": seed})
         st.occupancy.reset()  # 全 0 -> 没有任何队列有压力 -> 直接兜底
         picks = []
         for _ in range(6):
@@ -268,41 +273,34 @@ def test_fallback_is_seeded_random():
     a, b, c = run(0), run(0), run(7)
     check(a == b, f"same seed must reproduce, got {a} vs {b}")
     check(a != c, "different seed should differ")
-    check(all(src == "weight:fallback" for _, src in a),
-          f"all picks must be labelled weight:fallback, got {a}")
+    check(all(src == "value:fallback" for _, src in a),
+          f"all picks must be labelled value:fallback, got {a}")
     state_before = _random.getstate()
     run(0)
     check(_random.getstate() == state_before, "fallback must not touch global random")
 
 
-def test_weight_params_validation():
-    """权重必填三队、必须为正；比例等价。"""
-    print("[10] weight params: all three queues, positive, ratio-invariant")
-    check(hu.QueueWeightParams().weights == hu.DEFAULT_QUEUE_WEIGHTS,
-          "missing config must fall back to DEFAULT_QUEUE_WEIGHTS")
+def test_value_params_validation():
+    """VD 参数：时间常数与统计下限必须为正，seed 必须是 int；未知键报错。"""
+    print("[10] value params: positive tau/floor, int seed, unknown keys rejected")
+    params = hu.QueueValueParams()
+    check(params.tau_s == hu.DEFAULT_VALUE_TAU_S,
+          f"default tau={params.tau_s}, want {hu.DEFAULT_VALUE_TAU_S}")
+    check(params.floor_tokens == hu.DEFAULT_VALUE_FLOOR_TOKENS,
+          f"default floor={params.floor_tokens}, want {hu.DEFAULT_VALUE_FLOOR_TOKENS}")
     for bad in (
-        {"struct": 0.2, "agentic": 0.5},                      # 缺 chat
-        {"struct": 0.2, "agentic": 0.5, "chat": 0.3, "x": 1},  # 未知键
-        {"struct": 0.0, "agentic": 0.5, "chat": 0.3},          # 非正
+        {"tau_s": 0.0},
+        {"tau_s": -1.0},
+        {"floor_tokens": 0.0},
+        {"seed": True},
+        {"nope": 1},
     ):
         try:
-            hu.QueueWeightParams(weights=bad)
+            hu.QueueValueParams.from_any(bad)
         except ValueError:
             pass
         else:
-            check(False, f"invalid weights must be rejected: {bad}")
-    # 比例等价：occ/w 在整体缩放下不变
-    st = _strategy()
-    st.occupancy.reconcile({"struct": {"total": 400, "one_shot": 0},
-                            "agentic": {"total": 400, "one_shot": 0},
-                            "chat": {"total": 200, "one_shot": 0}}, capacity=1000)
-    scaled = ep.HeterCacheStrategy(
-        weight={"weights": {q: w * 10 for q, w in WEIGHTS.items()}})
-    scaled.occupancy.reconcile({"struct": {"total": 400, "one_shot": 0},
-                                "agentic": {"total": 400, "one_shot": 0},
-                                "chat": {"total": 200, "one_shot": 0}}, capacity=1000)
-    check(st.pressure_ranking() == scaled.pressure_ranking(),
-          "scaling all weights must not change the queue order")
+            check(False, f"invalid value params must be rejected: {bad}")
 
 
 def test_multi_agentic_orders_by_reuse_score():
@@ -345,15 +343,14 @@ def test_multi_agentic_orders_by_reuse_score():
                             "agentic": {"total": 900, "one_shot": 0},
                             "chat": {"total": 0, "one_shot": 0}}, capacity=1000)
     victim, source = qs.pick_victim(strategy=st, leaves=[expired, fresh])
-    check(victim is expired and source == "weight:agentic",
-          f"weight:agentic must use the reuse score, got {source}")
+    check(victim is expired and source == "value:agentic",
+          f"value:agentic must use the reuse score, got {source}")
 
 
 def test_queue_policy_assignment():
     """队内策略归属：chat 走 RR，agentic 只由 multi_agentic 出候选。"""
     print("[12] chat uses RR, agentic is served by multi_agentic only")
-    st = ep.HeterCacheStrategy(
-        rr={"fair_rr": True}, weight={"weights": dict(WEIGHTS)})
+    st = ep.HeterCacheStrategy(rr={"fair_rr": True})
     check(st.rr_evict.queue is hu.HeterCacheNodeTag.QCHAT,
           f"RR must own the chat queue, got {st.rr_evict.queue}")
 
@@ -367,7 +364,7 @@ def test_queue_policy_assignment():
     check({id(first), id(second)} == {id(c1), id(c2)},
           "RR must rotate between the two chat sessions")
 
-    off = ep.HeterCacheStrategy(weight={"weights": dict(WEIGHTS)})
+    off = ep.HeterCacheStrategy()
     check(off.rr_evict is None and off.queue_victim("chat", [c1, c2]) is None,
           "without fair_rr the chat queue abstains")
 
@@ -377,8 +374,7 @@ def test_queue_policy_assignment():
           st.queue_victim("agentic", [expired, fresh]) is None,
           "agentic must abstain when multi_agentic is off")
     ma = ep.HeterCacheStrategy(
-        rr={"fair_rr": True}, multi_agentic={"enabled": True},
-        weight={"weights": dict(WEIGHTS)})
+        rr={"fair_rr": True}, multi_agentic={"enabled": True})
     check(ma.queue_victim("agentic", [expired, fresh]) is expired,
           "multi_agentic must pick the node whose reuse window already expired")
 
@@ -454,18 +450,15 @@ def test_per_type_ageing_ttl():
     check(st.one_shot_key(aged) < st.one_shot_key(plain),
           "aged nodes must outrank plain one-shot inside the band")
 
-    partial = ep.HeterCacheStrategy(
-        slru={"ageing_ttl_s": {"struct": 10}}, weight={"weights": dict(WEIGHTS)})
+    partial = ep.HeterCacheStrategy(slru={"ageing_ttl_s": {"struct": 10}})
     check(partial.slru.ageing_ttl_s["struct"] == 10 and
           partial.slru.ageing_ttl_s["chat"] == ttl["chat"],
           "a partial override must merge over the defaults")
-    off = ep.HeterCacheStrategy(
-        slru={"ageing_ttl_s": {"struct": 0}}, weight={"weights": dict(WEIGHTS)})
+    off = ep.HeterCacheStrategy(slru={"ageing_ttl_s": {"struct": 0}})
     check(not off.is_aged(aged), "0 disables ageing for that type only")
     for bad in ({"nope": 1}, {"struct": -1}):
         try:
-            ep.HeterCacheStrategy(
-                slru={"ageing_ttl_s": bad}, weight={"weights": dict(WEIGHTS)})
+            ep.HeterCacheStrategy(slru={"ageing_ttl_s": bad})
         except ValueError:
             pass
         else:
@@ -491,16 +484,16 @@ def test_per_type_ageing_ttl():
 
 def main():
     tests = [
-        test_pressure_orders_by_weighted_occupancy,
+        test_queue_order_by_value_density,
         test_struct_tier,
         test_accounting_insert_and_evict,
         test_random_is_never_counted,
         test_accounting_cascade_decrements_each_node,
         test_snapshot_heals_drift,
-        test_stage0_one_shot_preempts_weights,
+        test_stage0_one_shot_preempts_arbitration,
         test_stage1_labels_and_skip,
         test_fallback_is_seeded_random,
-        test_weight_params_validation,
+        test_value_params_validation,
         test_multi_agentic_orders_by_reuse_score,
         test_queue_policy_assignment,
         test_reuse_window_probability,

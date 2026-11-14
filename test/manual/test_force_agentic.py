@@ -71,8 +71,8 @@ def _in_slru_scope(strategy, node) -> bool:
 
 
 def build(force_agentic):
-    # 按权重的跨队列淘汰：三队权重必填
-    cfg = {"weight": {"weights": {"struct": 0.3, "agentic": 0.4, "chat": 0.3}}}
+    # 按已兑现价值密度（VD）的跨队列淘汰
+    cfg = {"value": {"tau_s": 120.0, "floor_tokens": 2048.0}}
     if force_agentic:
         cfg["force_agentic"] = True
     return HeterCacheRadixCache(

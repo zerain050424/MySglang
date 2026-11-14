@@ -2,7 +2,7 @@
 #
 # 定位：HeterCacheStrategy 的「记账 + 渲染」从策略类中剥离出的独立观测对象
 #   1. 独占四本累计账：total_hit / total_evicted / total_evicted_one_shot /
-#      victim_sources（键为裁决来源：one_shot 带 / weight:<queue> / weight:fallback）；
+#      victim_sources（键为裁决来源：one_shot 带 / value:<queue> / value:fallback）；
 #   2. summary() 渲染 [HeterCache profile] 文本 —— 与旧 profile_summary
 #      逐字节等价（验收基线：diff == 0）；
 #   3. 输出口仅走 HeterLogger（heterlog 双写），本类不持文件句柄。
@@ -33,7 +33,7 @@ class HeterProfiler:
     与 strategy 的契约：
       record_hit / record_evict / record_victim_source —— 三个记账收口由
       策略调用，本类只做累加，不做任何判定；
-      summary(queue_occ, session_summary, slru_policy, weights) —— 纯渲染，
+      summary(queue_occ, session_summary, slru_policy, values) —— 纯渲染，
       参数为只读引用。
     """
 
@@ -88,7 +88,7 @@ class HeterProfiler:
                 slru_policy=None,
                 multi_agentic_policy=None,
                 sched_occ=None,
-                weights=None) -> str:
+                values=None) -> str:
         """返回各队列的 profile 摘要。
 
         字段含义：
@@ -96,9 +96,9 @@ class HeterProfiler:
           occ           : 该队列的全部驻留 token（含 response 段）；
                           `occ(-N)` 后缀 = 其中 one-shot 部分（random 整行、
                           struct 的 response 段）
-          sched / w     : sched 是账本口径的可调度占用（排除 one-shot，含
-                          locked）；w 是该队列的跨队列权重，淘汰顺序按
-                          ``sched / w`` 降序。
+          sched / vd    : sched 是账本口径的可调度占用（排除 one-shot，含
+                          locked）；vd 是该队列的已兑现价值密度（命中质量 /
+                          驻留量），淘汰顺序按 ``sched / (1 + vd)`` 降序。
 
         Σocc == schedulable + Σone_shot。
         多轮负载的 one_shot 恒为 0，不打印后缀；random 整行 one-shot。
@@ -107,7 +107,7 @@ class HeterProfiler:
         weighted = sched_occ is not None
         header = "  queue              hit     evicted             occ"
         if weighted:
-            header += "        sched       w"
+            header += "        sched       vd"
         lines = [header]
         pool = 0
         schedulable = 0
@@ -124,14 +124,14 @@ class HeterProfiler:
                 occ_s += f"(-{c['one_shot']:.0f})"
             row = f"  {q:8s} {hit:>12.0f} {evicted:>12.0f} {occ_s:>16s}"
             if weighted:
-                if weights is not None and q in weights:
+                if values is not None and q in values:
                     row += (
                         f" {(sched_occ or {}).get(q, 0.0):>11.0f}"
-                        f" {weights[q]:>7.2f}"
+                        f" {values[q]:>8.4f}"
                     )
                 else:
-                    # random 不参与权重（整行 one-shot）
-                    row += f" {'-':>11s} {'-':>7s}"
+                    # random 不参与 VD 仲裁（整行 one-shot）
+                    row += f" {'-':>11s} {'-':>8s}"
             lines.append(row)
         lines.append(
             f"  pool={pool:.0f} schedulable={schedulable:.0f} "

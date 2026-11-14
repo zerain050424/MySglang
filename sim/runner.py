@@ -17,7 +17,7 @@ release），差别只在「顺序模型没有并发」：
 from __future__ import annotations
 
 from array import array
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional
 
 from sim import bootstrap
@@ -26,8 +26,6 @@ from sim.clock import VirtualClock
 from sim.metrics import RequestRecord, SimResult, summarize
 from sim.req import OUTPUT_SENTINEL_BASE, FakeReqToTokenPool, SimReq
 from sim.trace import Session, Turn, max_total_len
-
-DEFAULT_WEIGHTS = {"struct": 0.2, "agentic": 0.5, "chat": 0.3}
 
 
 @dataclass
@@ -55,10 +53,11 @@ class Pending:
 
 @dataclass
 class SimConfig:
-    """一次 run 的全部可调项。权重比例等价（只影响仲裁顺序，不参与队内排序）。"""
+    """一次 run 的全部可调项。VD 参数只影响跨队列顺序，不参与队内排序。"""
 
     capacity: int = 4096
-    weights: Dict[str, float] = field(default_factory=lambda: dict(DEFAULT_WEIGHTS))
+    value_tau_s: float = 120.0
+    value_floor_tokens: float = 2048.0
     seed: int = 0
     page_size: int = 1
     eviction_policy: str = "heter_cache"
@@ -117,7 +116,11 @@ class Simulator:
             page_size=cfg.page_size,
             eviction_policy=cfg.eviction_policy,
             eviction_policy_config={
-                "weight": {"weights": dict(cfg.weights), "seed": cfg.seed}
+                "value": {
+                    "tau_s": cfg.value_tau_s,
+                    "floor_tokens": cfg.value_floor_tokens,
+                    "seed": cfg.seed,
+                }
             },
             now=self.clock,
         )

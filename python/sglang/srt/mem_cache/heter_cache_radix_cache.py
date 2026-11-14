@@ -1,8 +1,8 @@
 """HeterCache 后端 RadixCache 实现。
 
-在原生 RadixCache 基础上叠加分带与按权重的跨队列淘汰：
+在原生 RadixCache 基础上叠加分带与按已兑现价值密度（VD）的跨队列淘汰：
 - 优先清理无复用价值的 One-shot 临时节点；
-- 可调度节点委托给 `queue_selector.pick_victim` 按队列权重仲裁。
+- 可调度节点委托给 `queue_selector.pick_victim`，按 VD 仲裁。
 本模块专注执行层面的内存回收、Radix 树拓扑维护与级联修剪。
 """
 
@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 
 class HeterCacheRadixCache(RadixCache):
-    """支持多队列分带、按权重淘汰的 RadixCache 实现。"""
+    """支持多队列分带、按已兑现价值密度淘汰的 RadixCache 实现。"""
 
     def evict(self, params: EvictParams) -> EvictResult:
         """批量淘汰节点，直至释放至少 params.num_tokens 个 Token。
@@ -43,7 +43,7 @@ class HeterCacheRadixCache(RadixCache):
             available = self.token_to_kv_pool_allocator.available_size()
             capacity = float(self.token_to_kv_pool_allocator.size)
 
-        # 淘汰前同步全树占用，防止权重仲裁基于过期水位做出错误倾斜
+        # 淘汰前同步全树占用，防止 VD 仲裁基于过期水位做出错误倾斜
         self._observe_occupancy(available, capacity)
 
         strategy = self.eviction_strategy
@@ -71,7 +71,8 @@ class HeterCacheRadixCache(RadixCache):
 
         编排留在驱动层：只有这里同时知道 allocator 水位、树与会话账本。
         两个时钟分属两个协作者——校准（tracker）服务账本正确性，打印
-        （telemetry）服务观测；任一到期只遍历一次树。
+        （telemetry）服务观测；任一到期只遍历一次树。VD 的物化挂在校准分支里：
+        它必须在 occ 校准之后、用同一时刻的占用做分母。
 
         Args:
             available: allocator 当前可用 token。
@@ -92,6 +93,8 @@ class HeterCacheRadixCache(RadixCache):
         snapshot = self._per_queue_token_count()
         if want_reconcile:
             tracker.reconcile(snapshot, capacity)
+            # 先校准 occ 再物化 VD：分子（命中质量）与分母（驻留量）必须同刻。
+            strategy.realized.materialize()
         if not want_render:
             return
         telemetry.observe_profile(
@@ -100,7 +103,7 @@ class HeterCacheRadixCache(RadixCache):
             slru_policy=strategy.slru_evict,
             multi_agentic_policy=strategy.multi_agentic_evict,
             sched_occ=tracker.snapshot(),
-            weights=strategy.weight.weights,
+            values=strategy.realized.densities(tracker.occ),
         )
 
     def _pick_victim(self, leaves):

@@ -60,7 +60,7 @@ git log --oneline -3 && git status --short
 | 策略的 `victim_overrides` | 缓存层两个 observer 元组恒空 → SLRU 共享数账本停更 → `share_of` 恒 0 → 所有节点被判 one-shot | `rg "node_observers"` 看装配链是否完整 |
 | 策略的 `needs_capacity` | 驱动层 `getattr(..., False)` 拿到 False → `capacity=0` → 账本只能按常规窗口校准，承压时会按过期水位点名 | 起服务看 `[HeterCache profile]` 的 sched 是否与 occ 长期偏离 |
 | 缓存层的 `_per_queue_token_count` | 占用账本失去唯一校准源，`_occ` 只会随增量缓慢漂移 | 它被 `_observe_occupancy` 调用，不是日志 |
-| 缓存层的 `_record_insert` 钩子 | 新建节点不进账本，权重排名恒空、只能走随机兜底 | `test_evict_loop` 会出现 `weight:fallback` 满屏 |
+| 缓存层的 `_record_insert` 钩子 | 新建节点不进账本，VD 排名恒空、只能走随机兜底 | `test_evict_loop` 会出现 `value:fallback` 满屏 |
 
 **归纳**：凡是靠 `getattr(obj, "能力", 默认值)` 探测的能力，删掉实现等于**静默返回默认值**。
 改这类代码时，先 `rg "getattr\(.*strategy"` 把所有探测点列出来。
@@ -112,7 +112,7 @@ sys.modules["sglang.srt.mem_cache"] = m
 ### 5.3 假树测试的陷阱
 
 给假缓存 stub `_per_queue_token_count` 返回 `{}` 时，驱动层新增的 reconcile 会用它把
-测试种下的 `_occ` 清零 → 权重排名为空 → 断言全部走兜底。桩要回显账本：
+测试种下的 `_occ` 清零 → VD 排名为空 → 断言全部走兜底。桩要回显账本：
 
 ```python
 return {q: {"total": v, "one_shot": 0.0} for q, v in self.occupancy.occ.items()}
@@ -154,7 +154,9 @@ Heter-Bench 文档里的历史数字与旧口径说明保留原文，只在需�
 - `HeterCacheStrategy.get_priority` **保持继承基类 + 显式抛 `NotImplementedError`**：
   HeterCache 没有跨队列可比的节点分数，退回任何默认序都是假语义。
 - 配额机制（caps / reservations / 充水 target / deadzone / chunk）已整体删除，
-  跨队列淘汰只按 `weight.weights`：归一化占用 `occ_q / w_q` 最大的队列先削。
+  跨队列淘汰只按已兑现价值密度 VD：`occ_q / (1 + VD_q)` 最大的队列先削。
+  VD 是过去 `tau_s` 内按队列的时间衰减命中量除以驻留量；权重（`weight.weights`）
+  已整体删除，`VD=0` 退化为按占用降序。
   不要再引入任何硬上限或保底预留。
 - 全局复用分（`_reuse_score` / `victim_key`）已整体删除，不要以任何形式复活。
 - 观测三层已分离：`QueueOccupancyTracker`（账本）、`CacheTelemetry`（时钟+打点）、

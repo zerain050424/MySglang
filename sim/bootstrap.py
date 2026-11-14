@@ -153,10 +153,10 @@ def load(force: bool = False) -> Dict[str, Any]:
     from sglang.srt.mem_cache.heter_cache_radix_cache import HeterCacheRadixCache
     from sglang.srt.mem_cache.heter_utils import (
         HeterCacheNodeTag,
-        QueueWeightParams,
+        QueueValueParams,
         SessionRegistry,
         SessionType,
-        WEIGHT_QUEUES,
+        VALUE_QUEUES,
     )
     from sglang.srt.mem_cache.queue_occupancy import QueueOccupancyTracker
     from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
@@ -177,12 +177,12 @@ def load(force: bool = False) -> Dict[str, Any]:
         "EvictResult": EvictResult,
         # 策略与账本
         "HeterCacheStrategy": HeterCacheStrategy,
-        "QueueWeightParams": QueueWeightParams,
+        "QueueValueParams": QueueValueParams,
         "QueueOccupancyTracker": QueueOccupancyTracker,
         "SessionRegistry": SessionRegistry,
         "SessionType": SessionType,
         "HeterCacheNodeTag": HeterCacheNodeTag,
-        "WEIGHT_QUEUES": WEIGHT_QUEUES,
+        "VALUE_QUEUES": VALUE_QUEUES,
     }
     return _LOADED
 

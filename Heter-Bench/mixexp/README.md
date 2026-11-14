@@ -3,7 +3,7 @@
 
 # mixexp · 混合负载实验套件
 
-本实验套件（`exp3`）用于评估在四类异构负载混合且主导类变化的场景下，HeterCache（三队列 + 队内策略 + 权重仲裁）相比单策略（LRU / LFU / SLRU / T-LRU）的收益，以及各模块的消融贡献。
+本实验套件（`exp3`）用于评估在四类异构负载混合且主导类变化的场景下，HeterCache（三队列 + 队内策略 + VD 仲裁）相比单策略（LRU / LFU / SLRU / T-LRU）的收益，以及各模块的消融贡献。
 
 实验包含四个单类主导的测试场景（cell）。每个 cell 中四类负载同时在场，其中一类按 token 占优，用于分别检验不同压力源下多队列隔离的效果：
 
@@ -79,10 +79,10 @@ python mixexp/tools/build_exp3_data.py --mix scan --total-tokens 3e6
 | arm | 策略 | 用途 |
 |---|---|---|
 | `lru` | lru | 基础基线：全局单一 LRU |
-| `hc_full` | heter_cache | 完整方案：三队列 + 队内策略 + 权重仲裁 |
+| `hc_full` | heter_cache | 完整方案：三队列 + 队内策略 + VD 仲裁 |
 | `hc_norr` | heter_cache | 消融项：关闭会话轮询（chat 队内退化） |
 
-> 说明：当前版本已移除配额机制（无 cap 与 reservation）。跨队列淘汰顺序由 `weight.weights` 决定，优先从归一化占用 `occ_q / w_q` 最大的队列中驱逐。默认权重为 `struct 0.2 / agentic 0.5 / chat 0.3`（仅表示相对比例，支持等比缩放）。
+> 说明：当前版本已移除配额机制（无 cap 与 reservation）与权重（`weight.weights` 已整体删除）。跨队列淘汰顺序由已兑现价值密度 VD 决定：优先驱逐 `occ_q / (1 + VD_q)` 最大的队列，其中 VD 是过去 `tau_s` 内按队列统计的时间衰减命中量除以驻留量。VD=0（没有命中证据）时退化为按占用降序。
 
 ---
 
@@ -115,7 +115,7 @@ mkdir -p mixexp/result/exp3/chat
 
 # 1) 起 server（hc_full 臂；arms_exp3.tsv 的 policy / policy_config 原样搬过来）
 POLICY=heter_cache MAX_TOTAL_TOKENS=198000 \
-  POLICY_CONFIG='{"weight":{"weights":{"struct":0.2,"agentic":0.5,"chat":0.3}},"rr":{"fair_rr":true,"kappa":0.5,"min_retain_tokens":512,"min_retain_frac":0.3},"slru":{"share_min":2},"mt":{"enabled":true}}' \
+  POLICY_CONFIG='{"value":{"tau_s":120.0,"floor_tokens":2048.0},"rr":{"fair_rr":true,"kappa":0.5,"min_retain_tokens":512,"min_retain_frac":0.3},"slru":{"share_min":2},"mt":{"enabled":true}}' \
   EXTRA_ARGS="--kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.85" \
   LOG=mixexp/result/exp3/chat/server_full_hc_full.log \
   bash scripts/serve.sh          # 前台；另开终端等 curl -sf .../health 返回 200
