@@ -7,6 +7,10 @@
 > 硬件：NVIDIA RTX 5090 D（32GB） | 模型：`Qwen2.5-7B-Instruct`
 > 运行环境 python：`/root/sl_old/bin/python`（UniCache 部署 venv）
 
+> **驱动已下线（2026-11）**：本文的 `bench_hetercache.py` / `run_all.sh` 命令已随旧
+> 发射器一并删除，仅作历史记录；当前驱动为 `scripts/bench_heap.py`（只支持
+> `--tasks-config`，无单负载 / 相位 / burst-pause 模式）。
+
 本文覆盖完整流程：**初始化环境 → 启动服务器 → 单一负载测试 → 多负载（混合）测试**，
 并在最后给出**各数据集的测试时间预估**。
 

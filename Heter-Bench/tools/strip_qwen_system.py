@@ -112,7 +112,7 @@ def main() -> int:
             except json.JSONDecodeError as exc:
                 print(f"{src}:{line_no} 不是合法 JSON：{exc}", file=sys.stderr)
                 return 1
-            # 数据格式是 {session_id: session}（与 bench_hetercache.load_sessions /
+            # 数据格式是 {session_id: session}（与 bench_heap.load_sessions /
             # prepare_session_data.py 一致）。直接把整行当 session 用会让 num_turns
             # 恒为 0、改写轮次恒为 0——上一版就是这么静默失效的。
             if not isinstance(obj, dict) or len(obj) != 1:

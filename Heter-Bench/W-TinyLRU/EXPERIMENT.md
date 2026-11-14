@@ -96,7 +96,7 @@ python -m wtl.synth --out-dir data/exp/D2 \
 ```
 
 > `noise_frac=2.0` ⇒ burst 会话数 = 2 × 模板会话数；`--phased` 把 burst 均分到每个模板块之后。
-> 需要 `--no-shuffle` 才能保住块顺序；在线端用 `bench_hetercache.py --no-shuffle`（已支持）。
+> 需要 `--no-shuffle` 才能保住块顺序；在线端当时用 `bench_hetercache.py --no-shuffle`（该驱动已删除）。
 
 ### 3.3 D-SLRU（主场景）
 
@@ -165,7 +165,7 @@ python -m wtl.synth --out-dir data/exp/D2 \
 |---|---|---|
 | **命中率** | `Σcached_tokens / Σprompt_tokens`，**按成分拆分**（struct / burst） | 离线 rows、在线逐请求 CSV |
 | **结构复用保留度** | `ret@P full_rate`（模板前缀整段命中比例）、`cover@P`（部分保留） | `RetentionTracker` |
-| **TTFT** | `p50 / p90 / p99`，并给 `prefill_ms` 与 `queue_time_ms` 分解 | 在线 `bench_hetercache` CSV |
+| **TTFT** | `p50 / p90 / p99`，并给 `prefill_ms` 与 `queue_time_ms` 分解 | 在线 CSV（旧 `bench_hetercache` 产出，已下线） |
 
 ### 5.2 护栏
 
@@ -207,7 +207,7 @@ python -m wtl.synth --out-dir data/exp/D2 \
 |---|---|---|---|---|---|
 | **S6** | A0, A2, A3 | D2 | 200k / 50k tokens | 42 | **6 次** |
 
-每次 `bench_hetercache` 跑 D2（768 session、~1150 请求、并发 32）约 8–12 分钟 ⇒
+当时每次 `bench_hetercache` 跑 D2（768 session、~1150 请求、并发 32）约 8–12 分钟 ⇒
 **约 1–1.5 小时机时**。只跑 6 次是有意的：TTFT 用**同池同负载的配对残差**判断，
 不需要多 seed 覆盖（每请求都是一次配对样本）。
 
@@ -248,9 +248,7 @@ python -m wtl.run_matrix --mode synth --no-shuffle --data-dir result/data/dslru 
 # 4) 汇总（配对 CI + 判定表 + 两张图）
 python -m wtl.analyze --offline result/offline --prefix-stats result/prefix_stats.json
 
-# 5) 在线 TTFT（GPU 机器，6 次）
-ARMS="A0 A2 A3" MODES=exp_D2 TOKENS_LIST="200000 50000" SEEDS=42 \
-  bash scripts/run_online.sh
+# 5) 在线 TTFT（GPU 机器，6 次）—— 已下线：run_online.sh 与旧驱动均已删除
 ```
 
 > `--no-shuffle` 与 `--data-dir` 是本次需要补的两个小参数（各 ~5 行）；

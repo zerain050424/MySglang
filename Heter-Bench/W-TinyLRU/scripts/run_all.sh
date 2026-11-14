@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 一键全流程：Phase-0 门控 → 离线矩阵 → 分析（在线部分需自己跑 run_online.sh）
+# 一键全流程：Phase-0 门控 → 离线矩阵 → 分析（在线路径已随旧驱动下线）
 #
 #   bash scripts/run_all.sh              # 全量（耗时较长）
 #   bash scripts/run_all.sh --quick      # 小规模冒烟：20 session × 2 臂 × 1 压力
@@ -56,4 +56,4 @@ echo "== [3/4] analyze（在线结果缺失时自动跳过对应判据）"
   --struct 'result/online/struct_*.jsonl' || exit 1
 
 echo "== [4/4] 完成：result/analysis/summary.md"
-echo "   在线 TTFT 请另跑：ARMS='A0 A2 A3' bash scripts/run_online.sh"
+echo "   在线 TTFT 路径已下线（旧驱动 bench_hetercache.py 已删除）"

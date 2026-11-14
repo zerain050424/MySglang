@@ -16,7 +16,7 @@
 #     python mixexp/tools/build_exp3_data.py --only struct --struct-prefix-tokens 4000
 #
 # lambda_rate = 会话数 / 12000s，四类同时收尾，混合组成不随时间漂移。
-# 池容量与并发由 run_exp3.sh 传入（mem-fraction 0.85 + fp8 KV，约 198k token）。
+# 池容量与并发由启动命令传入（mem-fraction 0.85 + fp8 KV，约 198k token）。
 # chat / agentic 两类带 min_turns: 5（= MULTI_TURN_MIN），bench 起跑前校验
 # 选中会话都活得到非 TRANS 轮次；chat 的源是 prepare_data.sh 步 2 的 *.mt5.jsonl。
 tasks:

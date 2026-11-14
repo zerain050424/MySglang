@@ -220,7 +220,7 @@ def default_task_paths(sg_root: Path) -> List[Path]:
 
 
 # ---------------------------------------------------------------------------
-# 真实 trace（bench_hetercache.py 输出的 CSV）
+# 真实 trace（scripts/bench_heap.py 输出的 CSV）
 # ---------------------------------------------------------------------------
 
 

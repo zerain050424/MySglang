@@ -10,7 +10,7 @@
 
 | 类别 | 路径 | 说明 |
 |---|---|---|
-| 压测驱动 | `../scripts/bench_hetercache.py` | asyncio + aiohttp，混合负载，逐请求 CSV |
+| 压测驱动 | `../scripts/bench_heap.py` | 堆 + 真实墙钟，混合负载，逐请求 CSV（旧 `bench_hetercache.py` 已删除） |
 | 起 server | `../scripts/{serve,env,config}.sh` | `POLICY` × `MAX_TOTAL_TOKENS` |
 | 数据 | `TaskData/` | alfred(agentic) / apps(random) / Codeparrot(single) / ShareGPT(text) |
 | 标定 | `../tools/calibrate.py` | 冷启动 prefill 速率 → `ttft = a + b·L` |

@@ -1,6 +1,6 @@
 # =============================================================================
-# Heter-Bench 配置（被 run_all.sh source；也可手动 export 覆盖）
-# 用法：source config.sh 后运行 run_all.sh
+# Heter-Bench 配置（被 serve.sh source；也可手动 export 覆盖）
+# 用法：source config.sh 后再跑 serve.sh
 # =============================================================================
 
 # 模型路径（tokenizer 必须与数据准备时一致，否则 token ids 错位）
@@ -23,7 +23,7 @@ export DATA=${DATA:-/root/sg-unicache/Uni-Bench/TaskData/SharedGPT-multi-turn/Qw
 export CONC=${CONC:-32}
 
 # 混合负载配置（模仿 HeterCache TaskData/Hybrid/*/tasks_config.yaml）。
-# 用 bench_hetercache.py --tasks-config 时生效；每个 task 的 lambda_rate 之比即混合比例。
+# 用 bench_heap.py --tasks-config 时生效；每个 task 的 lambda_rate 之比即混合比例。
 export HYBRID_TASKS_CONFIG=${HYBRID_TASKS_CONFIG:-$BENCH_DIR/configs/hybrid_tasks_config.yaml}
 # 会话到达节奏缩放：1=HeterCache 真实 Poisson 到达；0=全部立即到达（等同单负载并发）。
 export ARRIVAL_SCALE=${ARRIVAL_SCALE:-1.0}

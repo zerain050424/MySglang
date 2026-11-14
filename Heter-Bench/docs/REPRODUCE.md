@@ -3,6 +3,10 @@
 本目录在服务器 `/root/sg-unicache/Uni-Bench`，是对本地 HeterCache 数据准备与发送逻辑的
 **复用 + 服务器适配**。所有脚本含中文注释，可直接按序执行。
 
+> **驱动已下线（2026-11）**：本文的 `bench_hetercache.py` / `run_all.sh` 命令已随旧
+> 发射器一并删除，仅作历史记录；当前驱动为 `scripts/bench_heap.py`（只支持
+> `--tasks-config`，无单负载 / 相位 / burst-pause 模式）。
+
 ## 环境
 
 | 组件 | 位置 |

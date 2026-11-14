@@ -11,14 +11,11 @@ Heter-Bench/
   docs/                   # 说明与实验报告，索引见 docs/README.md
   archive/                # 历史配置快照，仅供追溯
 
-  scripts/                # 运行入口（实验机按路径调用，改名/搬动前先改 queue_detect.sh）
-    bench_hetercache.py   # 多轮压测 driver（asyncio + aiohttp）
+  scripts/                # 运行入口
+    bench_heap.py         # 压测驱动：最小堆 + 真实墙钟，到点发、不等结束、空窗不占槽
+                          # （对齐 UniCache simulator 的调度语义；只支持 --tasks-config）
     serve.sh              # 起单个 server（指定 policy / cache 大小）
-    run_all.sh            # 实验矩阵：policy × cache 大小，自动启停 + 汇总
-    run_single.sh         # 单场景驱动
-    run_ShareGPT_first10.py  # 冒烟：前 10 个 session
-    queue_detect.sh       # 远端：排队检测 + 分阶段负载
-    config.sh / env.sh    # 配置与环境变量（被上面几个 source）
+    config.sh / env.sh    # 配置与环境变量（被 serve.sh source）
 
   configs/                # 全部 yaml / json 配置
     arrival_config.yaml                  # 轮间到达间隔，按 session_id 前缀区分负载
@@ -73,11 +70,11 @@ cd /home/rain/sglang
 # 1) 起实验组 server（另一个终端）
 POLICY=heter_cache MAX_TOTAL_TOKENS=200000 bash Heter-Bench/scripts/serve.sh
 
-# 2) 跑 driver（20-session demo）
-python Heter-Bench/scripts/bench_hetercache.py \
-  --data-path /home/rain/HeterCache/demo/ShareGPT_cleaned_valid_session_data_head20.jsonl \
+# 2) 跑 driver（smoke 配比：四类各 10 条 session）
+python Heter-Bench/scripts/bench_heap.py \
+  --tasks-config Heter-Bench/mixexp/configs/mix_smoke.yaml \
   --base-url http://127.0.0.1:30000 \
-  --concurrency 8 \
+  --max-inflight 8 --wait-scale 0 \
   --output Heter-Bench/result/smoke.json
 
 # 3) 观察 server 日志里的 [HeterCache profile]（每 30s）：text 队列应有 hit/evicted/alpha
@@ -98,10 +95,10 @@ POLICY=heter_cache MAX_TOTAL_TOKENS=100000 bash scripts/serve.sh
 
 # 跑混合负载（4 类负载 lambda_rate=1:1:1:1，见 configs/hybrid_tasks_config.yaml）
 source scripts/env.sh
-"$PY" scripts/bench_hetercache.py \
+"$PY" scripts/bench_heap.py \
   --tasks-config configs/hybrid_tasks_config.yaml \
   --base-url http://127.0.0.1:30000 \
-  --concurrency 32 --arrival-scale 1 --wait-scale 1 \
+  --arrival-scale 1 --wait-scale 1 \
   --output result/hybrid.json
 ```
 
@@ -115,23 +112,20 @@ source scripts/env.sh
 
 结果 JSON 含 `per_task` 字段：每个负载各自的命中率细分。
 
-## 跑完整实验矩阵
+## 跑多臂矩阵
 
-```bash
-cd /home/rain/sglang
-# 编辑 Heter-Bench/scripts/config.sh：DATA 换成全量 session_data.jsonl
-bash Heter-Bench/scripts/run_all.sh
-```
-默认矩阵：`POLICIES="lru heter_cache"` × `TOKENS_LIST="50000 100000 200000"`。
+矩阵脚本（原 `run_all.sh` / `run_mixexp.sh` / `run_single.sh`）已随旧 driver 一并删除。
+现在按臂逐次手动跑：每个臂起一次 server（`serve.sh`）→ 跑一次 `bench_heap.py` → 停 server。
+`result/` 下历史结果不受影响。
 
 ## 关键参数
 
 | 参数 | 含义 | 调参建议 |
 |---|---|---|
-| `--concurrency` / `CONC` | 并发会话数 | 越大竞争越激烈，越能区分 policy |
+| `--max-inflight` | 同时在飞的请求上限 | 0=不限（排队交给服务端）；设值即驱动侧限流 |
 | `--max-total-tokens` | KV pool token 上限 | **关键**：调到装不下工作集，淘汰才会发生 |
 | `--wait-scale` | 轮间等待缩放 | 0=快速跑；1=按 lognormal(mu,sigma) 真实等待 |
-| `--num-sessions` | 使用 session 数 | -1=全部 |
+| 配置里的 `max_record` | 每个 task 用多少 session | 冒烟 10；正式 500~2000 |
 
 ## 指标解读
 
@@ -155,8 +149,8 @@ bash Heter-Bench/scripts/run_all.sh
 
 ## 与其他基线的对比
 
-把 `POLICIES` 改成 `"lru lfu slru heter_cache"` 即可多基线对比（这些策略都在
-`RADIX_EVICTION_POLICY_CHOICES` 里，无需 `--enable-heter-cache`）。
+把 `serve.sh` 的 `POLICY` 换成 `lru` / `lfu` / `slru` / `heter_cache` 即可多基线对比
+（这些策略都在 `RADIX_EVICTION_POLICY_CHOICES` 里，无需 `--enable-heter-cache`）。
 
 ## 四阶段负载自动预测准确率实验
 
@@ -170,15 +164,8 @@ bash Heter-Bench/scripts/run_all.sh
 
 结构复用真值仅指 Codeparrot；AgentBank apps 保留为 `random`。先启动服务，再运行：
 
-```bash
-POLICY=heter_cache MAX_TOTAL_TOKENS=100000 bash scripts/serve.sh
-source scripts/env.sh
-"$PY" scripts/bench_hetercache.py \
-  --phases-config configs/phased_load_prediction.yaml \
-  --base-url http://127.0.0.1:30000 \
-  --concurrency 32 --arrival-scale 1 --wait-scale 1 \
-  --output result/phased_load_prediction.json
-```
+**驱动已下线**：分阶段（`--phases-config`）模式随旧 driver 一并删除，`bench_heap.py`
+只支持 `--tasks-config`。要重跑这条实验，需要先给新驱动补回相位调度。
 
 **数据源已下线**：这里原本依赖 server 侧 `SGLANG_QUEUE_OCC_LOG` 打印的 `[QueueOcc]`
 日志。该采样器（策略无关的队列占用日志）已从 `radix_cache` 删除，现在只有

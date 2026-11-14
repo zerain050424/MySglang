@@ -1,5 +1,9 @@
 # LRU vs HeterCache：搅拌压力下的前缀缓存存活能力
 
+> **驱动已下线（2026-11）**：本文的 `bench_hetercache.py` / `run_all.sh` 命令已随旧
+> 发射器一并删除，仅作历史记录；当前驱动为 `scripts/bench_heap.py`（只支持
+> `--tasks-config`，无单负载 / 相位 / burst-pause 模式）。
+
 > 位置：`/root/sg-unicache/Uni-Bench/tailshot/`
 > 结论速览：把「重访间隔」固定为 30 s，只扫「池子周转速率」——LRU 在
 > `池容量 / F ≈ 30 s` 处发生**阈值型崩溃**（受害者重算率 8.5% → 98.1%，

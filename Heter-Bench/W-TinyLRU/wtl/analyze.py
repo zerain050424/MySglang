@@ -117,7 +117,7 @@ def _parse_seed(stem: str) -> int:
 
 
 def load_online_rows(pattern: str) -> Dict[str, List[dict]]:
-    """读取 bench_hetercache 的逐请求 CSV（文件名去掉 .json 加 .csv）。"""
+    """读取 scripts/bench_heap.py 的逐请求 CSV（文件名去掉 .json 加 .csv）。"""
     out: Dict[str, List[dict]] = {}
     for path in sorted(glob.glob(os.path.join(pattern, "*.csv"))):
         rows = []
@@ -258,7 +258,7 @@ def _hist_full(r: dict) -> float:
 
 
 def _norm_online_row(r: dict) -> dict:
-    """把 bench_hetercache 的 CSV 行规范化成与离线 rows 同构（并转数值）。"""
+    """把 bench_heap 的 CSV 行规范化成与离线 rows 同构（并转数值）。"""
 
     def num(key):
         v = r.get(key)
@@ -782,7 +782,7 @@ def main(argv=None) -> int:
     online = load_online(a.online)
     online_rows = load_online_rows(a.online)
     if not runs and not online:
-        print("[analyze] 没找到结果：先跑 wtl.run_matrix / scripts/run_online.sh")
+        print("[analyze] 没找到结果：先跑 wtl.run_matrix")
         return 2
 
     off_rows = offline_table(runs)

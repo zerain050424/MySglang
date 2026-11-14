@@ -132,7 +132,7 @@ S1 是纯观测改动，验收标准是**零回归**；S2、S3 才允许指标�
 ## 4. 不做的事
 
 - 不动 `_reuse_score` / `is_one_shot` / 两带结构 / alpha 控制器。
-- 不动 `TaskData`、`bench_hetercache.py`、`exp/` 下的实验脚本。
+- 不动 `TaskData`、驱动脚本、`exp/` 下的实验脚本。
 - 不引入 `cost()` 折算（见 `design1.md` §9）。
 - 不做跨 workload 仲裁。
 

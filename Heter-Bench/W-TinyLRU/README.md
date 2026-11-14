@@ -20,7 +20,7 @@ W-TinyLRU/
 │   ├── serve.py               python -m wtl.serve（带埋点的 launch_server）
 │   ├── analyze.py             表 + 配对 bootstrap + 图
 │   └── gate.py                Phase-0 门控（G1–G5）
-├── scripts/                   run_offline.sh / run_online.sh / run_all.sh / run_gate.sh
+├── scripts/                   run_offline.sh / run_all.sh / run_gate.sh（在线路径已下线）
 ├── tests/test_smoke.py        无 GPU 链路测试（8 项）
 └── result/                    输出（offline / online / analysis / gate.json）
 ```
@@ -73,9 +73,8 @@ bash scripts/run_offline.sh --arms all --workloads sharegpt,alfred,codeparrot \
 bash scripts/run_offline.sh --mode synth --arms A0,A1,A2,A3 \
      --synth-depths 512,2048,8192 --synth-breadths 3,10 --ratios 0.3,0.6
 
-# 5) 真机 TTFT（L2，需 GPU + 模型）
-ARMS="A0 A2 A3" MODES="hybrid sharegpt" TOKENS_LIST="100000" SEEDS="42" \
-  bash scripts/run_online.sh
+# 5) 真机 TTFT（L2）—— 在线路径已下线：run_online.sh 随旧驱动
+#    bench_hetercache.py 一并删除，这一步无法再跑，离线矩阵不受影响。
 
 # 6) 分析
 python -m wtl.analyze --offline result/offline --online result/online \

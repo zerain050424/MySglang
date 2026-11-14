@@ -5,7 +5,7 @@
 #   突发期同一批会话在 20 秒内集中到达（到达率放大 10 倍），随后回到基线。
 #
 # 会话总数与 mix_full.yaml 一致（apps 15 000 / chat 800 / agentic 96 / struct 2 600）。
-# 用法：bash mixexp/run_mixexp.sh --scale full --mode drift ...
+# 用法：相位模式仅旧 driver 支持（已删除）；本文件保留作配置参考。
 #       （--mode drift 即相位模式，读取本目录下的 drift_phases.yaml）
 #
 # data_path 相对 Heter-Bench 根目录解析。
