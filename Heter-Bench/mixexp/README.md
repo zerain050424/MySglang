@@ -1,7 +1,7 @@
 # mixexp · 混合负载实验套件
 
 回答一个问题：**异构负载混合、且主导类会轮换时，HeterCache 的三队列 + 队内策略 +
-配额仲裁，是否比单策略（LRU / LFU / SLRU / T-LRU）更好，以及每个部件各自贡献多少。**
+权重仲裁，是否比单策略（LRU / LFU / SLRU / T-LRU）更好，以及每个部件各自贡献多少。**
 
 实验主体是**四个单类主导的 cell**。每个 cell 里四类负载同时在场，但只有一类
 按 token 占优——这样每个 cell 都在问同一个问题的不同切面：当压力主要来自这一类时，
@@ -77,17 +77,11 @@ TOTAL_TOKENS=3e6 CONC=8 bash mixexp/run_exp3.sh --build-data --mix scan
 | arm | 策略 | 用途 |
 |---|---|---|
 | `lru` | lru | 最弱基线：全局单一最近性顺序 |
-| `hc_full` | heter_cache | 完整方案：三队列 + 队内策略 + 配额仲裁 |
+| `hc_full` | heter_cache | 完整方案：三队列 + 队内策略 + 权重仲裁 |
 | `hc_norr` | heter_cache | 消融：关会话轮询（chat 队内退化） |
-| `hc_demandcap` | heter_cache | 消融：配额按 mid 实测需求对齐（0.05/0.92/0.03），归因 cap 错配 |
 
-`hc_full` 的配额是 `caps = struct 0.20 / agentic 0.50 / chat 0.30`（合计 1.0），
-`reservations = 0.05 / 0.20 / 0.10`。`random`（one-shot）队列**不在配额账本里**：
-它整行都是 one-shot，在 Stage 0 就被清掉，所以单轮冲刷流量不受 caps 约束。
-
-> 这套 caps 是定性配的（agentic 长会话最需要保前缀），**没有按四个新 cell 重新标定**。
-> 想让结论更强，先跑一轮看 server 日志里 `[HeterCache profile]` 的 per-queue 占用与
-> target，再决定要不要给每个 cell 单独配 caps。
+> 配额机制已整体删除：跨队列顺序只由 `weight.weights` 决定，归一化占用 `occ_q / w_q` 最大的队列先被削，没有 cap / reservation。
+默认权重 `struct 0.2 / agentic 0.5 / chat 0.3`（比例语义，可整体缩放）。
 
 ---
 

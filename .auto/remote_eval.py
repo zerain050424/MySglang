@@ -45,7 +45,7 @@ UPLOAD = [
     "python/sglang/srt/mem_cache/evict_policy.py",
     "python/sglang/srt/mem_cache/victim_override.py",
     "python/sglang/srt/mem_cache/heter_utils.py",
-    "python/sglang/srt/mem_cache/quota_selector.py",
+    "python/sglang/srt/mem_cache/queue_selector.py",
     "python/sglang/srt/mem_cache/queue_occupancy.py",
     "python/sglang/srt/mem_cache/heter_cache_radix_cache.py",
     "python/sglang/srt/mem_cache/heter_bench_bridge.py",

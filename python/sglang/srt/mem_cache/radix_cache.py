@@ -350,19 +350,19 @@ class RadixCache(BasePrefixCache):
         )
         self._heter = heter
         if heter is not None:
-            # 账本归驱动层持有：驱逐循环与配额仲裁读的是同一份，
+            # 账本归驱动层持有：驱逐循环与权重仲裁读的是同一份，
             # 但仲裁只拿只读投影（occ），不持有 tracker。
             self.occupancy = heter.occupancy
             self.telemetry = heter.telemetry
             self._hit_recorder = heter.record_hit
-            # 配额仲裁要 allocator 的可用量/容量判断承压；其它策略不碰 allocator，
+            # 权重仲裁要 allocator 的可用量/容量判断承压；其它策略不碰 allocator，
             # 测试里的极简替身因此仍能跑。
             self._needs_capacity = True
             self.force_agentic = heter.force_agentic
             # 节点生命周期观测器：命中记账与分裂继承（当前只有 SLRU 的共享数账本）。
-            # 队内选点（RR / MT）不在这里——它们只由配额裁决调用。
+            # 队内选点（RR / multi_agentic）不在这里——它们只由权重裁决调用。
             self.node_observers = heter.node_observers
-            # 配额的节点入账只挂「新建节点」一条路径。不能挂 _insert_observers：
+            # 队列占用的节点入账只挂「新建节点」一条路径。不能挂 _insert_observers：
             # 分裂也会触发它，而分裂时占用净变化为 0，再记一次就是双计。
             self._record_insert = heter.record_insert
         else:
@@ -1014,7 +1014,7 @@ class RadixCache(BasePrefixCache):
 
             for observe in self._insert_observers:
                 observe(new_node)
-            # 配额账本：只记新出现的 token,分裂路径不走这里（净变化为 0）。
+            # 占用账本：只记新出现的 token,分裂路径不走这里（净变化为 0）。
             if self._record_insert is not None:
                 self._record_insert(new_node)
             if (

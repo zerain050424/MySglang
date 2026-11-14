@@ -35,7 +35,7 @@ class VictimOverride(ABC):
     """队内策略的基类：选点者实现 ``pick``，纯观测者可以不实现。
 
     基类不再把 ``pick`` 定为抽象方法——SLRU 现在只是共享数账本 + 生命周期
-    观测器，struct 队的选点由 ``quota_selector.struct_tier`` 直接完成，让它
+    观测器，struct 队的选点由 ``queue_selector.struct_tier`` 直接完成，让它
     再实现一个永远收不到调用的 ``pick`` 就是死代码。
     """
 
@@ -70,7 +70,7 @@ class RrEvictPolicy(VictimOverride):
     目的：多轮会话轮间间隔长且互不相同，按全局分数淘汰会让同一条会话
     连续挨刀，下一轮 prefill 时集中爆发。这里改成"按会话轮着削"：
 
-    * 只处理调用方传入的 chat 叶子（配额层已按队列筛过池），每会话只取最
+    * 只处理调用方传入的 chat 叶子（权重层已按队列筛过池），每会话只取最
       深的叶子——删它才能一次腾出最多空间；
     * 本轮缺口d已达上限的会话直接跳过，避免把一条会话掏空；
     * 其余会话按"最久未被选中"排序，实现跨会话轮询。
@@ -86,7 +86,7 @@ class RrEvictPolicy(VictimOverride):
         self.params = params
         self._rr_last: Dict[str, int] = {}
         self._rr_seq = 0
-        self.quota_breach = 0
+        self.deficit_breach = 0
 
     # ---- 参数 ----
 
@@ -112,15 +112,12 @@ class RrEvictPolicy(VictimOverride):
     # ---- 插件接口 ----
 
 
-    def pick(self, leaves, registry, *, max_deficit=None) -> Optional["TreeNode"]:
+    def pick(self, leaves, registry) -> Optional["TreeNode"]:
         """按会话轮询选一个 chat 叶子；没有可动会话时返回 None。
 
         Args:
-            leaves: 配额层筛过的候选池（已限定在 chat 队列）。
+            leaves: 权重层筛过的候选池（已限定在 chat 队列）。
             registry: 会话账本，提供每会话的 ``d`` / ``L``。
-            max_deficit: 配额缺口上限（token）。跨队列配额点名 chat 时传入，
-                保证单次淘汰不会为了追配额而削穿一条会话；弹性区为 None，
-                退回 ``loss_cap`` 语义。
 
         Returns:
             选中的叶子；无候选时返回 None 并累加违约计数。
@@ -130,21 +127,19 @@ class RrEvictPolicy(VictimOverride):
         pool = list(leaves or ())
         if not pool:
             return None
-        victim = self._pick_round_robin(pool, registry, max_deficit=max_deficit)
+        victim = self._pick_round_robin(pool, registry)
         if victim is None:
-            self.quota_breach += 1
+            self.deficit_breach += 1
         return victim
 
     # ---- 内部 ----
 
-    def _pick_round_robin(self, leaves, registry, max_deficit=None) -> Optional["TreeNode"]:
+    def _pick_round_robin(self, leaves, registry) -> Optional["TreeNode"]:
         """挑最久未被选中且缺口未达上限的会话，返回它最深的叶子。
 
         Args:
             leaves: 已限定在 chat 范围内的叶子。
             registry: 会话账本。
-            max_deficit: 本轮缺口上限；与 ``loss_cap(L)`` 取 min，即"配额缺口
-                不得把单个会话削穿"。
 
         Returns:
             选中的叶子；所有会话都达上限时返回 None（由调用方回退）。
@@ -165,10 +160,8 @@ class RrEvictPolicy(VictimOverride):
         best = None
         for sid, (node, state) in tails.items():
             limit = self.loss_cap(state.L)
-            if max_deficit is not None:
-                limit = min(limit, max_deficit)
             if state.d >= limit:
-                # 缺口已达上限（loss_cap 或配额缺口），本轮不再动它。
+                # 缺口已达 loss_cap，本轮不再动它。
                 continue
             last = self._rr_last.get(sid, -1)  # -1 = 从未被选中，优先照顾
             if best is None or last < best[0]:
@@ -186,13 +179,13 @@ class RrEvictPolicy(VictimOverride):
         return {
             "rr_sessions": len(self._rr_last),
             "rr_rounds": self._rr_seq,
-            "rr_quota_breach": self.quota_breach,
+            "rr_deficit_breach": self.deficit_breach,
         }
 
     def reset(self) -> None:
         self._rr_last.clear()
         self._rr_seq = 0
-        self.quota_breach = 0
+        self.deficit_breach = 0
 
 
 class SlruEvictPolicy(VictimOverride):
@@ -332,7 +325,7 @@ class MultiTurnEvictPolicy(VictimOverride):
         """在 agentic 带内挑未来窗口内复用概率最低的节点；无候选时返回 None。
 
         Args:
-            leaves: 配额层筛过的候选池（已限定在 agentic 队列）。
+            leaves: 权重层筛过的候选池（已限定在 agentic 队列）。
             registry: 未使用；保留基类签名。
 
         Returns:

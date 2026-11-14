@@ -1,16 +1,15 @@
 """HeterCache 后端 RadixCache 实现。
 
-在原生 RadixCache 基础上叠加分带与配额淘汰机制：
+在原生 RadixCache 基础上叠加分带与按权重的跨队列淘汰：
 - 优先清理无复用价值的 One-shot 临时节点；
-- 可调度节点委托给 `quota_selector.pick_victim` 进行跨队列仲裁。
+- 可调度节点委托给 `queue_selector.pick_victim` 按队列权重仲裁。
 本模块专注执行层面的内存回收、Radix 树拓扑维护与级联修剪。
 """
 
 import logging
 import time
 
-from sglang.srt.mem_cache import quota_selector
-from sglang.srt.mem_cache.quota_selector import queue_capacities
+from sglang.srt.mem_cache import queue_selector
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams, EvictResult
 from sglang.srt.mem_cache.evict_policy import HeterCacheStrategy
 from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -20,13 +19,13 @@ logger = logging.getLogger(__name__)
 
 
 class HeterCacheRadixCache(RadixCache):
-    """支持多队列分带配额淘汰的 RadixCache 实现。"""
+    """支持多队列分带、按权重淘汰的 RadixCache 实现。"""
 
     def evict(self, params: EvictParams) -> EvictResult:
         """批量淘汰节点，直至释放至少 params.num_tokens 个 Token。
 
         执行流程：
-        1. 观测对齐：淘汰前触发快照采样，校准配额占用并驱动指标输出；
+        1. 观测对齐：淘汰前触发快照采样，校准队列占用并驱动指标输出；
         2. 仲裁选点：调用 _pick_victim 决出牺牲节点及决策源；
         3. 物理释放：调用 _evict_one 执行显存释放与树结构修剪。
         """
@@ -44,13 +43,13 @@ class HeterCacheRadixCache(RadixCache):
             available = self.token_to_kv_pool_allocator.available_size()
             capacity = float(self.token_to_kv_pool_allocator.size)
 
-        # 淘汰前同步全树占用，防止配额仲裁基于过期水位做出错误倾斜
+        # 淘汰前同步全树占用，防止权重仲裁基于过期水位做出错误倾斜
         self._observe_occupancy(available, capacity)
 
         strategy = self.eviction_strategy
         num_evicted = 0
         while num_evicted < num_tokens:
-            victim, source = self._pick_victim(self.evictable_leaves, capacity)
+            victim, source = self._pick_victim(self.evictable_leaves)
             if victim is None:
                 break
             released = self._evict_one(victim)
@@ -85,7 +84,6 @@ class HeterCacheRadixCache(RadixCache):
             available,
             capacity,
             normal_window_s=telemetry.PROFILE_INTERVAL,
-            pressure_window_s=strategy.quota.pressure_window_s,
             has_capacity=capacity > 0,
         )
         if not (want_render or want_reconcile):
@@ -101,20 +99,14 @@ class HeterCacheRadixCache(RadixCache):
             self.session_registry.summary(),
             slru_policy=strategy.slru_evict,
             multi_agentic_policy=strategy.multi_agentic_evict,
-            quota_occ=tracker.occ,
-            quota_targets=strategy.quota_targets(tracker.occ, tracker.capacity),
-            quota_caps=queue_capacities(strategy.quota, tracker.capacity),
+            sched_occ=tracker.snapshot(),
+            weights=strategy.weight.weights,
         )
 
-    def _pick_victim(self, leaves, capacity: float):
-        """转发至 quota_selector 纯策略决策器。"""
-        return quota_selector.pick_victim(
-            strategy=self.eviction_strategy,
-            leaves=leaves,
-            # 账本由驱动层持有，这里传只读投影给纯决策器。
-            occ=self.occupancy.occ,
-            capacity=capacity,
-            page_size=self.page_size,
+    def _pick_victim(self, leaves):
+        """转发至 queue_selector 纯策略决策器。"""
+        return queue_selector.pick_victim(
+            strategy=self.eviction_strategy, leaves=leaves
         )
 
     def _release_node(self, node) -> int:
@@ -122,7 +114,7 @@ class HeterCacheRadixCache(RadixCache):
 
         四个动作的顺序不可调换：
 
-        1. ``record_evict`` 必须最先。它扣减配额账本，而 ``_pick_victim``
+        1. ``record_evict`` 必须最先。它扣减占用账本，而 ``_pick_victim``
            在同一个淘汰循环里每轮都读这份账本——
            把扣减推后会让下一轮按错误的占用选受害者；
         2. 之后才是物理释放、对外事件与摘树。

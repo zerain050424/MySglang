@@ -2,7 +2,7 @@
 #
 # 定位：HeterCacheStrategy 的「记账 + 渲染」从策略类中剥离出的独立观测对象
 #   1. 独占四本累计账：total_hit / total_evicted / total_evicted_one_shot /
-#      victim_sources（键为裁决来源：one_shot 带 / quota:<queue> / fallback）；
+#      victim_sources（键为裁决来源：one_shot 带 / weight:<queue> / weight:fallback）；
 #   2. summary() 渲染 [HeterCache profile] 文本 —— 与旧 profile_summary
 #      逐字节等价（验收基线：diff == 0）；
 #   3. 输出口仅走 HeterLogger（heterlog 双写），本类不持文件句柄。
@@ -33,8 +33,8 @@ class HeterProfiler:
     与 strategy 的契约：
       record_hit / record_evict / record_victim_source —— 三个记账收口由
       策略调用，本类只做累加，不做任何判定；
-      summary(queue_occ, session_summary, slru_policy,
-      mt_policy) —— 纯渲染，参数为只读引用。
+      summary(queue_occ, session_summary, slru_policy, weights) —— 纯渲染，
+      参数为只读引用。
     """
 
     def __init__(self):
@@ -86,11 +86,9 @@ class HeterProfiler:
                 queue_occ,
                 session_summary=None,
                 slru_policy=None,
-                mt_policy=None,
                 multi_agentic_policy=None,
-                quota_occ=None,
-                quota_targets=None,
-                quota_caps=None) -> str:
+                sched_occ=None,
+                weights=None) -> str:
         """返回各队列的 profile 摘要。
 
         字段含义：
@@ -98,18 +96,18 @@ class HeterProfiler:
           occ           : 该队列的全部驻留 token（含 response 段）；
                           `occ(-N)` 后缀 = 其中 one-shot 部分（random 整行、
                           struct 的 response 段）
-          q_occ / target / cap : 只在启用跨队列配额时出现。q_occ 是配额口径的
-                          占用（排除 one-shot，含 locked）；target 是水填充后的
-                          有效目标；cap 是该队列的硬上限（k*C）。
+          sched / w     : sched 是账本口径的可调度占用（排除 one-shot，含
+                          locked）；w 是该队列的跨队列权重，淘汰顺序按
+                          ``sched / w`` 降序。
 
         Σocc == schedulable + Σone_shot。
         多轮负载的 one_shot 恒为 0，不打印后缀；random 整行 one-shot。
         """
         from sglang.srt.mem_cache.heter_utils import QUEUE_NAMES
-        quota_on = quota_caps is not None
+        weighted = sched_occ is not None
         header = "  queue              hit     evicted             occ"
-        if quota_on:
-            header += "       q_occ    target       cap"
+        if weighted:
+            header += "        sched       w"
         lines = [header]
         pool = 0
         schedulable = 0
@@ -125,16 +123,15 @@ class HeterProfiler:
             if c["one_shot"]:
                 occ_s += f"(-{c['one_shot']:.0f})"
             row = f"  {q:8s} {hit:>12.0f} {evicted:>12.0f} {occ_s:>16s}"
-            if quota_on:
-                if q in quota_caps:
+            if weighted:
+                if weights is not None and q in weights:
                     row += (
-                        f" {(quota_occ or {}).get(q, 0.0):>11.0f}"
-                        f" {(quota_targets or {}).get(q, 0.0):>9.0f}"
-                        f" {quota_caps[q]:>9.0f}"
+                        f" {(sched_occ or {}).get(q, 0.0):>11.0f}"
+                        f" {weights[q]:>7.2f}"
                     )
                 else:
-                    # random 不参与配额（整行 one-shot）
-                    row += f" {'-':>11s} {'-':>9s} {'-':>9s}"
+                    # random 不参与权重（整行 one-shot）
+                    row += f" {'-':>11s} {'-':>7s}"
             lines.append(row)
         lines.append(
             f"  pool={pool:.0f} schedulable={schedulable:.0f} "
@@ -154,13 +151,6 @@ class HeterProfiler:
                 f"{k}={v:.0f}" for k, v in self._victim_sources.items()
             )
             lines.append(f"  victim_src: {src}")
-        if mt_policy is not None:
-            # agentic 带内改写器（1-prob(e)）：picks=0 说明窗口内没有 QAGENT victim。
-            s = mt_policy.stats()
-            lines.append(
-                f"  mt: picks={s['mt_picks']:.0f} "
-                f"fallback={s['mt_fallbacks']:.0f}"
-            )
         if multi_agentic_policy is not None:
             # agentic 带内复用分改写器：picks=0 说明窗口内没有 QAGENT victim。
             s = multi_agentic_policy.stats()

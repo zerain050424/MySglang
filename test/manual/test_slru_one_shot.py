@@ -87,7 +87,7 @@ def make_strategy(session_types, *, force_agentic=False, now=None, **slru):
         slru=slru or None,
         force_agentic=force_agentic,
         now=now,
-        quota={"caps": {"struct": 0.3, "agentic": 0.4, "chat": 0.3}},
+        weight={"weights": {"struct": 0.3, "agentic": 0.4, "chat": 0.3}},
     )
     reg = SessionRegistry()
     for sid, stype in session_types.items():
@@ -273,7 +273,7 @@ def test_share_min_is_single_knob():
     try:
         HeterCacheStrategy(
             slru={"share_min": 1},
-            quota={"caps": {"struct": 0.3, "agentic": 0.4, "chat": 0.3}},
+            weight={"weights": {"struct": 0.3, "agentic": 0.4, "chat": 0.3}},
         )
     except ValueError as exc:
         check("share_min" in str(exc), f"unexpected message: {exc}")

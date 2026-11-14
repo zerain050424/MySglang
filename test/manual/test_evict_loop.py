@@ -227,9 +227,9 @@ def _bootstrap():
     _install_stubs()
     _load("sglang.srt.mem_cache.heter_utils", "sglang/srt/mem_cache/heter_utils.py")
     _load("sglang.srt.mem_cache.queue_occupancy", "sglang/srt/mem_cache/queue_occupancy.py")
-    # evict_policy 现在直接依赖 quota_selector 与 heter_bench_bridge（观测装配）：
+    # evict_policy 现在直接依赖 queue_selector 与 heter_bench_bridge（观测装配）：
     # 这两者必须先于它装载，否则包路径被 stub 掉后无法按名解析。
-    _load("sglang.srt.mem_cache.quota_selector", "sglang/srt/mem_cache/quota_selector.py")
+    _load("sglang.srt.mem_cache.queue_selector", "sglang/srt/mem_cache/queue_selector.py")
     _load("sglang.srt.mem_cache.heter_bench_bridge", "sglang/srt/mem_cache/heter_bench_bridge.py")
     _load("sglang.srt.mem_cache.victim_override", "sglang/srt/mem_cache/victim_override.py")
     ep = _load("sglang.srt.mem_cache.evict_policy", "sglang/srt/mem_cache/evict_policy.py")
@@ -244,11 +244,11 @@ def _bootstrap():
     return ep, shc, sys.modules["sglang.srt.mem_cache.base_prefix_cache"]
 
 
-CAPS = {"caps": {"struct": 0.3, "agentic": 0.4, "chat": 0.3}}
+WEIGHTS = {"weights": {"struct": 0.3, "agentic": 0.4, "chat": 0.3}}
 
 
 def _strategy(ep, sessions, **slru):
-    st = ep.HeterCacheStrategy(slru=slru or None, quota=dict(CAPS))
+    st = ep.HeterCacheStrategy(slru=slru or None, weight=dict(WEIGHTS))
     reg = sys.modules["sglang.srt.mem_cache.heter_utils"].SessionRegistry()
     hu = sys.modules["sglang.srt.mem_cache.heter_utils"]
     for sid, stype in sessions.items():
@@ -266,7 +266,7 @@ def _seed_share(st, node, n):
 
 def test_no_one_shot_leaves_does_not_crash(ep, shc, base):
     """历史 P0：没有 one-shot 叶子时 victim 曾是 None / 陈旧节点。"""
-    print("[1] no one-shot leaves: quota path still yields a victim")
+    print("[1] no one-shot leaves: weighted path still yields a victim")
     hu = sys.modules["sglang.srt.mem_cache.heter_utils"]
     st = _strategy(ep, {"a1": hu.SessionType.AGENTIC})
     nodes = [
@@ -284,9 +284,9 @@ def test_no_one_shot_leaves_does_not_crash(ep, shc, base):
     check(len(cache.deleted) == 3, f"all leaves evicted, got {len(cache.deleted)}")
     check(result.num_tokens_evicted == 96,
           f"released tokens, got {result.num_tokens_evicted}")
-    quota_srcs = {k: v for k, v in st.profiler._victim_sources.items() if k.startswith("quota:")}
-    check(quota_srcs.get("quota:agentic", 0) + quota_srcs.get("quota:fallback", 0) == 96,
-          f"all 96 tokens must come from the quota path, got {st.profiler._victim_sources}")
+    srcs = {k: v for k, v in st.profiler._victim_sources.items() if k.startswith("weight:")}
+    check(srcs.get("weight:agentic", 0) + srcs.get("weight:fallback", 0) == 96,
+          f"all 96 tokens must come from the weighted path, got {st.profiler._victim_sources}")
     check(not st.profiler._victim_sources.get("one_shot"),
           "no one-shot band should have been used")
 
@@ -350,7 +350,7 @@ def test_one_shot_band_first(ep, shc, base):
 
 def test_slru_rewrites_struct_candidate(ep, shc, base):
     """只有受保护的 struct 叶子时，配额点名 struct 队，队内按段内 LRU 挑最久未访问的那片。"""
-    print("[4] struct queue: quota names it, struct_tier picks the LRU-oldest")
+    print("[4] struct queue: weighted pressure names it, struct_tier picks the LRU-oldest")
     hu = sys.modules["sglang.srt.mem_cache.heter_utils"]
     st = _strategy(ep, {"s1": hu.SessionType.STRUCT})
     thr = st.slru_evict.share_min
@@ -364,7 +364,7 @@ def test_slru_rewrites_struct_candidate(ep, shc, base):
     cache.evict(base.EvictParams(num_tokens=16))
 
     check(cache.deleted == [old], f"LRU-oldest must be picked, got {cache.deleted}")
-    check(st.profiler._victim_sources.get("quota:struct") == 16,
+    check(st.profiler._victim_sources.get("weight:struct") == 16,
           f"source must be the struct queue, got {st.profiler._victim_sources}")
     # struct 队的选点由 struct_tier 直接完成（share 分级 + 段内 LRU）；
     # SLRU 只是账本 + 生命周期观测器，不参与选点。

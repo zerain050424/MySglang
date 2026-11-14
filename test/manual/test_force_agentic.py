@@ -71,8 +71,8 @@ def _in_slru_scope(strategy, node) -> bool:
 
 
 def build(force_agentic):
-    # 配额必填：HeterCache 只走配额仲裁
-    cfg = {"quota": {"caps": {"struct": 0.3, "agentic": 0.4, "chat": 0.3}}}
+    # 按权重的跨队列淘汰：三队权重必填
+    cfg = {"weight": {"weights": {"struct": 0.3, "agentic": 0.4, "chat": 0.3}}}
     if force_agentic:
         cfg["force_agentic"] = True
     return HeterCacheRadixCache(

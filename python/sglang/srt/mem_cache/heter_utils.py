@@ -5,7 +5,7 @@
 * ``evict_policy``：跨队列仲裁与 one-shot 判定；
 * ``victim_override``：改写器的作用域、共享数阈值、会话类型，以及 agentic
   队内的复用分（lognormal 条件生存概率，``MultiAgenticEvict``）；
-* ``quota_selector`` / profile：队列标签与占用口径。
+* ``queue_selector`` / profile：队列标签、占用口径与跨队列权重。
 
 命名约定：``HeterCacheNodeTag`` 是**节点级**标签（KV 片段出生时盖章），
 ``SessionType`` 是**会话级**分类（由分类器推得）。两者经常不一致，判定归属时
@@ -47,7 +47,7 @@ class HeterCacheNodeTag(str, enum.Enum):
 
     与 ``SessionType`` 是两个维度：本枚举回答“这段 KV 是谁创建的”，
     ``SessionType`` 回答“这个会话现在是什么”。两者会不同步，升级规则见
-    ``RadixCache._record_node_hit``。评分模型、配额分池、profile 列名都只读本枚举。
+    ``RadixCache._record_node_hit``。评分模型、队列分池、profile 列名都只读本枚举。
 
     值（``qtrans`` 等）随节点标签快照落盘（JSONL 的 ``tag`` 字段），改值等于改
     数据格式，故保持原样。
@@ -74,7 +74,7 @@ class HeterCacheNodeTag(str, enum.Enum):
 
     @property
     def queue_name(self) -> str:
-        """归属队列名（配额配置的键、profile 的列名）。
+        """归属队列名（权重配置的键、profile 的列名）。
 
         把枚举投影成字符串只是为了对接 CLI 配置（`caps` / `reservations` 的键
         必须是字符串）与日志列名；判定一律用枚举本身。
@@ -86,8 +86,8 @@ class HeterCacheNodeTag(str, enum.Enum):
         """队列名反查枚举；没有对应关系时返回 None。
 
         反向表包含全部四项（含 ``QTRANS`` ↔ ``random``），因此与旧的"队列名
-        等于字符串"判定逐字等价。配额层只会传入 ``QUOTA_QUEUES`` 里的三个名字
-        （random 由 ``quota_ranking`` 滤掉），其余名字走 None 分支。
+        等于字符串"判定逐字等价。权重层只会传入 ``WEIGHT_QUEUES`` 里的三个
+        名字，其余名字走 None 分支。
         """
         return _QUEUE_TO_TAG.get(name)
 
@@ -145,16 +145,16 @@ def session_type_to_node_tag(session_type: SessionType) -> HeterCacheNodeTag:
 #
 # 用 dataclass 而非裸 kwargs：让 eviction_policy_config 有层级、可校验、可整体
 # 传递。配置只接受分组形式
-# {"rr":{...},"slru":{...},"mt":{...},"multi_agentic":{...},"quota":{...}}，
+# {"rr":{...},"slru":{...},"mt":{...},"multi_agentic":{...},"weight":{...}}，
 # 拼错的键会在构造处报错——实验配置静默失效比启动失败更难查。
 #
-#   RrParams           : CHAT 会话级轮询配额（跨会话公平）
+#   RrParams           : CHAT 会话级轮询（跨会话公平）
 #   SlruParams         : SLRU 的共享会话数阈值（决定 one-shot 分界与保护范围）
 #   MultiTurnParams    : AGENTIC 带内复用间隔权重
 #   MultiAgenticParams : AGENTIC 带内复用分排序（与 MT 互斥）
-#   QuotaParams        : 跨队列配额（下限 + 上限，分母为池容量）
+#   QueueWeightParams  : 跨队列权重（occ/w 决定淘汰顺序，无硬上限）
 # 用 dataclass 而不是裸 kwargs，是为了让 `eviction_policy_config` 有层级、能校验、能整体
-# 配置只接受 {"rr":{...},"slru":{...},"mt":{...},"multi_agentic":{...},"quota":{...}}
+# 配置只接受 {"rr":{...},"slru":{...},"mt":{...},"multi_agentic":{...},"weight":{...}}
 # 分组形式。
 # ---------------------------------------------------------------------------
 
@@ -165,7 +165,7 @@ def _coerce_params(cls, value, *, name: str):
     Args:
         cls: 参数组类。
         value: None（取默认值）、dict（按关键字展开）或已有实例。
-        name: 错误消息里的配置分组名（如 ``"quota"``）。
+        name: 错误消息里的配置分组名（如 ``"weight"``）。
 
     Returns:
         参数组实例。
@@ -379,97 +379,54 @@ class MultiAgenticParams:
         return dataclasses.asdict(self)
 
 
-# 配额覆盖的三级队列。`random` 不在此列：它整行都是 one-shot，
-# 在阶段 0 就被清掉，因此永远不会计入配额账本。
-QUOTA_QUEUES = ("struct", "agentic", "chat")
+# 参与跨队列权重仲裁的三级队列。`random` 不在此列：它整行都是 one-shot，
+# 在 Stage 0 就被清掉，永远不会计入权重账本。
+WEIGHT_QUEUES = ("struct", "agentic", "chat")
+
+# 默认权重（越大的队列越晚被削，等价于旧 cap 的份额语义，但没有任何硬上限）。
+DEFAULT_QUEUE_WEIGHTS = {"struct": 0.2, "agentic": 0.5, "chat": 0.3}
 
 
 @dataclasses.dataclass
-class QuotaParams:
-    """跨队列配额：下限 rho + 上限 k，中间是弹性区。
+class QueueWeightParams:
+    """按权重的跨队列淘汰参数。
 
-    配额必填。没有“关掉配额”这个态了——早期的未配额降级路径（全局复用分）
-    已删除，`caps` 不给就直接报错，而不是静默退回一套不同语义的淘汰。
+    没有 cap / reservation / deadzone / chunk：淘汰只由「归一化占用」决定，
+    队列 q 的压力是 ``occ_q / w_q``，每轮从压力最大的队列里取一个 victim，
+    队内仍交给该队列的改写器。权重只影响跨队列顺序，不参与队内排序。
 
-    配置形式：
-        --radix-eviction-policy-config '{"quota": {
-            "caps": {"struct": 0.2, "agentic": 0.5, "chat": 0.3},
-            "reservations": {"struct": 0.05, "agentic": 0.2, "chat": 0.1}}}'
-
-    两个字典都是容量比例，分母恒为池容量C,不随淘汰变化
-    chunk_tokens 与 page_size 取大作为单次最小减持量；deadzone与它共同防止在边界上来回颠簸淘汰。
+    Attributes:
+        weights: 三个队列的权重，必须全部给出且 > 0；比例等价，无需归一化。
+        seed: 兜底随机抽样的种子（同 seed 可复现）。
     """
 
-    caps: Dict[str, float] = dataclasses.field(default_factory=dict)
-    reservations: Dict[str, float] = dataclasses.field(default_factory=dict)
-    deadzone: float = 0.05
-    chunk_tokens: int = 0
-    pressure_window_s: float = 3.0
+    weights: Dict[str, float] = dataclasses.field(
+        default_factory=lambda: dict(DEFAULT_QUEUE_WEIGHTS)
+    )
     seed: int = 0
 
     def __post_init__(self):
-        if not self.caps:
-            raise ValueError(
-                "quota.caps is required: HeterCache now evicts only through "
-                f"quota arbitration; give all of {list(QUOTA_QUEUES)}."
-            )
-
-        unknown = set(self.caps) - set(QUOTA_QUEUES)
+        unknown = set(self.weights) - set(WEIGHT_QUEUES)
         if unknown:
             raise ValueError(
-                f"quota.caps has unknown queues {sorted(unknown)}; "
-                f"expected exactly {list(QUOTA_QUEUES)}."
+                f"weight.weights has unknown queues {sorted(unknown)}; "
+                f"expected exactly {list(WEIGHT_QUEUES)}."
             )
-        missing = set(QUOTA_QUEUES) - set(self.caps)
+        missing = set(WEIGHT_QUEUES) - set(self.weights)
         if missing:
             raise ValueError(
-                f"quota.caps is missing {sorted(missing)}; give all of "
-                f"{list(QUOTA_QUEUES)} (a missing cap silently never binds)."
+                f"weight.weights is missing {sorted(missing)}; give all of "
+                f"{list(WEIGHT_QUEUES)} (a missing queue would never be drained)."
             )
-        unknown = set(self.reservations) - set(QUOTA_QUEUES)
-        if unknown:
-            raise ValueError(
-                f"quota.reservations has unknown queues {sorted(unknown)}; "
-                f"expected a subset of {list(QUOTA_QUEUES)}."
-            )
-
-        for q, cap in self.caps.items():
-            if not 0.0 < cap <= 1.0:
-                raise ValueError(f"quota.caps[{q!r}] must be in (0, 1], got {cap}")
-        total_cap = sum(self.caps.values())
-        if total_cap > 1.0 + 1e-9:
-            raise ValueError(
-                f"quota caps must sum to <= 1, got {total_cap:.4f}; "
-                "caps are fractions of the pool capacity."
-            )
-
-        for q, res in self.reservations.items():
-            if not 0.0 <= res <= self.caps[q]:
-                raise ValueError(
-                    f"quota.reservations[{q!r}] must be in [0, caps[{q!r}]={self.caps[q]}], "
-                    f"got {res}"
-                )
-        total_res = sum(self.reservations.values())
-        if total_res > 1.0 + 1e-9:
-            raise ValueError(f"quota reservations must sum to <= 1, got {total_res:.4f}")
-
-        self._validate_scalars()
-
-    def _validate_scalars(self) -> None:
-        if not 0.0 <= self.deadzone < 1.0:
-            raise ValueError(f"quota.deadzone must be in [0, 1), got {self.deadzone}")
-        if self.chunk_tokens < 0:
-            raise ValueError(f"quota.chunk_tokens must be >= 0, got {self.chunk_tokens}")
-        if self.pressure_window_s <= 0:
-            raise ValueError(
-                f"quota.pressure_window_s must be > 0, got {self.pressure_window_s}"
-            )
+        for queue, w in self.weights.items():
+            if w <= 0:
+                raise ValueError(f"weight.weights[{queue!r}] must be > 0, got {w}")
         if not isinstance(self.seed, int) or isinstance(self.seed, bool):
-            raise ValueError(f"quota.seed must be int, got {self.seed!r}")
+            raise ValueError(f"weight.seed must be int, got {self.seed!r}")
 
     @classmethod
-    def from_any(cls, value=None) -> "QuotaParams":
-        return _coerce_params(cls, value, name="quota")
+    def from_any(cls, value=None) -> "QueueWeightParams":
+        return _coerce_params(cls, value, name="weight")
 
     def as_dict(self) -> dict:
         return dataclasses.asdict(self)
@@ -546,7 +503,7 @@ _QUEUE_NAME = {
 _QUEUE_TO_TAG = {name: tag for tag, name in _QUEUE_NAME.items()}
 
 # profile 的四列，顺序即打印顺序。
-# random 不参与跨队列配额：它整行都是 one-shot，在阶段 0 就被清掉。
+# random 不参与跨队列权重：它整行都是 one-shot，在阶段 0 就被清掉。
 QUEUE_NAMES = ("chat", "agentic", "struct", "random")
 
 

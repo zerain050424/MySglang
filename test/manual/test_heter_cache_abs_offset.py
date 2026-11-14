@@ -42,8 +42,8 @@ from sglang.srt.mem_cache.heter_utils import (  # noqa: E402
     HeterCacheNodeTag,
 )
 
-# 配额必填：HeterCache 只走配额仲裁，测试统一用一组均衡上限。
-QUOTA_CFG = {"caps": {"struct": 0.3, "agentic": 0.4, "chat": 0.3}}
+# 按权重的跨队列淘汰：三队权重必填，测试统一用一组均衡权重。
+WEIGHT_CFG = {"weights": {"struct": 0.3, "agentic": 0.4, "chat": 0.3}}
 
 FAILS = []
 
@@ -211,7 +211,7 @@ def test_one_shot_still_drained_first():
             page_size=1,
             eviction_policy="heter_cache",
             eviction_policy_config={
-                "quota": {"caps": {"struct": 0.3, "agentic": 0.4, "chat": 0.3}}
+                "weight": {"weights": {"struct": 0.3, "agentic": 0.4, "chat": 0.3}}
             },
         )
     )
@@ -268,7 +268,7 @@ def test_one_shot_order_by_tree_offset():
             page_size=1,
             eviction_policy="heter_cache",
             eviction_policy_config={
-                "quota": {"caps": {"struct": 0.3, "agentic": 0.4, "chat": 0.3}}
+                "weight": {"weights": {"struct": 0.3, "agentic": 0.4, "chat": 0.3}}
             },
         )
     )
@@ -343,7 +343,7 @@ def test_one_shot_chain_stops_at_branch_and_lock():
                 page_size=1,
                 eviction_policy="heter_cache",
                 eviction_policy_config={
-                    "quota": {"caps": {"struct": 0.3, "agentic": 0.4, "chat": 0.3}}
+                    "weight": {"weights": {"struct": 0.3, "agentic": 0.4, "chat": 0.3}}
                 },
             )
         )
@@ -417,7 +417,7 @@ def _sh_cache():
             page_size=1,
             eviction_policy="heter_cache",
             eviction_policy_config={
-                "quota": {"caps": {"struct": 0.3, "agentic": 0.4, "chat": 0.3}}
+                "weight": {"weights": {"struct": 0.3, "agentic": 0.4, "chat": 0.3}}
             },
         )
     )
@@ -434,7 +434,7 @@ def test_queue_and_band_are_orthogonal():
     只有单轮负载的生成段才是一次性的。
     """
     print("[18] queue attribution vs eviction band must be orthogonal")
-    st = HeterCacheStrategy(quota=QUOTA_CFG)
+    st = HeterCacheStrategy(weight=WEIGHT_CFG)
     # one-shot 判定看「会话类型 + 跨会话共享数」，因此节点需要会话证据。
     reg = SessionRegistry()
     st.session_registry = reg
@@ -542,7 +542,7 @@ def test_queue_occ_accounting_adds_up():
 def test_record_hit_uses_queue_name():
     """命中记账按队列归因到 HeterProfiler，且每请求只记一次。"""
     print("[20] record_hit: profile 按队列记账")
-    st = HeterCacheStrategy(quota=QUOTA_CFG)
+    st = HeterCacheStrategy(weight=WEIGHT_CFG)
     req = SimpleNamespace(rid="r1", session_id="apps_123", extra_key=None)
     node = _mk_node(32, 0, tag=HeterCacheNodeTag.QTRANS)
     st.record_hit(req, node, 500)
@@ -556,7 +556,7 @@ def test_record_hit_uses_queue_name():
 def test_record_evict_one_shot_scalar():
     """淘汰记账：队列一本账 + one-shot 一个标量（decode 带可推导）。"""
     print("[21] record_evict: 队列账本 + one-shot 标量")
-    st = HeterCacheStrategy(quota=QUOTA_CFG)
+    st = HeterCacheStrategy(weight=WEIGHT_CFG)
     resp = _mk_node(64, 32, tag=HeterCacheNodeTag.QAGENT)
     resp.is_decode = True
     st.record_evict(resp)
@@ -582,7 +582,7 @@ def test_multiturn_decode_is_not_one_shot():
     只有单轮负载的生成段（以及随机单轮）才是一次性内容。
     """
     print("[22] multi-turn decode stays in its queue")
-    strat = HeterCacheStrategy(quota=QUOTA_CFG)
+    strat = HeterCacheStrategy(weight=WEIGHT_CFG)
 
     def node(tt, dec):
         return SimpleNamespace(
@@ -615,7 +615,7 @@ def test_decode_band_end_to_end():
                 token_to_kv_pool_allocator=None, page_size=1,
                 eviction_policy="heter_cache",
                 eviction_policy_config={
-                    "quota": {"caps": {"struct": 0.3, "agentic": 0.4, "chat": 0.3}}
+                    "weight": {"weights": {"struct": 0.3, "agentic": 0.4, "chat": 0.3}}
                 },
             )
         )

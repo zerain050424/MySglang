@@ -111,7 +111,7 @@ class CacheTelemetry:
             heterlog.victim_source(source, tokens)
 
     def wants_profile(self) -> bool:
-        """profile 打印时钟是否到期。与配额校准时钟完全独立。"""
+        """profile 打印时钟是否到期。与账本校准时钟完全独立。"""
         return time.monotonic() - self._last_profile >= self.PROFILE_INTERVAL
 
     def observe_profile(
@@ -120,26 +120,22 @@ class CacheTelemetry:
         session_summary,
         *,
         slru_policy,
-        mt_policy,
         multi_agentic_policy=None,
-        quota_occ: dict,
-        quota_targets: dict,
-        quota_caps: dict,
+        sched_occ: dict = None,
+        weights: dict = None,
     ) -> None:
         """渲染并输出一行 profile，同时推进打印时钟。
 
-        只做渲染：目标配额与上限由调用方算好传进来，这里不碰配额数学。
+        只做渲染：可调度占用与权重由调用方传入，这里不做任何仲裁数学。
         """
         self._last_profile = time.monotonic()
         rendered = self.profiler.summary(
             queue_occ,
             session_summary,
             slru_policy=slru_policy,
-            mt_policy=mt_policy,
             multi_agentic_policy=multi_agentic_policy,
-            quota_occ=quota_occ,
-            quota_targets=quota_targets,
-            quota_caps=quota_caps,
+            sched_occ=sched_occ,
+            weights=weights,
         )
         heterlog.info("Profile", f"[HeterCache profile]\n{rendered}")
 
