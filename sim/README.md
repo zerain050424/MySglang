@@ -4,18 +4,35 @@
 按权重跨队列淘汰 + 队内改写器）。目标不是「另写一个缓存」，而是**让生产代码原样跑**：
 树、标签、仲裁、账本全部 `import python/sglang/srt/mem_cache/`，本目录只做装配与驱动。
 
-> 现状：仓库正在被并行修改。本目录**不改 `python/sglang/`**；等改动收敛后再统一搬运
-> 回仓库测试。当前只实现逻辑。
+> 现状：M0~M3 已完成。仿真器已在同一个 run 里重放四类混合会话并产出策略口径的
+> 指标（命中率 / victim 来源 / 队列占用）。保真对拍（M4）待做。
 
 ## 快速开始
 
 ```bash
 cd /home/rain/MySglang
-python -m sim              # M0 自检：装载 + 最小 match/insert/evict 回路
+python -m sim              # M0~M3 自检：装载 / 回路 / 时钟 / 驱动
 python -m sim --import-only
+python -m sim --verbose    # 保留策略 profile 日志（默认 quiet）
 ```
 
 从其它目录跑需要 `PYTHONPATH=/home/rain/MySglang`。
+
+跑一条自己的 trace（不需要任何数据集）：
+
+```python
+from sim.runner import SimConfig, Simulator
+from sim.trace import Session, Turn
+
+sim = Simulator(SimConfig(capacity=4096, seed=7))
+result = sim.run([
+    Session("apps_0", (Turn(t=0.0, prompt=list(range(400)), out=16),)),
+    Session("ShareGPT-0", (Turn(t=30.0, prompt=list(range(400)) + [1], out=16),)),
+])
+print(result.render())          # 命中率 / 按会话类型 / victim 来源
+print(result.fingerprint())     # 同 seed 复现基线
+result.to_jsonl("out/run.jsonl")
+```
 
 ## 为什么能在 CPU 上跑
 
@@ -40,7 +57,7 @@ python -m sim --import-only
 | **M0** | 装载层：CPU 上导入生产模块并跑通 match/insert/evict | ✅ 已完成（`bootstrap.py` + `__main__.py`） |
 | M1 | 时钟单点化：`CacheInitParams.now` → `TreeNode` / `match` / `insert` / `QueueOccupancyTracker` / `CacheTelemetry` / `MultiAgenticEvict` 全部走同一虚拟时钟 | ✅ 已完成（`sim/clock.py`） |
 | M2 | `TokenAllocator` + `create_simulated(eviction_policy=..., now=...)` | ✅ 已完成（`sim/allocator.py`） |
-| M3 | 请求驱动：`SimReq` + `FakeReqToTokenPool` + `cache._adopt()` + 短缺即淘汰 + 指标 | 待做 |
+| M3 | 请求驱动：`SimReq` + `FakeReqToTokenPool` + `cache._adopt()` + 短缺即淘汰 + 指标 | ✅ 已完成（`sim/req.py`、`trace.py`、`runner.py`、`metrics.py`） |
 | M4 | 保真对拍：树不变量 / 同 seed 复现 / TTL 边界 / （可选）与真 server 比命中率 | 待做 |
 
 ### 分配器（M2）
@@ -67,20 +84,51 @@ HeterCache 后端，`eviction_policy_config` 原样展开成策略 kwargs，`now
 失真。现在时钟由 `CacheInitParams.now` 单点持有，`RadixCache._stamp()` 给每个新节点
 盖时间戳，再经 `use_clock()` 推给账本 / 遥测 / 队内改写器。
 
-## 建模规则（M3 会强制遵守）
+### 请求驱动（M3）
+
+单轮请求六步，顺序对齐线上（`schedule_batch` 的 match → 挂锁 → 分配/写入 → release）：
+
+1. `clock.advance_to(t)` —— 时间只由 trace 推进；
+2. `match_prefix` —— 内含 `observe_request`（分类证据）；
+3. `inc_lock_ref(匹配节点)` —— 在飞请求保护已匹配前缀；
+4. 短缺即 `evict` → `alloc(need)` —— 对齐 allocator 的 shortfall 回调；
+5. `_adopt(prompt+output, split_prompt=True)` —— 内含 `touch` + `decode_start` + 分裂；
+6. `dec_lock_ref`。
+
+三个必须知道的建模决定：
+
+- **第 3 步不能省**。没有锁，第 4 步可能把刚命中的前缀淘汰掉、插入时再重建，
+  命中率与 victim 来源都会偏离线上（线上在飞请求的节点不在 `evictable_leaves`）。
+- **请求行不建模**。仿真只把树当占用主体，所以 `req.kv.cache_protected_len` 被设为
+  整条长度，令 `_adopt` 收尾的「释放重复槽位」段为空。这样池账恒等于树内 token，
+  而 `_adopt` 的语义（`touch` / `decode_start` / prompt 边界分裂）一字不改。
+- **单请求超池容量直接报错**（`OutOfTokens` 带 rid/need/capacity）：顺序模型不模拟
+  retraction（生产会拆 chunk 或重算），这是 trace/容量不匹配的信号，不是缓存行为。
+
+指标里 `victim_sources` / `queue_hit` / `queue_evicted` / `sched_occ` 直接读生产对象
+（`eviction_strategy.profiler` 与 `occupancy`），只有逐请求命中率是新算的。
+
+## 建模规则（driver 已强制）
 
 1. `SimReq.origin_input_ids` 只放 **prompt**，不含 output（否则分类器 prompt_len 偏大）。
-2. 每请求 `rid` 唯一（`CacheTelemetry.on_hit` 按 rid 去重，重复则命中计数恒 0）。
+2. 每请求 `rid` 唯一（`CacheTelemetry.on_hit` 按 rid 去重，重复则命中计数恒 0）；
+   driver 用 `session_id#序号` 自动生成。
 3. `match_prefix` 必须在 `_adopt` 之前（出生标签取 registry 里的 session_type）。
-4. 每次 run 前 `SessionRegistry.reset_global()` 再建 cache（进程级单例）。
-5. 分配量 = `len(page_aligned(key)) - hit`，不要用 insert 返回值推断（分裂是净零）。
+4. 每次 run 前 `SessionRegistry.reset_global()` 再建 cache（进程级单例）；
+   `Simulator.prepare()` 负责这一步。
+5. 分配量 = `len(page_aligned(prompt+output)) - hit`，不要用 insert 返回值推断
+   （分裂是净零）。
 6. `page_size=1` 起步（>1 会截断 prompt 尾 token）。
+7. 会话账本的时钟也必须同源：`SessionRegistry.use_clock()` 由
+   `HeterCacheStrategy.use_clock()` 从缓存层推下去。否则 `last_active` 是墙钟、
+   `is_one_shot` 的时间豁免永远不成立，one-shot 带静默失效。
 
 自检不变量（自检里已生效）：`alloc.used == cache.evictable_size() + cache.protected_size()`。
 
 ## 边界（写清楚，避免以后误用）
 
-- **顺序模型**：不模拟并发 racing / 在飞请求 `lock_ref` / chunked prefill / retraction /
-  page sharding / HiCache 多级 / 多副本。
+- **顺序模型**：不模拟并发 racing / chunked prefill / retraction / page sharding /
+  HiCache 多级 / 多副本；在飞窗口只有「当前这一条请求」。
+- 单条请求超过池容量会直接报错（见上文），不会静默降级。
 - 因此与真 server 对拍时只期望「同量级」，不期望逐 token 相同。
 - 不复制策略：本目录出现第二份仲裁或标签逻辑就是 bug。

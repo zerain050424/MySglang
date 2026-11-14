@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from array import array
 
@@ -345,6 +346,66 @@ def _check_clock(sym) -> list:
     return fails
 
 
+def _check_driver() -> list:
+    """M3 验收：驱动跑通、同 seed 可复现、one-shot 由虚拟时钟推进触发。"""
+
+    print("[4] 请求驱动（M3）")
+    from sim.runner import SimConfig, Simulator, run_synthetic
+    from sim.trace import Session, Turn
+
+    fails = []
+    first = run_synthetic(SimConfig(capacity=4096, seed=7), seed=3, chat_turns=5)
+    second = run_synthetic(SimConfig(capacity=4096, seed=7), seed=3, chat_turns=5)
+    summary = first.summary
+    types = sorted(summary.get("per_type", {}))
+    print(
+        f"    synthetic : requests={summary['requests']} "
+        f"hit_rate={summary['hit_rate']:.1%} "
+        f"evicted={summary['evicted_tokens']} types={types}"
+    )
+    same = first.fingerprint() == second.fingerprint()
+    print(
+        f"    同 seed   : {'逐字一致' if same else '不一致'}"
+        f" ({first.fingerprint()})"
+    )
+    if not same:
+        fails.append(
+            f"同 seed 两次 run 指纹不同：{first.fingerprint()} vs {second.fingerprint()}"
+        )
+    if not 0.0 < summary["hit_rate"] < 1.0:
+        fails.append(f"命中率越界：{summary['hit_rate']:.3f}")
+    for expected in ("struct", "trans", "chat", "agentic"):
+        if expected not in summary["per_type"]:
+            fails.append(f"四类会话未全部出现，缺 {expected}（合成 trace 没跑开）")
+    if not summary["victim_sources"]:
+        fails.append("没有任何 victim 来源记录")
+
+    # one-shot 时间豁免：只有虚拟时钟真的推到 90s 后才会成立。
+    # t=0 写入一条单轮会话（400 token），t=200 来一条 800 token 的请求，
+    # 池 1024 -> 短缺 176 -> 只能拿已经放凉的单轮节点开刀。
+    sim = Simulator(SimConfig(capacity=1024, seed=0))
+    trace = [
+        Session("apps_0", (Turn(t=0.0, prompt=array("q", range(400)), out=0),)),
+        Session(
+            "apps_1", (Turn(t=200.0, prompt=array("q", range(5000, 5800)), out=0),)
+        ),
+    ]
+    result = sim.run(trace)
+    sources = result.summary["victim_sources"]
+    one_shot = sources.get("one_shot", 0.0)
+    ok = one_shot >= 176
+    print(
+        f"    one-shot  : 短缺 176 -> victim_sources={dict(sources)}"
+        f"{'  <-- 未触发' if not ok else ''}"
+    )
+    if not ok:
+        fails.append(
+            "虚拟时钟下 one-shot 未被触发（SessionRegistry 的 last_active "
+            f"是否仍取墙钟？）：{sources}"
+        )
+    return fails
+
+
 def main(argv: list) -> int:
     parser = argparse.ArgumentParser(prog="python -m sim", description="M0/M1 自检")
     parser.add_argument(
@@ -353,7 +414,14 @@ def main(argv: list) -> int:
     parser.add_argument(
         "--skip-clock", action="store_true", help="跳过 M1 虚拟时钟检查"
     )
+    parser.add_argument(
+        "--verbose", action="store_true", help="保留策略 profile 日志（默认 quiet）"
+    )
     args = parser.parse_args(argv)
+
+    # 策略 profile 每 30 虚拟秒打一行，自检里纯噪声；用户显式设了就不覆盖。
+    if not args.verbose:
+        os.environ.setdefault("STRAT_LOG_LEVEL", "quiet")
 
     try:
         sym = bootstrap.load()
@@ -369,6 +437,7 @@ def main(argv: list) -> int:
     fails += _check_allocator()
     if not args.skip_clock:
         fails += _check_clock(sym)
+    fails += _check_driver()
     if fails:
         print("\nFAIL")
         for item in fails:

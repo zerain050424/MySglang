@@ -412,6 +412,7 @@ class RadixCache(BasePrefixCache):
         cls,
         disable: bool = False,
         mock_allocator: Optional[Any] = None,
+        mock_req_pool: Optional[Any] = None,
         page_size: int = 1,
         enable_kv_cache_events: bool = False,
         eviction_policy: str = "lru",
@@ -426,6 +427,8 @@ class RadixCache(BasePrefixCache):
         Args:
             disable: 关掉缓存（命中恒 0，写入无副作用）。
             mock_allocator: 替身分配器；None 时缓存不能调 evict。
+            mock_req_pool: 替身 req_to_token 池；只有 ``_adopt`` 会读它
+                （``req_to_token[row, :n]``），仿真给一个宽度足够的常量即可。
             page_size: 页对齐粒度（前缀长度会被截到整页）。
             enable_kv_cache_events: 是否记录对外 KV 事件。
             eviction_policy: 淘汰策略名，与 ``--radix-eviction-policy`` 同值。
@@ -439,7 +442,7 @@ class RadixCache(BasePrefixCache):
         """
         params = CacheInitParams(
             disable=disable,
-            req_to_token_pool=None,
+            req_to_token_pool=mock_req_pool,
             token_to_kv_pool_allocator=mock_allocator,
             page_size=page_size,
             enable_kv_cache_events=enable_kv_cache_events,

@@ -153,8 +153,9 @@ class HeterCacheStrategy(EvictionStrategy):
         """接管缓存层的时间源（默认墙钟下等价于无操作）。
 
         节点时间戳由 ``RadixCache`` 盖（``CacheInitParams.now``），所以策略与它
-        持有的三个读时钟协作者必须与缓存同源；否则 ``is_aged`` / one-shot 豁免 /
-        承压校准窗口会拿假 now 去减真时间戳，阈值全部失真。
+        持有的读时钟协作者（占用账本 / 遥测 / 会话账本 / 队内改写器）必须与缓存
+        同源；否则 ``is_aged`` / one-shot 豁免 / 承压校准窗口会拿假 now 去减真
+        时间戳，阈值全部失真。
 
         Args:
             now: 返回秒数的单调时钟。
@@ -162,6 +163,7 @@ class HeterCacheStrategy(EvictionStrategy):
         self._now = now
         self.occupancy.use_clock(now)
         self.telemetry.use_clock(now)
+        self.session_registry.use_clock(now)
         if self.multi_agentic_evict is not None:
             self.multi_agentic_evict.use_clock(now)
 

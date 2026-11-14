@@ -24,7 +24,7 @@ import os
 import math
 import time
 from functools import lru_cache
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple, Union
 
 # SPDX-License-Identifier: Apache-2.0
 from enum import Enum
@@ -781,6 +781,7 @@ class SessionRegistry:
         idle_ttl: float = 3600.0,
         empty_grace: float = 60.0,
         probe: Optional[SessionProbe] = None,
+        now: Optional[Callable[[], float]] = None,
     ):
         """构造账本。
 
@@ -788,10 +789,14 @@ class SessionRegistry:
             idle_ttl: 会话无请求的最大存活时间（秒）。
             empty_grace: 节点清空后保留分类证据的宽限期（秒）。
             probe: 诊断探针；``None`` 表示按环境变量装配，全关时不挂探针。
+            now: 时间源；``None`` 表示 ``time.monotonic``。这个时钟必须与
+                缓存层的 ``CacheInitParams.now`` 同源：``last_active`` 要拿去跟
+                节点时间戳做差（one-shot 时间豁免），混源等于拿假 now 减真时间。
         """
         self._sessions: Dict[str, SessionState] = {}
         self.idle_ttl = idle_ttl          # 会话无请求的最大存活时间
         self.empty_grace = empty_grace    # 节点清空后保留分类证据的宽限期
+        self._now = now if now is not None else time.monotonic
         self._touches = 0
         self._probe = _probe_from_env() if probe is None else probe
         # 绑定回调而不是每次都判断并调一个空对象：默认态只剩一次 None 判断。
@@ -804,6 +809,14 @@ class SessionRegistry:
         )
 
     # ---- 查询 ----
+    def use_clock(self, now: Callable[[], float]) -> None:
+        """接管时间源（默认墙钟下等价于无操作）。
+
+        由 ``HeterCacheStrategy.use_clock`` 从缓存层推过来：会话账本里的
+        ``last_active`` 与节点 ``last_access_time`` 必须由同一个时钟产生。
+        """
+        self._now = now
+
     def get(self, session_id: Optional[str]) -> Optional[SessionState]:
         return self._sessions.get(session_id) if session_id else None
 
@@ -826,7 +839,7 @@ class SessionRegistry:
         """
         if not session_id:
             return None
-        now = time.monotonic() if now is None else now
+        now = self._now() if now is None else now
         st = self._sessions.get(session_id)
         if st is None:
             st = self._sessions[session_id] = SessionState(session_id=session_id)
@@ -907,7 +920,7 @@ class SessionRegistry:
         """
         if not session_id:
             return None
-        now = time.monotonic() if now is None else now
+        now = self._now() if now is None else now
         st = self._sessions.get(session_id)
         if st is None:
             st = self._sessions[session_id] = SessionState(session_id=session_id)
@@ -987,7 +1000,7 @@ class SessionRegistry:
         Returns:
             本次回收的会话数。
         """
-        now = time.monotonic() if now is None else now
+        now = self._now() if now is None else now
         # 只有挂了计时探针才取时钟与规模，默认路径不付这个成本。
         on_sweep = self._on_sweep
         if on_sweep is not None:

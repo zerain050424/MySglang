@@ -73,8 +73,13 @@ class TokenAllocator:
         return self._used
 
     def free_segment(self, indices=None, start_pos: int = 0) -> None:
-        """归还一段槽位。签名与生产 allocator 一致，由 ``_release_node`` 调用。"""
-        tokens = len(indices) - int(start_pos)
+        """归还一段槽位。签名与生产 allocator 一致，由 ``_release_node`` / ``_adopt`` 调用。
+
+        ``start_pos`` 在生产里只是**页对齐断言**（见
+        ``BaseTokenToKVPoolAllocator.free_segment``），不参与释放计数：释放量恒为
+        ``len(indices)``。把它当偏移量会少还一截，池账会静默偏高。
+        """
+        tokens = len(indices)
         if tokens <= 0:
             return
         if tokens > self._used:
