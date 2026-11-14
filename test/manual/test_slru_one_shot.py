@@ -17,6 +17,7 @@
 
 import os
 import sys
+import time
 
 sys.path.insert(
     0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "python")
@@ -231,6 +232,8 @@ def test_works_under_force_agentic():
     ):
         st, _ = make_strategy({"t1": SessionType.TRANS}, **kwargs)
         n = FakeNode(session_id="t1", tag=HeterCacheNodeTag.QAGENT)
+        # 过 90s 豁免但未到 3600s 老化 TTL：两种判据都不该干扰本条
+        n.last_access_time = time.monotonic() - 200
         check(st.is_one_shot(n) is True, f"{kwargs}: unshared TRANS is one-shot")
         for i in range(st.slru_evict.share_min):
             st.slru_evict.on_node_hit(n, f"w{i}")

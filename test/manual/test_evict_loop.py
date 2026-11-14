@@ -96,7 +96,7 @@ class FakeNode:
         tag,
         tokens=16,
         abs_start=0,
-        last_access=0.0,
+        last_access=None,
         share_sessions=0,
         is_decode=False,
     ):
@@ -111,7 +111,9 @@ class FakeNode:
         self.session_bloom = 0
         self.absolute = abs_start
         self.abs_start = abs_start
-        self.last_access_time = last_access
+        self.last_access_time = (
+            time.monotonic() if last_access is None else last_access
+        )
         self.hit_count = 0
         self.is_decode = is_decode
         self.parent = None
@@ -383,7 +385,7 @@ def test_aged_struct_prefix_cascade(ep, shc, base):
     """老化 struct：前缀不是叶子时不动，最后一个子节点清理完后同轮级联剪掉。"""
     print("[6] aged struct prefix is swept by the one-shot cascade")
     hu = sys.modules["sglang.srt.mem_cache.heter_utils"]
-    st = _strategy(ep, {"s1": hu.SessionType.STRUCT}, ageing_idle_s=600)
+    st = _strategy(ep, {"s1": hu.SessionType.STRUCT}, ageing_ttl_s={"struct": 400})
     now = time.monotonic()
     prefix = FakeNode(
         "s1", hu.HeterCacheNodeTag.QSTRUCT, tokens=32, last_access=now - 700)
@@ -395,7 +397,7 @@ def test_aged_struct_prefix_cascade(ep, shc, base):
     for i in range(st.slru_evict.share_min):
         st.slru_evict.on_node_hit(prefix, f"seed-{i}")
     prefix.hit_count = 1
-    check(st.is_aged_struct(prefix), "precondition: shared prefix is aged")
+    check(st.is_aged(prefix), "precondition: shared prefix is aged")
 
     cache = make_cache(shc.HeterCacheRadixCache, st, [])
     cache.root_node.children[prefix.ckey] = prefix

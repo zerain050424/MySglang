@@ -251,34 +251,39 @@ ONE_SHOT_IDLE_S = 90.0
 # 但两者语义不同，改一个不会自动改另一个。
 DEFAULT_REUSE_WINDOW_S = 90.0
 
-# 结构复用队列的老化阈值（秒）：共享前缀超过该时长未被访问，即降级到
-# one-shot 带（Stage 0 先清，且不再计入配额账本）。
-# 取值依据 exp3 结构复用负载（8 个前缀变体、lambda_struct 0.21 会话/s、
-# 单臂 12000s）：单个变体的正常复用间隔约 38s；struct 只占 13% token 的
-# 配角 cell 也只有约 60s。600s 是后者的 10 倍，也高于它的单变体整臂期望
-# 最大间隔（约 353s），因此正常轮转不会被误判；变体真正停用 10 分钟后才老化。
-DEFAULT_AGEING_IDLE_S = 600.0
+# 按生效标签的老化阈值（秒）：节点超过该时长未被访问，即降级到 one-shot 带。
+# 值为 0 表示该类型不老化。取值依据（本仓库实测负载）：
+#   struct  400s：exp3 有 8 个前缀变体、lambda_struct 0.13~0.61 会话/s，单变体
+#           复用间隔 13~60s；最冷的配角 cell 整臂期望最大间隔约 353s。400s 高于
+#           353s，误老化约 0.25 次/臂/变体（8 变体合计约 2 次，代价是重算 2k 前缀）。
+#   chat   1800s：mt_vs_lru 实测轮间中位 30s、p95 63s（人速）。1800s 是 p95 的
+#           29 倍，覆盖"人离开一会儿"，又能在一个 12000s 的臂内回收已结束会话。
+#   agentic 3600s：rr_vs_tlru 的挂起窗口 60s、QAGENT 复用中位 6.1s。agentic
+#           前缀最贵（alfred 约 89k token）且 resume 保护是已验证收益，取到与
+#           SessionRegistry.idle_ttl 同量级：只回收"已被判死"的会话。
+#   random    0：整行本来就是 one-shot，老化没有增量。
+DEFAULT_AGEING_TTL_S = {
+    "struct": 400.0,
+    "chat": 1800.0,
+    "agentic": 3600.0,
+    "random": 0.0,
+}
 
 
 @dataclasses.dataclass
 class SlruParams:
-    """SLRU 的共享会话数阈值（唯一配置入口）。
-
-    为什么只允许一处配置：同一个数既决定"是否受 SLRU 保护"，又决定"是否退出
-    one-shot 带"。两处分别配置必然漂移，最后表现为"受保护的节点被当 one-shot
-    清掉"这类难查的错。
-
-    共享数由SlruEvictPolicy记录：每个不同会话 +1，同会话由 bloom 去重。
-    share_min = 2,意味着共 2 个会话用过（创建者 + 1 次外部命中）才算
-    跨会话模板。
+    """SLRU 的共享会话数阈值与按类型的节点老化 TTL。
 
     Attributes:
         share_min: 受保护的共享会话数阈值，必须 >= 2。
-        ageing_idle_s: 共享前缀的老化阈值（秒），0 表示关闭老化。
+        ageing_ttl_s: 按队列名的老化 TTL（秒），0 表示该类型不老化。只写想
+            覆盖的键即可，其余类型沿用 DEFAULT_AGEING_TTL_S。
     """
 
     share_min: int = DEFAULT_SHARE_MIN
-    ageing_idle_s: float = DEFAULT_AGEING_IDLE_S
+    ageing_ttl_s: Dict[str, float] = dataclasses.field(
+        default_factory=lambda: dict(DEFAULT_AGEING_TTL_S)
+    )
 
     def __post_init__(self):
         if self.share_min < 2:
@@ -286,10 +291,19 @@ class SlruParams:
                 "slru.share_min must be >= 2 (>1 个外部会话才算共享), "
                 f"got {self.share_min}"
             )
-        if self.ageing_idle_s < 0:
+        unknown = set(self.ageing_ttl_s) - set(QUEUE_NAMES)
+        if unknown:
             raise ValueError(
-                f"slru.ageing_idle_s must be >= 0, got {self.ageing_idle_s}"
+                f"slru.ageing_ttl_s has unknown queues {sorted(unknown)}; "
+                f"expected a subset of {list(QUEUE_NAMES)}."
             )
+        merged = {**DEFAULT_AGEING_TTL_S, **self.ageing_ttl_s}
+        for queue, ttl in merged.items():
+            if ttl < 0:
+                raise ValueError(
+                    f"slru.ageing_ttl_s[{queue!r}] must be >= 0, got {ttl}"
+                )
+        self.ageing_ttl_s = merged
 
     @classmethod
     def from_any(cls, value=None) -> "SlruParams":
@@ -303,11 +317,11 @@ class SlruParams:
 class MultiTurnParams:
     """AGENTIC 队列带内改写器的参数。
 
-    分数取 ``P(reuse in (elapsed, elapsed+H] | not reused by elapsed)``，
+    分数取P(reuse in (elapsed, elapsed+H] | not reused by elapsed)，
     mu/sigma 来自 HeterCacheNodeTag.reuse_config。
     Attributes:
         enabled: 是否启用改写器。
-        reuse_window_s: 预测窗口 H（秒），即“未来 H 秒内会不会被复用”。
+        reuse_window_s: 预测窗口H，即未来 H 秒内会不会被复用。
     """
 
     enabled: bool = True
@@ -331,15 +345,10 @@ class MultiTurnParams:
 
 @dataclasses.dataclass
 class MultiAgenticParams:
-    """Agentic 队列的复用分排序改写器（``MultiAgenticEvict``）参数。
+    """Agentic 队列的复用分排序改写器参数。
 
-    打开后 agentic 队内选点改用复用分升序（``1 - CDF(elapsed)``，QAGENT 的
-    lognormal 参数），不再走 MT 改写器 ``MultiTurnEvictPolicy``；两者互斥，
-    本开关优先。
-
-    默认关闭。这是一条新增的实验臂，未显式打开时 agentic 的淘汰序列与之前
-    完全一致（MT 或随机兜底），避免升级后静默改变已有对照结果。
-
+    打开后 agentic 队内选点改用复用分升序（1 - CDF(elapsed)，QAGENT 的
+    lognormal 参数）
     Attributes:
         enabled: 是否启用复用分排序。
         reuse_window_s: 预测窗口 H（秒），与 ``mt.reuse_window_s`` 同义。
@@ -465,13 +474,13 @@ class QuotaParams:
 
 @lru_cache(maxsize=8)
 def _cached_lognorm_params(mu: float, sigma: float):
-    """缓存 lognormal 的派生常数（避免每次命中回调都重算 sqrt）。"""
+    """缓存 lognormal 的派生常数"""
     return mu, sigma, sigma * math.sqrt(2.0)
 
 
 @lru_cache(maxsize=8)
 def _cached_lognorm_params_v1(mu: float, sigma: float):
-    """同上，但多返回两个供概率密度使用的常数（历史实现保留）。"""
+    """同上，但多返回两个供概率密度使用的常数。"""
     inv_sigma = 1.0 / sigma
     denom = sigma * math.sqrt(2.0)
     norm_const = inv_sigma / math.sqrt(2.0 * math.pi)
@@ -509,14 +518,7 @@ def _cached_lognorm_cdf(x: float, mu: float, sigma: float) -> float:
 def reuse_window_probability(
     elapsed_s: float, horizon_s: float, mu: float, sigma: float
 ) -> float:
-    """P(reuse in (elapsed, elapsed+horizon] | not reused by elapsed).
-
-    队内淘汰要最小化的是“接下来 H 秒还会不会被复用”，而不是“到此刻复用
-    过没有”：后者（CDF(elapsed)）会把“刚写入”和“已彻底过期”混在两个端点。
-
-    分母 S(elapsed) 在极老节点上会下溢到 0（erf 已饱和），此时返回 0：
-    视作不会再被复用，而不是把 0/0 抛出去。
-    """
+    """P(reuse in (elapsed, elapsed+horizon] | not reused by elapsed)."""
     elapsed_s = max(float(elapsed_s), 0.0)
     survived = 1.0 - _cached_lognorm_cdf(elapsed_s, mu, sigma)
     if survived <= 0.0:
@@ -525,15 +527,13 @@ def reuse_window_probability(
     return max(0.0, 1.0 - survived_after / survived)
 
 
-# 多轮任务的复用间隔分布参数 (mu, sigma)，lognormal（UniCache 原机制）。
-# 评分与改写器都必须从这里取值：两边各写一份会让“评分为正、改写为负”。
+# 多轮任务的复用间隔分布参数 (mu, sigma)，lognormal。
 _REUSE_CONFIG = {
     HeterCacheNodeTag.QCHAT: (4.77, 1.279),
     HeterCacheNodeTag.QAGENT: (1.81, 1.092),
 }
 
-# 节点标签 → 队列名。既是配额配置（caps / reservations）的键，
-# 也是 profile 的列名，所以只在这里定义一次。
+# 节点标签到队列名映射
 _QUEUE_NAME = {
     HeterCacheNodeTag.QCHAT: "chat",
     HeterCacheNodeTag.QAGENT: "agentic",

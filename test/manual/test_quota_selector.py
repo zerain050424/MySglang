@@ -243,15 +243,15 @@ class _Leaf:
     WeakKeyDictionary，需要节点可弱引用。
     """
 
-    def __init__(self, tag, tokens, ts=0.0, session_id=None):
+    def __init__(self, tag, tokens, ts=None, session_id=None):
         self.queue_tag = tag
         self.value = [0] * tokens
         self.key = [0] * tokens
-        self.last_access_time = ts
+        self.last_access_time = time.monotonic() if ts is None else ts
         self.session_id = session_id
 
 
-def _leaf(tag, tokens, ts=0.0, session_id=None):
+def _leaf(tag, tokens, ts=None, session_id=None):
     return _Leaf(tag, tokens, ts, session_id)
 
 
@@ -283,7 +283,8 @@ def test_accounting_insert_and_evict():
     # TRANS 会话 + share < share_min -> one-shot，插入与淘汰两侧都不进账
     # （now=0.0：会话早已搁置，超过 ONE_SHOT_IDLE_S 时间豁免窗口，
     #   否则活跃会话的未匹配节点会被时间豁免挡在带外）
-    trans = _leaf(TAG["struct"], 50, session_id="t1")
+    # 显式给一个“旧但未老化”的时间（老化对未共享 struct 不生效）。
+    trans = _leaf(TAG["struct"], 50, ts=0.0, session_id="t1")
     st.session_registry.touch("t1", "r1", prompt_len=50, now=0.0)
     st.session_registry.get("t1").session_type = hu.SessionType.TRANS
     check(st.is_one_shot(trans), "precondition: a TRANS node with share 0 is one-shot")
@@ -405,7 +406,7 @@ def test_stage1_quota_labels_and_skip():
     check(rank[0] == "struct", f"struct overshoots most (900-200), got {rank}")
 
     # 第一名 struct 无候选（一个 struct 叶子都没给）-> 应跳到 agentic
-    agentic_node = _leaf(TAG["agentic"], 100, ts=1.0)
+    agentic_node = _leaf(TAG["agentic"], 100)
     victim, source = qs.pick_victim(
         strategy=st, leaves=[agentic_node], occ=st.occupancy.occ,
         capacity=1000, page_size=1)
@@ -424,7 +425,8 @@ def test_stage1_fallback_is_seeded_random():
     print("[19] stage 1 fallback: seeded RNG, reproducible, isolated")
     import random as _random
 
-    leaves = [_leaf(TAG["chat"], 10, ts=float(i)) for i in range(30)]
+    now = time.monotonic()
+    leaves = [_leaf(TAG["chat"], 10, ts=now - i) for i in range(30)]
     index = {id(n): i for i, n in enumerate(leaves)}
 
     def run(seed):
@@ -467,14 +469,14 @@ def test_multi_agentic_orders_by_reuse_score():
     check(st.multi_agentic_evict is not None, "multi_agentic.enabled must build the picker")
 
     now = time.monotonic()
-    expired = _leaf(TAG["agentic"], 100, ts=now - 3600)  # 复用窗口已过期
+    expired = _leaf(TAG["agentic"], 100, ts=now - 600)   # 复用窗口已过期（未到老化 TTL）
     fresh = _leaf(TAG["agentic"], 400, ts=now - 1)       # 刚写入，仍可能被复用
     chat = _leaf(TAG["chat"], 10, ts=now - 3600)         # 不归本队
     check(st.multi_agentic_evict.pick([expired, fresh, chat]) is expired,
           "lowest reuse score (oldest elapsed) must be evicted first")
 
-    small = _leaf(TAG["agentic"], 10, ts=now - 3600)
-    large = _leaf(TAG["agentic"], 90, ts=now - 3600)
+    small = _leaf(TAG["agentic"], 10, ts=now - 600)
+    large = _leaf(TAG["agentic"], 90, ts=now - 600)
     check(st.multi_agentic_evict.pick([small, large]) is large,
           "same reuse score must prefer the larger segment")
 
@@ -597,55 +599,73 @@ def test_queue_policy_swap():
           "multi_agentic must prefer the larger segment on a tie")
 
 
-def test_struct_ageing_demotes_shared_prefix():
-    """结构复用老化：共享前缀久未访问 → 跌进 one-shot 带，且带内最优先。
+def test_per_type_ageing_ttl():
+    """按类型老化：struct < chat < agentic，random 永不老化；带内最优先。
 
     老化必须先于 hit_count / share 的短路：共享前缀必然命中过、且共享数早已
     达到 share_min，现有两个提前 return 会让它永远留在保护态。
     """
-    print("[24] struct ageing: idle shared prefix drops to one-shot first")
+    print("[24] per-type ageing TTL: struct < chat < agentic, random off")
     caps = {"caps": {"struct": 0.2, "agentic": 0.5, "chat": 0.3}}
-    ttl = hu.DEFAULT_AGEING_IDLE_S
-    st = ep.HeterCacheStrategy(slru={"ageing_idle_s": ttl}, quota=caps)
+    ttl = hu.DEFAULT_AGEING_TTL_S
+    check(ttl["struct"] < ttl["chat"] < ttl["agentic"],
+          f"TTL must grow with re-prefill cost: {ttl}")
+    check(ttl["random"] == 0, "random nodes are one-shot already; no ageing")
+    st = ep.HeterCacheStrategy(quota=caps)
     now = time.monotonic()
 
-    def shared(tag, age_s, tokens=100, sid=None):
-        node = _leaf(tag, tokens, ts=now - age_s, session_id=sid)
-        for i in range(st.slru_evict.share_min):
-            st.slru_evict.on_node_hit(node, f"{id(node)}-{i}")
-        node.hit_count = 1  # 共享节点必然被命中过
-        return node
+    def node(tag, age_s, share=0, tokens=100):
+        n = _leaf(tag, tokens, ts=now - age_s, session_id=None)
+        for i in range(share):
+            st.slru_evict.on_node_hit(n, f"{id(n)}-{i}")
+        n.hit_count = 1 if share else 0
+        return n
 
-    aged = shared(TAG["struct"], ttl + 1)
-    fresh = shared(TAG["struct"], ttl - 1)
-    check(st.is_aged_struct(aged), "share>=min and idle>=ttl must age")
-    check(not st.is_aged_struct(fresh), "idle<ttl must keep the template protected")
+    # struct：只有共享模板参与老化（未共享的交给原有 90s 规则）
+    aged = node(TAG["struct"], ttl["struct"] + 1, share=st.slru_evict.share_min)
+    fresh = node(TAG["struct"], ttl["struct"] - 1, share=st.slru_evict.share_min)
+    check(st.is_aged(aged), "shared struct ages at the struct TTL")
+    check(not st.is_aged(fresh), "idle<ttl must keep the template protected")
     check(st.is_one_shot(aged), "aged shared prefix must enter the one-shot band")
     check(not st.is_one_shot(fresh), "fresh shared prefix must stay in struct")
-    check(st.session_registry.get(aged.session_id) is None,
-          "precondition: ageing must not need the creator session to survive")
+    check(not st.is_aged(node(TAG["struct"], ttl["struct"] + 1, share=0)),
+          "unshared struct is left to the original 90s one-shot rule")
+
+    # chat / agentic：各自 TTL，不互相借用
+    check(not st.is_aged(node(TAG["chat"], ttl["struct"] + 1)),
+          "chat must not age at the struct TTL")
+    check(st.is_aged(node(TAG["chat"], ttl["chat"] + 1)), "chat ages at chat TTL")
+    check(not st.is_aged(node(TAG["agentic"], ttl["chat"] + 1)),
+          "agentic must not age at the chat TTL")
+    check(st.is_aged(node(TAG["agentic"], ttl["agentic"] + 1)),
+          "agentic ages at the agentic TTL")
+    check(not st.is_aged(_leaf(hu.HeterCacheNodeTag.QTRANS, 100, ts=now - 10 ** 6)),
+          "random class never ages")
 
     # 带内优先：比更老的普通 one-shot 还先走
-    plain = _leaf(TAG["struct"], 100, ts=now - ttl * 10)
+    plain = _leaf(TAG["struct"], 100, ts=now - ttl["struct"] * 10)
     check(st.one_shot_key(aged) < st.one_shot_key(plain),
-          "aged struct must outrank plain one-shot inside the band")
+          "aged nodes must outrank plain one-shot inside the band")
 
-    # 只对 QSTRUCT 生效
-    agent = shared(TAG["agentic"], ttl * 10)
-    check(not st.is_aged_struct(agent), "only struct templates age")
+    # 配置：部分覆盖 + 显式关闭 + 非法键/值
+    partial = ep.HeterCacheStrategy(slru={"ageing_ttl_s": {"struct": 10}}, quota=caps)
+    check(partial.slru.ageing_ttl_s["struct"] == 10 and
+          partial.slru.ageing_ttl_s["chat"] == ttl["chat"],
+          "a partial override must merge over the defaults")
+    off = ep.HeterCacheStrategy(slru={"ageing_ttl_s": {"struct": 0}}, quota=caps)
+    check(not off.is_aged(aged), "0 disables ageing for that type only")
+    for bad in ({"nope": 1}, {"struct": -1}):
+        try:
+            ep.HeterCacheStrategy(slru={"ageing_ttl_s": bad}, quota=caps)
+        except ValueError:
+            pass
+        else:
+            check(False, f"invalid ageing_ttl_s must be rejected: {bad}")
 
-    # 开关与校验
-    off = ep.HeterCacheStrategy(slru={"ageing_idle_s": 0}, quota=caps)
-    check(not off.is_aged_struct(aged), "ageing_idle_s=0 must disable ageing")
-    try:
-        ep.HeterCacheStrategy(slru={"ageing_idle_s": -1}, quota=caps)
-    except ValueError:
-        pass
-    else:
-        check(False, "negative ageing_idle_s must be rejected")
-    fa = ep.HeterCacheStrategy(
-        force_agentic=True, slru={"ageing_idle_s": ttl}, quota=caps)
-    check(not fa.is_aged_struct(aged), "force_agentic must disable struct ageing")
+    # force_agentic：所有标签都按 agentic TTL 计
+    fa = ep.HeterCacheStrategy(force_agentic=True, quota=caps)
+    check(fa.is_aged(node(TAG["struct"], ttl["agentic"] + 1)),
+          "force_agentic must score every node with the agentic TTL")
 
     # 观测：只有老化淘汰计入 aged_evicted
     before = st.slru_evict.aged_evicted
@@ -662,7 +682,7 @@ def test_struct_ageing_demotes_shared_prefix():
         strategy=st, leaves=[aged, fresh],
         occ={"struct": 0, "agentic": 0, "chat": 0}, capacity=1000, page_size=1)
     check(victim is aged and source == "one_shot",
-          f"aged struct must win Stage 0, got {source}")
+          f"aged node must win Stage 0, got {source}")
 
 
 def test_quota_is_mandatory():
@@ -715,7 +735,7 @@ def main():
         test_multi_agentic_orders_by_reuse_score,
         test_queue_policy_swap,
         test_reuse_window_probability,
-        test_struct_ageing_demotes_shared_prefix,
+        test_per_type_ageing_ttl,
     ]
     for t in tests:
         try:
