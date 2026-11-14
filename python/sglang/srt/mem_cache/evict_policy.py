@@ -65,15 +65,6 @@ _node_num_tokens = node_num_tokens
 
 
 class EvictionStrategy(ABC):
-    """单节点淘汰排序的抽象基类。
-
-    契约：``get_priority`` 返回可比较的键，**越小越先淘汰**。调用方只做
-    ``min(candidates, key=strategy.get_priority)``，不关心内部是标量还是元组。
-
-    返回元组时应把判据按优先级从高到低排列（如 ``(band, score, -tokens)``），
-    靠元组字典序在单次比较中一并完成 tie-break，避免多次扫描。
-    """
-
     @abstractmethod
     def get_priority(self, node: TreeNode) -> Union[float, Tuple]:
         """返回节点的淘汰优先级；实现必须满足"越小越先淘汰"。"""
@@ -81,67 +72,37 @@ class EvictionStrategy(ABC):
 
 
 class LRUStrategy(EvictionStrategy):
-    """最近最少使用：直接以访问时间作优先级。"""
 
     def get_priority(self, node: TreeNode) -> float:
         return node.last_access_time ## LRU返回最近使用时间,较小的时间优先级越低
 
 
 class LFUStrategy(EvictionStrategy):
-    """最少使用频率：先比命中次数，再比访问时间。"""
-
     def get_priority(self, node: TreeNode) -> Tuple[int, float]:
         return (node.hit_count, node.last_access_time)
 
 
 class FIFOStrategy(EvictionStrategy):
-    """先进先出：以创建时间作优先级。"""
-
     def get_priority(self, node: TreeNode) -> float:
         return node.creation_time
 
 
 class MRUStrategy(EvictionStrategy):
-    """最近最常使用：取负把"越新越该走"倒过来。"""
-
     def get_priority(self, node: TreeNode) -> float:
         return -node.last_access_time
 
 
 class FILOStrategy(EvictionStrategy):
-    """后进先出：取负把"越新越该走"倒过来。"""
-
     def get_priority(self, node: TreeNode) -> float:
         return -node.creation_time
 
 
 class PriorityStrategy(EvictionStrategy):
-    """优先级感知淘汰：小 priority 值先走，同优先级内退化 LRU。"""
-
     def get_priority(self, node: TreeNode) -> Tuple[int, float]:
         return (node.priority, node.last_access_time)
 
 
 class TLRUStrategy(EvictionStrategy):
-    """Tail-Optimized LRU（Zhang et al., arXiv:2510.15152）。
-
-    预算：一条历史长度为 L、预计下一轮还要追加 Q_hat 的会话，只需缓存
-    ``L + Q_hat - threshold`` 个 token，就足以把下一轮 prefill 压在 TTFT 预算内。
-    超过这条线的那部分尾部对本轮 TTFT 再无贡献，称为 TEL-safe，可以随便淘汰。
-
-    实现方式按论文建议：把这类节点报成"无限老"（优先级 -1），淘汰驱动自然先
-    把它们排干（论文的 phase 1），排干后回落到普通 recency 序（phase 2）。这样
-    任何淘汰循环都不需要知道 T-LRU 的存在。
-
-    threshold 与 next_prompt_estimate 都是 **token** 数；论文以 block 计，
-    移植时需要乘 page_size。
-
-    Args:
-        threshold: 允许放弃的尾部预算（token），必须大于 ``next_prompt_estimate``，
-            否则预算永远不小于 L、没有任何节点 TEL-safe，退化成纯 LRU。
-        next_prompt_estimate: 下一轮 prompt 相对本轮的增量估计（token）。
-    """
-
     def __init__(self, threshold: int = 0, next_prompt_estimate: int = 0):
         self.threshold = threshold
         self.next_prompt_estimate = next_prompt_estimate
@@ -159,16 +120,6 @@ class TLRUStrategy(EvictionStrategy):
 
 
 class SLRUStrategy(EvictionStrategy):
-    """分段 LRU：按命中次数把节点分成 probation / protected 两段。
-
-    先清 probation（``hit_count < protected_threshold``），再清 protected；
-    段内按 recency 排序。用元组 ``(segment, last_access_time)`` 一次比较完成
-    两段排序，不需要维护两个独立候选池。
-
-    Args:
-        protected_threshold: 进入 protected 段所需的命中次数。
-    """
-
     def __init__(self, protected_threshold: int = 2):
         self.protected_threshold = protected_threshold
 
@@ -179,23 +130,10 @@ class SLRUStrategy(EvictionStrategy):
 
 class HeterCacheStrategy(EvictionStrategy):
     """HeterCache 多队列缓存淘汰策略。
-
-    继承 ``EvictionStrategy`` 只为满足策略注册表与类型契约；基类唯一的抽象
-    方法 ``get_priority`` 在这里是显式拒绝——HeterCache 的裁决来自配额仲裁
-    （按队列与目标占用的水填充），不存在一个跨队列可比的节点分数，退回任何
-    默认序都是假语义。
-
     两层决策：
-    1. 分带过滤：One-shot 节点（无跨轮复用价值）优先清理，不计入配额账本；
+    1. 分带过滤：One-shot 节点优先清理，不计入配额账本；
        归属会话仍活跃的未匹配节点受时间豁免（ONE_SHOT_IDLE_S）保护，不进带。
     2. 配额仲裁：先按配额承压情况排出候选队列，再由队内策略决出具体牺牲节点
-       （struct = 共享数分级，agentic = MT 复用间隔，chat = RR 会话轮询；
-       ``multi_agentic`` 显式打开时覆盖 agentic 的 MT）。
-
-    没有全局价值分：早期版本用 ``reuse_score`` 给每个节点打分、跨队列比较后再竞争，
-    在配额为主的用法下已无意义，已整体删除。
-
-    注：本策略只做裁决，KV 释放与 Radix 树拓扑修改由外层缓存引擎执行。
     """
 
     def __init__(
