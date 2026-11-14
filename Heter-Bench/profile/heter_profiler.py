@@ -154,7 +154,7 @@ class HeterProfiler:
             )
             lines.append(f"  victim_src: {src}")
         if mt_policy is not None:
-            # 多轮带内改写器（1-prob(e)）：picks=0 说明窗口内没有 QCHAT victim。
+            # agentic 带内改写器（1-prob(e)）：picks=0 说明窗口内没有 QAGENT victim。
             s = mt_policy.stats()
             lines.append(
                 f"  mt: picks={s['mt_picks']:.0f} "

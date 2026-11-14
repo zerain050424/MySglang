@@ -188,8 +188,9 @@ class HeterCacheStrategy(EvictionStrategy):
     两层决策：
     1. 分带过滤：One-shot 节点（无跨轮复用价值）优先清理，不计入配额账本；
        归属会话仍活跃的未匹配节点受时间豁免（ONE_SHOT_IDLE_S）保护，不进带。
-    2. 配额仲裁：先按配额承压情况排出候选队列，再由队内策略（RR / SLRU / MT /
-       MultiAgentic）决出具体牺牲节点。
+    2. 配额仲裁：先按配额承压情况排出候选队列，再由队内策略决出具体牺牲节点
+       （struct = 共享数分级，agentic = MT 复用间隔，chat = RR 会话轮询；
+       ``multi_agentic`` 显式打开时覆盖 agentic 的 MT）。
 
     没有全局价值分：早期版本用 ``reuse_score`` 给每个节点打分、跨队列比较后再竞争，
     在配额为主的用法下已无意义，已整体删除。
@@ -230,8 +231,12 @@ class HeterCacheStrategy(EvictionStrategy):
         self.slru_evict = SlruEvictPolicy(
             self.session_registry, self.slru.share_min
         )
-        self.mt_evict = MultiTurnEvictPolicy(self.mt, self.session_registry) if self.mt.enabled else None
-        # agentic 的复用分排序：与 RR 互斥且优先（multi_agentic.enabled 显式打开）。
+        self.mt_evict = (
+            MultiTurnEvictPolicy(self.mt, self.session_registry, self._node_tag)
+            if self.mt.enabled
+            else None
+        )
+        # agentic 的复用分排序：与 MT 互斥且优先（multi_agentic.enabled 显式打开）。
         # 注入 _node_tag：force_agentic 下所有节点都按 QAGENT 分布算分。
         self.multi_agentic_evict = (
             MultiAgenticEvict(self._node_tag)
@@ -362,20 +367,20 @@ class HeterCacheStrategy(EvictionStrategy):
                 pool, key=lambda n: struct_tier(n, share_of, share_min)
             )
         if queue == "agentic":
-            # 两个改写器互斥：显式打开 multi_agentic 时按复用分排序，否则 RR。
+            # 两个改写器互斥：显式打开 multi_agentic 时按复用分排序，否则 MT。
             if self.multi_agentic_evict is not None:
                 return self.multi_agentic_evict.pick(pool, self.session_registry)
-            if self.rr_evict is not None:
-                # RR 轮询调度，受配额超额缺口上限约束
-                picked = self.rr_evict.pick(
-                    pool,
-                    self.session_registry,
-                    max_deficit=self._quota_gap("agentic", occ, capacity),
-                )
+            if self.mt_evict is not None:
+                picked = self.mt_evict.pick(pool, self.session_registry)
                 if picked is not None:
                     return picked
-        if queue == "chat" and self.mt_evict is not None:
-            picked = self.mt_evict.pick(pool, self.session_registry)
+        if queue == "chat" and self.rr_evict is not None:
+            # RR 轮询调度，受配额超额缺口上限约束
+            picked = self.rr_evict.pick(
+                pool,
+                self.session_registry,
+                max_deficit=self._quota_gap("chat", occ, capacity),
+            )
             if picked is not None:
                 return picked
         return None

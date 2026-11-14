@@ -18,7 +18,7 @@
    属于 ``quota_selector``。
 
 内置实现：``RrEvictPolicy``（会话轮询）、``SlruEvictPolicy``（分段 LRU + 共享数
-账本）、``MultiTurnEvictPolicy``（多轮带内 1-prob(e) 排序）、
+账本）、``MultiTurnEvictPolicy``（agentic 带内 1-prob(e) 排序）、
 ``MultiAgenticEvict``（agentic 带内复用分排序）。
 """
 
@@ -33,7 +33,6 @@ from sglang.srt.mem_cache.heter_utils import (
     RrParams,
     SESSION_SHARE_MAX,
     SessionRegistry,
-    SessionType,
     HeterCacheNodeTag,
     MultiTurnParams,
     _cached_lognorm_cdf,
@@ -88,13 +87,13 @@ class VictimOverride(ABC):
 
 
 class RrEvictPolicy(VictimOverride):
-    """Agentic 队列的会话级轮询（round-robin）。
+    """CHAT 队列（多轮人工会话）的会话级轮询（round-robin）。
 
-    目的：agentic 队列里常有几十条并行会话，按全局分数淘汰会让同一条会话
+    目的：多轮会话轮间间隔长且互不相同，按全局分数淘汰会让同一条会话
     连续挨刀，下一轮 prefill 时集中爆发。这里改成"按会话轮着削"：
 
-    * 只处理 agentic 叶子，并归到所属会话（每会话只取最深的叶子——删它才能
-      一次腾出最多空间）；
+    * 只处理调用方传入的 chat 叶子（配额层已按队列筛过池），每会话只取最
+      深的叶子——删它才能一次腾出最多空间；
     * 本轮缺口 ``d`` 已达上限的会话直接跳过，避免把一条会话掏空；
     * 其余会话按"最久未被选中"排序，实现跨会话轮询。
 
@@ -103,7 +102,7 @@ class RrEvictPolicy(VictimOverride):
     """
 
     name = "rr"
-    queue = HeterCacheNodeTag.QAGENT
+    queue = HeterCacheNodeTag.QCHAT
 
     def __init__(self, params: RrParams):
         self.params = params
@@ -136,12 +135,12 @@ class RrEvictPolicy(VictimOverride):
 
 
     def pick(self, leaves, registry, *, max_deficit=None) -> Optional["TreeNode"]:
-        """按会话轮询选一个 agentic 叶子；没有可动会话时返回 None。
+        """按会话轮询选一个 chat 叶子；没有可动会话时返回 None。
 
         Args:
-            leaves: 当前可淘汰叶子集合。
+            leaves: 配额层筛过的候选池（已限定在 chat 队列）。
             registry: 会话账本，提供每会话的 ``d`` / ``L``。
-            max_deficit: 配额缺口上限（token）。跨队列配额点名 agentic 时传入，
+            max_deficit: 配额缺口上限（token）。跨队列配额点名 chat 时传入，
                 保证单次淘汰不会为了追配额而削穿一条会话；弹性区为 None，
                 退回 ``loss_cap`` 语义。
 
@@ -150,15 +149,10 @@ class RrEvictPolicy(VictimOverride):
         """
         if not self.params.fair_rr:
             return None
-        agentic = [
-            node
-            for node in leaves
-            if HeterCacheNodeTag.coerce(getattr(node, "queue_tag", None))
-            is HeterCacheNodeTag.QAGENT
-        ]
-        if not agentic:
+        pool = list(leaves or ())
+        if not pool:
             return None
-        victim = self._pick_round_robin(agentic, registry, max_deficit=max_deficit)
+        victim = self._pick_round_robin(pool, registry, max_deficit=max_deficit)
         if victim is None:
             self.quota_breach += 1
         return victim
@@ -169,7 +163,7 @@ class RrEvictPolicy(VictimOverride):
         """挑"最久未被选中且缺口未达上限"的会话，返回它最深的叶子。
 
         Args:
-            leaves: 已限定在 agentic 范围内的叶子。
+            leaves: 已限定在 chat 范围内的叶子。
             registry: 会话账本。
             max_deficit: 本轮缺口上限；与 ``loss_cap(L)`` 取 min，即"配额缺口
                 不得把单个会话削穿"。
@@ -348,7 +342,7 @@ Args:
 
 
 class MultiTurnEvictPolicy(VictimOverride):
-    """CHAT 队列的带内改写器：用 lognormal 生存概率挑最冷的节点。
+    """AGENTIC 队列的带内改写器：用 lognormal 生存概率挑最冷的节点。
 
 权重取"复用已经过期的概率"（UniCache 原机制）：
 
@@ -357,58 +351,54 @@ class MultiTurnEvictPolicy(VictimOverride):
 权重取对数正态的CDF(elapsed)：1 - CDF才是"还没被复用"的概率，
 所以这里越大越先淘汰。同权重时退化为段内 LRU。
 
-带内归属按SessionType ∈ {CHAT, AGENTIC}判定，而不是节点标签：分类器产出
-的是会话类型，queue_tag不一定与之对齐。本类只处理传入的池，绝不跨带取点。
+分布参数按节点生效标签取（``_REUSE_CONFIG``）：agentic 节点用 QAGENT 的
+(mu, sigma)，force_agentic 下所有节点都走 QAGENT。本类只处理传入的池，
+绝不跨带取点。
 """
 
     name = "mt"
-    queue = HeterCacheNodeTag.QCHAT
+    queue = HeterCacheNodeTag.QAGENT
 
-    def __init__(self, params: MultiTurnParams, registry=None) -> None:
+    def __init__(self, params: MultiTurnParams, registry=None, tag_of=None) -> None:
         self.params = params
-        # 与 SLRU / one-shot 同用一本会话账：带内归属只认 SessionType，
-        # 不认 queue_tag（标签会因分叉、命中间隔等原因漂移）。
         self.registry = registry or SessionRegistry.global_instance()
+        # 生效标签而非原始 queue_tag：force_agentic 下全池都按 QAGENT 评分。
+        self._tag_of = tag_of or (
+            lambda node: HeterCacheNodeTag.coerce(getattr(node, "queue_tag", None))
+        )
         # ---- 观测 ----
         self.mt_picks = 0       # 带内实际改写的次数
-        self.mt_fallbacks = 0   # 管辖带内无可淘汰 多轮叶子
+        self.mt_fallbacks = 0   # 管辖带内无可淘汰叶子
 
     # ------------------------------------------------------------ 插件接口
 
 
     def pick(self, leaves, registry=None) -> Optional["TreeNode"]:
-        """在多轮带内挑"过期概率"最高的节点；带内无候选时返回 None。
+        """在 agentic 带内挑"过期概率"最高的节点；带内无候选时返回 None。
 
         Args:
-            leaves: 当前可淘汰叶子集合。
+            leaves: 配额层筛过的候选池（已限定在 agentic 队列）。
             registry: 未使用；保留基类签名。
 
         Returns:
             选中的叶子；带内无候选时返回 None 并累加 fallback 计数。
         """
-        mt_nodes = [
-            node
-            for node in (leaves or ())
-            if (st := self.registry.get(getattr(node, "session_id", None))) is not None
-            and st.session_type in (SessionType.CHAT, SessionType.AGENTIC)
-        ]
-        if not mt_nodes:
+        # 参数统一取自 HeterCacheNodeTag.reuse_config：带内排序与其它
+        # 复用间隔判断共用一个分布定义，避免两处各写一份 mu/sigma。
+        candidates = []
+        for node in leaves or ():
+            cfg = self._tag_of(node).reuse_config
+            if cfg is not None:
+                candidates.append((node, cfg))
+        if not candidates:
             self.mt_fallbacks += 1
             return None
-        # 参数统一取自 HeterCacheNodeTag.reuse_config：多轮带的排序与其它
-        # 复用间隔判断共用一个分布定义，避免两处各写一份 mu/sigma。
+        # 一次取时钟：同一轮里所有节点必须用同一个 elapsed 基准，否则顺序会
+        # 随遍历位置漂移，同 seed 的对照实验无法复现。
+        now = time.monotonic()
         best = None
-        for node in mt_nodes:
-            st = self.registry.get(getattr(node, "session_id", None))
-            stype = st.session_type if st is not None else SessionType.CHAT
-            cfg_key = (
-                HeterCacheNodeTag.QAGENT
-                if stype == SessionType.AGENTIC
-                else HeterCacheNodeTag.QCHAT
-            )
-            mu, sigma = cfg_key.reuse_config
-            elapsed = time.monotonic() - node.last_access_time
-            weight = _cached_lognorm_cdf(int(elapsed), mu, sigma)  # 1-prob(e)
+        for node, (mu, sigma) in candidates:
+            weight = _cached_lognorm_cdf(int(now - node.last_access_time), mu, sigma)
             # 权重大者先走；同分用 -last_access 让更久未访问的胜出（key 取 max）。
             key = (weight, -node.last_access_time)
             if best is None or key > best[0]:
@@ -444,12 +434,12 @@ class MultiAgenticEvict(VictimOverride):
     CDF是 lognormal 的P(复用间隔 <= elapsed)，因此1 - CDF是
     到此刻还没被复用的概率：越小越先淘汰（复用窗口已经过去）。
     (mu, sigma) 取自HeterCacheNodeTag.reuse_config——agentic 节点即
-    QAGENT:(1.81, 1.092)，与MultiTurnEvictPolicy的 chat 分支同源。
+    QAGENT:(1.81, 1.092)，与MultiTurnEvictPolicy同源。
 
-    与RR的分工：RR 保证会话间公平（避免单会话被连续削），本类只按复用分
-    排序，不做会话级的缺口上限与轮询。两者互斥且本类优先，开关是
+    与MT的分工：MT 按同一复用分布排序并带段内 LRU 的 tie-break，本类在
+    同分时优先弃大片段（一次腾更多空间）。两者互斥且本类优先，开关是
     ``MultiAgenticParams.enabled``；关闭时策略侧不构造本类，agentic 队回落到
-    RR / 兜底。
+    MT / 兜底。
 
     Args:
         tag_of: 节点→生效标签的解析器。由策略注入 ``_node_tag``，这样

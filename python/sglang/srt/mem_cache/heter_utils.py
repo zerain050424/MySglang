@@ -148,10 +148,10 @@ def session_type_to_node_tag(session_type: SessionType) -> HeterCacheNodeTag:
 # {"rr":{...},"slru":{...},"mt":{...},"multi_agentic":{...},"quota":{...}}，
 # 拼错的键会在构造处报错——实验配置静默失效比启动失败更难查。
 #
-#   RrParams           : Agentic 会话级轮询配额（跨会话公平）
+#   RrParams           : CHAT 会话级轮询配额（跨会话公平）
 #   SlruParams         : SLRU 的共享会话数阈值（决定 one-shot 分界与保护范围）
-#   MultiTurnParams    : 多轮对话（QCHAT）带内权重
-#   MultiAgenticParams : Agentic 带内复用分排序（与 RR 互斥）
+#   MultiTurnParams    : AGENTIC 带内复用间隔权重
+#   MultiAgenticParams : AGENTIC 带内复用分排序（与 MT 互斥）
 #   QuotaParams        : 跨队列配额（下限 + 上限，分母为池容量）
 # 用 dataclass 而不是裸 kwargs，是为了让 `eviction_policy_config` 有层级、能校验、能整体
 # 配置只接受 {"rr":{...},"slru":{...},"mt":{...},"multi_agentic":{...},"quota":{...}}
@@ -193,7 +193,7 @@ def _coerce_params(cls, value, *, name: str):
 
 @dataclasses.dataclass
 class RrParams:
-    """Agentic 会话级轮询参数。
+    """CHAT（多轮人工会话）队列的会话级轮询参数。
 
     ``fair_rr`` 打开后，淘汰在会话之间轮询挑 victim，并用
     ``RrEvictPolicy.loss_cap`` 限制单会话本轮可承受的 KV 缺口。
@@ -205,7 +205,7 @@ class RrParams:
         min_retain_frac: 每条会话至少保留的比例（相对链长 L）。
     """
 
-    fair_rr: bool = False  # Agentic 会话轮询开关
+    fair_rr: bool = False  # CHAT 会话轮询开关
     kappa: float = 0.5  # 单次缺口上限 = min(kappa*L, L-keep)
     min_retain_tokens: int = 512  # 每条会话至少保留的 token
     min_retain_frac: float = 0.3  # 每条会话至少保留的比例
@@ -291,7 +291,7 @@ class SlruParams:
 
 @dataclasses.dataclass
 class MultiTurnParams:
-    """多轮对话（QCHAT）带内改写器的参数。
+    """AGENTIC 队列带内改写器的参数。
 
     带内权重取 1 - prob(e) = CDF(elapsed; mu, sigma)，mu/sigma 来自 HeterCacheNodeTag.reuse_config
     Attributes:
@@ -317,10 +317,11 @@ class MultiAgenticParams:
     """Agentic 队列的复用分排序改写器（``MultiAgenticEvict``）参数。
 
     打开后 agentic 队内选点改用复用分升序（``1 - CDF(elapsed)``，QAGENT 的
-    lognormal 参数），不再走会话轮询 ``RrEvictPolicy``；两者互斥，本开关优先。
+    lognormal 参数），不再走 MT 改写器 ``MultiTurnEvictPolicy``；两者互斥，
+    本开关优先。
 
     默认关闭。这是一条新增的实验臂，未显式打开时 agentic 的淘汰序列与之前
-    完全一致（RR 或随机兜底），避免升级后静默改变已有对照结果。
+    完全一致（MT 或随机兜底），避免升级后静默改变已有对照结果。
 
     Attributes:
         enabled: 是否启用复用分排序。

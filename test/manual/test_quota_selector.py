@@ -476,7 +476,7 @@ def test_multi_agentic_orders_by_reuse_score():
 
     check(st.multi_agentic_evict.pick([]) is None, "empty pool must yield None")
 
-    # 关闭时整个改写器不构造：agentic 仍走 RR / 兜底，行为与升级前一致
+    # 关闭时整个改写器不构造：agentic 仍走 MT / 兜底。
     off = ep.HeterCacheStrategy(quota=caps)
     check(off.multi_agentic_evict is None, "multi_agentic must be opt-in")
 
@@ -499,6 +499,55 @@ def test_multi_agentic_orders_by_reuse_score():
         capacity=1000, page_size=1)
     check(victim is expired and source == "quota:agentic",
           f"quota:agentic must use the reuse score, got {source}")
+
+
+def test_queue_policy_swap():
+    """队内策略对调：chat 走 RR 会话轮询，agentic 走 MT 复用间隔。
+
+    对调前是 agentic=RR / chat=MT；两个方向各钉一次，避免改回去时只有一条
+    队列被静默换掉。
+    """
+    print("[22] chat uses RR round-robin, agentic uses MT reuse interval")
+    caps = {"caps": {"struct": 0.2, "agentic": 0.5, "chat": 0.3}}
+    st = ep.HeterCacheStrategy(rr={"fair_rr": True}, mt={"enabled": True}, quota=caps)
+    check(st.rr_evict.queue is hu.HeterCacheNodeTag.QCHAT,
+          f"RR must own the chat queue, got {st.rr_evict.queue}")
+    check(st.mt_evict.queue is hu.HeterCacheNodeTag.QAGENT,
+          f"MT must own the agentic queue, got {st.mt_evict.queue}")
+
+    now = time.monotonic()
+    # chat：两条长会话、缺口为 0 -> RR 轮询，不连续削同一条
+    c1 = _leaf(TAG["chat"], 100, ts=now - 10, session_id="swap-c1")
+    c2 = _leaf(TAG["chat"], 100, ts=now - 20, session_id="swap-c2")
+    for sid in ("swap-c1", "swap-c2"):
+        st.session_registry.touch(sid, f"r-{sid}", prompt_len=1000, now=now)
+    occ_chat = {"struct": 0, "agentic": 0, "chat": 900}
+    first = st.quota_victim("chat", [c1, c2], occ_chat, 1000)
+    second = st.quota_victim("chat", [c1, c2], occ_chat, 1000)
+    check({id(first), id(second)} == {id(c1), id(c2)},
+          "RR must rotate between the two chat sessions")
+
+    # 关掉 fair_rr：chat 队内无策略，必须弃权而不是退回 MT
+    off = ep.HeterCacheStrategy(mt={"enabled": True}, quota=caps)
+    check(off.rr_evict is None and
+          off.quota_victim("chat", [c1, c2], occ_chat, 1000) is None,
+          "hc_norr must leave the chat queue without an in-queue picker")
+
+    # agentic：复用窗口已过期的节点先走（MT 的 1 - CDF 判据）
+    expired = _leaf(TAG["agentic"], 100, ts=now - 3600, session_id="swap-a1")
+    fresh = _leaf(TAG["agentic"], 100, ts=now - 1, session_id="swap-a2")
+    occ_agentic = {"struct": 0, "agentic": 900, "chat": 0}
+    check(st.quota_victim("agentic", [expired, fresh], occ_agentic, 1000) is expired,
+          "MT must pick the node whose reuse window already expired")
+
+    # multi_agentic 仍覆盖 agentic 的 MT：同分时它弃大片段
+    ma = ep.HeterCacheStrategy(
+        rr={"fair_rr": True}, mt={"enabled": True},
+        multi_agentic={"enabled": True}, quota=caps)
+    small = _leaf(TAG["agentic"], 10, ts=now - 11, session_id="swap-m1")
+    large = _leaf(TAG["agentic"], 900, ts=now - 11, session_id="swap-m2")
+    check(ma.quota_victim("agentic", [small, large], occ_agentic, 1000) is large,
+          "multi_agentic must keep priority over MT in the agentic queue")
 
 
 def test_quota_is_mandatory():
@@ -549,6 +598,7 @@ def main():
         test_stage1_fallback_is_seeded_random,
         test_quota_is_mandatory,
         test_multi_agentic_orders_by_reuse_score,
+        test_queue_policy_swap,
     ]
     for t in tests:
         try:

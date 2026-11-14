@@ -78,7 +78,7 @@ TOTAL_TOKENS=3e6 CONC=8 bash mixexp/run_exp3.sh --build-data --mix scan
 |---|---|---|
 | `lru` | lru | 最弱基线：全局单一最近性顺序 |
 | `hc_full` | heter_cache | 完整方案：三队列 + 队内策略 + 配额仲裁 |
-| `hc_norr` | heter_cache | 消融：关会话轮询（agentic 队内退化） |
+| `hc_norr` | heter_cache | 消融：关会话轮询（chat 队内退化） |
 | `hc_demandcap` | heter_cache | 消融：配额按 mid 实测需求对齐（0.05/0.92/0.03），归因 cap 错配 |
 
 `hc_full` 的配额是 `caps = struct 0.20 / agentic 0.50 / chat 0.30`（合计 1.0），

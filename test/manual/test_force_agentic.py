@@ -1,7 +1,7 @@
 """force_agentic：把全部节点直达 QAGENT 队列。
 
-实验前提（RR vs T-LRU 的 burst/pause 场景）：RrEvictPolicy 的
-队内策略只认 QAGENT，而状态机默认会把新节点标成 QTRANS（one-shot）、把间隔
+实验前提（RR vs T-LRU 的 burst/pause 场景）：agentic 队内策略按 QAGENT 的
+复用间隔分布打分，而状态机默认会把新节点标成 QTRANS（one-shot）、把间隔
 ≥8s 的命中标成 QCHAT。force_agentic 关掉这套分流：
 
   1. 新节点直接 QAGENT（不再 QTRANS → 不被 one-shot 带先清）
