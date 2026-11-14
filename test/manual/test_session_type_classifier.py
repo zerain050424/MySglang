@@ -302,14 +302,20 @@ def test_tokenized_tool_call_round_trips_through_msgpack():
     assert decoded.tool_call == call
 
 
-def test_bench_passes_only_completed_tool_calls(monkeypatch):
+def test_emitter_passes_only_completed_tool_calls(monkeypatch):
+    """发射器只把**上一轮已结束**的工具调用透给本轮，避免未来信息泄漏。
+
+    跑的是堆发射器的最小闭环：堆里只有该 session 的第 1 轮，空窗 wait_scale=0，
+    第 1 轮结束后自动压回第 2 轮。
+    """
     import asyncio
     from argparse import Namespace
 
-    # cbd6614 把 bench_hetercache.py 归入 scripts/，路径基准随之更新
-    bench_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "Heter-Bench", "scripts"))
+    bench_path = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "Heter-Bench", "scripts")
+    )
     sys.path.insert(0, bench_path)
-    import bench_hetercache
+    import bench_heap
 
     sent_tool_calls = []
 
@@ -325,7 +331,7 @@ def test_bench_passes_only_completed_tool_calls(monkeypatch):
             "prefill_ms": 0.0,
         }
 
-    monkeypatch.setattr(bench_hetercache, "one_request", fake_one_request)
+    monkeypatch.setattr(bench_heap, "one_request", fake_one_request)
     first_call = {"action": "move_ahead"}
     session = {
         "id": "alfred_test_session",
@@ -333,17 +339,30 @@ def test_bench_passes_only_completed_tool_calls(monkeypatch):
         "turn_1": {"input_ids": [1], "response_ids": [2], "tool_call": first_call},
         "turn_2": {"input_ids": [1, 2], "response_ids": [3], "tool_call": None},
     }
-    stats = bench_hetercache.Stats()
-    asyncio.run(
-        bench_hetercache.run_session(
-            http=None,
-            sem=asyncio.Semaphore(1),
-            sess=session,
-            args=Namespace(wait_scale=0.0, timeout_s=1.0, seed=42),
-            stats=stats,
-            url="http://unused/generate",
-            task_cfg={"name": "AgentBank_alfred", "seed": 42, "task_id": 3},
+
+    async def run() -> bench_heap.Stats:
+        heap = bench_heap.ArrivalHeap()
+        heap.push(
+            due_ts=0.0,
+            turn=bench_heap.PendingTurn(
+                task_name="AgentBank_alfred",
+                task_cfg={"name": "AgentBank_alfred", "seed": 42, "task_id": 3},
+                session=session,
+                turn_idx=1,
+            ),
         )
-    )
+        args = Namespace(
+            max_inflight=0, progress_every=0, timeout_s=1.0,
+            seed=42, mu=None, sigma=None, wait_scale=0.0,
+        )
+        stats = bench_heap.Stats()
+        emitter = bench_heap.HeapEmitter(
+            args=args, stats=stats, heap=heap, http=None, url="http://unused/generate"
+        )
+        await emitter.run()
+        return stats
+
+    stats = asyncio.run(run())
+
     assert sent_tool_calls == [None, first_call]
     assert [row["prior_tool_call"] for row in stats.rows] == [False, True]
