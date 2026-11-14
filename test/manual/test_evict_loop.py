@@ -385,7 +385,7 @@ def test_aged_struct_prefix_cascade(ep, shc, base):
     """老化 struct：前缀不是叶子时不动，最后一个子节点清理完后同轮级联剪掉。"""
     print("[6] aged struct prefix is swept by the one-shot cascade")
     hu = sys.modules["sglang.srt.mem_cache.heter_utils"]
-    st = _strategy(ep, {"s1": hu.SessionType.STRUCT}, ageing_ttl_s={"struct": 400})
+    st = _strategy(ep, {"s1": hu.SessionType.STRUCT}, ageing_ttl_s={"struct": 120})
     now = time.monotonic()
     prefix = FakeNode(
         "s1", hu.HeterCacheNodeTag.QSTRUCT, tokens=32, last_access=now - 700)

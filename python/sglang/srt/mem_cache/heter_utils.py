@@ -252,20 +252,23 @@ ONE_SHOT_IDLE_S = 90.0
 DEFAULT_REUSE_WINDOW_S = 90.0
 
 # 按生效标签的老化阈值（秒）：节点超过该时长未被访问，即降级到 one-shot 带。
-# 值为 0 表示该类型不老化。取值依据（本仓库实测负载）：
-#   struct  400s：exp3 有 8 个前缀变体、lambda_struct 0.13~0.61 会话/s，单变体
-#           复用间隔 13~60s；最冷的配角 cell 整臂期望最大间隔约 353s。400s 高于
-#           353s，误老化约 0.25 次/臂/变体（8 变体合计约 2 次，代价是重算 2k 前缀）。
-#   chat   1800s：mt_vs_lru 实测轮间中位 30s、p95 63s（人速）。1800s 是 p95 的
-#           29 倍，覆盖"人离开一会儿"，又能在一个 12000s 的臂内回收已结束会话。
-#   agentic 3600s：rr_vs_tlru 的挂起窗口 60s、QAGENT 复用中位 6.1s。agentic
-#           前缀最贵（alfred 约 89k token）且 resume 保护是已验证收益，取到与
-#           SessionRegistry.idle_ttl 同量级：只回收"已被判死"的会话。
+# 值为 0 表示该类型不老化。全部取在 ONE_SHOT_IDLE_S(90s) 之上，避免与
+# 会话时间豁免互相矛盾。取值按"该类型在实验里从活跃转冷的时间尺度"定：
+#   struct  120s：exp3 有 8 个前缀变体，单变体复用间隔 13~60s（主导 cell 13s /
+#           稳态 37s / 最冷配角 cell 60s）。120s 是冷 cell 的 2 倍：配角 cell
+#           有 13.3% 的时间处于老化态（约 215 次/臂），稳态 3.9%，主导 cell
+#           0.01%（几乎不触发）；代价是重算 2k 前缀。
+#   chat    180s：mt_vs_lru 轮间中位 30s、p95 63s（人速）。按该 lognormal 估计，
+#           单个轮间超过 180s 的概率约 4e-5，活跃会话几乎不会被误判；已结束
+#           会话 3 分钟内即被回收。
+#   agentic 300s：rr_vs_tlru 的挂起窗口 60s、QAGENT 复用中位 6.1s。300s 是
+#           挂起窗口的 5 倍（burst/pause 实验仍安全），活跃会话不会触发；已结束
+#           会话（alfred 约 89k token）5 分钟内回收。
 #   random    0：整行本来就是 one-shot，老化没有增量。
 DEFAULT_AGEING_TTL_S = {
-    "struct": 400.0,
-    "chat": 1800.0,
-    "agentic": 3600.0,
+    "struct": 120.0,
+    "chat": 180.0,
+    "agentic": 300.0,
     "random": 0.0,
 }
 

@@ -217,8 +217,7 @@ class HeterCacheStrategy(EvictionStrategy):
         if st is None:
             return False
         if getattr(node, "hit_count", 0) != 0:
-            # 内容已被再次用到：离开优先淘汰带（晋升后的记账漂移由
-            # 全树快照 reconcile 吸收，见 record_evict 注释）。
+            # 内容已被再次用到：离开优先淘汰带
             return False
         # 时间豁免：会话还没凉，它的内容就还在可能的重访窗口内。
         anchor = max(st.last_active, getattr(node, "last_access_time", 0.0))

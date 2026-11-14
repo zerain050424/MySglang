@@ -469,14 +469,14 @@ def test_multi_agentic_orders_by_reuse_score():
     check(st.multi_agentic_evict is not None, "multi_agentic.enabled must build the picker")
 
     now = time.monotonic()
-    expired = _leaf(TAG["agentic"], 100, ts=now - 600)   # 复用窗口已过期（未到老化 TTL）
+    expired = _leaf(TAG["agentic"], 100, ts=now - 200)   # 复用窗口已过期（未到 300s 老化 TTL）
     fresh = _leaf(TAG["agentic"], 400, ts=now - 1)       # 刚写入，仍可能被复用
     chat = _leaf(TAG["chat"], 10, ts=now - 3600)         # 不归本队
     check(st.multi_agentic_evict.pick([expired, fresh, chat]) is expired,
           "lowest reuse score (oldest elapsed) must be evicted first")
 
-    small = _leaf(TAG["agentic"], 10, ts=now - 600)
-    large = _leaf(TAG["agentic"], 90, ts=now - 600)
+    small = _leaf(TAG["agentic"], 10, ts=now - 200)
+    large = _leaf(TAG["agentic"], 90, ts=now - 200)
     check(st.multi_agentic_evict.pick([small, large]) is large,
           "same reuse score must prefer the larger segment")
 
