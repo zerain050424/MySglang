@@ -1,31 +1,8 @@
 #!/usr/bin/env python3
-"""Heter-Bench：堆驱动的真实墙钟发射器（对齐 UniCache simulator 的调度语义）。
-
-旧驱动（`bench_hetercache.py`，已随本次提交删除）按「一个 session 一个协程」发射：
-协程进入后持有并发信号量直到整个会话跑完（含轮间空窗），空窗期不产生任何请求却占着
-一个名额。本文件只有一点不同——**请求怎么被发出去**：
-
+"""Heter-Bench：堆驱动的真实墙钟发射器
   全局最小堆只存 (due_ts, seq, 待发轮次)。主循环 peek → sleep 到真实墙钟 →
   create_task 发请求，不 await 它；每轮流式响应结束后按 lognormal 算 next_t 再压回堆。
   轮间空窗不占任何名额。
-
-逐条对齐 `UniCache/vllm/simulator/simulator.py`：
-
-  init_heap                   各 task 独立 Poisson(λ) 生成首轮时刻，全部压进同一个堆
-  engine_loop                 主循环：到点就发，堆空/无槽就等事件
-  _check_future_requests      pop 出来的轮次立刻交给下游（那里是 engine，这里是 HTTP）
-  _maybe_schedule_next_turn   响应结束 → lognormal 空窗 → 下一轮压回堆
-  request_id_2_conv_key_map   这里用 session_id + turn 序号标识轮次
-
-三点刻意保留的差异：
-
-1. `--max-inflight` 默认 0（不限流）。UniCache 靠 engine 的 max_num_seqs 兜并发，服务端
-   有等价物 `--max-running-requests`，因此驱动侧不限流才是同口径；排队时间会体现为
-   server 侧的 `queue_time`。给 0 以外的值等于把旧 driver 的信号量近似加回来。
-2. 每轮请求由驱动自己带上完整历史（见 `_resolve_prompt_ids`），服务端不做多轮状态。
-3. 不实现单负载 / burst-pause / phased 三种模式——它们随旧发射器一并删除。前两者的
-   语义依赖「会话独占槽位」，与这里的不占槽模型不兼容；phased 需要另一套相位调度。
-
 用法：
   python scripts/bench_heap.py \
       --tasks-config mixexp/TaskData/exp3/chat/tasks.yaml \
@@ -101,7 +78,7 @@ def load_sessions(
 def assert_turn_policy(
     task: Dict[str, Any], sessions: List[Dict[str, Any]], data_path: str
 ) -> None:
-    """校验选中的会话都长过 TRANS 带：``num_turns >= 配置里的 min_turns``。
+    """校验选中的会话都长过 TRANS 带:num_turns >= 配置里的 min_turns。
 
     依据：分类器（``SessionRegistry._classify``）对 ``turn_count < MULTI_TURN_MIN``
     的会话判 TRANS。多轮源里这类会话**终身**是 TRANS，会以「一次性流量」身份
