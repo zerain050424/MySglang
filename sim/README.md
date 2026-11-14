@@ -58,7 +58,7 @@ result.to_jsonl("out/run.jsonl")
 | M1 | 时钟单点化：`CacheInitParams.now` → `TreeNode` / `match` / `insert` / `QueueOccupancyTracker` / `CacheTelemetry` / `MultiAgenticEvict` 全部走同一虚拟时钟 | ✅ 已完成（`sim/clock.py`） |
 | M2 | `TokenAllocator` + `create_simulated(eviction_policy=..., now=...)` | ✅ 已完成（`sim/allocator.py`） |
 | M3 | 请求驱动：`SimReq` + `FakeReqToTokenPool` + `cache._adopt()` + 短缺即淘汰 + 指标 | ✅ 已完成（`sim/req.py`、`trace.py`、`runner.py`、`metrics.py`） |
-| M4 | 保真对拍：树不变量 / 同 seed 复现 / TTL 边界 / （可选）与真 server 比命中率 | 待做 |
+| M4 | 保真对拍：树不变量 / 同 seed 复现 / TTL 边界 / （可选）与真 server 比命中率 | ✅ 已完成（`sim/fidelity.py` + `test/manual/test_sim_fidelity.py`） |
 
 ### 分配器（M2）
 
@@ -107,6 +107,30 @@ HeterCache 后端，`eviction_policy_config` 原样展开成策略 kwargs，`now
 
 指标里 `victim_sources` / `queue_hit` / `queue_evicted` / `sched_occ` 直接读生产对象
 （`eviction_strategy.profiler` 与 `occupancy`），只有逐请求命中率是新算的。
+
+### 保真对拍（M4）
+
+`sim/fidelity.py` 跑 80 请求的压力 trace（分裂 / 跨会话共享 / 一次性 / 老化四类模式
+轮流出现），每一步后全树校验三件事：
+
+1. **拓扑不变量**：`abs_start` 链（子 = 父偏移 + 父段长）、`len(key) == len(value)`、
+   `evictable_leaves` 与树形双向一致（无子节点且未上锁 ⇔ 在集合里）。分裂路径算错
+   不会报错，只会让命中位置偏移——所以逐请求校验而不是只查末态。
+2. **账本对拍**：`occupancy.occ`（增量维护）vs 全树快照（`total - one_shot`）。
+   增量记账**有意**允许两次校准之间漂移，所以只要求 reconcile 之后逐键相等；
+   reconcile 之前的漂移作为数据报出来（实测 struct +64 / chat +16 / agentic 0），
+   它是对的：节点被升级成 one-shot 或改了标签时，增量侧不会回冲。
+3. **复现性**：同 seed 两次 run 的逐请求指纹（含淘汰量与水位）必须相同。
+
+接进 pytest：
+
+```bash
+PYTHONPATH=$PWD/python python -m pytest -q test/manual/test_sim_fidelity.py
+```
+
+**不包掉**：与真 server 的命中率对拍。那需要 GPU 起服务 + 同一份 token 化 trace，
+属于搬运回仓库后的实验步骤（Simulator 的 `result.to_jsonl()` 与 Heter-Bench 的
+逐请求口径一致，可直接拿来比对）。
 
 ## 建模规则（driver 已强制）
 

@@ -152,7 +152,18 @@ class Simulator:
             self.cache.dec_lock_ref(node)
 
         # 5) 写入树（含 touch / decode_start / prompt 边界分裂）
+        tree_before = tree_tokens(self.cache)
         self.cache._adopt(req, req.fill_ids(), split_prompt=True)
+        grew = tree_tokens(self.cache) - tree_before
+        # 预留量是「全序列 - prompt 命中」，但 response 段也可能已经在树里
+        # （同一 prompt 的重放会命中整条），差额就是 _adopt 本该释放的重复槽位；
+        # 因为仿真不建模请求行，这里显式归还，保持池账 == 树内 token。
+        if grew < need:
+            self.alloc.release(need - grew)
+        elif grew > need:
+            raise AssertionError(
+                f"树增长超过预留：grew={grew} > need={need} (rid={rid})"
+            )
 
         # 6) 不变量：槽位账 == 树内 token，任何漂移都是记账 bug
         tree = tree_tokens(self.cache)

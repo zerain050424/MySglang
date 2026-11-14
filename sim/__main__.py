@@ -406,6 +406,45 @@ def _check_driver() -> list:
     return fails
 
 
+def _check_fidelity() -> list:
+    """M4 验收：逐请求拓扑不变量 + 账本对拍 + 同 seed 复现。"""
+
+    print("[5] 保真对拍（M4）")
+    from sim.fidelity import run_fidelity
+    from sim.runner import SimConfig
+
+    fails = []
+    report = run_fidelity(SimConfig(capacity=2048, seed=11))
+    print(
+        f"    压力 trace: {report.requests} 请求，拓扑违反={len(report.violations)}"
+    )
+    for item in report.violations[:3]:
+        print(f"      - {item}")
+    if report.violations:
+        fails.append(f"拓扑不变量被破坏：{report.violations[0]}")
+
+    ledger = report.ledger or {}
+    before = ledger.get("drift_before_reconcile", {})
+    after = ledger.get("drift_after_reconcile", {})
+    exact = ledger.get("exact_after_reconcile", False)
+    drift_txt = " ".join(f"{q}={v:+.0f}" for q, v in sorted(before.items()))
+    print(f"    账本漂移   : reconcile 前 {drift_txt} -> 后 {after}")
+    print(
+        f"    账本对拍   : {'reconcile 后逐键相等' if exact else '仍有漂移'}"
+        f"{'' if exact else '  <-- 口径不一致'}"
+    )
+    if not exact:
+        fails.append(f"reconcile 后账本仍与全树快照不一致：{after}")
+
+    print(
+        f"    同 seed   : {'逐字一致' if report.matched else '不一致'}"
+        f" ({report.fingerprint})"
+    )
+    if not report.matched:
+        fails.append("压力 trace 两次 run 的逐请求指纹不同")
+    return fails
+
+
 def main(argv: list) -> int:
     parser = argparse.ArgumentParser(prog="python -m sim", description="M0/M1 自检")
     parser.add_argument(
@@ -438,6 +477,7 @@ def main(argv: list) -> int:
     if not args.skip_clock:
         fails += _check_clock(sym)
     fails += _check_driver()
+    fails += _check_fidelity()
     if fails:
         print("\nFAIL")
         for item in fails:

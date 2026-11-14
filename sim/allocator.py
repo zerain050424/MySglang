@@ -72,6 +72,22 @@ class TokenAllocator:
         self._used += tokens
         return self._used
 
+    def release(self, tokens: int) -> None:
+        """直接归还 ``tokens`` 个槽位（不走 indices）。
+
+        驱动层用它对账：插入前预留的是「页对齐后的全序列 - prompt 命中」，
+        而实际树增长可能更少（response 段也可能是已缓存内容），差额应当立即归还，
+        否则池账会比树高出一截。
+        """
+        tokens = int(tokens)
+        if tokens <= 0:
+            return
+        if tokens > self._used:
+            raise RuntimeError(
+                f"二次释放：release={tokens} 超过已分配 used={self._used}"
+            )
+        self._used -= tokens
+
     def free_segment(self, indices=None, start_pos: int = 0) -> None:
         """归还一段槽位。签名与生产 allocator 一致，由 ``_release_node`` / ``_adopt`` 调用。
 
@@ -79,14 +95,7 @@ class TokenAllocator:
         ``BaseTokenToKVPoolAllocator.free_segment``），不参与释放计数：释放量恒为
         ``len(indices)``。把它当偏移量会少还一截，池账会静默偏高。
         """
-        tokens = len(indices)
-        if tokens <= 0:
-            return
-        if tokens > self._used:
-            raise RuntimeError(
-                f"二次释放：free={tokens} 超过已分配 used={self._used}"
-            )
-        self._used -= tokens
+        self.release(len(indices))
 
     def __repr__(self) -> str:  # pragma: no cover - 调试用
         return f"<TokenAllocator used={self._used}/{self.size}>"
