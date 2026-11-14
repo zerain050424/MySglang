@@ -146,7 +146,8 @@ class HeterProfiler:
             lines.append(
                 f"  slru: min_share={slru_policy.share_min} "
                 f"share_counted={s['share_counted']:.0f} "
-                f"share_dedup={s['share_dedup']:.0f}"
+                f"share_dedup={s['share_dedup']:.0f} "
+                f"aged_evicted={s['aged_evicted']:.0f}"
             )
         if self._victim_sources:
             src = " ".join(

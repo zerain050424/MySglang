@@ -186,13 +186,28 @@ class HeterCacheStrategy(EvictionStrategy):
             "use quota arbitration (quota_selector.pick_victim) instead"
         )
 
+    def is_aged_struct(self, node) -> bool:
+        """结构复用队列的老化：共享前缀久未访问即降级到 one-shot"""
+        ttl = self.slru.ageing_idle_s
+        if ttl <= 0:
+            return False
+        if self._node_tag(node) is not HeterCacheNodeTag.QSTRUCT:
+            return False
+        if self.slru_evict.share_of(node) < self.slru_evict.share_min:
+            return False
+        return self._now() - node.last_access_time >= ttl
+
     def is_one_shot(self, node) -> bool:
         """判定节点是否属于 One-shot 带。
-        标准：属于 TRANS/STRUCT 且跨会话共享数未达到 share_min，
+        标准：老化的共享 struct 前缀，或
+        属于 TRANS/STRUCT 且跨会话共享数未达到 share_min，
         且从未被任何请求匹配过
         且归属会话已搁置超过 ONE_SHOT_IDLE_S
         若节点无会话元数据，保守返回 False 防止误删热前缀。
         """
+        # 老化必须先于 hit_count/share 的短路：共享前缀必然命中过且已达标。
+        if self.is_aged_struct(node):
+            return True
         st = self.session_registry.get(getattr(node, "session_id", None))
         if st is None:
             return False
@@ -209,8 +224,8 @@ class HeterCacheStrategy(EvictionStrategy):
         return st.session_type in (SessionType.TRANS, SessionType.STRUCT)
 
     def one_shot_key(self, node) -> tuple:
-        """One-shot 带内淘汰排序：按访问时间升序（带内 LRU）。"""
-        return (node.last_access_time,)
+        """One-shot 带内淘汰排序：老化的 struct 最优先，其余按访问时间升序。"""
+        return (0 if self.is_aged_struct(node) else 1, node.last_access_time)
 
     # ---- 命中/淘汰记账 ----
 
@@ -243,6 +258,9 @@ class HeterCacheStrategy(EvictionStrategy):
         # 仅维护启用了配额且非 one-shot 的三队列占用
         if not one_shot:
             self.occupancy.evict(queue, tokens)
+        elif self.is_aged_struct(node):
+            # 老化淘汰单独计数：否则与真正的一次性流量混在 one_shot 里。
+            self.slru_evict.on_aged_evict(tokens)
         self.telemetry.on_evict(
             node_id=id(node), tag=tag, tokens=tokens, one_shot=one_shot
         )

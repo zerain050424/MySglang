@@ -17,6 +17,7 @@ torch 的依赖，只加载 `heter_cache_radix_cache.py` 本体，再挂一棵�
 import importlib.util
 import os
 import sys
+import time
 import types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -327,7 +328,10 @@ def test_one_shot_band_first(ep, shc, base):
     deep = FakeNode(
         "t1", hu.HeterCacheNodeTag.QTRANS, tokens=16, abs_start=256, last_access=2.0
     )
-    shared = FakeNode("s1", hu.HeterCacheNodeTag.QSTRUCT, tokens=16, abs_start=0)
+    # 共享模板必须“新鲜”，否则默认 600s 老化会把它降级成 one-shot。
+    shared = FakeNode(
+        "s1", hu.HeterCacheNodeTag.QSTRUCT, tokens=16, abs_start=0,
+        last_access=time.monotonic())
     _seed_share(st, shared, st.slru_evict.share_min)
     check(st.is_one_shot(deep) is True, "sanity: trans node is one-shot")
     check(st.is_one_shot(shared) is False, "sanity: shared struct is protected")
@@ -348,10 +352,9 @@ def test_slru_rewrites_struct_candidate(ep, shc, base):
     hu = sys.modules["sglang.srt.mem_cache.heter_utils"]
     st = _strategy(ep, {"s1": hu.SessionType.STRUCT})
     thr = st.slru_evict.share_min
-    old = FakeNode("s1", hu.HeterCacheNodeTag.QSTRUCT, tokens=16, last_access=1_000.0)
-    new = FakeNode(
-        "s1", hu.HeterCacheNodeTag.QSTRUCT, tokens=16, last_access=9_999_999.0
-    )
+    now = time.monotonic()
+    old = FakeNode("s1", hu.HeterCacheNodeTag.QSTRUCT, tokens=16, last_access=now - 100)
+    new = FakeNode("s1", hu.HeterCacheNodeTag.QSTRUCT, tokens=16, last_access=now - 10)
     _seed_share(st, old, thr)
     _seed_share(st, new, thr)
     cache = make_cache(shc.HeterCacheRadixCache, st, [old, new])
@@ -376,6 +379,43 @@ def test_empty_tree_is_noop(ep, shc, base):
     check(cache.deleted == [], "nothing to delete")
 
 
+def test_aged_struct_prefix_cascade(ep, shc, base):
+    """老化 struct：前缀不是叶子时不动，最后一个子节点清理完后同轮级联剪掉。"""
+    print("[6] aged struct prefix is swept by the one-shot cascade")
+    hu = sys.modules["sglang.srt.mem_cache.heter_utils"]
+    st = _strategy(ep, {"s1": hu.SessionType.STRUCT}, ageing_idle_s=600)
+    now = time.monotonic()
+    prefix = FakeNode(
+        "s1", hu.HeterCacheNodeTag.QSTRUCT, tokens=32, last_access=now - 700)
+    kids = [
+        FakeNode("s1", hu.HeterCacheNodeTag.QSTRUCT, tokens=8,
+                 last_access=now - 700)
+        for _ in range(2)
+    ]
+    for i in range(st.slru_evict.share_min):
+        st.slru_evict.on_node_hit(prefix, f"seed-{i}")
+    prefix.hit_count = 1
+    check(st.is_aged_struct(prefix), "precondition: shared prefix is aged")
+
+    cache = make_cache(shc.HeterCacheRadixCache, st, [])
+    cache.root_node.children[prefix.ckey] = prefix
+    prefix.parent = cache.root_node
+    for kid in kids:
+        prefix.children[kid.ckey] = kid
+        kid.parent = prefix
+        kid.key = FakeRadixKey(kid)
+        cache.evictable_leaves.add(kid)
+
+    result = cache.evict(base.EvictParams(num_tokens=16))
+    check(result.num_tokens_evicted == 48,
+          f"two kids + cascaded prefix = 48 tokens, got {result.num_tokens_evicted}")
+    check(set(cache.deleted) == {kids[0], kids[1], prefix},
+          f"the aged prefix must be cascaded away, got {cache.deleted}")
+    check(st.slru_evict.aged_evicted == 32,
+          f"aged_evicted must count 32 prefix tokens, "
+          f"got {st.slru_evict.aged_evicted}")
+
+
 def main():
     ep, shc, base = _bootstrap()
     tests = [
@@ -384,6 +424,7 @@ def main():
         test_one_shot_band_first,
         test_slru_rewrites_struct_candidate,
         test_empty_tree_is_noop,
+        test_aged_struct_prefix_cascade,
     ]
     for t in tests:
         try:

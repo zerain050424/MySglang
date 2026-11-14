@@ -393,7 +393,11 @@ def test_stage0_one_shot_preempts_quota():
 def test_stage1_quota_labels_and_skip():
     """组合顺序：点名队列出 victim 时标 quota:<queue>；无候选则跳队。"""
     print("[18] stage 1: quota names a queue, skips empty ones")
-    st = _strategy()
+    # agentic 的队内 picker 现在是 multi_agentic（MT 已从分派中移除）。
+    st = ep.HeterCacheStrategy(
+        multi_agentic={"enabled": True},
+        quota={"caps": {"struct": 0.2, "agentic": 0.5, "chat": 0.3}},
+    )
     st.occupancy.reconcile({"struct": {"total": 900, "one_shot": 0},
                             "agentic": {"total": 600, "one_shot": 0},
                             "chat": {"total": 0, "one_shot": 0}}, capacity=1000)
@@ -534,31 +538,29 @@ def test_reuse_window_probability():
     check(hu.reuse_window_probability(10 ** 9, H, mu, sigma) == 0.0,
           "underflowed survival must score 0, not raise")
 
-    # MT 的排序方向：取分数最低者（未来窗口内最不可能被复用）
-    st = ep.HeterCacheStrategy(mt={"enabled": True}, quota={
+    # 排序方向：取分数最低者（未来窗口内最不可能被复用）
+    st = ep.HeterCacheStrategy(multi_agentic={"enabled": True}, quota={
         "caps": {"struct": 0.2, "agentic": 0.5, "chat": 0.3}})
     now = time.monotonic()
     young = _leaf(TAG["agentic"], 100, ts=now - 2)
     stale = _leaf(TAG["agentic"], 100, ts=now - 3600)
-    check(st.mt_evict.pick([young, stale], st.session_registry) is stale,
-          "MT must evict the node with the lowest future-reuse probability")
-    check(st.mt_evict.pick([young], st.session_registry) is young,
+    check(st.multi_agentic_evict.pick([young, stale]) is stale,
+          "the lowest future-reuse probability must be evicted first")
+    check(st.multi_agentic_evict.pick([young]) is young,
           "a single candidate must still be picked")
 
 
 def test_queue_policy_swap():
-    """队内策略对调：chat 走 RR 会话轮询，agentic 走 MT 复用间隔。
+    """队内策略归属：chat 走 RR 会话轮询，agentic 只由 multi_agentic 出候选。
 
-    对调前是 agentic=RR / chat=MT；两个方向各钉一次，避免改回去时只有一条
-    队列被静默换掉。
+    agentic 的默认 picker（MT）已从分派中移除，未显式打开 multi_agentic 时
+    该队列弃权、由上层跳到下一队或走兜底。
     """
-    print("[22] chat uses RR round-robin, agentic uses MT reuse interval")
+    print("[22] chat uses RR, agentic is served by multi_agentic only")
     caps = {"caps": {"struct": 0.2, "agentic": 0.5, "chat": 0.3}}
-    st = ep.HeterCacheStrategy(rr={"fair_rr": True}, mt={"enabled": True}, quota=caps)
+    st = ep.HeterCacheStrategy(rr={"fair_rr": True}, quota=caps)
     check(st.rr_evict.queue is hu.HeterCacheNodeTag.QCHAT,
           f"RR must own the chat queue, got {st.rr_evict.queue}")
-    check(st.mt_evict.queue is hu.HeterCacheNodeTag.QAGENT,
-          f"MT must own the agentic queue, got {st.mt_evict.queue}")
 
     now = time.monotonic()
     # chat：两条长会话、缺口为 0 -> RR 轮询，不连续削同一条
@@ -572,27 +574,95 @@ def test_queue_policy_swap():
     check({id(first), id(second)} == {id(c1), id(c2)},
           "RR must rotate between the two chat sessions")
 
-    # 关掉 fair_rr：chat 队内无策略，必须弃权而不是退回 MT
-    off = ep.HeterCacheStrategy(mt={"enabled": True}, quota=caps)
+    # 关掉 fair_rr：chat 队内无策略，必须弃权
+    off = ep.HeterCacheStrategy(quota=caps)
     check(off.rr_evict is None and
           off.quota_victim("chat", [c1, c2], occ_chat, 1000) is None,
           "hc_norr must leave the chat queue without an in-queue picker")
 
-    # agentic：复用窗口已过期的节点先走（MT 的 1 - CDF 判据）
+    # agentic：未开 multi_agentic 时弃权；打开后按复用分出候选
     expired = _leaf(TAG["agentic"], 100, ts=now - 3600, session_id="swap-a1")
     fresh = _leaf(TAG["agentic"], 100, ts=now - 1, session_id="swap-a2")
     occ_agentic = {"struct": 0, "agentic": 900, "chat": 0}
-    check(st.quota_victim("agentic", [expired, fresh], occ_agentic, 1000) is expired,
-          "MT must pick the node whose reuse window already expired")
-
-    # multi_agentic 仍覆盖 agentic 的 MT：同分时它弃大片段
+    check(st.multi_agentic_evict is None and
+          st.quota_victim("agentic", [expired, fresh], occ_agentic, 1000) is None,
+          "agentic must abstain when multi_agentic is off")
     ma = ep.HeterCacheStrategy(
-        rr={"fair_rr": True}, mt={"enabled": True},
-        multi_agentic={"enabled": True}, quota=caps)
+        rr={"fair_rr": True}, multi_agentic={"enabled": True}, quota=caps)
+    check(ma.quota_victim("agentic", [expired, fresh], occ_agentic, 1000) is expired,
+          "multi_agentic must pick the node whose reuse window already expired")
     small = _leaf(TAG["agentic"], 10, ts=now - 11, session_id="swap-m1")
     large = _leaf(TAG["agentic"], 900, ts=now - 11, session_id="swap-m2")
     check(ma.quota_victim("agentic", [small, large], occ_agentic, 1000) is large,
-          "multi_agentic must keep priority over MT in the agentic queue")
+          "multi_agentic must prefer the larger segment on a tie")
+
+
+def test_struct_ageing_demotes_shared_prefix():
+    """结构复用老化：共享前缀久未访问 → 跌进 one-shot 带，且带内最优先。
+
+    老化必须先于 hit_count / share 的短路：共享前缀必然命中过、且共享数早已
+    达到 share_min，现有两个提前 return 会让它永远留在保护态。
+    """
+    print("[24] struct ageing: idle shared prefix drops to one-shot first")
+    caps = {"caps": {"struct": 0.2, "agentic": 0.5, "chat": 0.3}}
+    ttl = hu.DEFAULT_AGEING_IDLE_S
+    st = ep.HeterCacheStrategy(slru={"ageing_idle_s": ttl}, quota=caps)
+    now = time.monotonic()
+
+    def shared(tag, age_s, tokens=100, sid=None):
+        node = _leaf(tag, tokens, ts=now - age_s, session_id=sid)
+        for i in range(st.slru_evict.share_min):
+            st.slru_evict.on_node_hit(node, f"{id(node)}-{i}")
+        node.hit_count = 1  # 共享节点必然被命中过
+        return node
+
+    aged = shared(TAG["struct"], ttl + 1)
+    fresh = shared(TAG["struct"], ttl - 1)
+    check(st.is_aged_struct(aged), "share>=min and idle>=ttl must age")
+    check(not st.is_aged_struct(fresh), "idle<ttl must keep the template protected")
+    check(st.is_one_shot(aged), "aged shared prefix must enter the one-shot band")
+    check(not st.is_one_shot(fresh), "fresh shared prefix must stay in struct")
+    check(st.session_registry.get(aged.session_id) is None,
+          "precondition: ageing must not need the creator session to survive")
+
+    # 带内优先：比更老的普通 one-shot 还先走
+    plain = _leaf(TAG["struct"], 100, ts=now - ttl * 10)
+    check(st.one_shot_key(aged) < st.one_shot_key(plain),
+          "aged struct must outrank plain one-shot inside the band")
+
+    # 只对 QSTRUCT 生效
+    agent = shared(TAG["agentic"], ttl * 10)
+    check(not st.is_aged_struct(agent), "only struct templates age")
+
+    # 开关与校验
+    off = ep.HeterCacheStrategy(slru={"ageing_idle_s": 0}, quota=caps)
+    check(not off.is_aged_struct(aged), "ageing_idle_s=0 must disable ageing")
+    try:
+        ep.HeterCacheStrategy(slru={"ageing_idle_s": -1}, quota=caps)
+    except ValueError:
+        pass
+    else:
+        check(False, "negative ageing_idle_s must be rejected")
+    fa = ep.HeterCacheStrategy(
+        force_agentic=True, slru={"ageing_idle_s": ttl}, quota=caps)
+    check(not fa.is_aged_struct(aged), "force_agentic must disable struct ageing")
+
+    # 观测：只有老化淘汰计入 aged_evicted
+    before = st.slru_evict.aged_evicted
+    st.record_evict(aged)
+    check(st.slru_evict.aged_evicted == before + 100,
+          f"aged evict must count {before + 100} tokens, "
+          f"got {st.slru_evict.aged_evicted}")
+    st.record_evict(fresh)
+    check(st.slru_evict.aged_evicted == before + 100,
+          "a non-aged evict must not be counted as aged")
+
+    # 端到端：仲裁层直接走 one-shot 带
+    victim, source = qs.pick_victim(
+        strategy=st, leaves=[aged, fresh],
+        occ={"struct": 0, "agentic": 0, "chat": 0}, capacity=1000, page_size=1)
+    check(victim is aged and source == "one_shot",
+          f"aged struct must win Stage 0, got {source}")
 
 
 def test_quota_is_mandatory():
@@ -645,6 +715,7 @@ def main():
         test_multi_agentic_orders_by_reuse_score,
         test_queue_policy_swap,
         test_reuse_window_probability,
+        test_struct_ageing_demotes_shared_prefix,
     ]
     for t in tests:
         try:

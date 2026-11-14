@@ -231,11 +231,6 @@ class RrParams:
 
 
 # 跨会话模板的共享会话数阈值。
-#
-# 语义：共享数 >= N 意味着共 N 个会话用过（创建者首次重读即计 1）。
-# 它同时决定两件事，两处必须同源，所以只允许配置一处：
-#   * SlruEvictPolicy.share_of         : 共享数，决定是否退出 one-shot 带
-#   * HeterCacheStrategy.is_one_shot : 是否退出 one-shot 带
 DEFAULT_SHARE_MIN = 2
 
 # 一次性带的时间豁免窗口（秒）。
@@ -246,19 +241,23 @@ DEFAULT_SHARE_MIN = 2
 #
 # 机制依据（quick_wt1 / fast_mid 双重复现）：Stage 0 的清理节奏是秒级，而
 # 多轮会话的重访间隔是 6.1s（alfred）到 30~63s（chat）；仅凭 hit_count==0
-# 判定时，「创建者自己的下一轮重读」来不及发生，hit_count 证据永远立不起来
+# 判定时,创建者自己的下一轮重读来不及发生，hit_count 证据永远立不起来
 # （实测 ShareGPT turn-1 命中 39.7%→7.5%，victim_src one_shot=157k）。
 # 取值覆盖实测重访间隔 p95：中位 30s、p90 44s、最大 63s → 90s。
-#
-# 消费方：HeterCacheStrategy.is_one_shot（淘汰裁决与全树快照口径共用，见
-# RadixCache._per_queue_token_count）；记账增量不读它（判据随时间翻转的
-# 漂移由 QueueOccupancyTracker.reconcile 吸收）。
 ONE_SHOT_IDLE_S = 90.0
 
 # 队内复用分的预测窗口 H（秒）：P(reuse in (a, a+H] | not reused by a)。
 # 与 ONE_SHOT_IDLE_S 同值（见上：它已经是实测重访间隔 p95 的覆盖窗口），
 # 但两者语义不同，改一个不会自动改另一个。
 DEFAULT_REUSE_WINDOW_S = 90.0
+
+# 结构复用队列的老化阈值（秒）：共享前缀超过该时长未被访问，即降级到
+# one-shot 带（Stage 0 先清，且不再计入配额账本）。
+# 取值依据 exp3 结构复用负载（8 个前缀变体、lambda_struct 0.21 会话/s、
+# 单臂 12000s）：单个变体的正常复用间隔约 38s；struct 只占 13% token 的
+# 配角 cell 也只有约 60s。600s 是后者的 10 倍，也高于它的单变体整臂期望
+# 最大间隔（约 353s），因此正常轮转不会被误判；变体真正停用 10 分钟后才老化。
+DEFAULT_AGEING_IDLE_S = 600.0
 
 
 @dataclasses.dataclass
@@ -275,15 +274,21 @@ class SlruParams:
 
     Attributes:
         share_min: 受保护的共享会话数阈值，必须 >= 2。
+        ageing_idle_s: 共享前缀的老化阈值（秒），0 表示关闭老化。
     """
 
     share_min: int = DEFAULT_SHARE_MIN
+    ageing_idle_s: float = DEFAULT_AGEING_IDLE_S
 
     def __post_init__(self):
         if self.share_min < 2:
             raise ValueError(
                 "slru.share_min must be >= 2 (>1 个外部会话才算共享), "
                 f"got {self.share_min}"
+            )
+        if self.ageing_idle_s < 0:
+            raise ValueError(
+                f"slru.ageing_idle_s must be >= 0, got {self.ageing_idle_s}"
             )
 
     @classmethod

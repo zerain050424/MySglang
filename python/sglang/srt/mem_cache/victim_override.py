@@ -219,6 +219,7 @@ class SlruEvictPolicy(VictimOverride):
         # 共享会话数账本的观测
         self.share_counted = 0   # 计入 share_sessions 的命中次数
         self.share_dedup = 0     # 同一会话重复命中的去重次数
+        self.aged_evicted = 0    # 老化降级后被淘汰的 token（按事件累加）
 
     # ------------------------------------------------------------ 共享会话数账本
 
@@ -269,6 +270,10 @@ class SlruEvictPolicy(VictimOverride):
         """
         self._record_session(node, session_id)
 
+    def on_aged_evict(self, tokens: int) -> None:
+        """老化降级的 struct 节点被淘汰时累加 token（观测用）。"""
+        self.aged_evicted += int(tokens)
+
     @staticmethod
     def share_of(node) -> int:
         """返回节点被多少个不同会话命中过（创建者自己的首次重读计 1）。
@@ -284,11 +289,13 @@ class SlruEvictPolicy(VictimOverride):
         return {
             "share_counted": self.share_counted,
             "share_dedup": self.share_dedup,
+            "aged_evicted": self.aged_evicted,
         }
 
     def reset(self) -> None:
         self.share_counted = 0
         self.share_dedup = 0
+        self.aged_evicted = 0
 
     def __repr__(self) -> str:  # pragma: no cover - 调试用
         return f"<{type(self).__name__} name={self.name}>"
