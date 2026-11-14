@@ -8,8 +8,7 @@
 3. **虚拟时钟**（M1）：节点时间戳、老化 TTL、one-shot 豁免、承压校准窗口、
    profile 间隔全部由注入的时钟推进，且精确在边界翻转。
 
-第 2/3 段里的 ``_CheckAllocator`` 只是自检用的最小分配器，M2 会被
-``sim/allocator.py`` 的 ``TokenAllocator`` 取代，不要在这里加功能。
+第 2/3 段用 ``sim/allocator.py`` 的 ``TokenAllocator`` 充当替身分配器。
 """
 
 from __future__ import annotations
@@ -19,6 +18,7 @@ import sys
 from array import array
 
 from sim import bootstrap
+from sim.allocator import OutOfTokens, TokenAllocator, tree_tokens
 from sim.clock import VirtualClock
 
 WEIGHTS = {"struct": 0.2, "agentic": 0.5, "chat": 0.3}
@@ -52,17 +52,13 @@ class _CheckReq:
 def _build(sym, capacity: int = 1200, now=None):
     """按仿真口径建一个 HeterCache 缓存（page_size=1，权重三队齐全）。"""
 
-    alloc = _CheckAllocator(capacity)
-    cache = sym["HeterCacheRadixCache"](
-        sym["CacheInitParams"](
-            disable=False,
-            req_to_token_pool=None,  # 自检不走 _adopt（M3 才需要假池）
-            token_to_kv_pool_allocator=alloc,
-            page_size=1,
-            eviction_policy="heter_cache",
-            eviction_policy_config={"weight": {"weights": dict(WEIGHTS)}},
-            now=now,
-        )
+    alloc = TokenAllocator(capacity)
+    cache = sym["HeterCacheRadixCache"].create_simulated(
+        mock_allocator=alloc,
+        page_size=1,
+        eviction_policy="heter_cache",
+        eviction_policy_config={"weight": {"weights": dict(WEIGHTS)}},
+        now=now,
     )
     return cache, alloc
 
@@ -138,7 +134,15 @@ def _check_run(sym) -> list:
             sym["MatchPrefixParams"](key=key, req=_CheckReq(rid, sid, tokens))
         )
         hit = result.device_indices.numel()
-        alloc.used += len(tokens) - hit
+        # 生产顺序：短缺 -> 淘汰 -> 预留 -> 写入。
+        need = len(tokens) - hit
+        evicted = 0
+        shortfall = need - alloc.available_size()
+        if shortfall > 0:
+            evicted = cache.evict(
+                sym["EvictParams"](num_tokens=shortfall)
+            ).num_tokens_evicted
+        alloc.alloc(need)
         cache.session_registry.touch(sid, rid, len(tokens))
         cache.insert(
             sym["InsertParams"](
@@ -148,11 +152,6 @@ def _check_run(sym) -> list:
                 session_id=sid,
             )
         )
-        evicted = 0
-        if alloc.used > alloc.size:
-            evicted = cache.evict(
-                sym["EvictParams"](num_tokens=int(alloc.used - alloc.size))
-            ).num_tokens_evicted
         return hit, evicted
 
     # (rid, session, tokens, 期望命中)：r1 与 r0 完全相同 -> 全中；r2 只共享
@@ -165,7 +164,7 @@ def _check_run(sym) -> list:
     ]
     for rid, sid, tokens, want_hit in plan:
         hit, evicted = request(rid, sid, tokens)
-        balanced = alloc.used == cache.evictable_size() + cache.protected_size()
+        balanced = alloc.used == tree_tokens(cache)
         flag = "" if hit == want_hit else "  <-- 命中不符"
         print(
             f"    {rid:3s} {sid:11s} tokens={len(tokens):4d} hit={hit:4d} "
@@ -176,8 +175,7 @@ def _check_run(sym) -> list:
             fails.append(f"{rid}: 期望命中 {want_hit}，实际 {hit}")
         if not balanced:
             fails.append(
-                f"{rid}: 池账不平 used={alloc.used} "
-                f"tree={cache.evictable_size() + cache.protected_size()}"
+                f"{rid}: 池账不平 used={alloc.used} tree={tree_tokens(cache)}"
             )
 
     profiler = cache.eviction_strategy.profiler
@@ -189,6 +187,35 @@ def _check_run(sym) -> list:
         fails.append("没有产生任何 victim 来源记录（淘汰路径没走到）")
     if cache.occupancy.capacity <= 0:
         fails.append("账本 capacity 仍为 0（reconcile 没跑到）")
+    return fails
+
+
+def _check_allocator() -> list:
+    """M2 验收：容量守卫、二次释放守卫、归还后水位回零。"""
+
+    print("[2b] 分配器守卫")
+    fails = []
+    alloc = TokenAllocator(100)
+    alloc.alloc(60)
+    over = False
+    try:
+        alloc.alloc(41)
+    except OutOfTokens:
+        over = True
+    double_free = False
+    try:
+        alloc.free_segment([0] * 70)
+    except RuntimeError:
+        double_free = True
+    alloc.free_segment([0] * 60)
+    drained = alloc.used == 0 and alloc.available_size() == 100
+    ok = over and double_free and drained
+    print(
+        f"    over-alloc 拦={over} 二次释放拦={double_free} "
+        f"归还后水位={alloc.used}{'' if ok else '  <-- 守卫失效'}"
+    )
+    if not ok:
+        fails.append(f"分配器守卫错：over={over} double_free={double_free} drained={drained}")
     return fails
 
 
@@ -339,6 +366,7 @@ def main(argv: list) -> int:
         return 1 if fails else 0
 
     fails += _check_run(sym)
+    fails += _check_allocator()
     if not args.skip_clock:
         fails += _check_clock(sym)
     if fails:

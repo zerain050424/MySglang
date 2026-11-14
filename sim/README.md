@@ -38,19 +38,34 @@ python -m sim --import-only
 | # | 内容 | 状态 |
 |---|---|---|
 | **M0** | 装载层：CPU 上导入生产模块并跑通 match/insert/evict | ✅ 已完成（`bootstrap.py` + `__main__.py`） |
-| M1 | 时钟单点化：`CacheInitParams.now` → `TreeNode` / `match` / `insert` / `QueueOccupancyTracker` / `CacheTelemetry` / `MultiAgenticEvict` 全部走同一虚拟时钟 | 待做；需要改 `python/sglang/`（搬运后） |
-| M2 | `TokenAllocator` + `create_simulated(eviction_policy=...)` | 待做 |
+| M1 | 时钟单点化：`CacheInitParams.now` → `TreeNode` / `match` / `insert` / `QueueOccupancyTracker` / `CacheTelemetry` / `MultiAgenticEvict` 全部走同一虚拟时钟 | ✅ 已完成（`sim/clock.py`） |
+| M2 | `TokenAllocator` + `create_simulated(eviction_policy=..., now=...)` | ✅ 已完成（`sim/allocator.py`） |
 | M3 | 请求驱动：`SimReq` + `FakeReqToTokenPool` + `cache._adopt()` + 短缺即淘汰 + 指标 | 待做 |
 | M4 | 保真对拍：树不变量 / 同 seed 复现 / TTL 边界 / （可选）与真 server 比命中率 | 待做 |
 
-### 为什么 M1 不能省
+### 分配器（M2）
 
-策略的 `HeterCacheStrategy(now=...)` 已经能注入时钟，但节点时间戳写死在
-`radix_cache.py`（`TreeNode.__init__:272`、`match:821`、`insert:961`）。注入假时钟后
+`sim/allocator.py::TokenAllocator` 只回答缓存真正会问的四件事：`size` /
+`device` / `available_size()` / `free_segment()`，外加驱动层用的 `alloc(n)`。
+
+- **不能用 `cache.evictable_size()` 冒充 `available_size()`**：`evict()` 的承压判据要
+  真实水位（含在飞请求与已锁节点），用可淘汰量会让承压窗口永不触发。
+- `alloc` 超容量直接 `OutOfTokens`，`free_segment` 超已分配直接报错：驱动顺序错了
+  应当当场炸，而不是静默超配让命中率虚高。
+- 不变量（每一步都该成立，自检里逐请求校验）：
+  `alloc.used == cache.evictable_size() + cache.protected_size()`
+
+构造走 `HeterCacheRadixCache.create_simulated(...)`：`cls` 调用所以拿到的就是
+HeterCache 后端，`eviction_policy_config` 原样展开成策略 kwargs，`now` 注入虚拟时钟。
+
+### 为什么时间源必须单点（M1 已落地）
+
+策略的 `HeterCacheStrategy(now=...)` 曾经能注入时钟，但节点时间戳写死在
+`radix_cache.py`（`TreeNode.__init__`、`match`、`insert`）。注入假时钟后
 `is_aged` / `is_one_shot` 会算成「假 now − 真时间戳」，结果是所有节点立刻老化或永不
 老化——TTL（120/180/300s）、`ONE_SHOT_IDLE_S=90`、`reuse_window=90`、承压窗口 3s 全部
-失真。M0 的自检里这些规则**没有**被推进过，所以现在只能验「结构与仲裁」，不能验
-「时间相关淘汰」。
+失真。现在时钟由 `CacheInitParams.now` 单点持有，`RadixCache._stamp()` 给每个新节点
+盖时间戳，再经 `use_clock()` 推给账本 / 遥测 / 队内改写器。
 
 ## 建模规则（M3 会强制遵守）
 

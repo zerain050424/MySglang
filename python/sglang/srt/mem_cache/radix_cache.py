@@ -28,7 +28,7 @@ import sys
 import time
 from array import array
 from collections import defaultdict
-from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Iterator, List, Optional, Tuple, Union
 
 import torch
 
@@ -409,21 +409,45 @@ class RadixCache(BasePrefixCache):
 
     @classmethod
     def create_simulated(
-        self,
+        cls,
         disable: bool = False,
         mock_allocator: Optional[Any] = None,
         page_size: int = 1,
         enable_kv_cache_events: bool = False,
+        eviction_policy: str = "lru",
+        eviction_policy_config: Optional[dict] = None,
+        now: Optional[Callable[[], float]] = None,
     ) -> RadixCache:
-        """Init a radix cache without memory pools for simulation purpose."""
+        """Init a radix cache without memory pools for simulation purpose.
+
+        这是仿真/单测的唯一构造入口：不喂 memory pool，只给一个能回答
+        ``size`` / ``available_size()`` / ``free_segment()`` 的替身分配器。
+
+        Args:
+            disable: 关掉缓存（命中恒 0，写入无副作用）。
+            mock_allocator: 替身分配器；None 时缓存不能调 evict。
+            page_size: 页对齐粒度（前缀长度会被截到整页）。
+            enable_kv_cache_events: 是否记录对外 KV 事件。
+            eviction_policy: 淘汰策略名，与 ``--radix-eviction-policy`` 同值。
+                选 ``heter_cache`` 时走 HeterCache 后端（多队列 + 权重仲裁）。
+            eviction_policy_config: 策略构造参数（原样作 kwargs 展开）。
+            now: 时间源；None 表示墙钟。仿真注入 ``sim.clock.VirtualClock``。
+
+        Returns:
+            ``cls`` 的实例，因此在子类上调用会得到子类（
+            ``HeterCacheRadixCache.create_simulated(...)`` -> HeterCache 后端）。
+        """
         params = CacheInitParams(
             disable=disable,
             req_to_token_pool=None,
             token_to_kv_pool_allocator=mock_allocator,
             page_size=page_size,
             enable_kv_cache_events=enable_kv_cache_events,
+            eviction_policy=eviction_policy,
+            eviction_policy_config=eviction_policy_config,
+            now=now,
         )
-        return RadixCache(params)
+        return cls(params)
 
     def _stamp(self, node: TreeNode) -> None:
         """给新建节点盖时间戳。
