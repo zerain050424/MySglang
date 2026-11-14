@@ -246,6 +246,29 @@ class Simulator:
         )
 
 
+    # ------------------------------------------------------------------ 发射器口径
+    def run_scheduled(
+        self,
+        sessions: Iterable[Session],
+        specs: Iterable,
+        *,
+        service=None,
+        arrival_scale: float = 1.0,
+        wait_scale: float = 1.0,
+    ) -> SimResult:
+        """按 ``bench_heap`` 的发射规则跑（闭环轮次 + 服务时长模型）。
+
+        与 ``run()`` 的区别：``run()`` 吃的是「已有绝对时刻」的 trace（开环）；
+        本方法自己根据「完成时刻 + lognormal」生成时刻（闭环），并推进时钟。
+        """
+
+        from sim.schedule import Emitter
+
+        return Emitter(self, sessions, specs, service).run(
+            arrival_scale=arrival_scale, wait_scale=wait_scale
+        )
+
+
 def run_synthetic(config: Optional[SimConfig] = None, **trace_kwargs) -> SimResult:
     """冒烟用：造一批合成会话并跑一遍。``trace_kwargs`` 透传给 generator。"""
 

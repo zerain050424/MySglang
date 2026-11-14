@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 from array import array
@@ -445,6 +446,47 @@ def _check_fidelity() -> list:
     return fails
 
 
+def _check_emitter() -> list:
+    """R2 验收：闭环轮次（完成时刻 + lognormal）与服务时长模型。"""
+
+    print("[6] 闭环发射（R2）")
+    from sim.runner import SimConfig, Simulator
+    from sim.schedule import ServiceModel, TaskSpec
+    from sim.trace import Session, Turn
+
+    spec = TaskSpec(name="chat", lambda_rate=1.0, mu=1.0, sigma=0.0, seed=1)
+    service = ServiceModel(
+        prefill_base_s=0.0, prefill_tokens_per_s=100.0, decode_tokens_per_s=10.0
+    )
+    sessions = [
+        Session(
+            "ShareGPT-0",
+            (
+                Turn(t=0.0, prompt=array("q", range(100)), out=10),
+                Turn(t=0.0, prompt=array("q", range(200)), out=0),
+            ),
+            task_name="chat",
+        )
+    ]
+    result = Simulator(SimConfig(capacity=4096)).run_scheduled(
+        sessions, [spec], service=service, arrival_scale=0.0
+    )
+    t1, t2 = result.records[0].t, result.records[1].t
+    want = service(100, 10) + math.e  # 第一轮服务 2.0s + e^1.0 空窗
+    ok = t1 == 0.0 and abs(t2 - want) < 1e-6
+    emit = result.summary["emit"]
+    print(
+        f"    闭环      : t1={t1:.3f} t2={t2:.3f} (want {want:.3f}) "
+        f"wall={emit['wall_s']}s lag_p50={emit['send_lag_p50_ms']}ms"
+        f"{'' if ok else '  <-- 闭环断开'}"
+    )
+    if not ok:
+        return [f"闭环轮次时刻错：t1={t1} t2={t2} want={want}"]
+    if emit["service"]["prefill_tokens_per_s"] != 100.0:
+        return ["服务时长模型没进 summary"]
+    return []
+
+
 def main(argv: list) -> int:
     parser = argparse.ArgumentParser(prog="python -m sim", description="M0/M1 自检")
     parser.add_argument(
@@ -478,6 +520,7 @@ def main(argv: list) -> int:
         fails += _check_clock(sym)
     fails += _check_driver()
     fails += _check_fidelity()
+    fails += _check_emitter()
     if fails:
         print("\nFAIL")
         for item in fails:

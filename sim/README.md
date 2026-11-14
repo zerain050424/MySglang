@@ -99,6 +99,37 @@ HeterCache 后端，`eviction_policy_config` 原样展开成策略 kwargs，`now
 失真。现在时钟由 `CacheInitParams.now` 单点持有，`RadixCache._stamp()` 给每个新节点
 盖时间戳，再经 `use_clock()` 推给账本 / 遥测 / 队内改写器。
 
+### 闭环发射（R2）：`bench_heap` 的调度规则
+
+`sim/schedule.py` 把 emitter 的时间轴搬到虚拟时钟：
+
+```python
+from sim.runner import SimConfig, Simulator
+from sim.schedule import ServiceModel, TaskSpec
+
+sessions = load_tasks(cfg["tasks"], base_dir="Heter-Bench")
+specs = [TaskSpec.from_config(t) for t in cfg["tasks"]]
+service = ServiceModel.from_calibration("result/tailshot/calib_lru.json",
+                                        decode_tokens_per_s=40.0)
+result = Simulator(SimConfig(capacity=100_000)).run_scheduled(
+    sessions, specs, service=service, arrival_scale=1.0, wait_scale=1.0)
+```
+
+| 规则 | 实现 |
+|---|---|
+| 首轮到达 | 每 task 独立 Poisson（`expovariate(λ)` 累加）或 `arrival.mode=fixed`（`offset + step*i`），乘 `arrival_scale` |
+| 轮间空窗 | `lognormal(mu, sigma) * wait_scale`，每 session 一条独立 RNG，seed = `stable_seed_from_str(sid, seed + task_id*1000)`（与 emitter 同式，金标对拍过） |
+| 轮次时刻 | **闭环**：`due = 本轮完成时刻 + 空窗`，而不是 trace 里写死的 t |
+| 服务时长 | `prefill_base + prompt/prefill_rate + out/decode_rate`，`prefill_*` 直读 `tools/calibrate.py` 产物 |
+
+为什么必须有服务时长模型：虚拟时钟里没有「读流完成」，没有它 `finished_ts` 就等于
+`开始时刻`，闭环退化成 0 延迟——`wait_scale`/lognormal 都对，但整条时间轴偏快，
+老化 TTL 与 one-shot 豁免会在错的时刻触发。
+
+限制（R3 才放开）：本阶段是**单通道**（`start = max(due, now)`，等价
+`max_inflight=1`）。同一时刻到点的多条请求会排队，`summary["emit"]["send_lag_*"]`
+报的就是这段排队。
+
 ### 数据集接入（R1）：`session_data.jsonl → List[Session]`
 
 `sim/session_data.py` 逐字段对齐 `bench_heap.py` 的读取口径：

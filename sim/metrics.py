@@ -118,6 +118,13 @@ class SimResult:
         if s["sched_occ"]:
             occ = ", ".join(f"{k}={v:.0f}" for k, v in sorted(s["sched_occ"].items()))
             lines.append(f"  sched_occ     : {occ}")
+        emit = s.get("emit")
+        if emit:
+            lines.append(
+                f"  emit          : {emit.get('mode')} wall={emit.get('wall_s')}s "
+                f"lag_p50={emit.get('send_lag_p50_ms')}ms "
+                f"lag_p99={emit.get('send_lag_p99_ms')}ms"
+            )
         if limit and self.records:
             lines.append(f"  first {min(limit, len(self.records))} requests:")
             for record in self.records[:limit]:
