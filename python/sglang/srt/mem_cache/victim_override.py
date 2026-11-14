@@ -87,14 +87,14 @@ class VictimOverride(ABC):
 
 
 class RrEvictPolicy(VictimOverride):
-    """CHAT 队列（多轮人工会话）的会话级轮询（round-robin）。
+    """CHAT 队列的会话级轮询（round-robin）。
 
     目的：多轮会话轮间间隔长且互不相同，按全局分数淘汰会让同一条会话
     连续挨刀，下一轮 prefill 时集中爆发。这里改成"按会话轮着削"：
 
     * 只处理调用方传入的 chat 叶子（配额层已按队列筛过池），每会话只取最
       深的叶子——删它才能一次腾出最多空间；
-    * 本轮缺口 ``d`` 已达上限的会话直接跳过，避免把一条会话掏空；
+    * 本轮缺口d已达上限的会话直接跳过，避免把一条会话掏空；
     * 其余会话按"最久未被选中"排序，实现跨会话轮询。
 
     Args:
@@ -115,8 +115,8 @@ class RrEvictPolicy(VictimOverride):
     def loss_cap(self, chain_len: int) -> float:
         """单会话在本轮可以承受的 KV 缺口上限（token）。
 
-        取 ``kappa * L`` 与 ``L - keep`` 的较小值：前者限制"一次最多削掉多少
-        比例"，后者保证会话至少留下 ``min_retain_*`` 的底。
+        取kappa * L与L - keep的较小值：前者限制一次最多削掉多少
+        比例，后者保证会话至少留下min_retain_*的底。
 
         Args:
             chain_len: 会话当前链长 L（token）。
@@ -220,36 +220,25 @@ class RrEvictPolicy(VictimOverride):
 class SlruEvictPolicy(VictimOverride):
     """共享会话数账本 + 节点生命周期观测器。
 
-职责：
+    职责：
 
-1. **账本**：维护每个节点被多少个不同的会话命中过（``share``）与一份 bloom 位图
-   （用于同会话去重）。这台账本被两处读取——``HeterCacheStrategy.is_one_shot``
-   判 one-shot，和 ``quota_selector.struct_tier`` 判"是否受保护"，所以阈值只允许
-   一个来源（``SlruParams.share_min``），否则两处口径会漂移。
-2. **生命周期**：``on_node_hit`` / ``on_node_inserted`` 由缓存层调用。
-
-**不参与选点**：struct 队的候选由 ``struct_tier`` 直接排，本类原来的 ``pick``
-已删除——它永远收不到调用，``slru_picks`` 也恒为 0。
-
-账本写入点只有两个，都由缓存层调度：``on_node_hit``（命中去重计数）与
-``on_node_inserted``（分裂时新父节点继承）。树拓扑维护仍留在 RadixCache。
-
-Args:
-    session_registry: 会话账本；省略时取全局单例。
-    share_min: 保护阈值；省略时取 ``DEFAULT_SHARE_MIN``，下限 2。
-"""
+    1. 维护每个节点被多少个不同的会话命中过与一份 bloom 位图
+    2. 生命周期：on_node_hit/n_node_inserted由缓存层调用。
+    Args:
+        session_registry: 会话账本；省略时取全局单例。
+        share_min: 保护阈值；省略时取 ``DEFAULT_SHARE_MIN``，下限 2。
+    """
 
     queue: Optional[HeterCacheNodeTag] =  HeterCacheNodeTag.QSTRUCT
 
     def __init__(self, session_registry=None, share_min=None) -> None:
         # 与策略共用同一本会话账（由 HeterCacheStrategy 注入）：is_one_shot 与
-        # pick 必须看到同一份 session_type，否则"受保护"与"one-shot"会打架。
         self.session_registry = session_registry or SessionRegistry.global_instance()
         self.share_min = max(
             2,
             int(DEFAULT_SHARE_MIN if share_min is None else share_min),
         )
-        # 共享会话数账本的观测（唯一写者就是本类）
+        # 共享会话数账本的观测
         self.share_counted = 0   # 计入 share_sessions 的命中次数
         self.share_dedup = 0     # 同一会话重复命中的去重次数
 
@@ -257,10 +246,6 @@ Args:
 
     def _record_session(self, node, session_id) -> bool:
         """把 (node, session) 记进共享数账本；同会话重复命中只算一次。
-
-        去重用 64 bit bloom 而不是集合：会话数上万时集合会持续涨内存，而
-        bloom 的误判方向是"当作已记过"（少计一次），对本策略足够安全。
-
         Args:
             node: 被命中的节点。
             session_id: 命中该节点的会话；缺失时不计数。
@@ -282,10 +267,6 @@ Args:
 
     def on_node_inserted(self, node) -> None:
         """分裂回调：新父节点继承子节点的共享账本条目。
-
-        分裂不改变"哪些会话经过这段前缀"，所以两半都该继承。新父节点只有一个
-        子树，取该子树的值即可；普通插入（不带子节点）直接返回，不建条目。
-
         Args:
             node: 新挂上树的节点（普通插入的叶子，或分裂出来的父节点）。
         """
@@ -304,10 +285,6 @@ Args:
 
     def on_node_hit(self, node, session_id=None) -> None:
         """命中去重记账：新会话命中则共享数 +1。
-
-        必须在缓存层更新 ``queue_tag`` 之前调用：同一次命中里账本与标签要看到
-        同一份事实，否则 one-shot 判定会用到过期的共享数。
-
         Args:
             node: 被命中的节点。
             session_id: 命中该节点的会话。
@@ -317,8 +294,7 @@ Args:
     @staticmethod
     def share_of(node) -> int:
         """返回节点被多少个不同会话命中过（创建者自己的首次重读计 1）。
-
-        读侧表，无条目按 0：节点从未被命中过就不该享受共享保护。
+        读侧表，无条目返回 0：节点从未被命中过就不该享受共享保护。
         """
         entry = _SLRU_META.get(node)
         return int(entry[0]) if entry else 0
@@ -333,7 +309,6 @@ Args:
         }
 
     def reset(self) -> None:
-        """只清计数器。共享账本条目在侧表里随节点 GC 一起消失，不需要清。"""
         self.share_counted = 0
         self.share_dedup = 0
 
@@ -344,17 +319,13 @@ Args:
 class MultiTurnEvictPolicy(VictimOverride):
     """AGENTIC 队列的带内改写器：用 lognormal 生存概率挑最冷的节点。
 
-权重取"复用已经过期的概率"（UniCache 原机制）：
+    权重取复用已经过期的概率：
 
-    w = 1 - reuse_prob = CDF(elapsed; mu, sigma)
+        w = 1 - reuse_prob = CDF(elapsed; mu, sigma)
 
-权重取对数正态的CDF(elapsed)：1 - CDF才是"还没被复用"的概率，
-所以这里越大越先淘汰。同权重时退化为段内 LRU。
-
-分布参数按节点生效标签取（``_REUSE_CONFIG``）：agentic 节点用 QAGENT 的
-(mu, sigma)，force_agentic 下所有节点都走 QAGENT。本类只处理传入的池，
-绝不跨带取点。
-"""
+    权重取对数正态的CDF(elapsed)：1 - CDF才是还没被复用的概率，
+    所以这里越大越先淘汰。同权重时退化为段内 LRU。
+    """
 
     name = "mt"
     queue = HeterCacheNodeTag.QAGENT
@@ -374,12 +345,10 @@ class MultiTurnEvictPolicy(VictimOverride):
 
 
     def pick(self, leaves, registry=None) -> Optional["TreeNode"]:
-        """在 agentic 带内挑"过期概率"最高的节点；带内无候选时返回 None。
-
+        """在 agentic 带内挑过期概率最高的节点；带内无候选时返回 None。
         Args:
             leaves: 配额层筛过的候选池（已限定在 agentic 队列）。
             registry: 未使用；保留基类签名。
-
         Returns:
             选中的叶子；带内无候选时返回 None 并累加 fallback 计数。
         """
@@ -415,7 +384,6 @@ class MultiTurnEvictPolicy(VictimOverride):
         }
 
     def reset(self) -> None:
-        """只清计数器；1-prob 权重无状态，无需清理。"""
         self.mt_picks = 0
         self.mt_fallbacks = 0
 
@@ -425,26 +393,9 @@ class MultiTurnEvictPolicy(VictimOverride):
 
 class MultiAgenticEvict(VictimOverride):
     """AGENTIC 队列的复用分改写器：按复用分升序淘汰。
-
-    复用分沿用旧版HeterCacheStrategy._reuse_score的多轮分支口径（不是
-    跨队列的全局价值分，只在本队内排序）：
-
         reuse_score(node) = 1 - CDF(elapsed; mu, sigma)
-
     CDF是 lognormal 的P(复用间隔 <= elapsed)，因此1 - CDF是
     到此刻还没被复用的概率：越小越先淘汰（复用窗口已经过去）。
-    (mu, sigma) 取自HeterCacheNodeTag.reuse_config——agentic 节点即
-    QAGENT:(1.81, 1.092)，与MultiTurnEvictPolicy同源。
-
-    与MT的分工：MT 按同一复用分布排序并带段内 LRU 的 tie-break，本类在
-    同分时优先弃大片段（一次腾更多空间）。两者互斥且本类优先，开关是
-    ``MultiAgenticParams.enabled``；关闭时策略侧不构造本类，agentic 队回落到
-    MT / 兜底。
-
-    Args:
-        tag_of: 节点→生效标签的解析器。由策略注入 ``_node_tag``，这样
-            ``force_agentic`` 实验下所有节点都按 QAGENT 的分布算分，与旧版
-            ``_reuse_score`` 完全一致；省略时直接读 ``node.queue_tag``。
     """
 
     name = "multi_agentic"
@@ -461,16 +412,10 @@ class MultiAgenticEvict(VictimOverride):
     # ------------------------------------------------------------ 复用分
 
     def reuse_score(self, node, now: Optional[float] = None) -> float:
-        """节点的复用分（越小越先淘汰）。
-
-        无时间维度的标签（如 QSTRUCT）旧口径返回 0，即最不保值；本类只处理
-        agentic 池，那条分支仅作为口径兜底（仅非 ``force_agentic`` 的手工调用
-        才能碰到）。
-
+        """节点的复用分数
         Args:
             node: 待排序节点。
             now: 当前单调时钟；省略时现取（批量排序时传入同一个 now）。
-
         Returns:
             复用分，值域约 [0, 1]。
         """
@@ -491,11 +436,9 @@ class MultiAgenticEvict(VictimOverride):
 
     def pick(self, leaves, registry=None) -> Optional["TreeNode"]:
         """在 agentic 池内挑复用分最低的节点；带内无候选时返回 None。
-
         Args:
             leaves: 当前可淘汰叶子集合。
             registry: 未使用；保留基类签名。
-
         Returns:
             选中的叶子；无 agentic 叶子时返回 None 并累加 fallback 计数。
         """

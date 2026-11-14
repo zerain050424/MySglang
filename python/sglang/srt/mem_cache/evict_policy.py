@@ -218,10 +218,8 @@ class HeterCacheStrategy(EvictionStrategy):
         self.quota = QuotaParams.from_any(quota)
         self.force_agentic = bool(force_agentic)
 
-        # 配额账本：唯一写入口在缓存层（record_insert / record_evict），
-        # 策略只读它的 occ 做仲裁。
         self.occupancy = QueueOccupancyTracker()
-        # 兜底淘汰:采样独立 RNG，保证实验结果在相同 seed 下可复现
+
         self._quota_rng = random.Random(self.quota.seed)
         self.profiler = HeterProfiler()
         self.telemetry = CacheTelemetry(self.profiler)
@@ -231,13 +229,6 @@ class HeterCacheStrategy(EvictionStrategy):
         self.slru_evict = SlruEvictPolicy(
             self.session_registry, self.slru.share_min
         )
-        self.mt_evict = (
-            MultiTurnEvictPolicy(self.mt, self.session_registry, self._node_tag)
-            if self.mt.enabled
-            else None
-        )
-        # agentic 的复用分排序：与 MT 互斥且优先（multi_agentic.enabled 显式打开）。
-        # 注入 _node_tag：force_agentic 下所有节点都按 QAGENT 分布算分。
         self.multi_agentic_evict = (
             MultiAgenticEvict(self._node_tag)
             if self.multi_agentic.enabled
@@ -247,7 +238,6 @@ class HeterCacheStrategy(EvictionStrategy):
         self.node_observers = (self.slru_evict,)
 
     def _node_tag(self, node) -> HeterCacheNodeTag:
-        """节点的生效标签。force_agentic 开启时统一按 agentic 算。"""
         if self.force_agentic:
             return HeterCacheNodeTag.QAGENT
         return HeterCacheNodeTag.coerce(getattr(node, "queue_tag", None))
@@ -260,12 +250,10 @@ class HeterCacheStrategy(EvictionStrategy):
 
     def is_one_shot(self, node) -> bool:
         """判定节点是否属于 One-shot 带。
-
         标准：属于 TRANS/STRUCT 且跨会话共享数未达到 share_min，
         且从未被任何请求匹配过
         且归属会话已搁置超过 ONE_SHOT_IDLE_S
-
-        注：若节点无会话元数据，保守返回 False 防止误删热前缀。
+        若节点无会话元数据，保守返回 False 防止误删热前缀。
         """
         st = self.session_registry.get(getattr(node, "session_id", None))
         if st is None:
@@ -297,13 +285,13 @@ class HeterCacheStrategy(EvictionStrategy):
         )
 
     def record_evict(self, node) -> None:
-        """记录节点淘汰事件并扣减配额占用（支持级联删除逐点触发）。
+        """记录节点淘汰事件并扣减配额占用。
 
-        记账口径说明（F1）：晋升（hit_count 0→1）会把节点从 one-shot
+        晋升（hit_count 0→1）会把节点从 one-shot
         带挪进其标签队列，而该队列可能从未收到过对应的 insert 计入
         （one-shot 时 insert 跳过）——evict 会扣一个负项，直到下一次
         全树快照 reconcile 吸收。random 行仅作展示、不参与配额仲裁；
-        struct 行的短暂低估方向是「少淘汰、多保留」，与目标同向。
+        struct 行的短暂低估方向是少淘汰、多保留，与目标同向。
 
         时间豁免引入反向漂移（轴一）：insert 时会话活跃被计入、evict 时
         已过搁置窗口进入带内被跳过 → 占用短暂虚高，方向是「多淘汰」，
@@ -367,13 +355,8 @@ class HeterCacheStrategy(EvictionStrategy):
                 pool, key=lambda n: struct_tier(n, share_of, share_min)
             )
         if queue == "agentic":
-            # 两个改写器互斥：显式打开 multi_agentic 时按复用分排序，否则 MT。
             if self.multi_agentic_evict is not None:
                 return self.multi_agentic_evict.pick(pool, self.session_registry)
-            if self.mt_evict is not None:
-                picked = self.mt_evict.pick(pool, self.session_registry)
-                if picked is not None:
-                    return picked
         if queue == "chat" and self.rr_evict is not None:
             # RR 轮询调度，受配额超额缺口上限约束
             picked = self.rr_evict.pick(
@@ -394,7 +377,7 @@ class HeterCacheStrategy(EvictionStrategy):
         return gap if gap > 0 else None
 
     def quota_fallback(self, leaves):
-        """配额候选均耗尽时的均匀随机兜底（使用独立 RNG 确保可复现）。"""
+        """配额候选均耗尽时的均匀随机淘汰。"""
         pool = list(leaves)
         if not pool:
             return None
