@@ -480,11 +480,45 @@ def _check_emitter() -> list:
         f"wall={emit['wall_s']}s lag_p50={emit['send_lag_p50_ms']}ms"
         f"{'' if ok else '  <-- 闭环断开'}"
     )
+    fails = []
     if not ok:
-        return [f"闭环轮次时刻错：t1={t1} t2={t2} want={want}"]
+        fails.append(f"闭环轮次时刻错：t1={t1} t2={t2} want={want}")
     if emit["service"]["prefill_tokens_per_s"] != 100.0:
-        return ["服务时长模型没进 summary"]
-    return []
+        fails.append("服务时长模型没进 summary")
+
+    # 并发窗口（R3）：同刻到点 + 同前缀 -> 并发全 miss，顺序则后到者命中
+    prefix = list(range(64))
+    racers = [
+        Session(
+            f"apps_{i}",
+            (Turn(t=0.0, prompt=array("q", prefix + [900 + i] * 32), out=0),),
+            task_name="chat",
+        )
+        for i in range(3)
+    ]
+    spec0 = TaskSpec(
+        name="chat", arrival_mode="fixed", arrival_offset_s=0.0, arrival_step_s=0.0
+    )
+    par = Simulator(SimConfig(capacity=4096)).run_scheduled(
+        racers, [spec0], service=service, max_inflight=0
+    )
+    seq = Simulator(SimConfig(capacity=4096)).run_scheduled(
+        racers, [spec0], service=service, max_inflight=1
+    )
+    hits_par = [r.hit for r in par.records]
+    hits_seq = [r.hit for r in seq.records]
+    dup = par.summary["emit"]["duplicate_insert_tokens"]
+    peak = par.summary["emit"]["inflight_peak"]
+    ok2 = hits_par == [0, 0, 0] and hits_seq == [0, 64, 64] and dup == 128 and peak == 3
+    print(
+        f"    并发窗口  : 不限并发 hits={hits_par} peak={peak} dup={dup} / "
+        f"单通道 hits={hits_seq}{'' if ok2 else '  <-- 竞态没复现'}"
+    )
+    if not ok2:
+        fails.append(
+            f"并发/竞态不符：par={hits_par} seq={hits_seq} dup={dup} peak={peak}"
+        )
+    return fails
 
 
 def main(argv: list) -> int:

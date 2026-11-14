@@ -122,6 +122,8 @@ class SimResult:
         if emit:
             lines.append(
                 f"  emit          : {emit.get('mode')} wall={emit.get('wall_s')}s "
+                f"inflight_peak={emit.get('inflight_peak')} "
+                f"dup_insert={emit.get('duplicate_insert_tokens')} "
                 f"lag_p50={emit.get('send_lag_p50_ms')}ms "
                 f"lag_p99={emit.get('send_lag_p99_ms')}ms"
             )

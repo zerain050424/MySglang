@@ -31,6 +31,28 @@ DEFAULT_WEIGHTS = {"struct": 0.2, "agentic": 0.5, "chat": 0.3}
 
 
 @dataclass
+class Pending:
+    """已到点、已占槽、已挂锁，还没落树的一轮请求（见 ``Simulator.begin``）。
+
+    记录在 :meth:`Simulator.end` 里生成，因此 ``Simulator.records`` 是**完成序**
+    ——与 ``bench_heap`` 的 ``stats.rows``（响应读完后追加）一致。
+    """
+
+    req: SimReq
+    node: object
+    need: int
+    t: float
+    session_id: str
+    rid: str
+    prompt_len: int
+    out_len: int
+    hit: int
+    evicted: int
+    session_type: str
+    task_name: str
+
+
+@dataclass
 class SimConfig:
     """一次 run 的全部可调项。权重比例等价（只影响仲裁顺序，不参与队内排序）。"""
 
@@ -65,6 +87,9 @@ class Simulator:
         self.records: List[RequestRecord] = []
         self.tasks: Dict[str, str] = {}
         self._rid_seq = 0
+        self.inflight_tokens = 0
+        self.inflight_token_peak = 0
+        self.duplicate_insert_tokens = 0
 
     # ------------------------------------------------------------------ 装配
     def prepare(self, width: int) -> None:
@@ -95,23 +120,36 @@ class Simulator:
         self.records = []
         self.tasks = {}
         self._rid_seq = 0
+        self.inflight_tokens = 0
+        self.inflight_token_peak = 0
+        self.duplicate_insert_tokens = 0
 
     # ------------------------------------------------------------------ 单请求
-    def request(
+    def begin(
         self,
         turn: Turn,
         session_id: str,
         rid: Optional[str] = None,
         task_name: str = "",
-    ) -> RequestRecord:
-        """重放一轮请求并返回它的记录。
+    ) -> "Pending":
+        """请求到点：match → 挂锁 → 短缺即淘汰 → 预留；写树留到 :meth:`end`。
+
+        并发窗口里这一步和 ``end()`` 之间可能隔着别的请求，所以两件事必须分开：
+
+        * **写树在 end()**：生产里 KV 是请求结束时 ``cache_finished_req`` 才落树
+          （chunked prefill 例外）。若在 begin 写，同一时刻到点的后一条请求会命中
+          前一条刚写的前缀——竞态（racing）就消失了，命中率会虚高。
+        * **锁持到 end()**：生产里 ``inc_lock_ref`` 从 match 一直持到请求结束，
+          期间命中的前缀不可淘汰；提前放锁会让并发场景的占用与淘汰偏松。
 
         Args:
             turn: 本轮内容（``turn.t`` 是绝对时刻）。
             session_id: 会话 id（同时用于分类与跨会话共享判定）。
-            rid: 请求 id；缺省用 ``session_id#序号``。必须每请求唯一
-                （``CacheTelemetry.on_hit`` 按 rid 去重）。
-            task_name: 负载名，仅用于 per-task 指标（对齐 emitter 的 ``per_task``）。
+            rid: 请求 id；缺省 ``session_id#序号``，必须每请求唯一。
+            task_name: 负载名，仅用于 per-task 指标。
+
+        Returns:
+            :class:`Pending`；必须交给 :meth:`end` 收尾（否则锁与槽位都漏）。
         """
 
         if self.cache is None:
@@ -123,15 +161,13 @@ class Simulator:
         rid = rid or f"{session_id}#{self._rid_seq}"
 
         req = SimReq(rid, session_id, turn.prompt, turn.out, tool_call=turn.tool_call)
-        # 仿真不建模请求自己的 kv 行（顺序模型里它只是树的引用）：声明整条已由树
-        # 持有，于是 _adopt 收尾的「释放重复槽位」段为空（len=0），池账只跟树走。
+        # 仿真不建模请求自己的 kv 行（它只是树的引用）：声明整条已由树持有，
+        # 于是 _adopt 收尾的「释放重复槽位」段为空，池账只跟树 + 在飞走。
         req.kv.cache_protected_len = len(req.fill_ids())
 
-        # 2) 命中（observe_request 在 match_prefix 内部）
+        # 1) 命中（observe_request 在 match_prefix 内部）
         key = sym["RadixKey"](array("q", turn.prompt)).page_aligned(self.cache.page_size)
-        matched = self.cache.match_prefix(
-            sym["MatchPrefixParams"](key=key, req=req)
-        )
+        matched = self.cache.match_prefix(sym["MatchPrefixParams"](key=key, req=req))
         hit = int(matched.device_indices.numel())
 
         # 本次会写入树的完整 key（prompt + response），与 _adopt 的计算口径一致
@@ -141,10 +177,7 @@ class Simulator:
         total = len(full)
         need = total - hit
 
-        # 3) 挂锁 -> 4) 短缺即淘汰 -> 预留
-        #
-        # 预留量取 need（= 页对齐后的 prompt+response - 命中），因为命中段的槽位
-        # 本来就在树里、被同一个请求引用，不需要再占一份。
+        # 2) 挂锁 -> 3) 短缺即淘汰 -> 预留
         node = matched.last_device_node
         self.cache.inc_lock_ref(node)
         evicted = 0
@@ -162,47 +195,95 @@ class Simulator:
                     "单请求超出池容量；顺序模型不模拟 retraction"
                     "（生产会把请求拆 chunk 或重算），请调大 capacity 或截断 trace"
                 ) from exc
-        finally:
-            self.cache.dec_lock_ref(node)
+        except BaseException:
+            self.cache.dec_lock_ref(node)  # 失败也要放锁，否则后续 evict 全被挡住
+            raise
 
-        # 5) 写入树（含 touch / decode_start / prompt 边界分裂）
-        tree_before = tree_tokens(self.cache)
-        self.cache._adopt(req, req.fill_ids(), split_prompt=True)
-        grew = tree_tokens(self.cache) - tree_before
-        # 预留量是「全序列 - prompt 命中」，但 response 段也可能已经在树里
-        # （同一 prompt 的重放会命中整条），差额就是 _adopt 本该释放的重复槽位；
-        # 因为仿真不建模请求行，这里显式归还，保持池账 == 树内 token。
-        if grew < need:
-            self.alloc.release(need - grew)
-        elif grew > need:
-            raise AssertionError(
-                f"树增长超过预留：grew={grew} > need={need} (rid={rid})"
-            )
-
-        # 6) 不变量：槽位账 == 树内 token，任何漂移都是记账 bug
-        tree = tree_tokens(self.cache)
-        if self.alloc.used != tree:
-            raise AssertionError(
-                f"池账不平：alloc.used={self.alloc.used} tree={tree} "
-                f"(rid={rid}, need={need}, hit={hit}, evicted={evicted})"
-            )
+        # 槽位已占、树里还没有：这段就是「在飞但未落树」的 KV
+        self.inflight_tokens += need
+        self.inflight_token_peak = max(self.inflight_token_peak, self.inflight_tokens)
 
         state = self.cache.session_registry.get(session_id)
-        record = RequestRecord(
+        self._assert_balanced(where=f"begin({rid})")
+        return Pending(
+            req=req,
+            node=node,
+            need=need,
             t=turn.t,
             session_id=session_id,
             rid=rid,
             prompt_len=len(req.origin_input_ids),
             out_len=len(req.output_ids),
             hit=hit,
-            need=need,
             evicted=int(evicted),
-            used=self.alloc.used,
             session_type=state.session_type.value if state is not None else "none",
             task_name=task_name,
         )
-        self.records.append(record)
+
+    def end(self, pending: "Pending") -> RequestRecord:
+        """请求完成：写树 → 归还重复槽位 → 放锁。"""
+
+        req = pending.req
+        need = pending.need
+
+        # 4) 写入树（含 touch / decode_start / prompt 边界分裂）
+        tree_before = tree_tokens(self.cache)
+        self.cache._adopt(req, req.fill_ids(), split_prompt=True)
+        grew = tree_tokens(self.cache) - tree_before
+
+        self.inflight_tokens -= need
+        if grew < need:
+            # 预留量是「全序列 - prompt 命中」，但 response 段也可能已在树里
+            # （同一 prompt 的重放会命中整条），或等我们落树期间别的请求先写入了
+            # 同一段前缀（竞态）。差额在这里归还，并记为重复写入。
+            self.alloc.release(need - grew)
+            self.duplicate_insert_tokens += need - grew
+        elif grew > need:
+            raise AssertionError(
+                f"树增长超过预留：grew={grew} > need={need} (rid={pending.rid})"
+            )
+
+        # 5) 放锁（生产：cache_finished_req 之后 unpin）
+        self.cache.dec_lock_ref(pending.node)
+        self._assert_balanced(where=f"end({pending.rid})")
+
+        record = RequestRecord(
+            t=pending.t,
+            session_id=pending.session_id,
+            rid=pending.rid,
+            prompt_len=pending.prompt_len,
+            out_len=pending.out_len,
+            hit=pending.hit,
+            need=pending.need,
+            evicted=pending.evicted,
+            used=self.alloc.used,
+            session_type=pending.session_type,
+            task_name=pending.task_name,
+        )
+        self.records.append(record)  # 完成序，对齐 emitter 的 stats.rows
         return record
+
+    def request(
+        self,
+        turn: Turn,
+        session_id: str,
+        rid: Optional[str] = None,
+        task_name: str = "",
+    ) -> RequestRecord:
+        """begin + 立即 end（顺序模型走这条；并发由 Emitter 分开调）。"""
+
+        return self.end(self.begin(turn, session_id, rid, task_name))
+
+    def _assert_balanced(self, where: str = "") -> None:
+        """池账 == 树内 token + 在飞未落树的 token。"""
+
+        tree = tree_tokens(self.cache)
+        expect = tree + self.inflight_tokens
+        if self.alloc.used != expect:
+            raise AssertionError(
+                f"池账不平（{where}）：alloc.used={self.alloc.used} "
+                f"tree={tree} inflight={self.inflight_tokens}"
+            )
 
     # ------------------------------------------------------------------ 整条 trace
     def run(self, sessions: Iterable[Session]) -> SimResult:
@@ -255,17 +336,23 @@ class Simulator:
         service=None,
         arrival_scale: float = 1.0,
         wait_scale: float = 1.0,
+        max_inflight: int = 0,
     ) -> SimResult:
         """按 ``bench_heap`` 的发射规则跑（闭环轮次 + 服务时长模型）。
 
         与 ``run()`` 的区别：``run()`` 吃的是「已有绝对时刻」的 trace（开环）；
         本方法自己根据「完成时刻 + lognormal」生成时刻（闭环），并推进时钟。
+
+        Args:
+            max_inflight: 同时在飞上限；0 = 不限（emitter 默认），1 = 单通道。
         """
 
         from sim.schedule import Emitter
 
         return Emitter(self, sessions, specs, service).run(
-            arrival_scale=arrival_scale, wait_scale=wait_scale
+            arrival_scale=arrival_scale,
+            wait_scale=wait_scale,
+            max_inflight=max_inflight,
         )
 
 

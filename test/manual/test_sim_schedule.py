@@ -104,13 +104,13 @@ def test_wait_scale_and_arrival_scale():
     sessions = [_session(f"ShareGPT-{i}", [_turn(100, out=0)]) for i in range(3)]
 
     fast = Simulator(SimConfig(capacity=4096)).run_scheduled(
-        sessions, [spec], service=SERVICE, arrival_scale=0.0
+        sessions, [spec], service=SERVICE, arrival_scale=0.0, max_inflight=1
     )
     # 全部 t=0 到点：单通道排队 => 0, 1.0, 2.0（service(100,0)=1.0）
     assert [round(r.t, 3) for r in fast.records] == [0.0, 1.0, 2.0]
 
     scaled = Simulator(SimConfig(capacity=4096)).run_scheduled(
-        sessions, [spec], service=SERVICE, arrival_scale=2.0
+        sessions, [spec], service=SERVICE, arrival_scale=2.0, max_inflight=1
     )
     # 到点 0/20/40，均晚于前一条完成 => 直接按到点开始
     assert [round(r.t, 3) for r in scaled.records] == [0.0, 20.0, 40.0]
@@ -143,7 +143,7 @@ def test_poisson_arrivals_and_send_lag():
     )
     sessions = [_session(f"ShareGPT-{i}", [_turn(100, out=0)]) for i in range(3)]
     result = Simulator(SimConfig(capacity=4096)).run_scheduled(
-        sessions, [spec], service=SERVICE, arrival_scale=1.0
+        sessions, [spec], service=SERVICE, arrival_scale=1.0, max_inflight=1
     )
     lags = [round(r, 6) for r in [0.0, 1.0, 2.0]]
     assert result.summary["emit"]["send_lag_max_ms"] == pytest.approx(lags[-1] * 1000)

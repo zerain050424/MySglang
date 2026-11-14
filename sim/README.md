@@ -74,6 +74,9 @@ print(result.render())          # 含 per-task 命中率
 | M2 | `TokenAllocator` + `create_simulated(eviction_policy=..., now=...)` | ✅ 已完成（`sim/allocator.py`） |
 | M3 | 请求驱动：`SimReq` + `FakeReqToTokenPool` + `cache._adopt()` + 短缺即淘汰 + 指标 | ✅ 已完成（`sim/req.py`、`trace.py`、`runner.py`、`metrics.py`） |
 | M4 | 保真对拍：树不变量 / 同 seed 复现 / TTL 边界 / （可选）与真 server 比命中率 | ✅ 已完成（`sim/fidelity.py` + `test/manual/test_sim_fidelity.py`） |
+| R1 | 数据集接入：`session_data.jsonl → List[Session]` + per-task 指标 | ✅（`sim/session_data.py`） |
+| R2 | 发射规则：闭环轮次 + 服务时长模型 + arrival/wait scale | ✅（`sim/schedule.py`） |
+| R3 | 并发窗口：同刻 k 条在飞、锁持到完成、竞态可复现 | ✅（`Emitter(max_inflight=...)`） |
 
 ### 分配器（M2）
 
@@ -126,9 +129,33 @@ result = Simulator(SimConfig(capacity=100_000)).run_scheduled(
 `开始时刻`，闭环退化成 0 延迟——`wait_scale`/lognormal 都对，但整条时间轴偏快，
 老化 TTL 与 one-shot 豁免会在错的时刻触发。
 
-限制（R3 才放开）：本阶段是**单通道**（`start = max(due, now)`，等价
-`max_inflight=1`）。同一时刻到点的多条请求会排队，`summary["emit"]["send_lag_*"]`
-报的就是这段排队。
+### 并发窗口（R3）：同刻 k 条在飞
+
+`run_scheduled(..., max_inflight=k)`：`0` = 不限（`bench_heap` 的默认口径），
+`1` = 单通道顺序队列。默认是 `0`。
+
+并发语义的关键是**把 begin 与 end 拆开**：
+
+| | begin（到点） | end（完成） |
+|---|---|---|
+| 命中 | `match_prefix`（此时别人还没写树） | — |
+| 锁 | `inc_lock_ref(命中节点)` | `dec_lock_ref` |
+| 槽位 | `evict(shortfall) → alloc(need)` | 归还重复段 |
+| 树 | **不写** | `_adopt(prompt+output)` |
+
+由此得到的行为差异（也是三种模型最容易被忽略的分歧）：
+
+* **竞态（racing）**：同刻到点、前缀相同的两条请求都 miss，然后各自插入——
+  后者的 `need` 里有 64 token 是重复写入（`emit.duplicate_insert_tokens`）。
+  `max_inflight=1` 时后到者会命中（`hits=[0,64,64]` vs 并发 `[0,0,0]`）。
+* **锁窗口**：在飞期间命中的前缀 `lock_ref>0`、不在 `evictable_leaves`，
+  别的请求逼出的淘汰动不了它（`test_sim_concurrency.py` 有专门的用例）。
+* **池账**：在飞未落树的 KV 让不变量变成
+  `alloc.used == tree_tokens + inflight_tokens`（M4 的等树版本只在无在飞时成立）。
+
+代价（写清楚，避免过度解读）：写树发生在**完成时刻**，生产在 chunked prefill 下
+是分块边写，所以本模型让前缀可见的时间略晚；这会使并发命中略低、`duplicate`
+略高。方向是保守的（不虚高命中率）。
 
 ### 数据集接入（R1）：`session_data.jsonl → List[Session]`
 

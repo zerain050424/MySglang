@@ -28,6 +28,7 @@ import hashlib
 import heapq
 import itertools
 import json
+import math
 import random
 from dataclasses import dataclass, replace
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -200,10 +201,33 @@ class Emitter:
         return rng.lognormvariate(spec.mu, spec.sigma) * wait_scale
 
     # ---- 主循环 ----
-    def run(self, *, arrival_scale: float = 1.0, wait_scale: float = 1.0) -> SimResult:
+    def run(
+        self,
+        *,
+        arrival_scale: float = 1.0,
+        wait_scale: float = 1.0,
+        max_inflight: int = 0,
+    ) -> SimResult:
+        """按 emitter 的规则跑完整条到达流。
+
+        Args:
+            arrival_scale: 首轮到达时刻整体缩放（1=真实 Poisson 节奏，0=全部立即）。
+            wait_scale: 轮间空窗缩放（0=立即发下一轮）。
+            max_inflight: 同时在飞上限；0 = 不限（emitter 的默认口径）。
+                1 会退化成单通道顺序队列。
+
+        并发语义：同一虚拟时刻到点的请求按 ``(due_ts, seq)`` 依次 ``begin``——
+        各自 match / 挂锁 / 占槽，但**都不写树**；写树发生在各自完成时刻。
+        因此同刻到点、前缀相同的两条请求会都 miss 然后各自插入（racing），
+        与生产一致；顺序模型（``max_inflight=1``）下后到的那条会命中前一条，
+        这是两种模型最容易观察到的分歧。
+        """
+
         sim = self.sim
         if not self.sessions:
             return SimResult(records=[], summary={})
+        if max_inflight < 0:
+            raise ValueError(f"max_inflight 必须 >= 0，got {max_inflight}")
 
         # 首轮全部入堆：(due_ts, seq, sid, turn_idx)；seq 保证同刻按入堆顺序
         heap: List[Tuple[float, int, str, int]] = []
@@ -212,42 +236,67 @@ class Emitter:
             group = [s for s in self.sessions if s.task_name == spec.name]
             for session, offset in zip(group, self._arrival_offsets(spec, len(group))):
                 heapq.heappush(
-                    heap,
-                    (offset * arrival_scale, next(seq), session.session_id, 1),
+                    heap, (offset * arrival_scale, next(seq), session.session_id, 1)
                 )
-        heapq.heapify(heap)
 
         width = max_total_len(self.sessions)
         sim.prepare(width)
         sim.tasks = {s.session_id: s.task_name for s in self.sessions}
 
+        # 在飞：按 (完成时刻, 完成序) 出堆，保证同刻完成的事件顺序稳定
+        inflight: List[Tuple[float, int, object, str, int]] = []
+        done_seq = itertools.count()
+        eps = 1e-9
         now = 0.0
-        while heap:
-            due, _seq, sid, idx = heapq.heappop(heap)
-            session = self._by_sid[sid]
-            turn: Turn = session.turns[idx - 1]
-            spec = self.specs[session.task_name]
+        inflight_peak = 0
 
-            start = max(due, now)  # 单通道：上一轮没跑完就排队
-            self.send_lags.append(start - due)
-            record = sim.request(
-                replace(turn, t=start), sid, task_name=session.task_name
-            )
+        while heap or inflight:
+            can_dispatch = max_inflight <= 0 or len(inflight) < max_inflight
 
-            finish = start + self.service(record.prompt_len, record.out_len)
-            sim.clock.advance_to(finish)  # 时钟推进到「响应读完」
-            now = finish
+            # 1) 先完成（同刻先腾地方/放锁，再发新的）
+            if inflight and inflight[0][0] <= now + eps:
+                finish, _dseq, pending, sid, idx = heapq.heappop(inflight)
+                sim.clock.advance_to(finish)
+                sim.end(pending)
+                now = finish
+                self._push_next_turn(heap, seq, self._by_sid[sid], idx, finish, wait_scale)
+                continue
 
-            if idx < session.n_turns:
-                wait = self._inter_turn_wait(spec, sid, wait_scale)
-                heapq.heappush(heap, (finish + wait, next(seq), sid, idx + 1))
+            # 2) 到点且名额够 -> 派发（begin：match + 挂锁 + 占槽，不写树）
+            if heap and can_dispatch and heap[0][0] <= now + eps:
+                due, _s, sid, idx = heapq.heappop(heap)
+                self.send_lags.append(now - due)
+                session = self._by_sid[sid]
+                turn = replace(session.turns[idx - 1], t=now)
+                pending = sim.begin(turn, sid, task_name=session.task_name)
+                finish = now + self.service(pending.prompt_len, pending.out_len)
+                heapq.heappush(
+                    inflight, (finish, next(done_seq), pending, sid, idx)
+                )
+                inflight_peak = max(inflight_peak, len(inflight))
+                continue
+
+            # 3) 推进时钟到下一个事件；名额被占时只看到点完成
+            next_due = heap[0][0] if (heap and can_dispatch) else math.inf
+            next_finish = inflight[0][0] if inflight else math.inf
+            target = min(next_due, next_finish)
+            if target == math.inf:
+                raise RuntimeError("调度死锁：既不能派发也没有在飞请求")
+            sim.clock.advance_to(max(target, now))
+            now = sim.clock()
 
         result = SimResult(records=list(sim.records), summary=sim.summary())
         summary = result.summary or {}
         lags = sorted(self.send_lags)
         summary["emit"] = {
-            "mode": "closed_loop_sequential",
+            "mode": "closed_loop_concurrent"
+            if max_inflight != 1
+            else "closed_loop_sequential",
+            "max_inflight": max_inflight,
             "wall_s": round(now, 3),
+            "inflight_peak": int(inflight_peak),
+            "inflight_token_peak": int(sim.inflight_token_peak),
+            "duplicate_insert_tokens": int(sim.duplicate_insert_tokens),
             "send_lag_p50_ms": round(_pct(lags, 50) * 1000, 3) if lags else 0.0,
             "send_lag_p99_ms": round(_pct(lags, 99) * 1000, 3) if lags else 0.0,
             "send_lag_max_ms": round(max(lags) * 1000, 3) if lags else 0.0,
@@ -261,6 +310,23 @@ class Emitter:
         }
         result.summary = summary
         return result
+
+    def _push_next_turn(
+        self,
+        heap: List[Tuple[float, int, str, int]],
+        seq,
+        session: Session,
+        idx: int,
+        finish: float,
+        wait_scale: float,
+    ) -> None:
+        """本轮完成 -> 压入下一轮（``finish + lognormal * wait_scale``）。"""
+
+        if idx >= session.n_turns:
+            return
+        spec = self.specs[session.task_name]
+        wait = self._inter_turn_wait(spec, session.session_id, wait_scale)
+        heapq.heappush(heap, (finish + wait, next(seq), session.session_id, idx + 1))
 
 
 def _pct(values: Sequence[float], p: float) -> float:
