@@ -32,6 +32,7 @@ class RequestRecord:
     evicted: int
     used: int
     session_type: str
+    task_name: str = ""
 
     @property
     def hit_rate(self) -> float:
@@ -100,6 +101,14 @@ class SimResult:
                 f"hit_rate={rec['hit_rate']:.1%} "
                 f"(hit {rec['hit_tokens']}/{rec['prompt_tokens']})"
             )
+        if s.get("per_task"):
+            lines.append("  per task:")
+            for name, rec in sorted(s["per_task"].items()):
+                lines.append(
+                    f"    {name:20s} n={rec['requests']:4d} "
+                    f"hit_rate={rec['hit_rate']:.1%} "
+                    f"(hit {rec['hit_tokens']:.0f}/{rec['prompt_tokens']:.0f})"
+                )
         if s["victim_sources"]:
             src = ", ".join(f"{k}={v:.0f}" for k, v in sorted(s["victim_sources"].items()))
             lines.append(f"  victim_sources: {src}")
@@ -133,16 +142,21 @@ def summarize(
     """把逐请求记录与策略累计量折成一份 dict。"""
 
     per_type: Dict[str, Dict[str, float]] = {}
+    per_task: Dict[str, Dict[str, float]] = {}
     for record in records:
-        bucket = per_type.setdefault(
-            record.session_type,
-            {"requests": 0, "prompt_tokens": 0, "hit_tokens": 0, "hit_rate": 0.0},
-        )
-        bucket["requests"] += 1
-        bucket["prompt_tokens"] += record.prompt_len
-        bucket["hit_tokens"] += record.hit
-    for bucket in per_type.values():
-        bucket["hit_rate"] = _ratio(bucket["hit_tokens"], bucket["prompt_tokens"])
+        for table, key in ((per_type, record.session_type), (per_task, record.task_name)):
+            if not key:
+                continue
+            bucket = table.setdefault(
+                key,
+                {"requests": 0, "prompt_tokens": 0, "hit_tokens": 0, "hit_rate": 0.0},
+            )
+            bucket["requests"] += 1
+            bucket["prompt_tokens"] += record.prompt_len
+            bucket["hit_tokens"] += record.hit
+    for table in (per_type, per_task):
+        for bucket in table.values():
+            bucket["hit_rate"] = _ratio(bucket["hit_tokens"], bucket["prompt_tokens"])
 
     prompt_tokens = sum(r.prompt_len for r in records)
     hit_tokens = sum(r.hit for r in records)
@@ -152,6 +166,7 @@ def summarize(
         "hit_tokens": hit_tokens,
         "hit_rate": _ratio(hit_tokens, prompt_tokens),
         "per_type": per_type,
+        "per_task": per_task,
         "capacity": capacity,
         "final_used": final_used,
         "evicted_tokens": sum(r.evicted for r in records),

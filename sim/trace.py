@@ -28,10 +28,15 @@ class Turn:
 
 @dataclass(frozen=True)
 class Session:
-    """一条会话的全部轮次（按 ``t`` 升序）。"""
+    """一条会话的全部轮次（按 ``t`` 升序）。
+
+    ``task_name`` 对齐 bench_heap 的 per-task 口径（``[heap] tasks=...``）：
+    emitter 按 task 出命中率，仿真器按 session_type 出；两者同时保留。
+    """
 
     session_id: str
     turns: Tuple[Turn, ...]
+    task_name: str = ""
 
     @property
     def n_turns(self) -> int:

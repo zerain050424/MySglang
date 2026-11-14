@@ -34,6 +34,21 @@ print(result.fingerprint())     # 同 seed 复现基线
 result.to_jsonl("out/run.jsonl")
 ```
 
+直接吃 Heter-Bench 的 `session_data.jsonl`（与 `bench_heap.py` 同口径）：
+
+```python
+from sim.runner import SimConfig, Simulator
+from sim.session_data import load_task
+
+sessions = load_task(
+    "Heter-Bench/TaskData/SharedGPT-multi-turn/Qwen2.5-7B-Instruct/"
+    "ShareGPT_cleaned_valid_deduplicated_session_data.jsonl",
+    task_name="ShareGPT", max_record=200, shuffle=True, seed=42 + 2,
+)
+result = Simulator(SimConfig(capacity=100_000)).run(sessions)
+print(result.render())          # 含 per-task 命中率
+```
+
 ## 为什么能在 CPU 上跑
 
 只有两处重依赖挡路，且都**不是运行时需要**的：
@@ -83,6 +98,26 @@ HeterCache 后端，`eviction_policy_config` 原样展开成策略 kwargs，`now
 老化——TTL（120/180/300s）、`ONE_SHOT_IDLE_S=90`、`reuse_window=90`、承压窗口 3s 全部
 失真。现在时钟由 `CacheInitParams.now` 单点持有，`RadixCache._stamp()` 给每个新节点
 盖时间戳，再经 `use_clock()` 推给账本 / 遥测 / 队内改写器。
+
+### 数据集接入（R1）：`session_data.jsonl → List[Session]`
+
+`sim/session_data.py` 逐字段对齐 `bench_heap.py` 的读取口径：
+
+| 字段 | 来源 | 依据 |
+|---|---|---|
+| `prompt` | `turn_i.input_ids` 整段历史 | emitter 直发 `input_ids`（`bench_heap:_resolve_prompt_ids` 返回值恒等数据集） |
+| `out` | `len(turn_i.response_ids)` | emitter 只发 `max_new_tokens` |
+| `tool_call` | **上一轮**的 `tool_call`（第 1 轮为 False） | emitter payload：`sess[f"turn_{idx-1}"].get("tool_call") if idx > 1 else None` |
+| `task_name` | tasks_config 的 `name` | emitter 的 `per_task` 口径 |
+
+打乱/截断/轮数过滤也同口径：`load_task(..., shuffle=True, seed=seed+task_id, max_record=..., min_turns=...)`。
+
+由此得到一条推论：第 k+1 轮的 prompt 后缀是**数据集的** response，而生产树里存的是
+**模型实际生成的** token，两者一般不同 ⇒ 那一截必然 miss。仿真器把 response 写成
+每请求唯一的哨兵 id，正是为了让这件事也成立。
+
+指标同时给出两套分组：`per_type`（session_type，策略视角）与 `per_task`
+（tasks_config 的 name，emitter 视角）。
 
 ### 请求驱动（M3）
 

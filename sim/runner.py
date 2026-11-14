@@ -63,6 +63,7 @@ class Simulator:
         self.req_pool: Optional[FakeReqToTokenPool] = None
         self.cache = None
         self.records: List[RequestRecord] = []
+        self.tasks: Dict[str, str] = {}
         self._rid_seq = 0
 
     # ------------------------------------------------------------------ 装配
@@ -92,13 +93,26 @@ class Simulator:
         # 会话账本的空闲回收阈值（生产默认 3600s，虚拟时间下同样按秒算）
         self.cache.session_registry.idle_ttl = cfg.idle_ttl
         self.records = []
+        self.tasks = {}
         self._rid_seq = 0
 
     # ------------------------------------------------------------------ 单请求
     def request(
-        self, turn: Turn, session_id: str, rid: Optional[str] = None
+        self,
+        turn: Turn,
+        session_id: str,
+        rid: Optional[str] = None,
+        task_name: str = "",
     ) -> RequestRecord:
-        """重放一轮请求并返回它的记录。"""
+        """重放一轮请求并返回它的记录。
+
+        Args:
+            turn: 本轮内容（``turn.t`` 是绝对时刻）。
+            session_id: 会话 id（同时用于分类与跨会话共享判定）。
+            rid: 请求 id；缺省用 ``session_id#序号``。必须每请求唯一
+                （``CacheTelemetry.on_hit`` 按 rid 去重）。
+            task_name: 负载名，仅用于 per-task 指标（对齐 emitter 的 ``per_task``）。
+        """
 
         if self.cache is None:
             raise RuntimeError("先 prepare(width) 或直接用 run(sessions)")
@@ -185,6 +199,7 @@ class Simulator:
             evicted=int(evicted),
             used=self.alloc.used,
             session_type=state.session_type.value if state is not None else "none",
+            task_name=task_name,
         )
         self.records.append(record)
         return record
@@ -204,6 +219,7 @@ class Simulator:
         if width == 0:
             return SimResult(records=[], summary={})
         self.prepare(width)
+        self.tasks = {session.session_id: session.task_name for session in sessions}
 
         # (时刻, session_id, 轮次下标) 全局归并；同刻按 session_id 稳定排序
         events = sorted(
@@ -213,7 +229,7 @@ class Simulator:
         )
         turns = {session.session_id: session.turns for session in sessions}
         for _t, sid, idx in events:
-            self.request(turns[sid][idx], sid)
+            self.request(turns[sid][idx], sid, task_name=self.tasks[sid])
 
         return SimResult(records=list(self.records), summary=self.summary())
 
