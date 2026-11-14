@@ -1,26 +1,3 @@
-"""HeterCache 的队内候选策略（VictimOverride）。
-
-配额层先按队列把叶子筛成 ``pool``，再交给该队列的队内策略决出具体牺牲节点。
-早期版本是"全局 ``victim_key`` 先选一个基础候选，再问改写器要不要改写"，
-全局复用分删除后这条链已不存在，改写器变成了真正意义上的**队内选点者**：
-
-* ``pick(leaves, registry) -> Optional[TreeNode]``：在给定池内选点，返回
-  ``None`` 表示弃权（调用方跳下一个队列）。
-
-四条硬约束（违反任何一条都会让淘汰循环出错）：
-
-1. **只挑不删**：改写器不得释放 KV / 改树，副作用统一由缓存层 ``_evict_one``
-   执行，否则同一节点会被二次释放。
-2. **必可弃权**：返回 ``None`` 表示本队列无候选，调用方跳下一个队列；改写器
-   也不许抛错阻塞淘汰推进（会导致 evict 自旋）。
-3. **候选集封闭**：只能在传入的 ``leaves`` 内重选，不得构造新节点。
-4. **观测与仲裁分离**：``queue`` 只用于 profile 归类，不参与仲裁；跨队列仲裁
-   属于 ``quota_selector``。
-
-内置实现：``RrEvictPolicy``（会话轮询）、``SlruEvictPolicy``（分段 LRU + 共享数
-账本）、``MultiTurnEvictPolicy``（agentic 带内 1-prob(e) 排序）、
-``MultiAgenticEvict``（agentic 带内复用分排序）。
-"""
 
 from __future__ import annotations
 
@@ -99,7 +76,7 @@ class RrEvictPolicy(VictimOverride):
     * 其余会话按"最久未被选中"排序，实现跨会话轮询。
 
     Args:
-        params: ``RrParams``；``fair_rr`` 为假时整个改写器弃权。
+        params: RrParams；fair_rr为假时整个改写器弃权。
     """
 
     name = "rr"
@@ -161,7 +138,7 @@ class RrEvictPolicy(VictimOverride):
     # ---- 内部 ----
 
     def _pick_round_robin(self, leaves, registry, max_deficit=None) -> Optional["TreeNode"]:
-        """挑"最久未被选中且缺口未达上限"的会话，返回它最深的叶子。
+        """挑最久未被选中且缺口未达上限的会话，返回它最深的叶子。
 
         Args:
             leaves: 已限定在 chat 范围内的叶子。
@@ -320,12 +297,11 @@ class SlruEvictPolicy(VictimOverride):
 class MultiTurnEvictPolicy(VictimOverride):
     """AGENTIC 队列的带内改写器：挑未来窗口内最不可能被复用的节点。
 
-    分数取条件生存概率（H = ``reuse_window_s``）：
+    分数取条件生存概率（H =reuse_window_s）：
 
         p = P(reuse in (a, a+H] | not reused by a) = 1 - S(a+H)/S(a)
 
-    a 是距上次访问的秒数，S = 1 - CDF（lognormal，参数来自
-    ``HeterCacheNodeTag.reuse_config``）。p 越小越先淘汰；同分退化为段内 LRU。
+    a 是距上次访问的秒数，S = 1 - CDF p 越小越先淘汰；同分退化为段内 LRU。
     """
 
     name = "mt"
@@ -402,20 +378,8 @@ class MultiTurnEvictPolicy(VictimOverride):
 
 class MultiAgenticEvict(VictimOverride):
     """AGENTIC 队列的复用分改写器：按复用分升序淘汰。
-
-    复用分只在本队内排序（不是跨队列的全局价值分）：
-
         reuse_score(node) = P(reuse in (a, a+H] | not reused by a)
                           = 1 - S(a+H)/S(a)
-
-    a 是节点距上次访问的秒数，(mu, sigma) 取自
-    HeterCacheNodeTag.reuse_config（agentic 节点即 QAGENT:(1.81, 1.092)）。
-    分数越高说明未来 H 秒越可能被复用，越该保留；淘汰取最低分。
-
-    与MT的分工：MT 用同一个分数，同分时退化为段内 LRU；本类同分时优先
-    弃大片段（一次腾更多空间）。两者互斥且本类优先，开关是
-    ``MultiAgenticParams.enabled``；关闭时策略侧不构造本类，agentic 队回落到
-    MT / 兜底。
     """
 
     name = "multi_agentic"
@@ -433,11 +397,7 @@ class MultiAgenticEvict(VictimOverride):
     # ------------------------------------------------------------ 复用分
 
     def reuse_score(self, node, now: Optional[float] = None) -> float:
-        """节点的复用分：未来 H 秒内被复用的条件概率，值域 [0, 1]。
-
-        无时间维度的标签（如 QSTRUCT）返回 0，即最不保值；本类只处理 agentic
-        池，那条分支仅作为口径兜底（仅非 ``force_agentic`` 的手工调用才能碰到）。
-        """
+        """节点的复用分：未来 H 秒内被复用的条件概率，值域 [0, 1]"""
         cfg = self._tag_of(node).reuse_config
         if cfg is None:
             return 0.0
@@ -450,7 +410,6 @@ class MultiAgenticEvict(VictimOverride):
         )
 
     def victim_key(self, node, now: Optional[float] = None) -> Tuple[float, int]:
-        """队内排序键：复用分升序（低分先走），同分时大片段先走。"""
         return (self.reuse_score(node, now), -node_num_tokens(node))
 
     # ------------------------------------------------------------ 插件接口

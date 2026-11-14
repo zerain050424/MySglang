@@ -167,11 +167,6 @@ class HeterCacheStrategy(EvictionStrategy):
         self.slru_evict = SlruEvictPolicy(
             self.session_registry, self.slru.share_min
         )
-        self.mt_evict = (
-            MultiTurnEvictPolicy(self.mt, self.session_registry, self._node_tag)
-            if self.mt.enabled
-            else None
-        )
         self.multi_agentic_evict = (
             MultiAgenticEvict(self.multi_agentic, self._node_tag)
             if self.multi_agentic.enabled
@@ -300,10 +295,6 @@ class HeterCacheStrategy(EvictionStrategy):
         if queue == "agentic":
             if self.multi_agentic_evict is not None:
                 return self.multi_agentic_evict.pick(pool, self.session_registry)
-            if self.mt_evict is not None:
-                picked = self.mt_evict.pick(pool, self.session_registry)
-                if picked is not None:
-                    return picked
         if queue == "chat" and self.rr_evict is not None:
             # RR 轮询调度，受配额超额缺口上限约束
             picked = self.rr_evict.pick(
