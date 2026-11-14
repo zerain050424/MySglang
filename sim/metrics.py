@@ -33,6 +33,7 @@ class RequestRecord:
     used: int
     session_type: str
     task_name: str = ""
+    skipped: bool = False
 
     @property
     def hit_rate(self) -> float:
@@ -42,7 +43,8 @@ class RequestRecord:
         """指纹用的紧凑串（浮点定点，避免末位抖动）。"""
         return (
             f"{self.t:.3f}|{self.session_id}|{self.rid}|{self.prompt_len}|"
-            f"{self.out_len}|{self.hit}|{self.evicted}|{self.used}|{self.session_type}"
+            f"{self.out_len}|{self.hit}|{self.evicted}|{self.used}|"
+            f"{self.session_type}|{int(self.skipped)}"
         )
 
 
@@ -93,7 +95,8 @@ class SimResult:
             f"prompt_tokens={s['prompt_tokens']}  hit_tokens={s['hit_tokens']}  "
             f"hit_rate={s['hit_rate']:.1%}",
             f"  capacity={s['capacity']}  used={s['final_used']}  "
-            f"evicted={s['evicted_tokens']}  sessions={s['sessions']}",
+            f"evicted={s['evicted_tokens']}  skipped={s['skipped_requests']}  "
+            f"sessions={s['sessions']}",
         ]
         for name, rec in sorted(s["per_type"].items()):
             lines.append(
@@ -179,6 +182,7 @@ def summarize(
         "capacity": capacity,
         "final_used": final_used,
         "evicted_tokens": sum(r.evicted for r in records),
+        "skipped_requests": sum(1 for r in records if r.skipped),
         "sessions": sessions,
         # 以下三项直接读生产对象，口径不复制
         "victim_sources": dict(getattr(profiler, "_victim_sources", {})),

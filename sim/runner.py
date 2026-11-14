@@ -24,7 +24,7 @@ from sim import bootstrap
 from sim.allocator import OutOfTokens, TokenAllocator, tree_tokens
 from sim.clock import VirtualClock
 from sim.metrics import RequestRecord, SimResult, summarize
-from sim.req import FakeReqToTokenPool, SimReq
+from sim.req import OUTPUT_SENTINEL_BASE, FakeReqToTokenPool, SimReq
 from sim.trace import Session, Turn, max_total_len
 
 DEFAULT_WEIGHTS = {"struct": 0.2, "agentic": 0.5, "chat": 0.3}
@@ -50,6 +50,7 @@ class Pending:
     evicted: int
     session_type: str
     task_name: str
+    skipped: bool = False
 
 
 @dataclass
@@ -62,6 +63,10 @@ class SimConfig:
     page_size: int = 1
     eviction_policy: str = "heter_cache"
     idle_ttl: float = 3600.0
+    # 单请求无法在池里放下时的行为：
+    #   "error" —— 抛 OutOfTokens（默认；逼调用方直面 trace/容量不匹配）；
+    #   "skip"  —— 跳过落树、计数后继续（生产用 chunked prefill / retraction 伺候）。
+    oversize: str = "error"
 
 
 class Simulator:
@@ -90,6 +95,7 @@ class Simulator:
         self.inflight_tokens = 0
         self.inflight_token_peak = 0
         self.duplicate_insert_tokens = 0
+        self.skipped_requests = 0
 
     # ------------------------------------------------------------------ 装配
     def prepare(self, width: int) -> None:
@@ -123,6 +129,7 @@ class Simulator:
         self.inflight_tokens = 0
         self.inflight_token_peak = 0
         self.duplicate_insert_tokens = 0
+        self.skipped_requests = 0
 
     # ------------------------------------------------------------------ 单请求
     def begin(
@@ -160,7 +167,14 @@ class Simulator:
         self._rid_seq += 1
         rid = rid or f"{session_id}#{self._rid_seq}"
 
-        req = SimReq(rid, session_id, turn.prompt, turn.out, tool_call=turn.tool_call)
+        req = SimReq(
+            rid,
+            session_id,
+            turn.prompt,
+            turn.out,
+            tool_call=turn.tool_call,
+            output_token=OUTPUT_SENTINEL_BASE + self._rid_seq,
+        )
         # 仿真不建模请求自己的 kv 行（它只是树的引用）：声明整条已由树持有，
         # 于是 _adopt 收尾的「释放重复槽位」段为空，池账只跟树 + 在飞走。
         req.kv.cache_protected_len = len(req.fill_ids())
@@ -179,6 +193,39 @@ class Simulator:
 
         # 2) 挂锁 -> 3) 短缺即淘汰 -> 预留
         node = matched.last_device_node
+        state = self.cache.session_registry.get(session_id)
+        session_type = state.session_type.value if state is not None else "none"
+
+        def _pending(skipped: bool, evicted: int) -> Pending:
+            return Pending(
+                req=req,
+                node=node,
+                need=need,
+                t=turn.t,
+                session_id=session_id,
+                rid=rid,
+                prompt_len=len(req.origin_input_ids),
+                out_len=len(req.output_ids),
+                hit=hit,
+                evicted=int(evicted),
+                session_type=session_type,
+                task_name=task_name,
+                skipped=skipped,
+            )
+
+        if need > self.alloc.size:
+            # 整条请求比池子还大：生产会拆 chunk / retraction，仿真装不下。
+            if self.config.oversize != "skip":
+                raise OutOfTokens(
+                    f"单请求 {total} token 超过池容量 {self.alloc.size}"
+                    f"（rid={rid} hit={hit} need={need}）；"
+                    "生产会拆 chunk 重算，仿真请显式选择："
+                    'SimConfig(oversize="skip") 跳过并计数，或调大 capacity'
+                )
+            self.skipped_requests += 1
+            self._assert_balanced(where=f"skip({rid})")
+            return _pending(True, 0)
+
         self.cache.inc_lock_ref(node)
         evicted = 0
         try:
@@ -190,11 +237,17 @@ class Simulator:
             try:
                 self.alloc.alloc(need)
             except OutOfTokens as exc:
-                raise OutOfTokens(
-                    f"{exc}（rid={rid} total={total} hit={hit} need={need}）——"
-                    "单请求超出池容量；顺序模型不模拟 retraction"
-                    "（生产会把请求拆 chunk 或重算），请调大 capacity 或截断 trace"
-                ) from exc
+                # 淘汰也腾不出来（例如槽位全被别的在飞请求锁着）
+                if self.config.oversize != "skip":
+                    raise OutOfTokens(
+                        f"{exc}（rid={rid} total={total} hit={hit} need={need}）——"
+                        "仿真不模拟 retraction（生产会拆分/重算），"
+                        "请调大 capacity 或 SimConfig(oversize=\"skip\")"
+                    ) from exc
+                self.cache.dec_lock_ref(node)
+                self.skipped_requests += 1
+                self._assert_balanced(where=f"skip({rid})")
+                return _pending(True, evicted)
         except BaseException:
             self.cache.dec_lock_ref(node)  # 失败也要放锁，否则后续 evict 全被挡住
             raise
@@ -203,49 +256,35 @@ class Simulator:
         self.inflight_tokens += need
         self.inflight_token_peak = max(self.inflight_token_peak, self.inflight_tokens)
 
-        state = self.cache.session_registry.get(session_id)
         self._assert_balanced(where=f"begin({rid})")
-        return Pending(
-            req=req,
-            node=node,
-            need=need,
-            t=turn.t,
-            session_id=session_id,
-            rid=rid,
-            prompt_len=len(req.origin_input_ids),
-            out_len=len(req.output_ids),
-            hit=hit,
-            evicted=int(evicted),
-            session_type=state.session_type.value if state is not None else "none",
-            task_name=task_name,
-        )
+        return _pending(False, evicted)
 
     def end(self, pending: "Pending") -> RequestRecord:
-        """请求完成：写树 → 归还重复槽位 → 放锁。"""
+        """请求完成：写树 → 归还重复槽位 → 放锁（跳过的请求只出记录）。"""
 
-        req = pending.req
-        need = pending.need
+        if not pending.skipped:
+            req = pending.req
+            need = pending.need
 
-        # 4) 写入树（含 touch / decode_start / prompt 边界分裂）
-        tree_before = tree_tokens(self.cache)
-        self.cache._adopt(req, req.fill_ids(), split_prompt=True)
-        grew = tree_tokens(self.cache) - tree_before
+            # 4) 写入树（含 touch / decode_start / prompt 边界分裂）
+            tree_before = tree_tokens(self.cache)
+            self.cache._adopt(req, req.fill_ids(), split_prompt=True)
+            grew = tree_tokens(self.cache) - tree_before
 
-        self.inflight_tokens -= need
-        if grew < need:
-            # 预留量是「全序列 - prompt 命中」，但 response 段也可能已在树里
-            # （同一 prompt 的重放会命中整条），或等我们落树期间别的请求先写入了
-            # 同一段前缀（竞态）。差额在这里归还，并记为重复写入。
-            self.alloc.release(need - grew)
-            self.duplicate_insert_tokens += need - grew
-        elif grew > need:
-            raise AssertionError(
-                f"树增长超过预留：grew={grew} > need={need} (rid={pending.rid})"
-            )
+            self.inflight_tokens -= need
+            if grew < need:
+                # 预留量是「全序列 - prompt 命中」，但等我们落树期间可能已有别的
+                # 请求先写入了同一段前缀（竞态），差额在这里归还并记为重复写入。
+                self.alloc.release(need - grew)
+                self.duplicate_insert_tokens += need - grew
+            elif grew > need:
+                raise AssertionError(
+                    f"树增长超过预留：grew={grew} > need={need} (rid={pending.rid})"
+                )
 
-        # 5) 放锁（生产：cache_finished_req 之后 unpin）
-        self.cache.dec_lock_ref(pending.node)
-        self._assert_balanced(where=f"end({pending.rid})")
+            # 5) 放锁（生产：cache_finished_req 之后 unpin）
+            self.cache.dec_lock_ref(pending.node)
+            self._assert_balanced(where=f"end({pending.rid})")
 
         record = RequestRecord(
             t=pending.t,
@@ -259,6 +298,7 @@ class Simulator:
             used=self.alloc.used,
             session_type=pending.session_type,
             task_name=pending.task_name,
+            skipped=pending.skipped,
         )
         self.records.append(record)  # 完成序，对齐 emitter 的 stats.rows
         return record

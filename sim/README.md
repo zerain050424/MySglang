@@ -77,6 +77,7 @@ print(result.render())          # 含 per-task 命中率
 | R1 | 数据集接入：`session_data.jsonl → List[Session]` + per-task 指标 | ✅（`sim/session_data.py`） |
 | R2 | 发射规则：闭环轮次 + 服务时长模型 + arrival/wait scale | ✅（`sim/schedule.py`） |
 | R3 | 并发窗口：同刻 k 条在飞、锁持到完成、竞态可复现 | ✅（`Emitter(max_inflight=...)`） |
+| R4 | response 唯一哨兵 + 超大请求显式处理 | ✅（`sim/req.py`、`SimConfig(oversize=...)`） |
 
 ### 分配器（M2）
 
@@ -128,6 +129,21 @@ result = Simulator(SimConfig(capacity=100_000)).run_scheduled(
 为什么必须有服务时长模型：虚拟时钟里没有「读流完成」，没有它 `finished_ts` 就等于
 `开始时刻`，闭环退化成 0 延迟——`wait_scale`/lognormal 都对，但整条时间轴偏快，
 老化 TTL 与 one-shot 豁免会在错的时刻触发。
+
+### 边界处理（R4）
+
+两处会静默改变树形，所以显式建模：
+
+1. **response token 每请求唯一**（`sim/req.py::OUTPUT_SENTINEL_BASE`）。
+   若所有请求共用一串 token，同一个 prompt 的重放会命中上一次的 response 段，
+   树节点数/占用/`duplicate` 统计全偏低。也不能用数据集的 `response_ids`：
+   下一轮的 prompt 后缀正是它，用了反而会命中生产里必然 miss 的那一截
+   （生产存的是模型自己生成的 token）。
+2. **超大请求**：`SimConfig(oversize=...)`
+   - `"error"`（默认）：抛 `OutOfTokens`，带 rid/total/capacity——逼调用方别用
+     小池子跑大会话；
+   - `"skip"`：跳过落树、记 `skipped=True` 与 `summary["skipped_requests"]`，
+     命中量照记（请求确实被服务了），池账与锁都干净。
 
 ### 并发窗口（R3）：同刻 k 条在飞
 

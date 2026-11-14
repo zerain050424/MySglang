@@ -521,6 +521,56 @@ def _check_emitter() -> list:
     return fails
 
 
+def _check_bounds() -> list:
+    """R4 验收：response 哨兵唯一 + 超大请求显式跳过。"""
+
+    print("[7] 边界（R4）")
+    from sim.allocator import tree_tokens
+    from sim.req import OUTPUT_SENTINEL_BASE
+    from sim.runner import SimConfig, Simulator
+    from sim.trace import Session, Turn
+
+    fails = []
+    sim = Simulator(SimConfig(capacity=4096, seed=1))
+    sim.prepare(width=80)
+    prompt = list(range(64))
+    for i in range(2):
+        sim.request(
+            Turn(t=0.0, prompt=array("q", prompt), out=16),
+            f"apps_{i}",
+            task_name="chat",
+        )
+    # 两段 response 各写一份（共用一串 token 时只有 80）
+    unique_ok = tree_tokens(sim.cache) == 64 + 16 + 16
+    print(
+        f"    response  : 哨兵基址={OUTPUT_SENTINEL_BASE} "
+        f"dup={sim.duplicate_insert_tokens} tree={tree_tokens(sim.cache)} "
+        f"(want 96){'' if unique_ok else '  <-- decode 段被合并'}"
+    )
+    if not unique_ok or sim.duplicate_insert_tokens != 0:
+        fails.append(
+            f"response 段合并了：tree={tree_tokens(sim.cache)} "
+            f"dup={sim.duplicate_insert_tokens}"
+        )
+
+    skipped = Simulator(SimConfig(capacity=100, seed=1, oversize="skip"))
+    result = skipped.run(
+        [
+            Session("apps_0", (Turn(t=0.0, prompt=array("q", range(500))),), "chat"),
+            Session("apps_1", (Turn(t=0.0, prompt=array("q", range(900, 1000))),), "chat"),
+        ]
+    )
+    flags = [r.skipped for r in result.records]
+    ok = flags == [True, False] and result.summary["skipped_requests"] == 1
+    print(
+        f"    oversize  : skipped={flags} count={result.summary['skipped_requests']} "
+        f"tree={tree_tokens(skipped.cache)}{'' if ok else '  <-- 跳过路径错'}"
+    )
+    if not ok:
+        fails.append(f"oversize=skip 行为错：{flags}")
+    return fails
+
+
 def main(argv: list) -> int:
     parser = argparse.ArgumentParser(prog="python -m sim", description="M0/M1 自检")
     parser.add_argument(
@@ -555,6 +605,7 @@ def main(argv: list) -> int:
     fails += _check_driver()
     fails += _check_fidelity()
     fails += _check_emitter()
+    fails += _check_bounds()
     if fails:
         print("\nFAIL")
         for item in fails:
