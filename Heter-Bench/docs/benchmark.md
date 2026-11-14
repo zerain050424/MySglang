@@ -235,7 +235,6 @@ source scripts/env.sh
 | `--no-shuffle` | 关 | 保持文件原序（mashqa 同文档问题相邻；**同时启用提前终止加载，避免读全文件**） |
 | `--wait-scale` | 0.0 | 轮间等待缩放：0=不等（快速跑）；1=按 lognormal(mu,sigma) 真实等待（**仅多轮 num_turns>1 生效**） |
 | `--mu` / `--sigma` | None | 全局覆盖轮间 lognormal 参数；None=按负载类型取 |
-| `--arrival-config` | `configs/arrival_config.yaml` | 轮间 mu/sigma 查表（按 session_id 前缀区分负载） |
 | `--timeout-s` | 1800 | 单请求超时（秒） |
 | `--output` | None | 结果 JSON 输出路径 |
 

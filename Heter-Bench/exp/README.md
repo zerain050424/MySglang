@@ -14,7 +14,7 @@
 | 起 server | `../scripts/{serve,env,config}.sh` | `POLICY` × `MAX_TOTAL_TOKENS` |
 | 数据 | `TaskData/` | alfred(agentic) / apps(random) / Codeparrot(single) / ShareGPT(text) |
 | 标定 | `../tools/calibrate.py` | 冷启动 prefill 速率 → `ttft = a + b·L` |
-| 实验 1 | `tailshot/` + `result/tailshot*` | 已完成的 Tailshot 矩阵 |
+| 实验 1 | `result/tailshot*` | 已完成的 Tailshot 矩阵（配置与脚本已删除，结论见 `docs/reports/`） |
 | 实验 2 | `exp/`（本文件） | Cascade 设计 + 首次实测 |
 
 硬件基线：RTX 4090 24G / Qwen2.5-7B-Instruct(bf16) / 池实测 35,975 或 73,120 tok（`mem-fraction` 默认 vs 0.79）。`calibrate`: **8319 tok/s ⇒ 0.1202 ms/token**，截距 −82 ms。

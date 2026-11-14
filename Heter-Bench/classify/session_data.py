@@ -43,7 +43,7 @@ PRED_LABEL = {
     "agentic": "agentic",
 }
 
-# 各负载在 bench 里默认的轮间隔口径（见 phased_load_prediction.yaml）
+# 各负载在离线重放里的轮间隔口径（与 bench tasks 配置的 gap_mode/gap_s 一致）
 DEFAULT_GAP_S = {
     "chat": 20.0,  # ShareGPT: gap_mode=fixed, gap_s=20
     "agentic": 2.0,  # alfred: gap_mode=fixed, gap_s=2

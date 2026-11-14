@@ -45,7 +45,7 @@
    `tool_call` 回填，与 bench 的传递方式一致；prompt 长度用实测 `prompt_tokens`。
 2. **`--source task`（扩样本 / 消融）**：读 `TaskData/*/Qwen2.5-7B-Instruct/*_session_data.jsonl`，
    轮间隔由模型给出：`per_workload`（chat=20s / agentic=2s / 单轮=0，见
-   `phased_load_prediction.yaml`）、`fixed:<s>`、`lognormal:<mu>:<sigma>`。
+   负载默认值）、`fixed:<s>`、`lognormal:<mu>:<sigma>`。
 
 ## 跨会话结构证据怎么重放
 

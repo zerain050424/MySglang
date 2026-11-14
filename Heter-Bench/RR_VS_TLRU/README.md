@@ -3,6 +3,9 @@
 目标：暴露小流量涌入把长挂起会话的 KV 挤掉这个场景，并在同一场景下比较
 `RrEvictPolicy`（会话轮询 + 配额）与 `TlruEvictPolicy`（尾部预算）。
 
+> **部分脚本已下线**：`run_matrix.sh` / `serve_arm.sh` / `configs/burst_pause.yaml` 随旧
+> 驱动删除；`configs/arm_*.json` 仍可直接作为 `scripts/serve.sh` 的 `POLICY_CONFIG`。
+
 ## 1. 场景与时序
 
 ```

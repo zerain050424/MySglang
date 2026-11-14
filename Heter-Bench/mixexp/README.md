@@ -1,40 +1,35 @@
-# mixexp · 混合负载实验套件
-
-回答一个问题：**异构负载混合、且主导类会轮换时，HeterCache 的三队列 + 队内策略 +
-权重仲裁，是否比单策略（LRU / LFU / SLRU / T-LRU）更好，以及每个部件各自贡献多少。**
-
-实验主体是**四个单类主导的 cell**。每个 cell 里四类负载同时在场，但只有一类
-按 token 占优——这样每个 cell 都在问同一个问题的不同切面：当压力主要来自这一类时，
-多队列隔离有没有用？
-
-| cell | 主导类 | 考察什么 |
-|---|---|---|
-| `scan` | 一次性扫描流（apps） | 大流量、零复用的冲刷下，能复用的前缀能不能活下来 |
-| `struct` | 结构复用（struct） | 跨会话共享的公共前缀是否被饿死 |
-| `chat` | 多轮人工会话（chat） | 轮间间隔长的会话，早期轮次能否撑到重访 |
-| `agentic` | Agent 会话（agentic） | 长会话、短间隔、上下文暴涨下的会话内复用 |
 
 ---
 
-## 零、
+# mixexp · 混合负载实验套件
 
-**主导 = 该类 prompt token 占四类 token 总和的份额 ≥ 60%，与会话数无关。**
+本实验套件（`exp3`）用于评估在四类异构负载混合且主导类变化的场景下，HeterCache（三队列 + 队内策略 + 权重仲裁）相比单策略（LRU / LFU / SLRU / T-LRU）的收益，以及各模块的消融贡献。
 
-这条必须写死，因为两者的排序经常相反：
+实验包含四个单类主导的测试场景（cell）。每个 cell 中四类负载同时在场，其中一类按 token 占优，用于分别检验不同压力源下多队列隔离的效果：
 
-| 例子（实测量级） | 会话数 | 单条 token | token 占比 |
+| cell | 主导类 | 考察目标 |
+|---|---|---|
+| `scan` | 一次性扫描流（apps） | 大流量、零复用冲刷下，可复用前缀能否保留 |
+| `struct` | 结构复用（struct） | 跨会话共享的公共前缀是否被误驱逐 |
+| `chat` | 多轮人工会话（chat） | 轮间间隔较长时，早期轮次能否保留到下次访问 |
+| `agentic` | Agent 会话（agentic） | 长会话、短间隔、上下文快速增长时的会话内复用表现 |
+
+---
+
+## 零、负载份额口径
+
+主导类定义为：**该类 prompt token 占四类总 token 的比例 ≥ 60%**（与会话条数无关）。由于不同负载的上下文长度差异极大，按会话数统计与按 token 统计的结果往往相反：
+
+| 负载示例（实测量级） | 会话数 | 单条 token | token 占比 |
 |---|---|---|---|
 | apps 冲刷流 | 15 000 | ~400 | ~22% |
 | agentic 长会话 | 96 | ~89 000 | ~35% |
 
-agentic 的会话数只有 apps 的 0.6%，token 却更多。所以这套实验里：
+上例中 `agentic` 的会话数仅为 `apps` 的 0.6%，但消耗了更多 token。因此实验采用以下口径控制组成：
 
-- **不按会话数排序**，也不用每类 N 条这种配额去凑份额；
-- 份额在数据构造时按 token 反解（`build_exp3_data.py`），写进 `manifest.json`；
-- 跑前由 bench 复核数据组成，跑后由 `analyze.py` 用实测 `prompt_tokens` 复核——数据份额与实际跑出来的份额要一致，否则结论无效。
-
-配角份额默认均分：`(1-60%)/3 ≈ 13.3%` 每类。允许实际略高（最后一条会话会越界），
-所以主导类实测通常落在 60%~70%。
+- 数据构造阶段（`build_exp3_data.py`）按目标 token 占比反解各类会话条数，不按会话数量均分，结果写入 `manifest.json`；
+- 运行前由压测端复核数据组成，运行后由 `analyze.py` 校验实测 `prompt_tokens` 占比与配置是否一致；
+- 非主导类默认均分剩余份额（约 13.3%/类）。由于构造时需完整保留末尾会话，主导类实测占比通常在 60%~70% 之间。
 
 ---
 
@@ -42,10 +37,11 @@ agentic 的会话数只有 apps 的 0.6%，token 却更多。所以这套实验�
 
 | 类 | 源 | 轮数结构 | 是否合成 | 跑前校验 |
 |---|---|---|---|---|
-| `apps` | AgentBank_apps 单轮 | 1 轮 | 真实会话用尽后按真实长度分布补**合成冲刷会话**（互不共享） | — |
+| `apps` | AgentBank_apps 单轮 | 1 轮 | 真实会话用尽后按真实长度分布补合成冲刷会话（互不共享） | — |
 | `struct` | 独立构造 | 1 轮 | 8 条前缀链 × 2000 token，链内共用前缀、私有正文唯一 | — |
 | `chat` | ShareGPT `mt5` | 6–8 轮为主，20% 取 10–15 轮 | 否 | `min_turns: 5` |
 | `agentic` | AgentBank_alfred | 30% 为 60+ 轮长尾，其余 6–10 轮 | 否 | `min_turns: 5` |
+
 ---
 
 ## 二、准备数据（三步，串行）
@@ -53,103 +49,117 @@ agentic 的会话数只有 apps 的 0.6%，token 却更多。所以这套实验�
 ```bash
 # 0) 原始 session_data.jsonl 需先由 tools/prepare_session_data.py 在实验机上生成
 bash mixexp/prepare_data.sh          # 步 1 + 步 2（幂等；FORCE=1 重生成）
-bash mixexp/run_exp3.sh --build-data # 步 3：构造四个 cell（也可单独调 build_exp3_data.py）
+
+# 步 3：构造四个 cell（产物：TaskData/exp3/<cell>/tasks.yaml + 各类 jsonl + manifest.json）
+python mixexp/tools/build_exp3_data.py --mix all --total-tokens 25e6
 ```
+
 ---
 
 ## 三、规模
 
-exp3 的规模由两个旋钮控制（都是环境变量），池容量与并发另算：
+规模分两处：**数据预算**给 `build_exp3_data.py --total-tokens`，**池容量**给 server 的
+`MAX_TOTAL_TOKENS`。两者要同向放大，否则工作集压不满池子、各臂打平。
 
-| 档 | `TOTAL_TOKENS` | 池容量 | 并发 | 用途 |
+| 档位 | `--total-tokens`（造数据） | `MAX_TOTAL_TOKENS`（起 server） | `--max-inflight`（压测） | 用途 |
 |---|---|---|---|---|
-| 冒烟 | `3e6` | 60k | 8 | 验证链路、四类都在动 |
-| 趋势 | `10e6` | 120k | 16 | 看方向 |
-| 结论 | `25e6` | ~198k（fp8 0.85） | 32 | 出数字 |
+| 冒烟 | `3e6` | `60000` | `8` | 验证链路与四类负载并发 |
+| 趋势 | `10e6` | `120000` | `16` | 观察策略趋势 |
+| 结论 | `25e6` | `198000`（fp8 + mem-fraction 0.85） | `0`（不限） | 产出最终实验数据 |
 
 ```bash
-TOTAL_TOKENS=3e6 CONC=8 bash mixexp/run_exp3.sh --build-data --mix scan
+# 冒烟档：先按 3e6 token 预算造 scan cell
+python mixexp/tools/build_exp3_data.py --mix scan --total-tokens 3e6
 ```
+
 ---
 
 ## 四、实验臂（`arms_exp3.tsv`）
 
 | arm | 策略 | 用途 |
 |---|---|---|
-| `lru` | lru | 最弱基线：全局单一最近性顺序 |
+| `lru` | lru | 基础基线：全局单一 LRU |
 | `hc_full` | heter_cache | 完整方案：三队列 + 队内策略 + 权重仲裁 |
-| `hc_norr` | heter_cache | 消融：关会话轮询（chat 队内退化） |
+| `hc_norr` | heter_cache | 消融项：关闭会话轮询（chat 队内退化） |
 
-> 配额机制已整体删除：跨队列顺序只由 `weight.weights` 决定，归一化占用 `occ_q / w_q` 最大的队列先被削，没有 cap / reservation。
-默认权重 `struct 0.2 / agentic 0.5 / chat 0.3`（比例语义，可整体缩放）。
+> 说明：当前版本已移除配额机制（无 cap 与 reservation）。跨队列淘汰顺序由 `weight.weights` 决定，优先从归一化占用 `occ_q / w_q` 最大的队列中驱逐。默认权重为 `struct 0.2 / agentic 0.5 / chat 0.3`（仅表示相对比例，支持等比缩放）。
 
 ---
 
-## 五、判据
+## 五、判定标准
 
-`analyze.py` 读完结果逐条判定（硬判据不过时以非零退出）：
+`analyze.py` 会在汇总时自动校验以下硬性指标（任一项不通过则以非零状态码退出）：
 
 | # | 判据 | 含义 |
 |---|---|---|
-| 1 | 主判据 | `hc_full` 总命中率严格高于所有 baseline |
-| 2 | 公平判据 | `hc_full` 的**最弱类**命中率不低于最好的 baseline（不许靠饿死一类换总分数） |
-| 3 | 时延判据 | `hc_full` 的 `ttft_p99` 不劣于 baseline 的 1.10 倍 |
-| 4 | 消融判据 | `hc_full` 不弱于任一 `hc_*` 消融臂 |
-| 5 | 有效性 | 总 `prompt_tokens` 超过池容量，确实发生了淘汰 |
+| 1 | 总命中率 | `hc_full` 严格高于所有基线 |
+| 2 | 分项下限 | `hc_full` 在最弱负载类别上的命中率不低于最优基线（避免牺牲单类换取总命中率） |
+| 3 | 尾时延 | `hc_full` 的 `ttft_p99` 不超过基线的 1.10 倍 |
+| 4 | 消融表现 | `hc_full` 不弱于任一 `hc_*` 消融臂 |
+| 5 | 淘汰触发 | 总 `prompt_tokens` 超过缓存池容量，确保驱逐已实际发生 |
 
-跨 cell 还有一个额外判据，人工核对：
+此外，需人工核对以下跨场景一致性指标：
 
-**6. 份额判据** —— 实测 token 份额与 `manifest.json` 一致（±2pp）。
-不一致说明到达节奏被打散（例如中途 server 重启、`--wait-scale` 被改），
-这一轮的「单类主导」前提就不成立了。
+**6. 份额一致性** —— 实测 token 占比与 `manifest.json` 的偏差控制在 ±2pp 以内。若出现明显偏差（通常由中途重启服务或修改 `--wait-scale` 改变到达节奏所致），该组结果需重新采集。
 
 ---
 
-## 六、怎么跑
+## 六、运行方式
+
+臂的启停脚本（`run_exp3.sh` / `run_mixexp.sh`）已随旧驱动删除，现在是「一次 server、
+一次 `scripts/bench_heap.py`」。换臂 = 重启 server + 换输出文件名，其余命令不变。
 
 ```bash
 cd Heter-Bench
+mkdir -p mixexp/result/exp3/chat
 
-# 1) 只看命令（不起服务）
-bash mixexp/run_exp3.sh --mix all --dry-run
+# 1) 起 server（hc_full 臂；arms_exp3.tsv 的 policy / policy_config 原样搬过来）
+POLICY=heter_cache MAX_TOTAL_TOKENS=198000 \
+  POLICY_CONFIG='{"weight":{"weights":{"struct":0.2,"agentic":0.5,"chat":0.3}},"rr":{"fair_rr":true,"kappa":0.5,"min_retain_tokens":512,"min_retain_frac":0.3},"slru":{"share_min":2},"mt":{"enabled":true}}' \
+  EXTRA_ARGS="--kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.85" \
+  LOG=mixexp/result/exp3/chat/server_full_hc_full.log \
+  bash scripts/serve.sh          # 前台；另开终端等 curl -sf .../health 返回 200
 
-# 2) 全流程：准备数据 → 构造四个 cell → 每 cell 跑 lru,hc_full
-tmux new -s exp3
-bash mixexp/run_exp3.sh --build-data
+# 2) 压测一个 cell（轮间空窗按 lognormal 真实等待）
+"$PY" scripts/bench_heap.py \
+  --tasks-config TaskData/exp3/chat/tasks.yaml \
+  --base-url http://127.0.0.1:30000 \
+  --arrival-scale 1.0 --wait-scale 1.0 \
+  --output mixexp/result/exp3/chat/full_hc_full.json
 
-# 3) 只跑一个 cell（已有的数据不会再构造）
-bash mixexp/run_exp3.sh --mix agentic
+# 3) 换臂：lru 只把 POLICY 改成 lru（不带 POLICY_CONFIG）；
+#    hc_norr 用 arms_exp3.tsv 里那份配置（rr.fair_rr=false）。每换一臂都要重启 server。
 
-# 4) 指定臂 / 透传参数
-bash mixexp/run_exp3.sh --mix chat --arms lru,hc_full,hc_norr --conc 48
-
-# 5) 只汇总
-python mixexp/analyze.py --dir mixexp/result/exp3/agentic --scale full --tokens 198000
+# 4) 汇总（analyze 按 <scale>_<arm>[_rN].json 解析臂名，文件名别改成别的格式）
+python mixexp/analyze.py --dir mixexp/result/exp3/chat --scale full --tokens 198000
 ```
 
-产物按 cell 分开，互不覆盖：
+结果文件按 cell 分目录存放，互不覆盖：
 
 ```
-mixexp/result/exp3/<cell>/full_<arm>.json         每次运行的结果
-mixexp/result/exp3/<cell>/server_full_<arm>.log   server 日志（含 [HeterCache profile]）
+mixexp/result/exp3/<cell>/full_<arm>.json         每次运行的结果（--output 指定）
+mixexp/result/exp3/<cell>/server_full_<arm>.log   server 日志（serve.sh 的 LOG=...）
 ```
 
-旧的单组成（22/35/22/22）仍然保留为 `--mix legacy`，产物落在
-`mixexp/result/exp3/`、配置读 `configs/exp3/mix_full.yaml`；相位模式
-`--mode drift` **只**支持 legacy（相位文件是按那份组成写的）。
+并发口径：`bench_heap.py` 默认 `--max-inflight 0`（不限），排队交给服务端（体现在
+`queue_time`）。要复现旧 driver 的「最多 N 个会话在场」，加 `--max-inflight N`。
+
+旧的单比例组成（22/35/22/22）仍可用 `build_exp3_data.py` 不带 `--mix` 构造（legacy 模式，
+同样生成 tasks.yaml），产物输出至 `mixexp/result/exp3/`；相位模式（`--mode drift`）与其
+`configs/exp3/*.yaml` 随旧驱动一并删除。
 
 ---
 
-## 七、跑起来先看这几个数
+## 七、运行观测指标
 
-| 指标 | 位置 | 目标 | 偏离怎么办 |
+| 指标 | 位置 | 预期范围 | 异常处理 |
 |---|---|---|---|
-| 主导类 token 份额 | `manifest.json` / 结果 JSON | ≥60%，且与数据一致 | 不一致 → 查到达节奏与 `lambda_rate` |
-| `token usage` 峰值 | server 日志 | 0.60–0.90 | 长期 ≥0.95 → 降 `TOTAL_TOKENS` 或加大池；长期 ≤0.75 → 提高 `--conc` |
-| 主导类请求数占比 | 结果 JSON `per_task` | 与 token 份额同向，但**不必相等** | 差得远是正常的（会话长度差异），别拿请求数当份额 |
-| 共用前缀存活 | `[HeterCache profile]` 里 `share≥2` | `struct` cell 明显高于其他 cell | 偏低 → 查 struct 的 `prefix_tokens` 与变体数 |
-| `chat` 命中率 | `per_task.ShareGPT` | 25–40% | 明显偏低 → 查 `MULTI_TURN_MIN` 与数据轮数是否匹配 |
-| `scan` cell 的 `apps` 命中率 | `per_task.AgentBank_apps` | 接近 0 | 明显 >0 → 说明有复用漏进了冲刷流，查合成会话是否重复 |
+| 主导类 token 份额 | `manifest.json` / 结果 JSON | ≥60%，且与构造配置一致 | 偏差过大时检查到达节奏与 `lambda_rate` |
+| `token usage` 峰值 | server 日志 | 0.60–0.90 | 长期 ≥0.95 则降低 `--total-tokens` 或扩大池容量；长期 ≤0.75 则提高 `--max-inflight` |
+| 主导类请求数占比 | 结果 JSON `per_task` | 通常与 token 份额同向，但不必数值相等 | 受单次会话长度差异影响，两者差异较大属正常情况，以 token 占比为准 |
+| 共用前缀存活 | `[HeterCache profile]` 中 `share≥2` | `struct` cell 明显高于其他 cell | 偏低时检查 `struct` 的 `prefix_tokens` 与变体数 |
+| `chat` 命中率 | `per_task.ShareGPT` | 25–40% | 明显偏低时检查 `MULTI_TURN_MIN` 与数据轮数是否匹配 |
+| `scan` cell 的 `apps` 命中率 | `per_task.AgentBank_apps` | 接近 0 | 若明显大于 0，排查合成冲刷会话是否误引入了重复前缀 |
 
 ---
 
@@ -157,12 +167,10 @@ mixexp/result/exp3/<cell>/server_full_<arm>.log   server 日志（含 [HeterCach
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
-| `缺少输入数据：...nosys.mt5.jsonl` | 步 2 没跑 | `bash mixexp/prepare_data.sh` |
-| `缺少数据文件` + 提示 prepare_data | 配置里的 data_path 还不存在 | 同上，再 `--build-data` |
-| `[chat] 主导类 chat 只能做到 55.3%` | 数据源不够撑这个份额 | 降 `--dominant-share` / `--total-tokens`，或补数据源 |
-| `task 'ShareGPT': 4/10 条会话轮数 < 5` | 数据没过滤（旧文件） | `FORCE=1 bash mixexp/prepare_data.sh` |
-| `session_data.jsonl 期望 {session_id: session}` | 输入格式不对（如直接喂 raw 对话） | 先用 `tools/prepare_session_data.py` 生成 |
-| `全部会话都被剔除：这看起来是单轮数据集` | 把单轮源（apps / Code）喂给了过滤器 | 过滤器只用于多轮源 |
-| `phase 'x' needs N sessions from 'y', but only M are available` | 相位模式的条数超过数据池 | 降相位 `max_record`，或放大数据 |
-
----
+| `缺少输入数据：...nosys.mt5.jsonl` | 步 2 未执行 | 执行 `bash mixexp/prepare_data.sh` |
+| `缺少数据文件` + 提示 prepare_data | 配置中的 `data_path` 尚未生成 | 同上，再执行 `--build-data` |
+| `[chat] 主导类 chat 只能做到 55.3%` | 现有数据源总量不足以支撑该份额 | 降低 `--dominant-share` 或 `--total-tokens`，或扩充数据源 |
+| `task 'ShareGPT': 4/10 条会话轮数 < 5` | 缓存了未经过滤的旧数据文件 | 执行 `FORCE=1 bash mixexp/prepare_data.sh` |
+| `session_data.jsonl 期望 {session_id: session}` | 输入格式不符（如直接使用了原始对话文件） | 先通过 `tools/prepare_session_data.py` 转换 |
+| `全部会话都被剔除：这看起来是单轮数据集` | 将单轮数据源（如 apps / Code）传入了多轮过滤器 | 过滤器仅适用于多轮数据源 |
+| `phase 'x' needs N sessions from 'y', but only M are available` | 相位模式所需条数超出数据池容量 | 调低相位 `max_record`，或扩大数据源规模 |

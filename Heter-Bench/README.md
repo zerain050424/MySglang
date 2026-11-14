@@ -18,10 +18,7 @@ Heter-Bench/
     config.sh / env.sh    # 配置与环境变量（被 serve.sh source）
 
   configs/                # 全部 yaml / json 配置
-    arrival_config.yaml                  # 轮间到达间隔，按 session_id 前缀区分负载
-    hybrid_tasks_config.yaml             # 混合负载配比
-    phased_load_prediction.yaml          # 分阶段负载
-    phased_load_prediction_task_labels.json
+    hybrid_tasks_config.yaml             # 混合负载配比（4 类负载 lambda_rate 之比）
 
   tools/                  # 数据准备与标定
     prepare_session_data.py              # 原始数据 → session_data.jsonl
@@ -46,19 +43,24 @@ Heter-Bench/
    `qtrans`、`qstruct`、`qagent`、`qchat` 四类队列。
    **不使用 `extra_key` 做标签**——`extra_key` 会隔离 radix tree 命名空间，
    导致跨 session 的 31-token system prompt 无法共享。
-3. **并发模型**：会话间并发（`Semaphore`），**会话内逐轮串行**（下一轮依赖上一轮的 KV）。
+3. **并发模型**：最小堆按真实墙钟到点发射，请求发出后不等待；**会话内逐轮串行**
+   （下一轮由上一轮流式响应结束后压回堆）。轮间空窗不占并发名额。
 4. **命中率**：`Σcached_tokens / Σprompt_tokens`，取自每次响应的 `meta_info`。
 
 ## 前置条件
 
 1. **sglang 已按前面 Phase 1–6 打好补丁**（`HeterCacheStrategy` + `HeterCacheRadixCache`
    + `--enable-heter-cache` + profile 日志）。
-2. **数据**：HeterCache 的 `session_data.jsonl`。生成方式：
+2. **数据**：HeterCache 的 `session_data.jsonl`（每行一个 `{"<sid>": {id, num_turns, turn_1..N}}`，
+   `turn_i.input_ids` 必须是该轮的完整历史）。生成方式：
    ```bash
    cd /home/rain/HeterCache/TaskData/SharedGPT-multi-turn
    bash data.sh    # → models/<model>/ShareGPT_cleaned_valid_deduplicated_session_data.jsonl
    ```
-   冒烟可直接用 `demo/ShareGPT_cleaned_valid_session_data_head20.jsonl`（20 session）。
+   驱动只接受 `--tasks-config`（yaml 里逐个 task 写 `data_path` / `lambda_rate` / `mu` / `sigma`
+   / `max_record`），没有 `--data-path` / `--num-sessions` 这两个开关。冒烟用
+   `mixexp/configs/mix_smoke.yaml`（四类各 10 条）；多轮源需先跑
+   `bash mixexp/prepare_data.sh` 生成 `.nosys.mt5.jsonl`（轮数 < 5 的会话会被剔掉）。
    **tokenizer 必须与 server 加载的模型一致**。
 3. **依赖**：`aiohttp`（sglang 环境已自带）。
 
@@ -152,36 +154,15 @@ source scripts/env.sh
 把 `serve.sh` 的 `POLICY` 换成 `lru` / `lfu` / `slru` / `heter_cache` 即可多基线对比
 （这些策略都在 `RADIX_EVICTION_POLICY_CHOICES` 里，无需 `--enable-heter-cache`）。
 
-## 四阶段负载自动预测准确率实验
+## 四阶段负载自动预测准确率实验（已下线）
 
-`phased_load_prediction.yaml` 使用现有四类 session 数据，按以下顺序生成一条连续
-到达流：
+这条实验的两个前提都不在了：
 
-1. `mixed`：Codeparrot、AgentBank apps、ShareGPT、AgentBank alfred 为 `1:1:1:1`；
-2. `struct_dominant`：Codeparrot 为主，比例 `4:1:1:1`；
-3. `chat_dominant`：ShareGPT 为主，比例 `1:1:4:1`；
-4. `agentic_dominant`：AgentBank alfred 为主，比例 `1:1:1:4`。
+- **驱动**：分阶段（`--phases-config`）模式随旧 driver 删除，`configs/phased_load_prediction*.yaml`
+  一并删除；`bench_heap.py` 只支持 `--tasks-config`。
+- **数据源**：原本依赖 server 侧 `SGLANG_QUEUE_OCC_LOG` 打印的 `[QueueOcc]` 日志，
+  该采样器已从 `radix_cache` 删除，现在只有 `[HeterCache profile]`（每 30s 一张按队列的
+  表，含 occ / hit / evicted / target / cap）。
 
-结构复用真值仅指 Codeparrot；AgentBank apps 保留为 `random`。先启动服务，再运行：
-
-**驱动已下线**：分阶段（`--phases-config`）模式随旧 driver 一并删除，`bench_heap.py`
-只支持 `--tasks-config`。要重跑这条实验，需要先给新驱动补回相位调度。
-
-**数据源已下线**：这里原本依赖 server 侧 `SGLANG_QUEUE_OCC_LOG` 打印的 `[QueueOcc]`
-日志。该采样器（策略无关的队列占用日志）已从 `radix_cache` 删除，现在只有
-`[HeterCache profile]`（每 30s 一张按队列的表，含 occ / hit / evicted / target / cap）。
-`eval/evaluate_load_prediction.py` 只认 `[QueueOcc]` 的行格式，喂新日志会直接报「解析不到
-任何样本」——要恢复这条评测，得先把采样器加回来或改写解析口径。
-
-实验输出的 CSV 保存真实数据集标签，脚本按 60 秒窗口、30 秒步长和 10% 主导差距
-计算窗口级准确率（需要上面那份日志）：
-
-```bash
-"$PY" eval/evaluate_load_prediction.py \
-  --requests-csv result/phased_load_prediction.csv \
-  --occ-log result/server_heter_cache_100000.log \
-  --output result/phased_load_prediction_accuracy.json
-```
-
-结果中的 `accuracy` 是排除 `mixed` 和 `unknown` 窗口后的窗口级准确率，`coverage` 是
-有效窗口中具有自动预测结果的比例，`by_phase` 给出四个阶段的分项结果。
+结论与历史数字见 `docs/reports/`；要恢复这条实验，需要补回相位调度、`[QueueOcc]` 采样器，
+以及窗口级评测脚本（`eval/evaluate_load_prediction.py` 已随本实验删除）。
