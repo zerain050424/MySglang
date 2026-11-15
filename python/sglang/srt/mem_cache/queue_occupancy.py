@@ -73,11 +73,7 @@ class QueueOccupancyTracker:
         normal_window_s: float,
         has_capacity: bool,
     ) -> bool:
-        """校准时钟是否到期。
-
-        两个窗口不是一个东西：常规窗口跟 profile 打印同频，承压窗口固定为
-        PRESSURE_WINDOW_S，服务的是账本正确性而非观测。
-
+        """校准时钟是否到期
         Args:
             available: 当前可用 token；has_capacity为 False 时不参考。
             capacity: 池容量；0 表示还没拿到。
