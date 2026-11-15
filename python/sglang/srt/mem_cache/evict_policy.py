@@ -236,9 +236,8 @@ class HeterCacheStrategy(EvictionStrategy):
 
     def record_hit(self, req, node, hit_tokens: int, by_queue: dict) -> None:
         """记录一次命中：telemetry 按 rid 去重，VD 只吃首次命中的分队列命中量。
-
         同一 rid 的 chunked prefill 会重复进入，去重由 telemetry 负责（它已按
-        MAX_SEEN_RIDS 限长）；只有它判定"首次见到"时才更新 VD，否则一个 32k
+        MAX_SEEN_RIDS 限长）；只有它判定首次见到时才更新 VD，否则一个 32k
         prompt 的 4 个 chunk 会被记 4 遍。
 
         Args:
