@@ -21,9 +21,9 @@ from sglang.srt.mem_cache.heter_utils import (
 )
 from sglang.srt.mem_cache.queue_occupancy import QueueOccupancyTracker
 from sglang.srt.mem_cache.queue_value import QueueValueTracker
+from sglang.srt.mem_cache.node_share import NodeShareLedger
 from sglang.srt.mem_cache.victim_override import (
     RrEvictPolicy,
-    SlruEvictPolicy,
     MultiAgenticEvict,
     MultiTurnEvictPolicy,
 )
@@ -145,16 +145,12 @@ class HeterCacheStrategy(EvictionStrategy):
 
         self.rr_evict = RrEvictPolicy(self.rr) if self.rr.fair_rr else None
         self.session_registry = SessionRegistry.global_instance()
-        self.slru_evict = SlruEvictPolicy(
-            self.session_registry, self.slru.share_min
-        )
+        self.node_share = NodeShareLedger(self.slru.share_min)
         self.multi_agentic_evict = (
             MultiAgenticEvict(self.multi_agentic, self._node_tag)
             if self.multi_agentic.enabled
             else None
         )
-
-        self.node_observers = (self.slru_evict,)
 
     def use_clock(self, now: Callable[[], float]) -> None:
         """接管缓存层的时间源（默认墙钟下等价于无操作）。
@@ -193,7 +189,7 @@ class HeterCacheStrategy(EvictionStrategy):
         if ttl <= 0:
             return False
         if tag is HeterCacheNodeTag.QSTRUCT and (
-            self.slru_evict.share_of(node) < self.slru_evict.share_min
+            self.node_share.share_of(node) < self.node_share.share_min
         ):
             return False
         return self._now() - node.last_access_time >= ttl
@@ -219,7 +215,7 @@ class HeterCacheStrategy(EvictionStrategy):
         anchor = max(st.last_active, getattr(node, "last_access_time", 0.0))
         if self._now() - anchor < ONE_SHOT_IDLE_S:
             return False
-        if self.slru_evict.share_of(node) >= self.slru_evict.share_min:
+        if self.node_share.share_of(node) >= self.node_share.share_min:
             return False
         return st.session_type in (SessionType.TRANS, SessionType.STRUCT)
 
@@ -274,7 +270,7 @@ class HeterCacheStrategy(EvictionStrategy):
             self.occupancy.evict(queue, tokens)
         elif self.is_aged(node):
             # 老化淘汰单独计数：否则与真正的一次性流量混在 one_shot 里。
-            self.slru_evict.on_aged_evict(tokens)
+            self.node_share.on_aged_evict(tokens)
         self.telemetry.on_evict(
             node_id=id(node), tag=tag, tokens=tokens, one_shot=one_shot
         )
@@ -306,8 +302,8 @@ class HeterCacheStrategy(EvictionStrategy):
             return None
         if queue == "struct":
             # 模板分级淘汰：优先淘汰低共享度节点，同级按 LRU
-            share_of = self.slru_evict.share_of
-            share_min = self.slru_evict.share_min
+            share_of = self.node_share.share_of
+            share_min = self.node_share.share_min
             return min(pool, key=lambda n: struct_tier(n, share_of, share_min))
         if queue == "agentic" and self.multi_agentic_evict is not None:
             return self.multi_agentic_evict.pick(pool, self.session_registry)

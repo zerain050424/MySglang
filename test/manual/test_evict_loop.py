@@ -161,7 +161,7 @@ def make_cache(cache_cls, strategy, nodes):
     cache.disable = False
     cache.eviction_strategy = strategy
     cache.session_registry = strategy.session_registry
-    cache.node_observers = tuple(strategy.node_observers)
+    cache.node_share = strategy.node_share
     # evict() 依赖这三个由 __init__ 派生的字段；假缓存需要手工接上
     # 批次 C 之后账本与遥测归驱动层持有：假缓存要把引用接上
     cache.occupancy = strategy.occupancy
@@ -232,6 +232,7 @@ def _bootstrap():
     _load("sglang.srt.mem_cache.queue_value", "sglang/srt/mem_cache/queue_value.py")
     _load("sglang.srt.mem_cache.queue_selector", "sglang/srt/mem_cache/queue_selector.py")
     _load("sglang.srt.mem_cache.heter_bench_bridge", "sglang/srt/mem_cache/heter_bench_bridge.py")
+    _load("sglang.srt.mem_cache.node_share", "sglang/srt/mem_cache/node_share.py")
     _load("sglang.srt.mem_cache.victim_override", "sglang/srt/mem_cache/victim_override.py")
     ep = _load("sglang.srt.mem_cache.evict_policy", "sglang/srt/mem_cache/evict_policy.py")
     shc = _load(
@@ -252,14 +253,13 @@ def _strategy(ep, sessions, **slru):
     for sid, stype in sessions.items():
         reg._sessions[sid] = hu.SessionState(session_id=sid, session_type=stype)
     st.session_registry = reg
-    st.slru_evict.session_registry = reg
     return st
 
 
 def _seed_share(st, node, n):
     """把节点的跨会话共享数直接记进 SLRU 账本（share_of 只认这本账）。"""
     for i in range(n):
-        st.slru_evict.on_node_hit(node, f"seed-{id(node)}-{i}")
+        st.node_share.on_hit(node, f"seed-{id(node)}-{i}")
 
 
 def test_no_one_shot_leaves_does_not_crash(ep, shc, base):
@@ -332,7 +332,7 @@ def test_one_shot_band_first(ep, shc, base):
     shared = FakeNode(
         "s1", hu.HeterCacheNodeTag.QSTRUCT, tokens=16, abs_start=0,
         last_access=time.monotonic())
-    _seed_share(st, shared, st.slru_evict.share_min)
+    _seed_share(st, shared, st.node_share.share_min)
     check(st.is_one_shot(deep) is True, "sanity: trans node is one-shot")
     check(st.is_one_shot(shared) is False, "sanity: shared struct is protected")
 
@@ -351,7 +351,7 @@ def test_slru_rewrites_struct_candidate(ep, shc, base):
     print("[4] struct queue: VD arbitration names it, struct_tier picks the LRU-oldest")
     hu = sys.modules["sglang.srt.mem_cache.heter_utils"]
     st = _strategy(ep, {"s1": hu.SessionType.STRUCT})
-    thr = st.slru_evict.share_min
+    thr = st.node_share.share_min
     now = time.monotonic()
     old = FakeNode("s1", hu.HeterCacheNodeTag.QSTRUCT, tokens=16, last_access=now - 100)
     new = FakeNode("s1", hu.HeterCacheNodeTag.QSTRUCT, tokens=16, last_access=now - 10)
@@ -392,8 +392,8 @@ def test_aged_struct_prefix_cascade(ep, shc, base):
                  last_access=now - 700)
         for _ in range(2)
     ]
-    for i in range(st.slru_evict.share_min):
-        st.slru_evict.on_node_hit(prefix, f"seed-{i}")
+    for i in range(st.node_share.share_min):
+        st.node_share.on_hit(prefix, f"seed-{i}")
     prefix.hit_count = 1
     check(st.is_aged(prefix), "precondition: shared prefix is aged")
 
@@ -411,9 +411,9 @@ def test_aged_struct_prefix_cascade(ep, shc, base):
           f"two kids + cascaded prefix = 48 tokens, got {result.num_tokens_evicted}")
     check(set(cache.deleted) == {kids[0], kids[1], prefix},
           f"the aged prefix must be cascaded away, got {cache.deleted}")
-    check(st.slru_evict.aged_evicted == 32,
+    check(st.node_share.aged_evicted == 32,
           f"aged_evicted must count 32 prefix tokens, "
-          f"got {st.slru_evict.aged_evicted}")
+          f"got {st.node_share.aged_evicted}")
 
 
 def main():

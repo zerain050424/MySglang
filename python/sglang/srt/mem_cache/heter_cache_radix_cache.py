@@ -100,7 +100,7 @@ class HeterCacheRadixCache(RadixCache):
         telemetry.observe_profile(
             snapshot,
             self.session_registry.summary(),
-            slru_policy=strategy.slru_evict,
+            slru_policy=strategy.node_share,
             multi_agentic_policy=strategy.multi_agentic_evict,
             sched_occ=tracker.snapshot(),
             values=strategy.realized.densities(tracker.occ),

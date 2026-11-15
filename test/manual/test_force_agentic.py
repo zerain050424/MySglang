@@ -58,15 +58,15 @@ class Alloc:
 def _in_slru_scope(strategy, node) -> bool:
     """节点是否落在 SLRU 的保护范围内。
 
-    这就是原 ``SlruEvictPolicy.pick`` 的准入条件（会话类型 STRUCT 且共享数
-    达标），pick 删除后测试直接断言判据本身，不再借道一个无人调用的选点器。
+    判据即 is_aged / is_one_shot 里的那一对条件（会话类型 STRUCT 且共享数
+    达标）；测试直接断言判据本身，不再借道一个无人调用的选点器。
     """
-    st = strategy.slru_evict.session_registry.get(getattr(node, "session_id", None))
+    st = strategy.session_registry.get(getattr(node, "session_id", None))
     if st is None:
         return False
     return (
         st.session_type == SessionType.STRUCT
-        and strategy.slru_evict.share_of(node) >= strategy.slru_evict.share_min
+        and strategy.node_share.share_of(node) >= strategy.node_share.share_min
     )
 
 
@@ -228,7 +228,7 @@ def test_plugins_see_everything():
     match(cache, list(range(0, 200)), session_id="p")
 
     strategy = cache.eviction_strategy
-    slru = strategy.slru_evict
+    slru = strategy.node_share
     leaves = list(cache.evictable_leaves)
     covered = [n.id for n in leaves if _in_slru_scope(strategy, n) is True]
     check(covered, f"no leaf reaches the SLRU plugin, leaves={len(leaves)}")

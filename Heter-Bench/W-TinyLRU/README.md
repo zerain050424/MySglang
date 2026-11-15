@@ -133,7 +133,7 @@ python -m wtl.replay --arm A3 --data-path data/synth_p2048_b10/session_data.json
 | 证据 | 来源 | 用途 |
 |---|---|---|
 | `victim_src`（`one_shot` / `qstruct` / `global`） | `HeterCacheStrategy._victim_sources` | **gate**：`one_shot` 占绝大多数说明一次性带在干活；`qstruct` 说明 SLRU 真的给了候选 |
-| `slru.share_counted / share_dedup` | `SlruEvictPolicy.stats()` | 跨会话共享数账本是否在工作（区分「跨会话复用」与「同一会话反复读」） |
+| `slru.share_counted / share_dedup` | `NodeShareLedger.stats()` | 跨会话共享数账本是否在工作（区分「跨会话复用」与「同一会话反复读」） |
 | `slru.slru_picks` | 同上 | SLRU 实际改写候选的次数（=0 说明没被行使） |
 | `slru_share_min` | `SlruParams.share_min` | 唯一旋钮，越大保护越难触发（A2 用不可达值当基线） |
 | `slru` 快照时间序列 | `wtl.struct_profile`（真机 JSONL） | 看记账/去重/接管速率是否随负载漂移 |
@@ -151,7 +151,7 @@ python -m wtl.replay --arm A3 --data-path data/synth_p2048_b10/session_data.json
     one_shot(node) = 会话类型 ∈ {TRANS, STRUCT} 且 share_sessions < share_min
     受保护(node)   = STRUCT 且 share_sessions >= share_min
 
-* `share_sessions` 由 `SlruEvictPolicy` 记账：**每个不同会话 +1，创建者在插入那一刻
+* `share_sessions` 由 `NodeShareLedger` 记账：**每个不同会话 +1，创建者在插入那一刻
   就计入**，同一会话（含创建者后续轮次的重读）由 `session_bloom` 去重。所以
   `share_min=2` = 「共 2 个会话用过」= 创建者 + 1 次外部命中。**同一会话反复读自己的
   私有上下文永远涨不上去**——这正是它和上游 SLRU（按 `hit_count` 晋升）分出胜负的地方。

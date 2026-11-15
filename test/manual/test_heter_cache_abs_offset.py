@@ -437,14 +437,13 @@ def test_queue_and_band_are_orthogonal():
     st = HeterCacheStrategy(value=VALUE_CFG)
     # one-shot 判定看「会话类型 + 跨会话共享数」，因此节点需要会话证据。
     reg = SessionRegistry()
-    st.session_registry = reg
-    st.slru_evict.session_registry = reg
     for sid, stype in (
         ("ag", SessionType.AGENTIC),
         ("rnd", SessionType.TRANS),
         ("code", SessionType.STRUCT),
     ):
         reg._sessions[sid] = SessionState(session_id=sid, session_type=stype)
+    st.session_registry = reg
 
     prompt = _mk_node(32, 0, tag=HeterCacheNodeTag.QAGENT)
     prompt.session_id = "ag"
@@ -458,7 +457,7 @@ def test_queue_and_band_are_orthogonal():
     shared = _mk_node(32, 0, tag=HeterCacheNodeTag.QSTRUCT)
     shared.session_id = "code"
     # 被 >= share_min 个外部会话命中过：跨会话模板，退出 one-shot 带
-    shared.share_sessions = st.slru_evict.share_min
+    shared.share_sessions = st.node_share.share_min
 
     check(st._node_tag(prompt) is HeterCacheNodeTag.QAGENT, "agentic prompt tag")
     check(
@@ -513,7 +512,7 @@ def test_queue_occ_accounting_adds_up():
     shared = ins(list(range(9000, 9100)), HeterCacheNodeTag.QSTRUCT,
                  session_id="code")
     # 把 struct 前缀标记成「已被足够多外部会话复用」：它应退出 one-shot 带
-    shared.share_sessions = cache.eviction_strategy.slru_evict.share_min
+    shared.share_sessions = cache.eviction_strategy.node_share.share_min
 
     wl = cache._per_queue_token_count()
     print(f"      queue={ {k:{kk:int(vv) for kk,vv in v.items()} for k,v in wl.items()} }")

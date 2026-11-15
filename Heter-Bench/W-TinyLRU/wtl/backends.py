@@ -204,7 +204,7 @@ class RealBackend:
         self.cache = _Instrumented(init_params)
         # heter_cache 才带 SLRU 插件；lru/slru 臂没有，region 恒 0。
         self._slru_mode = (
-            getattr(self.cache.eviction_strategy, "slru_evict", None) is not None
+            getattr(self.cache.eviction_strategy, "node_share", None) is not None
         )
         self._req_seq = 0
         self.pool_tokens = int(pool_tokens)
@@ -307,7 +307,7 @@ class RealBackend:
         strategy = self.cache.eviction_strategy
         snap = None
         victim_src = dict(getattr(strategy, "_victim_sources", {}) or {})
-        slru = getattr(strategy, "slru_evict", None)
+        slru = getattr(strategy, "node_share", None)
         return {
             "available": self._available(),
             "evictable_size": int(getattr(self.cache, "evictable_size_", 0) or 0),

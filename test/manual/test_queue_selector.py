@@ -42,6 +42,8 @@ hu = _load("sglang.srt.mem_cache.heter_utils", os.path.join(_CACHE_DIR, "heter_u
 _load("sglang.srt.mem_cache.queue_occupancy", os.path.join(_CACHE_DIR, "queue_occupancy.py"))
 _load("sglang.srt.mem_cache.queue_value", os.path.join(_CACHE_DIR, "queue_value.py"))
 qs = _load("sglang.srt.mem_cache.queue_selector", os.path.join(_CACHE_DIR, "queue_selector.py"))
+# 共享数账本已独立成模块（evict_policy 直接依赖它）
+_load("sglang.srt.mem_cache.node_share", os.path.join(_CACHE_DIR, "node_share.py"))
 _load("sglang.srt.mem_cache.victim_override", os.path.join(_CACHE_DIR, "victim_override.py"))
 _load("sglang.srt.mem_cache.heter_bench_bridge", os.path.join(_CACHE_DIR, "heter_bench_bridge.py"))
 ep = _load("sglang.srt.mem_cache.evict_policy", os.path.join(_CACHE_DIR, "evict_policy.py"))
@@ -423,12 +425,12 @@ def test_per_type_ageing_ttl():
     def node(tag, age_s, share=0, tokens=100):
         n = _leaf(tag, tokens, ts=now - age_s)
         for i in range(share):
-            st.slru_evict.on_node_hit(n, f"{id(n)}-{i}")
+            st.node_share.on_hit(n, f"{id(n)}-{i}")
         n.hit_count = 1 if share else 0
         return n
 
-    aged = node(TAG["struct"], ttl["struct"] + 1, share=st.slru_evict.share_min)
-    fresh = node(TAG["struct"], ttl["struct"] - 1, share=st.slru_evict.share_min)
+    aged = node(TAG["struct"], ttl["struct"] + 1, share=st.node_share.share_min)
+    fresh = node(TAG["struct"], ttl["struct"] - 1, share=st.node_share.share_min)
     check(st.is_aged(aged), "shared struct ages at the struct TTL")
     check(not st.is_aged(fresh), "idle<ttl must keep the template protected")
     check(st.is_one_shot(aged), "aged shared prefix must enter the one-shot band")
@@ -468,13 +470,13 @@ def test_per_type_ageing_ttl():
     check(fa.is_aged(node(TAG["struct"], ttl["agentic"] + 1)),
           "force_agentic must score every node with the agentic TTL")
 
-    before = st.slru_evict.aged_evicted
+    before = st.node_share.aged_evicted
     st.record_evict(aged)
-    check(st.slru_evict.aged_evicted == before + 100,
+    check(st.node_share.aged_evicted == before + 100,
           f"aged evict must count {before + 100} tokens, "
-          f"got {st.slru_evict.aged_evicted}")
+          f"got {st.node_share.aged_evicted}")
     st.record_evict(fresh)
-    check(st.slru_evict.aged_evicted == before + 100,
+    check(st.node_share.aged_evicted == before + 100,
           "a non-aged evict must not be counted as aged")
 
     victim, source = qs.pick_victim(strategy=st, leaves=[aged, fresh])

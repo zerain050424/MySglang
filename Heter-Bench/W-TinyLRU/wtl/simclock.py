@@ -2,7 +2,7 @@
 
 为什么需要它
 ------------
-队内策略（``MultiTurnEvictPolicy`` 的 1 - CDF(elapsed)、``SlruEvictPolicy`` 的
+队内策略（``MultiTurnEvictPolicy`` 的 1 - CDF(elapsed)、``NodeShareLedger`` 的
 段内 LRU）都用 ``time.monotonic()``。离线回放若用真实时钟，整条 trace 会在几秒
 内跑完，所有 ``elapsed`` 都≈0：
 

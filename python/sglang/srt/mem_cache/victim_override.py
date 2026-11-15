@@ -4,11 +4,8 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Dict, Iterable, Optional, Tuple
 import time
-import weakref
 from sglang.srt.mem_cache.heter_utils import (
-    DEFAULT_SHARE_MIN,
     RrParams,
-    SESSION_SHARE_MAX,
     SessionRegistry,
     HeterCacheNodeTag,
     MultiAgenticParams,
@@ -16,7 +13,6 @@ from sglang.srt.mem_cache.heter_utils import (
     node_end_offset,
     node_num_tokens,
     reuse_window_probability,
-    session_bloom_bits,
 )
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -24,34 +20,20 @@ if TYPE_CHECKING:  # pragma: no cover
     from sglang.srt.mem_cache.heter_utils import SessionState
 
 
-# ---- HeterCache 插件的侧表 ----
-# 插件私有状态不内嵌到 TreeNode 上（那会污染所有缓存实现），改用本模块的侧表。
-# WeakKeyDictionary 以节点为弱键：节点被 GC（驱逐/分裂清理/reset）时条目自动
-# 消失，生命周期与内嵌字段等价，因此不需要任何显式清理钩子。
-_SLRU_META = weakref.WeakKeyDictionary()  # node -> [share_sessions, session_bloom]
-
-
 class VictimOverride(ABC):
-    """队内策略的基类：选点者实现 ``pick``，纯观测者可以不实现。
+    """队内选点策略的基类：子类必须实现 ``pick``。
 
-    基类不再把 ``pick`` 定为抽象方法——SLRU 现在只是共享数账本 + 生命周期
-    观测器，struct 队的选点由 ``queue_selector.struct_tier`` 直接完成，让它
-    再实现一个永远收不到调用的 ``pick`` 就是死代码。
+    账本不继承本类：共享数账本（``NodeShareLedger``）与占用账本一样不参与
+    选点，挂在策略上由缓存层直接回调。
     """
 
     name: str = "override"
-    # 本改写器管辖的队列；**仅**用于 profile 归类，不得参与仲裁判定。
+    # 本改写器管辖的队列；``pick`` 用它过滤候选池（见 MultiAgenticEvict）。
     queue: Optional[HeterCacheNodeTag] = None
 
+    @abstractmethod
     def pick(self, leaves: Iterable["TreeNode"], registry) -> Optional["TreeNode"]:
-        """在管辖范围内重选候选；返回 None 表示弃权。
-
-        Raises:
-            NotImplementedError: 纯观测型子类不参与选点。
-        """
-        raise NotImplementedError(
-            f"{type(self).__name__} is an observer, not a victim picker"
-        )
+        """在管辖范围内重选候选；返回 None 表示弃权。"""
 
     def stats(self) -> Dict[str, float]:
         """返回本改写器的观测量；无观测的插件返回空字典。"""
@@ -186,116 +168,6 @@ class RrEvictPolicy(VictimOverride):
         self._rr_last.clear()
         self._rr_seq = 0
         self.deficit_breach = 0
-
-
-class SlruEvictPolicy(VictimOverride):
-    """共享会话数账本 + 节点生命周期观测器。
-
-    职责：
-
-    1. 维护每个节点被多少个不同的会话命中过与一份 bloom 位图
-    2. 生命周期：on_node_hit/n_node_inserted由缓存层调用。
-    Args:
-        session_registry: 会话账本；省略时取全局单例。
-        share_min: 保护阈值；省略时取 ``DEFAULT_SHARE_MIN``，下限 2。
-    """
-
-    queue: Optional[HeterCacheNodeTag] =  HeterCacheNodeTag.QSTRUCT
-
-    def __init__(self, session_registry=None, share_min=None) -> None:
-        # 与策略共用同一本会话账（由 HeterCacheStrategy 注入）：is_one_shot 与
-        self.session_registry = session_registry or SessionRegistry.global_instance()
-        self.share_min = max(
-            2,
-            int(DEFAULT_SHARE_MIN if share_min is None else share_min),
-        )
-        # 共享会话数账本的观测
-        self.share_counted = 0   # 计入 share_sessions 的命中次数
-        self.share_dedup = 0     # 同一会话重复命中的去重次数
-        self.aged_evicted = 0    # 老化降级后被淘汰的 token（按事件累加）
-
-    # ------------------------------------------------------------ 共享会话数账本
-
-    def _record_session(self, node, session_id) -> bool:
-        """把 (node, session) 记进共享数账本；同会话重复命中只算一次。
-        Args:
-            node: 被命中的节点。
-            session_id: 命中该节点的会话；缺失时不计数。
-
-        Returns:
-            True 表示该会话是首次命中，共享数确实 +1。
-        """
-        if node is None or not session_id:
-            return False
-        bits = session_bloom_bits(session_id)
-        entry = _SLRU_META.setdefault(node, [0, 0])
-        if entry[1] & bits == bits:
-            self.share_dedup += 1
-            return False
-        entry[1] |= bits
-        entry[0] = min(SESSION_SHARE_MAX, entry[0] + 1)
-        self.share_counted += 1
-        return True
-
-    def on_node_inserted(self, node) -> None:
-        """分裂回调：新父节点继承子节点的共享账本条目。
-        Args:
-            node: 新挂上树的节点（普通插入的叶子，或分裂出来的父节点）。
-        """
-        if not node.children:
-            return
-        share = 0
-        bloom = 0
-        for child in node.children.values():
-            ce = _SLRU_META.get(child)
-            if ce:
-                if ce[0] > share:
-                    share = ce[0]
-                bloom |= ce[1]
-        if share or bloom:
-            _SLRU_META[node] = [share, bloom]
-
-    def on_node_hit(self, node, session_id=None) -> None:
-        """命中去重记账：新会话命中则共享数 +1。
-        Args:
-            node: 被命中的节点。
-            session_id: 命中该节点的会话。
-        """
-        self._record_session(node, session_id)
-
-    def on_aged_evict(self, tokens: int) -> None:
-        """老化降级的 struct 节点被淘汰时累加 token（观测用）。"""
-        self.aged_evicted += int(tokens)
-
-    @staticmethod
-    def share_of(node) -> int:
-        """返回节点被多少个不同会话命中过（创建者自己的首次重读计 1）。
-        读侧表，无条目返回 0：节点从未被命中过就不该享受共享保护。
-        """
-        entry = _SLRU_META.get(node)
-        return int(entry[0]) if entry else 0
-
-    # ------------------------------------------------------------ 插件接口
-
-
-    def stats(self) -> Dict[str, float]:
-        return {
-            "share_counted": self.share_counted,
-            "share_dedup": self.share_dedup,
-            "aged_evicted": self.aged_evicted,
-        }
-
-    def reset(self) -> None:
-        self.share_counted = 0
-        self.share_dedup = 0
-        self.aged_evicted = 0
-        # 共享数侧表按节点弱引用：节点被回收时条目自动消失，但被快照/观测句柄
-        # 临时持住的旧节点会活过 reset（/flush_cache 跨 run 复用同一进程时）。
-        # reset 的语义就是「上一次 run 的状态清空」，所以这里显式清掉。
-        _SLRU_META.clear()
-
-    def __repr__(self) -> str:  # pragma: no cover - 调试用
-        return f"<{type(self).__name__} name={self.name}>"
 
 
 class MultiTurnEvictPolicy(VictimOverride):

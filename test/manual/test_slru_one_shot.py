@@ -32,7 +32,6 @@ from sglang.srt.mem_cache.heter_utils import (  # noqa: E402
     SessionType,
     HeterCacheNodeTag,
 )
-from sglang.srt.mem_cache.victim_override import SlruEvictPolicy  # noqa: E402
 
 FAILS = []
 
@@ -64,15 +63,15 @@ class FakeNode:
 def _in_slru_scope(strategy, node) -> bool:
     """节点是否落在 SLRU 的保护范围内。
 
-    这就是原 ``SlruEvictPolicy.pick`` 的准入条件（会话类型 STRUCT 且共享数
-    达标），pick 删除后测试直接断言判据本身，不再借道一个无人调用的选点器。
+    判据即 is_aged / is_one_shot 里的那一对条件（会话类型 STRUCT 且共享数
+    达标）；测试直接断言判据本身，不再借道一个无人调用的选点器。
     """
-    st = strategy.slru_evict.session_registry.get(getattr(node, "session_id", None))
+    st = strategy.session_registry.get(getattr(node, "session_id", None))
     if st is None:
         return False
     return (
         st.session_type == SessionType.STRUCT
-        and strategy.slru_evict.share_of(node) >= strategy.slru_evict.share_min
+        and strategy.node_share.share_of(node) >= strategy.node_share.share_min
     )
 
 
@@ -91,9 +90,8 @@ def make_strategy(session_types, *, force_agentic=False, now=None, **slru):
     reg = SessionRegistry()
     for sid, stype in session_types.items():
         reg._sessions[sid] = SessionState(session_id=sid, session_type=stype)
-    # 策略与 SLRU 插件必须读同一本账
+    # one-shot 与老化判据都从策略持有的会话账读证据
     st.session_registry = reg
-    st.slru_evict.session_registry = reg
     return st, reg
 
 
@@ -105,9 +103,9 @@ def test_trans_unshared_vs_shared():
 
     check(st.is_one_shot(n) is True, "TRANS with share=0 must be one-shot")
 
-    for i in range(st.slru_evict.share_min):
-        st.slru_evict.on_node_hit(n, f"other-{i}")
-    check(n.share_sessions == st.slru_evict.share_min,
+    for i in range(st.node_share.share_min):
+        st.node_share.on_hit(n, f"other-{i}")
+    check(n.share_sessions == st.node_share.share_min,
           f"share_sessions, got {n.share_sessions}")
     check(st.is_one_shot(n) is False,
           "TRANS node reused by enough sessions must leave the one-shot band")
@@ -118,12 +116,12 @@ def test_struct_threshold():
     print("[2] STRUCT: threshold is share_min")
     st, _ = make_strategy({"s1": SessionType.STRUCT})
     n = FakeNode(session_id="s1")
-    thr = st.slru_evict.share_min
+    thr = st.node_share.share_min
     check(thr == 2, f"expected threshold 2 (share < 2 <=> sessions <= 2), got {thr}")
 
     for k in range(thr):
         check(st.is_one_shot(n) is True, f"STRUCT share={k} must be one-shot")
-        st.slru_evict.on_node_hit(n, f"other-{k}")
+        st.node_share.on_hit(n, f"other-{k}")
     check(n.share_sessions == thr, f"share_sessions, got {n.share_sessions}")
     check(st.is_one_shot(n) is False, "STRUCT at threshold must be protected")
 
@@ -138,7 +136,7 @@ def test_multiturn_never_one_shot():
         n = FakeNode(session_id=sid, decode=True)
         check(st.is_one_shot(n) is False, f"{sid} share=0 must not be one-shot")
         for i in range(3):
-            st.slru_evict.on_node_hit(n, f"x{i}")
+            st.node_share.on_hit(n, f"x{i}")
         check(st.is_one_shot(n) is False, f"{sid} share=3 must not be one-shot")
 
 
@@ -155,8 +153,8 @@ def test_queue_tag_is_irrelevant():
 
     # 方向 B：打着 QTRANS 标签、已被多次复用的节点，不再是
     reused = FakeNode(session_id="t1", tag=HeterCacheNodeTag.QTRANS)
-    for i in range(st.slru_evict.share_min):
-        st.slru_evict.on_node_hit(reused, f"y{i}")
+    for i in range(st.node_share.share_min):
+        st.node_share.on_hit(reused, f"y{i}")
     check(st.is_one_shot(reused) is False,
           "a QTRANS-tagged but widely reused node must leave the one-shot band")
     check(reused.queue_tag == HeterCacheNodeTag.QTRANS,
@@ -173,26 +171,26 @@ def test_ledger_semantics():
     check(st.is_one_shot(node) is True, "share=0 is one-shot")
 
     # 创建者第一次重读：计入 1
-    st.slru_evict.on_node_hit(node, "s1")
+    st.node_share.on_hit(node, "s1")
     check(node.share_sessions == 1, f"first self-hit must count, got {node.share_sessions}")
     check(node.session_bloom != 0, "session bloom must be written on the first counted hit")
     check(st.is_one_shot(node) is True, "share=1 is still one-shot")
 
     # 创建者后续轮次重读：去重
     for _ in range(3):
-        st.slru_evict.on_node_hit(node, "s1")
+        st.node_share.on_hit(node, "s1")
     check(node.share_sessions == 1, f"self re-reads must dedup, got {node.share_sessions}")
     check(_in_slru_scope(st, node) is False, "private context must not be protected")
 
     # 1 次外部命中即达阈值
-    st.slru_evict.on_node_hit(node, "s2")
+    st.node_share.on_hit(node, "s2")
     check(node.share_sessions == 2, f"one foreign hit must reach min, got {node.share_sessions}")
     check(st.is_one_shot(node) is False, "cross-session template leaves the band")
     check(_in_slru_scope(st, node) is True, "cross-session template is protected")
 
     # 无 session 的节点不记
     orphan = FakeNode(session_id=None)
-    st.slru_evict.on_node_hit(orphan, None)
+    st.node_share.on_hit(orphan, None)
     check(orphan.share_sessions == 0, "node without session must not be counted")
 
 
@@ -215,8 +213,8 @@ def test_is_one_shot_and_pick_scope_agree():
     check(_in_slru_scope(st, node) is False, "share=0 must not be SLRU-scoped")
     check(st.is_one_shot(node) is True, "share=0 must be one-shot")
 
-    for i in range(st.slru_evict.share_min):
-        st.slru_evict.on_node_hit(node, f"z{i}")
+    for i in range(st.node_share.share_min):
+        st.node_share.on_hit(node, f"z{i}")
     check(_in_slru_scope(st, node) is True,
           "at threshold the node becomes SLRU-scoped")
     check(st.is_one_shot(node) is False, "at threshold the node leaves the band")
@@ -234,9 +232,9 @@ def test_works_under_force_agentic():
         # 过 90s 豁免但未到 3600s 老化 TTL：两种判据都不该干扰本条
         n.last_access_time = time.monotonic() - 200
         check(st.is_one_shot(n) is True, f"{kwargs}: unshared TRANS is one-shot")
-        for i in range(st.slru_evict.share_min):
-            st.slru_evict.on_node_hit(n, f"w{i}")
-        check(n.share_sessions == st.slru_evict.share_min,
+        for i in range(st.node_share.share_min):
+            st.node_share.on_hit(n, f"w{i}")
+        check(n.share_sessions == st.node_share.share_min,
               f"{kwargs}: ledger must still count, got {n.share_sessions}")
         check(st.is_one_shot(n) is False, f"{kwargs}: reused TRANS is protected")
 
@@ -245,26 +243,26 @@ def test_share_min_is_single_knob():
     """share_min 是唯一旋钮：配置 / one-shot / SLRU 三处同值。"""
     print("[8] share_min drives config, one-shot and SLRU together")
     st, _ = make_strategy({"s1": SessionType.STRUCT}, share_min=3)
-    check(st.slru_evict.share_min == 3,
-          f"SLRU threshold must follow config, got {st.slru_evict.share_min}")
+    check(st.node_share.share_min == 3,
+          f"SLRU threshold must follow config, got {st.node_share.share_min}")
     check(st.slru.share_min == 3, "SlruParams must carry the configured value")
 
     node = FakeNode(session_id="s1")
     for k in (0, 1):
         check(st.is_one_shot(node) is True, f"share={k} < 3 must be one-shot")
-        st.slru_evict.on_node_hit(node, f"o{k}")
+        st.node_share.on_hit(node, f"o{k}")
     check(node.share_sessions == 2, f"share_sessions, got {node.share_sessions}")
     check(st.is_one_shot(node) is True, "share=2 is still one-shot when min=3")
     check(_in_slru_scope(st, node) is False, "share=2 is not SLRU-scoped yet")
 
-    st.slru_evict.on_node_hit(node, "o2")
+    st.node_share.on_hit(node, "o2")
     check(node.share_sessions == 3, f"share_sessions, got {node.share_sessions}")
     check(st.is_one_shot(node) is False, "share=3 leaves the one-shot band")
     check(_in_slru_scope(st, node) is True, "share=3 is SLRU-scoped")
 
     # 默认值：配置不写时两边都回落到 DEFAULT_SHARE_MIN
     d, _ = make_strategy({"s1": SessionType.STRUCT})
-    check(d.slru_evict.share_min == DEFAULT_SHARE_MIN,
+    check(d.node_share.share_min == DEFAULT_SHARE_MIN,
           "default threshold must come from DEFAULT_SHARE_MIN")
     check(DEFAULT_SHARE_MIN == 2, "documented default is 2 (sessions <= 2)")
 
@@ -306,8 +304,8 @@ def test_once_read_leaves_one_shot_band():
 
     # hit_count 不得推翻其它豁免：共享数达标的节点本来就不在带内
     shared = FakeNode(session_id="t1", hit_count=0)
-    st.slru_evict.on_node_hit(shared, "other-0")
-    st.slru_evict.on_node_hit(shared, "other-1")
+    st.node_share.on_hit(shared, "other-0")
+    st.node_share.on_hit(shared, "other-1")
     check(st.is_one_shot(shared) is False,
           "share>=min exemption must survive the hit_count rule")
 
@@ -357,8 +355,8 @@ def test_active_session_exempt_until_idle():
     check(st.is_one_shot(r) is False,
           "hit evidence still overrides after expiry (F1 unchanged)")
     shared = FakeNode(session_id="t1", hit_count=0)
-    for i in range(st.slru_evict.share_min):
-        st.slru_evict.on_node_hit(shared, f"other-{i}")
+    for i in range(st.node_share.share_min):
+        st.node_share.on_hit(shared, f"other-{i}")
     check(st.is_one_shot(shared) is False,
           "share exemption still overrides after expiry")
 

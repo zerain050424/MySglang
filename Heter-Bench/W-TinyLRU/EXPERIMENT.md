@@ -180,7 +180,7 @@ python -m wtl.synth --out-dir data/exp/D2 \
 |---|---|---|
 | `victim_src.one_shot` 占比 | `_victim_sources` | A2/A3 高（>60%）：一次性带在干活 |
 | `victim_src.qstruct` 占比 | 同上 | A3 > 0 且 A2 = 0（保护段真的接管过淘汰） |
-| `slru.share_counted` / `share_dedup` | `SlruEvictPolicy.stats()` | counted > 0；dedup > 0 证明同一会话去重生效 |
+| `slru.share_counted` / `share_dedup` | `NodeShareLedger.stats()` | counted > 0；dedup > 0 证明同一会话去重生效 |
 | `slru.slru_picks` | 同上 | > 0（机制被行使，门控 G2） |
 | `protected_waste_rate` | `RegretTracker`（`region==3` = `not is_one_shot`） | A1 高、A3 低：上游把废弃私有上下文保护起来了 |
 

@@ -362,8 +362,8 @@ class RadixCache(BasePrefixCache):
 
             self._needs_capacity = True
             self.force_agentic = heter.force_agentic
-            # 节点生命周期观测器：命中记账与分裂继承
-            self.node_observers = heter.node_observers
+            # 共享数账本：读侧给判据（share_of），写侧只有命中与分裂两个回调。
+            self.node_share = heter.node_share
             self._record_insert = heter.record_insert
         else:
             self.occupancy = None
@@ -372,21 +372,14 @@ class RadixCache(BasePrefixCache):
             self._hit_recorder = None
             self._needs_capacity = False
             self.force_agentic = False
-            self.node_observers = ()
+            self.node_share = None
             self._record_insert = None
 
-        # 两个回调元组在这里解析一次，插入/分裂热路径只做空循环。
-        self._insert_observers = tuple(
-            getattr(ov, "on_node_inserted")
-            for ov in self.node_observers
-            if hasattr(ov, "on_node_inserted")
+        # 回调按名字绑定一次：非 HeterCache 策略为 None，热路径只多一次判断。
+        self._split_observer = (
+            heter.node_share.on_inserted if heter is not None else None
         )
-
-        self._hit_observers = tuple(
-            getattr(ov, "on_node_hit")
-            for ov in self.node_observers
-            if hasattr(ov, "on_node_hit")
-        )
+        self._hit_observer = heter.node_share.on_hit if heter is not None else None
 
         self.evictable_leaves = set()
         self.session_registry = SessionRegistry.global_instance()
@@ -447,8 +440,8 @@ class RadixCache(BasePrefixCache):
     ##### Public API #####
 
     def reset(self):
-        for observer in getattr(self, "node_observers", ()):
-            observer.reset()
+        if self.node_share is not None:
+            self.node_share.reset()
         registry = getattr(self, "session_registry", None)
         if registry is not None:
             registry.clear()
@@ -886,8 +879,8 @@ class RadixCache(BasePrefixCache):
         """Apply the session's type to owned nodes; keep fork/shared tags sticky."""
         delta = access_time - node.last_access_time
         node.hit_count += 1
-        for observe in self._hit_observers:
-            observe(node, session_id)
+        if self._hit_observer is not None:
+            self._hit_observer(node, session_id)
         state = (
             self.session_registry.get(session_id)
             if self._hit_recorder is not None
@@ -960,11 +953,10 @@ class RadixCache(BasePrefixCache):
             child.event_hash_value, split_len, self.page_size
            )
            # T-LRU：分裂不增加分支深度，新父节点继承 child 的高水位。
-           # SLRU：共享账本的新父节点继承由 SlruEvictPolicy.on_node_inserted
-           # 在下方观察者回调里完成（分裂不改变「哪些请求经过这段前缀」，
-           # 两半都继承），不再新增占位字段。
-           for observe in self._insert_observers:
-               observe(new_node)
+           # 共享数账本的新父节点继承由 NodeShareLedger.on_inserted 完成（分裂
+           # 不改变「哪些请求经过这段前缀」，两半都继承），不再新增占位字段。
+           if self._split_observer is not None:
+               self._split_observer(new_node)
 
            return new_node
 
@@ -1031,7 +1023,7 @@ class RadixCache(BasePrefixCache):
                 new_node.queue_tag = HeterCacheNodeTag.QAGENT
             else:
                 # 出生标签只看谁创建了这段；跨会话共享的事实由
-                # SlruEvictPolicy 的共享数账本记录，与标签无关。
+                # NodeShareLedger 的共享数账本记录，与标签无关。
                 new_node.queue_tag = (
                     session_type_to_node_tag(state.session_type)
                     if state is not None
@@ -1044,8 +1036,6 @@ class RadixCache(BasePrefixCache):
             self.session_registry.attach(session_id, len(new_node.value)) ##插入新请求
             node.children[child_key] = new_node
 
-            for observe in self._insert_observers:
-                observe(new_node)
             # 占用账本：只记新出现的 token,分裂路径不走这里（净变化为 0）。
             if self._record_insert is not None:
                 self._record_insert(new_node)
