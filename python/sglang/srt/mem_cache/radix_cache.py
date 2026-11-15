@@ -342,10 +342,7 @@ class RadixCache(BasePrefixCache):
         self.eviction_strategy = get_eviction_strategy(
             self.eviction_policy, params.eviction_policy_config
         )
-        # ---- 策略协定：谁提供什么，按类型一次接清 ----
-        # 以前这里用 8 处 getattr 逐个试探策略能力，属性名拼错或某处漏实现都
-        # 只会静默退化成「该能力不存在」。现在按类型显式装配：HeterCache 把自己
-        # 的三个协作者（占用账本 / 遥测 / 节点观测器）交出来，其它策略一律留空。
+
         heter = (
             self.eviction_strategy
             if isinstance(self.eviction_strategy, HeterCacheStrategy)
@@ -362,15 +359,11 @@ class RadixCache(BasePrefixCache):
             self.telemetry = heter.telemetry
             self.realized = heter.realized
             self._hit_recorder = heter.record_hit
-            # VD 仲裁要 allocator 的可用量/容量判断承压；其它策略不碰 allocator，
-            # 测试里的极简替身因此仍能跑。
+
             self._needs_capacity = True
             self.force_agentic = heter.force_agentic
-            # 节点生命周期观测器：命中记账与分裂继承（当前只有 SLRU 的共享数账本）。
-            # 队内选点（RR / multi_agentic）不在这里——它们只由权重裁决调用。
+            # 节点生命周期观测器：命中记账与分裂继承
             self.node_observers = heter.node_observers
-            # 队列占用的节点入账只挂「新建节点」一条路径。不能挂 _insert_observers：
-            # 分裂也会触发它，而分裂时占用净变化为 0，再记一次就是双计。
             self._record_insert = heter.record_insert
         else:
             self.occupancy = None
@@ -388,8 +381,7 @@ class RadixCache(BasePrefixCache):
             for ov in self.node_observers
             if hasattr(ov, "on_node_inserted")
         )
-        # 命中记账不经过标签策略：force_agentic 等实验开关下账本同样要维护，
-        # 否则 SLRU 的准入条件会退化成恒真/恒假。
+
         self._hit_observers = tuple(
             getattr(ov, "on_node_hit")
             for ov in self.node_observers
@@ -397,16 +389,8 @@ class RadixCache(BasePrefixCache):
         )
 
         self.evictable_leaves = set()
-        # HeterCache：会话级 KV 账本（每会话 d/L/gaps），供公平淘汰使用。
-        # 进程级单例：同进程内多个缓存实例共享同一本账（见 SessionRegistry 文档）。
-        # 需要隔离时（单测 / 并行对照）构造后覆盖本属性：
-        #     cache.session_registry = SessionRegistry()
         self.session_registry = SessionRegistry.global_instance()
         self.reset()
-
-        # 节点级标签快照：观测组件见 node_label_logger（env 门控，默认关）。
-        # 这里只留一个句柄：采样器要读 root_node / session_registry / eviction_policy，
-        # 但遍历与落盘都不在缓存类里。
         self.node_labels = start_node_label_logger(self)
 
     @classmethod
@@ -455,12 +439,7 @@ class RadixCache(BasePrefixCache):
         return cls(params)
 
     def _stamp(self, node: TreeNode) -> None:
-        """给新建节点盖时间戳。
-
-        ``TreeNode.__init__`` 自己取 ``time.monotonic()``，那是给不持有缓存的调用方
-        留的默认值；一旦缓存持有时间源（``CacheInitParams.now``），节点的创建/访问
-        时间必须来自同一个时钟，否则注入假时钟后 aging 与 one-shot 豁免全部失真。
-        """
+        """给新建节点盖时间戳"""
         now = self._now()
         node.last_access_time = now
         node.creation_time = now
@@ -468,24 +447,17 @@ class RadixCache(BasePrefixCache):
     ##### Public API #####
 
     def reset(self):
-        # 观测器可能持有节点引用（SLRU 的弱引用表）/ 计数器，必须先于树一起清空
         for observer in getattr(self, "node_observers", ()):
             observer.reset()
-        # 会话账本与策略计数器同样属于「上一次 run 的状态」。`/flush_cache` 会走到
-        # 这里，因此复用同一个 server 跑多个 seed 时不会串味（RR 的 loss_cap 直接
-        # 读 SessionRegistry 的 d/L）。
         registry = getattr(self, "session_registry", None)
         if registry is not None:
             registry.clear()
-        # 观测协作者的状态同样属于「上一次 run」：账本与累计量一起清。
         if self.occupancy is not None:
             self.occupancy.reset()
         if self.telemetry is not None:
             self.telemetry.reset()
         if self.realized is not None:
-            # flush 之后旧 run 的命中质量不能继续给队列抬权重。
             self.realized.reset()
-        # Initialize root with minimum priority so any real priority overrides it
         self.root_node = TreeNode(priority=-sys.maxsize)
         self._stamp(self.root_node)
         self.root_node.key = RadixKey(token_ids=array("q"), extra_key=None)
@@ -638,7 +610,7 @@ class RadixCache(BasePrefixCache):
         # 定位 prompt/output 边界，使 decode 部分节点可以单独标记；
         # 不再要求客户端提供工作负载类型标签。
         decode_start = (len(req.origin_input_ids) // self.page_size) * self.page_size
-        # HeterCache：会话账本入口。请求写入后链完整驻留，缺口归零。
+        #请求写入后前缀链完整,缺口归零。
         self.session_registry.touch(
             req.session_id, getattr(req, "rid", ""), len(radix_key)
         )
@@ -772,19 +744,14 @@ class RadixCache(BasePrefixCache):
         return EvictResult(num_tokens_evicted=num_evicted)
 
     def _is_one_shot(self, node) -> bool:
-        """一次性内容判定：优先用策略口径（HeterCache 有多轮/单轮之分）。
-
-        非 HeterCache 策略没有 is_one_shot，退回旧规则（is_decode 或随机单轮）。
-        计数与淘汰必须用同一判定，否则 profile 的分母口径与实际淘汰会互相打架。
-        """
+        """单次请求判定"""
         fn = getattr(self.eviction_strategy, "is_one_shot", None)
         if fn is not None:
             return bool(fn(node))
         return bool(getattr(node, "is_decode", False))
 
     def _per_queue_token_count(self) -> dict:
-        """按队列统计驻留 token，包含各自的 response(decode) 段。
-           这个队列到底占了池子多少
+        """按队列统计驻留 token，包含各自的 response(decode) 段.
         返回 {label: {"total": t, "one_shot": o}}；
         one_shot = 该队列中一次性内容的 token（random 整行、struct 的 response 段；多轮恒为 0）。
         Σ(total - one_shot) 即 profile 里的可调度占用。
@@ -796,8 +763,6 @@ class RadixCache(BasePrefixCache):
             for child in node.children.values():
                 if child.evicted:
                     continue
-                # 标签直接读节点本身：任何策略下节点都带 queue_tag，
-                # 未知/缺失由 coerce 收敛为 chat（与旧默认一致）。
                 queue = HeterCacheNodeTag.coerce(
                     getattr(child, "queue_tag", None)
                 ).queue_name
@@ -921,8 +886,6 @@ class RadixCache(BasePrefixCache):
         """Apply the session's type to owned nodes; keep fork/shared tags sticky."""
         delta = access_time - node.last_access_time
         node.hit_count += 1
-        # 共享会话数账本（SlruEvictPolicy）：必须早于 queue_tag 更新，
-        # 也必须早于 force_agentic 短路，否则该实验开关会让账本永远停在 0。
         for observe in self._hit_observers:
             observe(node, session_id)
         state = (
@@ -1064,10 +1027,10 @@ class RadixCache(BasePrefixCache):
             new_node.value = value.clone()
             state = self.session_registry.get(session_id)
             if self.force_agentic:
-                # 直达 agentic 队列：新节点不再落 QTRANS（否则会被 one-shot 带先清）
+                # 直达 agentic 队列
                 new_node.queue_tag = HeterCacheNodeTag.QAGENT
             else:
-                # 出生标签只看「谁创建了这段」；跨会话共享的事实由
+                # 出生标签只看谁创建了这段；跨会话共享的事实由
                 # SlruEvictPolicy 的共享数账本记录，与标签无关。
                 new_node.queue_tag = (
                     session_type_to_node_tag(state.session_type)

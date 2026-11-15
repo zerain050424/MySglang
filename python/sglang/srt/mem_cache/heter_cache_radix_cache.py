@@ -114,19 +114,12 @@ class HeterCacheRadixCache(RadixCache):
 
     def _release_node(self, node) -> int:
         """释放一个节点的全部资源并从树上摘除，返回释放的 token 数。
-
-        四个动作的顺序不可调换：
-
-        1. ``record_evict`` 必须最先。它扣减占用账本，而 ``_pick_victim``
-           在同一个淘汰循环里每轮都读这份账本——
-           把扣减推后会让下一轮按错误的占用选受害者；
+        1. record_evict最先扣减队列占用
         2. 之后才是物理释放、对外事件与摘树。
-
         Args:
             node: 待释放的叶子节点。
-
         Returns:
-            该节点释出的 token 数（先取值再释放，value 不会被释放动作改写）。
+            该节点释放的token数
         """
         released = len(node.value)
         self.eviction_strategy.record_evict(node)

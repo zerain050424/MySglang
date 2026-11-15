@@ -224,12 +224,7 @@ class HeterCacheStrategy(EvictionStrategy):
         return st.session_type in (SessionType.TRANS, SessionType.STRUCT)
 
     def one_shot_key(self, node) -> tuple:
-        """One-shot 带内淘汰排序：老化节点最优先，其余按访问时间升序。
-
-        末尾的 ``node.id`` 是平局判据：虚拟时钟下同一 tick 写入的节点时间戳全等，
-        而 ``min()`` 在完全同分时取迭代顺序（set 的 id 哈希序，跨进程不稳定），
-        同 seed 就不可复现了。``id`` 按创建顺序递增，能给出稳定顺序。
-        """
+        """One-shot 带内淘汰排序：老化节点最优先，其余按访问时间升序"""
         return (0 if self.is_aged(node) else 1, node.last_access_time, node.id)
 
     # ---- 命中/淘汰记账 ----
@@ -297,12 +292,12 @@ class HeterCacheStrategy(EvictionStrategy):
     # ---- 跨队列仲裁（VD） ----
 
     def queue_order(self) -> list:
-        """按 ``occ_q / (1 + VD_q)`` 降序返回队列；越靠前越先削。"""
+        """按occ_q / (1 + VD_q)降序返回队列；越靠前越先削。"""
         occ = self.occupancy.occ
         return _queue_order(occ, self.realized.densities(occ))
 
     def queue_victim(self, queue: str, leaves):
-        """在指定队列内挑一个淘汰节点；无合适候选返回 None（上层跳队）。"""
+        """在指定队列内挑一个淘汰节点；无合适候选返回 None"""
         target = HeterCacheNodeTag.from_queue(queue)
         if target is None:
             return None
@@ -323,11 +318,7 @@ class HeterCacheStrategy(EvictionStrategy):
         return None
 
     def fallback(self, leaves):
-        """所有队列均弃权时的均匀随机淘汰。
-
-        候选先按 ``node.id`` 排序再抽：``leaves`` 是 set，迭代序取决于对象地址，
-        直接 ``choice`` 会让同一个 seed 在两次进程里抽出不同节点。
-        """
+        """所有队列均弃权时的均匀随机淘汰"""
         pool = sorted(leaves, key=lambda n: n.id)
         if not pool:
             return None

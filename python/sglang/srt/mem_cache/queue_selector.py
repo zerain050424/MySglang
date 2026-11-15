@@ -9,7 +9,7 @@ def queue_order(
     occ: Dict[str, float], value_density: Dict[str, float]
 ) -> List[str]:
     """按occ_q / (1 + VD_q)降序返回候选队列，最前的先削。
-    比值语义：每单位已兑现价值对应的驻留量，越大越应该削。用1 + VD而不是
+    比值语义：每单位已兑现价值对应的驻留量，越大越应该削。
     * VD=0 表示按照原occ计入,
     Args:
         occ: 各队列可调度占用（Token）

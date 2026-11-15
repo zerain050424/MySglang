@@ -1,14 +1,7 @@
 """队列占用账本：各队列可调度占用的唯一写入口。
-
-只做状态，不含策略、不碰树、不读时钟：
-
-* 写入口两条——``insert`` / ``evict``（节点级增量）；
-* 加上一条全量校准 ``reconcile``（吸收标签变更、one-shot 晋升等增量漂移）；
-* 读侧给 ``occ``（活引用，调用方约定只读）与 ``snapshot``（副本，供渲染）。
-
-为什么单独成对象：占用是唯一被"记账方"与"决策方"同时需要的状态。放在策略里，
-策略就同时扮演账本与决策器；放在缓存层，又会让驱逐循环直接摸账本内部。抽出来
-之后，谁写（缓存层）、谁读（VD 仲裁）在类型层面就分开了。
+* 触发位置:insert/evict;
+* 加上一条全量校准reconcile（吸收标签变更、one-shot 晋升等增量漂移）；
+* 读侧为occ与snapshot
 """
 
 from __future__ import annotations
@@ -25,11 +18,7 @@ PRESSURE_WINDOW_S = 3.0
 
 
 class QueueOccupancyTracker:
-    """三队列占用账本。
-
-    口径：只计"可调度"内容——one-shot 节点在写入方就已被排除，因此这里
-    不再判断 one-shot；``reconcile`` 用全树快照的 ``total - one_shot`` 对齐。
-    """
+    """三队列占用账本计数,只计可调度内容——one-shot 节点在写入方就已被排除"""
 
     __slots__ = ("_occ", "_capacity", "_last_reconcile", "_now")
 
@@ -71,9 +60,7 @@ class QueueOccupancyTracker:
 
     def evict(self, queue: str, tokens: int) -> None:
         """节点逐出时增量扣减，下界为 0。
-
-        必须早于同一轮淘汰循环里的下一次 ``_pick_victim``：仲裁按这份占用选队列，
-        扣减晚了就会按虚高的水位点名，多削一轮。
+        必须早于同一轮淘汰循环里的下一次_pick_victim：仲裁按这份占用选队列
         """
         if queue in self._occ:
             self._occ[queue] = max(0.0, self._occ[queue] - tokens)
@@ -89,10 +76,10 @@ class QueueOccupancyTracker:
         """校准时钟是否到期。
 
         两个窗口不是一个东西：常规窗口跟 profile 打印同频，承压窗口固定为
-        ``PRESSURE_WINDOW_S``，服务的是账本正确性而非观测。
+        PRESSURE_WINDOW_S，服务的是账本正确性而非观测。
 
         Args:
-            available: 当前可用 token；``has_capacity`` 为 False 时不参考。
+            available: 当前可用 token；has_capacity为 False 时不参考。
             capacity: 池容量；0 表示还没拿到。
             normal_window_s: 常规校准窗口（秒）。
             has_capacity: 调用方是否真的拿到了可用量。
@@ -108,7 +95,7 @@ class QueueOccupancyTracker:
         """用全树快照校准，吸收增量维护跟不上的漂移。
 
         Args:
-            snapshot: ``{queue: {"total": t, "one_shot": o}}``，来自全树遍历。
+            snapshot: {queue: {"total": t, "one_shot": o}}，来自全树遍历。
             capacity: 本次拿到的池容量（Token）；拿不到时传 0，容量保持不变。
         """
         for q in VALUE_QUEUES:
