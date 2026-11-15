@@ -280,8 +280,8 @@ def run_replay(
         "history_retention": retention.history_summary(),
         "regret": regret.summary() if regret is not None else None,
         "struct": stats.get("struct"),
-        "slru": stats.get("slru") or {},
-        "slru_share_min": stats.get("slru_share_min"),
+        "share": stats.get("share") or {},
+        "share_min": stats.get("share_min"),
         "victim_src": stats.get("victim_src") or {},
         "wall_s": round(time.perf_counter() - t0, 3),
     }
@@ -472,7 +472,7 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
 
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description="W-TinyLRU 离线回放（L1）")
-    p.add_argument("--arm", default="A3", help="实验臂 A0..A4（A3=两带 SLRU）")
+    p.add_argument("--arm", default="A3", help="实验臂 A0..A4（A3=两带共享保护）")
     add_common_args(p)
     a = p.parse_args(argv)
 

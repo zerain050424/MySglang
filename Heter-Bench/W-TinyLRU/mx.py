@@ -11,8 +11,7 @@ def load(name):
     cap = sum(x["prompt_tokens"] - TPL for x in reqs) or 1
     priv = sum(max(0, x["cached_tokens"] - TPL) for x in reqs) / cap * 100
     return dict(intact=round(intact,1), tpl=round(tpl,1), priv=round(priv,1),
-                hit=round(s["hit_pct"],2), ev=s["evictions"],
-                picks=(s.get("slru") or {}).get("slru_picks"))
+                hit=round(s["hit_pct"],2), ev=s["evictions"])
 rows = []
 for trace, pools in json.loads(sys.argv[1]):
     for pool in pools:

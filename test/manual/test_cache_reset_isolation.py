@@ -6,7 +6,7 @@ reset 必须把「上一次 run 的状态」全部清掉，否则会串味：
 
   SessionRegistry 的 d/L/gaps  ->  RR 的 loss_cap 直接读它们
   策略的窗口/累计/来源计数     ->  [HeterCache profile] 会打印混合值
-  插件的计数器                 ->  SLRU 的 share 账本失真
+  插件的计数器                 ->  共享数账本失真
 
 Run: /root/sl_old/bin/python test/manual/test_cache_reset_isolation.py
 """
@@ -51,7 +51,7 @@ class Alloc:
 
 CFG = {
     "force_agentic": True,
-    "slru": {"share_min": 2},
+    "share": {"share_min": 2},
     # 按已兑现价值密度（VD）的跨队列淘汰
     "value": {"tau_s": 120.0, "floor_tokens": 2048.0},
 }

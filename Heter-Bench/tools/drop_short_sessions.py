@@ -13,7 +13,7 @@
 2. ShareGPT / alfred 里那些**总共只有 1–4 轮**的会话，终身类型都是 TRANS。
    它们每一轮都在复用自己上一轮的前缀，却被当成一次性流量优先清掉——这就是
    M1 机制把多轮负载的均匀命中率压下去的主要来源（实测 LRU 与 hc 相差 ~20pp，
-   ShareGPT turn-1 39.7%→7.5%，见 test/manual/test_slru_one_shot.py [9]）。
+   ShareGPT turn-1 39.7%→7.5%，见 test/manual/test_share_one_shot.py [9]）。
 
 本工具的作用范围只有第 2 类：把「终身都是 TRANS」的会话整条丢掉，于是
 **TRANS 带里只剩单轮会话和长会话的前几轮**。单轮负载本身不经过它。

@@ -390,12 +390,11 @@ def offline_table(runs: Sequence[dict]) -> List[dict]:
             "protected_waste_rate": regret.get("protected_waste_rate"),
             "one_shot_pct": round(100.0 * vsrc.get("one_shot", 0.0) / tot_ev, 3) if tot_ev else 0.0,
             "qstruct_pct": round(100.0 * vsrc.get("qstruct", 0.0) / tot_ev, 3) if tot_ev else 0.0,
-            # 机制证据：共享数账本 + SLRU 实际给出的候选数
-            "slru_picks": (s.get("slru") or {}).get("slru_picks"),
-            "share_counted": (s.get("slru") or {}).get("share_counted"),
-            "share_dedup": (s.get("slru") or {}).get("share_dedup"),
+            # 机制证据：共享数账本
+            "share_counted": (s.get("share") or {}).get("share_counted"),
+            "share_dedup": (s.get("share") or {}).get("share_dedup"),
             # 唯一旋钮：越大保护越难触发（A2 用不可达值做基线）
-            "share_min": (d.get("config") or {}).get("slru", {}).get("share_min"),
+            "share_min": (d.get("config") or {}).get("share", {}).get("share_min"),
         }
         for task, layers in (ret or {}).items():
             for L, v in layers.items():
@@ -729,22 +728,21 @@ def struct_timeseries(paths: Sequence[str]) -> List[dict]:
                     d = json.loads(line)
                 except Exception:
                     continue
-                snap = d.get("slru") or {}
+                snap = d.get("share") or {}
                 vsrc = d.get("victim_src") or {}
                 tot = sum(vsrc.values()) or 0.0
                 rows.append(
                     {
-                        "slru": d.get("slru"),
+                        "share": d.get("share"),
                         "ts": d.get("ts"),
                         "evict_calls": d.get("evict_calls"),
                         "evict_us_p50": d.get("evict_us_p50"),
                         "evict_us_p99": d.get("evict_us_p99"),
                         "available": d.get("available"),
                         "evictable_size": d.get("evictable_size"),
-                        "slru_picks": snap.get("slru_picks"),
                         "share_counted": snap.get("share_counted"),
                         "share_dedup": snap.get("share_dedup"),
-                        "share_min": d.get("slru_share_min"),
+                        "share_min": d.get("share_min"),
                         "one_shot_evicted_pct": round(
                             100.0 * (vsrc.get("one_shot", 0.0) or 0.0) / tot, 2
                         ) if tot else 0.0,
@@ -995,9 +993,9 @@ def main(argv=None) -> int:
         rows = [r for r in off_rows if r["backend"] == "real"]
         cols = ["arm", "workload", "ladder", "hit_pct", "regret_rate",
                 "protected_waste_rate", "one_shot_pct", "qstruct_evicted_pct",
-                "share_counted", "slru_picks", "evictions"]
+                "share_counted", "evictions"]
         heads = ["arm", "workload", "压力轴", "hit%", "regret", "prot_waste",
-                 "one_shot_evict%", "qstruct_evicted%", "share_counted", "picks",
+                 "one_shot_evict%", "qstruct_evicted%", "share_counted",
                  "evicts"]
         extra = sorted({
             k for r in rows for k in r

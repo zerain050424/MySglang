@@ -9,7 +9,7 @@ torch 的依赖，只加载 `heter_cache_radix_cache.py` 本体，再挂一棵�
 2. **候选不跨轮复用**：每轮重新计算，已删除的节点不会被二次删除
    （历史 bug：复用上一轮 victim → 二次 `free_segment` + `_delete_leaf` 断言失败）。
 3. **one-shot 永远先走**：`one_shot_key` 口径（结束偏移最深者先）。
-4. **SLRU 只在受保护的 struct 叶子上改写候选**，并把来源记成 `qstruct`。
+4. **共享保护段只在受保护的 struct 叶子上改写候选**，并把来源记成 `qstruct`。
 
     python test/manual/test_evict_loop.py
 """
@@ -246,8 +246,8 @@ def _bootstrap():
     return ep, shc, sys.modules["sglang.srt.mem_cache.base_prefix_cache"]
 
 
-def _strategy(ep, sessions, **slru):
-    st = ep.HeterCacheStrategy(slru=slru or None)
+def _strategy(ep, sessions, **share):
+    st = ep.HeterCacheStrategy(share=share or None)
     reg = sys.modules["sglang.srt.mem_cache.heter_utils"].SessionRegistry()
     hu = sys.modules["sglang.srt.mem_cache.heter_utils"]
     for sid, stype in sessions.items():
@@ -257,7 +257,7 @@ def _strategy(ep, sessions, **slru):
 
 
 def _seed_share(st, node, n):
-    """把节点的跨会话共享数直接记进 SLRU 账本（share_of 只认这本账）。"""
+    """把节点的跨会话共享数直接记进共享数账本（share_of 只认这本账）。"""
     for i in range(n):
         st.node_share.on_hit(node, f"seed-{id(node)}-{i}")
 
@@ -346,7 +346,7 @@ def test_one_shot_band_first(ep, shc, base):
           f"source must be 'one_shot', got {st.profiler._victim_sources}")
 
 
-def test_slru_rewrites_struct_candidate(ep, shc, base):
+def test_share_rewrites_struct_candidate(ep, shc, base):
     """只有受保护的 struct 叶子时，VD 仲裁点名 struct 队，队内按段内 LRU 挑最久未访问的那片。"""
     print("[4] struct queue: VD arbitration names it, struct_tier picks the LRU-oldest")
     hu = sys.modules["sglang.srt.mem_cache.heter_utils"]
@@ -365,7 +365,7 @@ def test_slru_rewrites_struct_candidate(ep, shc, base):
     check(st.profiler._victim_sources.get("value:struct") == 16,
           f"source must be the struct queue, got {st.profiler._victim_sources}")
     # struct 队的选点由 struct_tier 直接完成（share 分级 + 段内 LRU）；
-    # SLRU 只是账本 + 生命周期观测器，不参与选点。
+    # 共享数账本只是账本 + 生命周期观测器，不参与选点。
 
 
 def test_empty_tree_is_noop(ep, shc, base):
@@ -422,7 +422,7 @@ def main():
         test_no_one_shot_leaves_does_not_crash,
         test_victim_not_reused_across_rounds,
         test_one_shot_band_first,
-        test_slru_rewrites_struct_candidate,
+        test_share_rewrites_struct_candidate,
         test_empty_tree_is_noop,
         test_aged_struct_prefix_cascade,
     ]

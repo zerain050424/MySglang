@@ -145,7 +145,7 @@ def session_type_to_node_tag(session_type: SessionType) -> HeterCacheNodeTag:
 #
 # 用 dataclass 而非裸 kwargs：让 eviction_policy_config 有层级、可校验、可整体
 # 传递。配置只接受分组形式
-# {"rr":{...},"slru":{...},"mt":{...},"multi_agentic":{...},"value":{...}}，
+# {"rr":{...},"share":{...},"mt":{...},"multi_agentic":{...},"value":{...}}，
 # 拼错的键会在构造处报错——实验配置静默失效比启动失败更难查。
 #
 #   RrParams           : CHAT 会话级轮询（跨会话公平）
@@ -154,7 +154,7 @@ def session_type_to_node_tag(session_type: SessionType) -> HeterCacheNodeTag:
 #   MultiAgenticParams : AGENTIC 带内复用分排序（与 MT 互斥）
 #   QueueValueParams   : 已兑现价值密度（VD）的时间尺度与统计下限
 # 用 dataclass 而不是裸 kwargs，是为了让 `eviction_policy_config` 有层级、能校验、能整体
-# 配置只接受 {"rr":{...},"slru":{...},"mt":{...},"multi_agentic":{...},"value":{...}}
+# 配置只接受 {"rr":{...},"share":{...},"mt":{...},"multi_agentic":{...},"value":{...}}
 # 分组形式。
 # ---------------------------------------------------------------------------
 
@@ -291,26 +291,26 @@ class ShareParams:
     def __post_init__(self):
         if self.share_min < 2:
             raise ValueError(
-                "slru.share_min must be >= 2 (>1 个外部会话才算共享), "
+                "share.share_min must be >= 2 (>1 个外部会话才算共享), "
                 f"got {self.share_min}"
             )
         unknown = set(self.ageing_ttl_s) - set(QUEUE_NAMES)
         if unknown:
             raise ValueError(
-                f"slru.ageing_ttl_s has unknown queues {sorted(unknown)}; "
+                f"share.ageing_ttl_s has unknown queues {sorted(unknown)}; "
                 f"expected a subset of {list(QUEUE_NAMES)}."
             )
         merged = {**DEFAULT_AGEING_TTL_S, **self.ageing_ttl_s}
         for queue, ttl in merged.items():
             if ttl < 0:
                 raise ValueError(
-                    f"slru.ageing_ttl_s[{queue!r}] must be >= 0, got {ttl}"
+                    f"share.ageing_ttl_s[{queue!r}] must be >= 0, got {ttl}"
                 )
         self.ageing_ttl_s = merged
 
     @classmethod
     def from_any(cls, value=None) -> "ShareParams":
-        return _coerce_params(cls, value, name="slru")
+        return _coerce_params(cls, value, name="share")
 
     def as_dict(self) -> dict:
         return dataclasses.asdict(self)

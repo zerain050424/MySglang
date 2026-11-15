@@ -40,12 +40,12 @@ def test_arms_select():
     assert [a.id for a in select("A0,A2-A4")] == ["A0", "A2", "A3", "A4"]
     assert [a.id for a in select("all")] == list(ARMS)
     assert select(None)[0].id == "A0"
-    # A3 是主对象（两带 SLRU），A2 只有 one-shot 带（share_min 不可达）
+    # A3 是主对象（两带共享保护），A2 只有 one-shot 带（share_min 不可达）
     assert ARMS["A3"].share_min == 2
     assert ARMS["A4"].share_min == 3
     assert ARMS["A2"].share_min >= 10 ** 6
-    assert ARMS["A3"].slru == {"share_min": 2}
-    assert ARMS["A0"].slru == {}
+    assert ARMS["A3"].share == {"share_min": 2}
+    assert ARMS["A0"].share == {}
 
 
 def _tiny_trace(tmp: Path, sessions: int = 30):
@@ -227,7 +227,7 @@ def test_analyze_offline_table():
 
 
 def test_arm_configs_match_framework():
-    """A2–A4 的 slru 配置必须能被框架的 ShareParams 接受。
+    """A2–A4 的 share 配置必须能被框架的 ShareParams 接受。
 
     这条是**配置漂移保险**：如果框架改了参数名（如 share_min），这里第一时间红。
     没有 torch 时用「stub 顶层包 + 真实源码路径」的方式只导入纯 Python 模块。
@@ -255,7 +255,7 @@ def test_arm_configs_match_framework():
         return
 
     for arm in ARMS.values():
-        cfg = (arm.config or {}).get("slru")
+        cfg = (arm.config or {}).get("share")
         if cfg is None:
             continue
         p = ShareParams.from_any(cfg)

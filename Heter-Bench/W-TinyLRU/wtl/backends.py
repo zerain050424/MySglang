@@ -199,11 +199,11 @@ class RealBackend:
                 return super()._delete_leaf(node)
 
         self._clock = radix.time  # 已被 SimClock 替换；缓存引用省掉逐次 import
-        self._slru_mode = False  # 建好 cache 后再判定（见下）
+        self._share_mode = False  # 建好 cache 后再判定（见下）
         self._cache_cls = _Instrumented
         self.cache = _Instrumented(init_params)
-        # heter_cache 才带 SLRU 插件；lru/slru 臂没有，region 恒 0。
-        self._slru_mode = (
+        # heter_cache 才带共享数账本；lru/slru 臂没有，region 恒 0。
+        self._share_mode = (
             getattr(self.cache.eviction_strategy, "node_share", None) is not None
         )
         self._req_seq = 0
@@ -281,7 +281,7 @@ class RealBackend:
             return
         depth, ph = _node_path_info(node, root)
         tokens = int(len(node.value)) if node.value is not None else 0
-        if self._slru_mode:
+        if self._share_mode:
             # region 3 = 「受保护段」= 非一次性内容。判定与淘汰路径同源
             # （strategy.is_one_shot），而不是看 queue_tag —— 标签与共享数
             # 已经解耦，拿标签统计会把 M4 的 protected_waste_rate 算歪。
@@ -307,13 +307,13 @@ class RealBackend:
         strategy = self.cache.eviction_strategy
         snap = None
         victim_src = dict(getattr(strategy, "_victim_sources", {}) or {})
-        slru = getattr(strategy, "node_share", None)
+        share = getattr(strategy, "node_share", None)
         return {
             "available": self._available(),
             "evictable_size": int(getattr(self.cache, "evictable_size_", 0) or 0),
-            # 共享数账本 + 本改写器实际给出的候选数（机制证据）
-            "slru": slru.stats() if slru is not None else None,
-            "slru_share_min": getattr(slru, "share_min", None),
+            # 共享数账本（机制证据）
+            "share": share.stats() if share is not None else None,
+            "share_min": getattr(share, "share_min", None),
             "victim_src": victim_src,
         }
 

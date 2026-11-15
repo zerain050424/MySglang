@@ -10,7 +10,7 @@
     SGLANG_STRUCT_PROFILE_TAG=A3_hybrid_100k \\
     $PY -m wtl.serve --model-path $MODEL \\
         --enable-heter-cache --radix-eviction-policy heter_cache \\
-        --radix-eviction-policy-config '{"slru":{"share_min":2}}' \\
+        --radix-eviction-policy-config '{"share":{"share_min":2}}' \\
         --max-total-tokens 100000 --enable-metrics --port 30000
 
 注意：``PYTHONPATH`` 需要包含仓库的 ``python/`` 目录（与直接 ``python -m

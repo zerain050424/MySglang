@@ -61,7 +61,7 @@ def check(cond, msg):
 class _Leaf:
     """极简叶子替身：只带权重仲裁 / 记账 / 老化用到的字段。
 
-    必须是普通类而不是 SimpleNamespace —— SLRU 的共享数账本是
+    必须是普通类而不是 SimpleNamespace —— 共享数账本是
     WeakKeyDictionary，需要节点可弱引用。
     """
 
@@ -452,15 +452,15 @@ def test_per_type_ageing_ttl():
     check(st.one_shot_key(aged) < st.one_shot_key(plain),
           "aged nodes must outrank plain one-shot inside the band")
 
-    partial = ep.HeterCacheStrategy(slru={"ageing_ttl_s": {"struct": 10}})
-    check(partial.slru.ageing_ttl_s["struct"] == 10 and
-          partial.slru.ageing_ttl_s["chat"] == ttl["chat"],
+    partial = ep.HeterCacheStrategy(share={"ageing_ttl_s": {"struct": 10}})
+    check(partial.share.ageing_ttl_s["struct"] == 10 and
+          partial.share.ageing_ttl_s["chat"] == ttl["chat"],
           "a partial override must merge over the defaults")
-    off = ep.HeterCacheStrategy(slru={"ageing_ttl_s": {"struct": 0}})
+    off = ep.HeterCacheStrategy(share={"ageing_ttl_s": {"struct": 0}})
     check(not off.is_aged(aged), "0 disables ageing for that type only")
     for bad in ({"nope": 1}, {"struct": -1}):
         try:
-            ep.HeterCacheStrategy(slru={"ageing_ttl_s": bad})
+            ep.HeterCacheStrategy(share={"ageing_ttl_s": bad})
         except ValueError:
             pass
         else:

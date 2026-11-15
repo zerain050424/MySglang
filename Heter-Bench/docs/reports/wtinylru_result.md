@@ -383,7 +383,7 @@ python -m wtl.replay --arm A3 \
 python mx.py '[["dslru3",[150000,250000]]]'
 
 # 3) 语义回归（本机即可，stub 掉 sglang 依赖）
-./.auto/checks.sh     # test_slru_one_shot(9) + test_evict_loop(6) + wtl smoke(11)
+./.auto/checks.sh     # test_share_one_shot(9) + test_evict_loop(6) + wtl smoke(11)
 ```
 
 `result/mx/*.json` 中每条记录包含 `summary`（`hit_pct` / `evictions` / `slru`）与

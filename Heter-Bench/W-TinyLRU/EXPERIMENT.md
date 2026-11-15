@@ -1,9 +1,9 @@
-# 两带 SLRU 正式实验方案（one-shot 带 × 跨会话保护）
+# 两带共享保护正式实验方案（one-shot 带 × 跨会话保护）
 
 > 范围声明：**只考察 one-shot 硬优先带与「跨会话共享 → 保护段」两级结构**。
 > 不考察 Agentic 队列、RR 会话公平、T-LRU、跨队列 alpha 仲裁——这些一律关闭或冻结。
 > 对照组只用 **SGLang 原生 LRU / SLRU**。
-> 唯一旋钮是 `--radix-eviction-policy-config '{"slru": {"share_min": N}}'`。
+> 唯一旋钮是 `--radix-eviction-policy-config '{"share": {"share_min": N}}'`。
 
 ---
 
@@ -11,7 +11,7 @@
 
 | # | 假设 | 判据（跑之前定死） |
 |---|---|---|
-| **H1** | 有 KV 压力时，两带 SLRU 让**跨会话模板**更久驻留 | `ret@P full_rate` 相对 A2（只有 one-shot 带）≥ **+5pp**，请求级配对 bootstrap 95% CI 排除 0 |
+| **H1** | 有 KV 压力时，两带共享保护让**跨会话模板**更久驻留 | `ret@P full_rate` 相对 A2（只有 one-shot 带）≥ **+5pp**，请求级配对 bootstrap 95% CI 排除 0 |
 | **H2** | 该驻留转化为命中率，且**不靠牺牲干扰项** | 模板子集 hit ≥ **+3pp**；干扰（burst）子集 hit 回退 ≤ **1pp** |
 | **H3** | 收益来自「按跨会话共享准入」，而非按访问频次 | A3 − A1 ≥ **+3pp**（A1 = 上游 SLRU，按 `hit_count` 晋升），且 A1 的 `protected_waste_rate` 显著更高 |
 | **H4** | 无压力时策略应退化为等价 | `pool/工作集 = 1.0` 时 A0/A2/A3 的 hit 极差 < **0.5pp** |
@@ -30,9 +30,9 @@
 |---|---|---|
 | **A0** | `--radix-eviction-policy lru` | SGLang 原生基线（无 one-shot 带、无跨会话保护） |
 | **A1** | `--radix-eviction-policy slru` | 上游分段 LRU（按 `hit_count>=2` 晋升 protected） |
-| **A2** | `heter_cache` + `{"slru":{"share_min":1000000}}` | **one-shot 带 + 分类器** 的贡献 = A2 − A0；保护段不可达 |
-| **A3** | `heter_cache` + `{"slru":{"share_min":2}}` | **跨会话保护** 的贡献 = A3 − A2（主对象） |
-| **A4** | `heter_cache` + `{"slru":{"share_min":3}}` | 阈值消融：要 3 个会话命中过才进保护段 |
+| **A2** | `heter_cache` + `{"share":{"share_min":1000000}}` | **one-shot 带 + 分类器** 的贡献 = A2 − A0；保护段不可达 |
+| **A3** | `heter_cache` + `{"share":{"share_min":2}}` | **跨会话保护** 的贡献 = A3 − A2（主对象） |
+| **A4** | `heter_cache` + `{"share":{"share_min":3}}` | 阈值消融：要 3 个会话命中过才进保护段 |
 
 固定配置（所有臂一致，避免混入跨队列因素）：
 
@@ -136,7 +136,7 @@ python -m wtl.synth --out-dir data/exp/D2 \
 | A0 LRU | 10–25% |
 | A1 上游 SLRU | 50–65%（protected 被废弃的私有上下文占满） |
 | A2 只有 one-shot 带 | 30–45%（模板也被判一次性） |
-| **A3 两带 SLRU** | **≥85%** |
+| **A3 两带共享保护** | **≥85%** |
 
 ---
 
@@ -180,8 +180,8 @@ python -m wtl.synth --out-dir data/exp/D2 \
 |---|---|---|
 | `victim_src.one_shot` 占比 | `_victim_sources` | A2/A3 高（>60%）：一次性带在干活 |
 | `victim_src.qstruct` 占比 | 同上 | A3 > 0 且 A2 = 0（保护段真的接管过淘汰） |
-| `slru.share_counted` / `share_dedup` | `NodeShareLedger.stats()` | counted > 0；dedup > 0 证明同一会话去重生效 |
-| `slru.slru_picks` | 同上 | > 0（机制被行使，门控 G2） |
+| `share.share_counted` / `share_dedup` | `NodeShareLedger.stats()` | counted > 0；dedup > 0 证明同一会话去重生效 |
+| `victim_src.qstruct` | `HeterCacheStrategy._victim_sources` | > 0（保护段真的被行使，门控 G2） |
 | `protected_waste_rate` | `RegretTracker`（`region==3` = `not is_one_shot`） | A1 高、A3 低：上游把废弃私有上下文保护起来了 |
 
 ---
@@ -283,7 +283,7 @@ python -m wtl.analyze --offline result/offline --prefix-stats result/prefix_stat
 ## 11. 与早期方案的关系
 
 三代实现依次是：「三区 + 频数准入 + aging」→「标签版 TinyLRU（`tag_lru`）」→
-「两带 SLRU（当前）」。前两代已随实现一起从框架与本套件中移除。
+「两带共享保护（当前）」。前两代已随实现一起从框架与本套件中移除。
 本方案保留它们的三条有用结论作为设计前提：
 
 1. **one-shot 硬优先带会吃掉 80%+ 的淘汰压力**（所以 A2−A0 是必须单独测的一项）；

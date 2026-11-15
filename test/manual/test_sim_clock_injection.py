@@ -190,7 +190,7 @@ def test_real_heter_cache_follows_the_simulator_clock():
 
     # 4) 老化 TTL 真的按模拟秒翻转
     leaf.queue_tag = sym["HeterCacheNodeTag"].QCHAT
-    ttl = cache.eviction_strategy.slru.ageing_ttl_s["chat"]
+    ttl = cache.eviction_strategy.share.ageing_ttl_s["chat"]
     StateManager.step_global_clock(ttl - 0.1)
     assert cache.eviction_strategy.is_aged(leaf) is False
     StateManager.step_global_clock(0.1)

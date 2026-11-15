@@ -56,7 +56,7 @@ TTFT：命中率带来的性能提升报告 p10/p50/p90。
 ## Files in Scope
 
 - `python/sglang/srt/mem_cache/evict_policy.py` — HeterCacheStrategy：one-shot 判定、victim_key、配额（QuotaParams）、候选挑选。
-- `python/sglang/srt/mem_cache/victim_override.py` — 各队列候选改写器（RR/SLRU/MT）与账本。
+- `python/sglang/srt/mem_cache/victim_override.py` — 各队列候选改写器（RR/MT）与账本。
 - `python/sglang/srt/mem_cache/uni_utils.py` / `heter_utils.py` — 策略参数与共享数据模型（新增参数只在这里）。
 - `python/sglang/srt/mem_cache/heter_cache_radix_cache.py` — 仅当策略接口需要时做最小适配，不动淘汰循环大框架。
 - `Heter-Bench/mixexp/arms_exp3.tsv` — 实验臂清单（新增候选臂配置属实验代码）。

@@ -9,10 +9,10 @@
 * ``config`` 直接对应 ``--radix-eviction-policy-config``（即策略构造 kwargs）；
 * ``A0/A1`` 是上游能力边界（lru / slru）；
 * ``A2`` 是「只有 one-shot 带」的基线（heter_cache + share_min 调到不可达），
-  ``A3`` 是主对象（两带 SLRU：one-shot 带 + 跨会话保护），``A4`` 是阈值消融。
+  ``A3`` 是主对象（两带共享保护：one-shot 带 + 跨会话保护），``A4`` 是阈值消融。
 
-共享数阈值只有一个旋钮 ``slru.share_min``（框架侧 ``ShareParams``）：
-它是「退出 one-shot 带 / 进入 SLRU 保护段」的分界，``share_min`` 越大保护越难触发。
+共享数阈值只有一个旋钮 ``share.share_min``（框架侧 ``ShareParams``）：
+它是「退出 one-shot 带 / 进入共享保护段」的分界，``share_min`` 越大保护越难触发。
 """
 
 from __future__ import annotations
@@ -36,12 +36,12 @@ class Arm:
     expect_struct: bool = False
 
     @property
-    def slru(self) -> dict:
-        return (self.config or {}).get("slru", {})
+    def share(self) -> dict:
+        return (self.config or {}).get("share", {})
 
     @property
     def share_min(self):
-        return self.slru.get("share_min")
+        return self.share.get("share_min")
 
     @property
     def is_baseline(self) -> bool:
@@ -69,15 +69,15 @@ ARMS: Dict[str, Arm] = {
     ),
     "A2": Arm(
         "A2", "hybrid_band_only", "heter_cache",
-        {"slru": {"share_min": BAND_ONLY_SHARE_MIN}},
+        {"share": {"share_min": BAND_ONLY_SHARE_MIN}},
         "只有 one-shot 带：保护段不可达（隔离「保护机制」的贡献）", False,
     ),
     "A3": Arm(
-        "A3", "slru_two_band", "heter_cache", {"slru": {"share_min": 2}},
-        "主对象：两带 SLRU（one-shot 带 + 跨会话共享保护段 · 段内 LRU）", True,
+        "A3", "share_two_band", "heter_cache", {"share": {"share_min": 2}},
+        "主对象：两带共享保护（one-shot 带 + 跨会话共享保护段 · 段内 LRU）", True,
     ),
     "A4": Arm(
-        "A4", "slru_min3", "heter_cache", {"slru": {"share_min": 3}},
+        "A4", "share_min3", "heter_cache", {"share": {"share_min": 3}},
         "消融：要 3 个会话命中过才进保护段（阈值敏感性）", True,
     ),
 }

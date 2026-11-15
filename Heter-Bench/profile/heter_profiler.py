@@ -33,7 +33,7 @@ class HeterProfiler:
     与 strategy 的契约：
       record_hit / record_evict / record_victim_source —— 三个记账收口由
       策略调用，本类只做累加，不做任何判定；
-      summary(queue_occ, session_summary, slru_policy, values) —— 纯渲染，
+      summary(queue_occ, session_summary, share_policy, values) —— 纯渲染，
       参数为只读引用。
     """
 
@@ -85,7 +85,7 @@ class HeterProfiler:
     def summary(self,
                 queue_occ,
                 session_summary=None,
-                slru_policy=None,
+                share_policy=None,
                 multi_agentic_policy=None,
                 sched_occ=None,
                 values=None) -> str:
@@ -137,11 +137,11 @@ class HeterProfiler:
             f"  pool={pool:.0f} schedulable={schedulable:.0f} "
             f"one_shot_evicted={self._total_evicted_one_shot:.0f}"
         )
-        if slru_policy is not None:
-            # 共享会话数账本（SLRU 不参与选点，没有 picks 可报）。
-            s = slru_policy.stats()
+        if share_policy is not None:
+            # 共享会话数账本（不参与选点，没有 picks 可报）。
+            s = share_policy.stats()
             lines.append(
-                f"  slru: min_share={slru_policy.share_min} "
+                f"  share: min_share={share_policy.share_min} "
                 f"share_counted={s['share_counted']:.0f} "
                 f"share_dedup={s['share_dedup']:.0f} "
                 f"aged_evicted={s['aged_evicted']:.0f}"

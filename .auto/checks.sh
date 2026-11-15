@@ -9,7 +9,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 PYTHONPATH=$PWD/python python3 -m pytest -q \
   test/manual/test_queue_selector.py \
-  test/manual/test_slru_one_shot.py \
+  test/manual/test_share_one_shot.py \
   Heter-Bench/mixexp/tools/tests/test_build_exp3_data.py \
   2>&1 | tail -3
 PYTHONPATH=$PWD/python python3 test/manual/test_evict_loop.py 2>&1 | tail -1

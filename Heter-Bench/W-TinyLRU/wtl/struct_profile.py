@@ -1,9 +1,9 @@
 """真机 struct 状态埋点（**运行时 monkeypatch，不改框架代码**）。
 
-SLRU 的共享数账本（``NodeShareLedger.stats()``）、它实际给出的候选数
-（``slru_picks``）与 ``victim_src`` 需要落盘，但框架里没有 dump 点，
-而本实验约定「不改主体框架代码」。因此这里在 ``HeterCacheRadixCache.evict``
-外面包一层：**只在 evict 返回之后再读状态**，不改变任何淘汰语义。
+共享数账本（``NodeShareLedger.stats()``）与 ``victim_src`` 需要落盘，但框架里
+没有 dump 点，而本实验约定「不改主体框架代码」。因此这里在
+``HeterCacheRadixCache.evict`` 外面包一层：**只在 evict 返回之后再读状态**，
+不改变任何淘汰语义。
 
 开关（env）
 -----------
@@ -16,8 +16,8 @@ SLRU 的共享数账本（``NodeShareLedger.stats()``）、它实际给出的候
 
     {"ts":..., "tag":..., "evict_calls":n, "evict_us_p50":..,"evict_us_p99":..,
      "available":.., "evictable_size":.., "protected_size":..,
-     "slru":{"slru_picks":..,"share_counted":..,"share_dedup":..},
-     "slru_share_min":2,
+     "share":{"share_counted":..,"share_dedup":..,"aged_evicted":..},
+     "share_min":2,
      "victim_src":{"one_shot":..,"qstruct":..,"qchat":..},
      "profile":"..."}
 
@@ -52,8 +52,8 @@ def _pct(xs, p):
 
 def _record(cache, tag: str, samples: list, calls: int) -> dict:
     strategy = getattr(cache, "eviction_strategy", None)
-    slru = getattr(strategy, "node_share", None)
-    snap = slru.stats() if slru is not None else None
+    share = getattr(strategy, "node_share", None)
+    snap = share.stats() if share is not None else None
     victim_src = dict(getattr(strategy, "_victim_sources", {}) or {})
     rec = {
         "ts": round(time.time(), 3),
@@ -65,8 +65,8 @@ def _record(cache, tag: str, samples: list, calls: int) -> dict:
         "available": int(cache.token_to_kv_pool_allocator.available_size()),
         "evictable_size": int(getattr(cache, "evictable_size_", 0) or 0),
         "protected_size": int(getattr(cache, "protected_size_", 0) or 0),
-        "slru": snap,
-        "slru_share_min": getattr(slru, "share_min", None),
+        "share": snap,
+        "share_min": getattr(share, "share_min", None),
         "victim_src": victim_src,
     }
     return rec
@@ -128,7 +128,7 @@ def install(
                     rec["profile"] = strategy.profiler.summary(
                         cache._per_queue_token_count(),
                         cache.session_registry.summary(),
-                        slru_policy=strategy.node_share,
+                        share_policy=strategy.node_share,
                         multi_agentic_policy=strategy.multi_agentic_evict,
                     )
                 except Exception:

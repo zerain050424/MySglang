@@ -136,7 +136,7 @@ class CacheTelemetry:
         queue_occ: dict,
         session_summary,
         *,
-        slru_policy,
+        share_policy,
         multi_agentic_policy=None,
         sched_occ: dict = None,
         values: dict = None,
@@ -149,7 +149,7 @@ class CacheTelemetry:
         rendered = self.profiler.summary(
             queue_occ,
             session_summary,
-            slru_policy=slru_policy,
+            share_policy=share_policy,
             multi_agentic_policy=multi_agentic_policy,
             sched_occ=sched_occ,
             values=values,

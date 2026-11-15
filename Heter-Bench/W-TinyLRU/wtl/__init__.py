@@ -1,6 +1,6 @@
 """W-TinyLRU 效果实验工具包（离线回放 / 真机埋点 / 分析 / 门控）。
 
-实现文档：``EXPERIMENT.md``（两带 SLRU：one-shot 带 × 跨会话保护）
+实现文档：``EXPERIMENT.md``（两带共享保护：one-shot 带 × 跨会话共享）
 本包**不修改**框架代码：所有观测都通过子类、monkeypatch、或运行时属性实现。
 
 模块分工

@@ -57,7 +57,7 @@ git log --oneline -3 && git status --short
 | 删除对象 | 静默后果 | 发现方式 |
 |---|---|---|
 | 策略上的 `is_one_shot` | `radix_cache._is_one_shot` 的 `getattr` 回退成 `is_decode`，profile 分母与实际淘汰口径分叉 | 读 `_is_one_shot` 实现；改动后跑 `test_heter_cache_abs_offset` 的 one-shot 用例 |
-| 策略的 `victim_overrides` | 缓存层两个 observer 元组恒空 → SLRU 共享数账本停更 → `share_of` 恒 0 → 所有节点被判 one-shot | `rg "node_observers"` 看装配链是否完整 |
+| 策略的 `victim_overrides` | 缓存层两个 observer 元组恒空 → 共享数账本停更 → `share_of` 恒 0 → 所有节点被判 one-shot | `rg "node_observers"` 看装配链是否完整 |
 | 策略的 `needs_capacity` | 驱动层 `getattr(..., False)` 拿到 False → `capacity=0` → 账本只能按常规窗口校准，承压时会按过期水位点名 | 起服务看 `[HeterCache profile]` 的 sched 是否与 occ 长期偏离 |
 | 缓存层的 `_per_queue_token_count` | 占用账本失去唯一校准源，`_occ` 只会随增量缓慢漂移 | 它被 `_observe_occupancy` 调用，不是日志 |
 | 缓存层的 `_record_insert` 钩子 | 新建节点不进账本，VD 排名恒空、只能走随机兜底 | `test_evict_loop` 会出现 `value:fallback` 满屏 |
@@ -87,7 +87,7 @@ base conda 的 `huggingface-hub==1.33.0` 与 `transformers` 要求的 `<1.0` 冲
 
 ```bash
 PYTHONPATH=$PWD/python python -m pytest -q \
-  test/manual/test_queue_selector.py test/manual/test_slru_one_shot.py
+  test/manual/test_queue_selector.py test/manual/test_share_one_shot.py
 PYTHONPATH=$PWD/python python test/manual/test_evict_loop.py     # ALL PASSED 才算过
 PYTHONPATH=$PWD/python python test/manual/test_session_type_classifier.py
 ```

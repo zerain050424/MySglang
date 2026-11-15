@@ -15,7 +15,7 @@
 另外附一条 ``meta.json``，记录共享前缀的实际长度与变体表，
 使 M1 指标不必再跑 prefix_stats。
 
-``--scenario dslru``（D-SLRU，本轮"两带 SLRU vs LRU vs 上游 SLRU"的主负载）
+``--scenario dslru``（D-SLRU，本轮"两带共享保护 vs LRU vs 上游 SLRU"的主负载）
 三条成分各自对准一条机制弱点：
 
     模板层   跨块长间隔复发      → LRU 按 recency 会把模板挤掉
@@ -175,7 +175,7 @@ def build_dslru(
 
     * 私有上下文是**唯一** token，且每轮都完整出现在 prompt 里 —— 它会被
       同一条会话反复命中（``hit_count`` 涨到 >=2，上游 SLRU 会晋升它），
-      但 ``share_sessions`` 停在 1（bloom 对同一会话去重），所以两带 SLRU
+      但 ``share_sessions`` 停在 1（bloom 对同一会话去重），所以两带共享保护
       永远把它留在 one-shot 带里先清。
     * ``turns`` 必须 < 5（分类器 ``MULTI_TURN_MIN``），否则会话被判成
       AGENTIC/CHAT，节点就不再进一次性带，本负载的靶子失效。
@@ -313,7 +313,7 @@ def main(argv=None) -> None:
     p.add_argument("--phased", action="store_true",
                    help="[ladder] 按变体分块并在块间插入冲刷文档（门控 G2 需要）")
     p.add_argument("--scenario", default="ladder", choices=["ladder", "dslru"],
-                   help="ladder=共享前缀阶梯（旧场景）；dslru=两带 SLRU 主负载")
+                   help="ladder=共享前缀阶梯（旧场景）；dslru=两带共享保护主负载")
     # ---- dslru 专用 ----
     p.add_argument("--blocks", type=int, default=8,
                    help="[dslru] 调度块数：块=模板会话 -> burst -> 下一块")

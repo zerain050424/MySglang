@@ -121,7 +121,7 @@ class HeterCacheStrategy(EvictionStrategy):
         *,
         force_agentic: bool = False,
         rr: Union[RrParams, dict, None] = None,
-        slru: Union[ShareParams, dict, None] = None,
+        share: Union[ShareParams, dict, None] = None,
         mt: Union[MultiTurnParams, dict, None] = None,
         multi_agentic: Union[MultiAgenticParams, dict, None] = None,
         value: Union[QueueValueParams, dict, None] = None,
@@ -130,7 +130,7 @@ class HeterCacheStrategy(EvictionStrategy):
         # 时间源可注入（单测用假时钟控制 one-shot 豁免窗口的推进）。
         self._now = now if now is not None else time.monotonic
         self.rr = RrParams.from_any(rr)
-        self.slru = ShareParams.from_any(slru)
+        self.share = ShareParams.from_any(share)
         self.mt = MultiTurnParams.from_any(mt)
         self.multi_agentic = MultiAgenticParams.from_any(multi_agentic)
         self.value = QueueValueParams.from_any(value)
@@ -149,7 +149,7 @@ class HeterCacheStrategy(EvictionStrategy):
 
         self.rr_evict = RrEvictPolicy(self.rr) if self.rr.fair_rr else None
         self.session_registry = SessionRegistry.global_instance()
-        self.node_share = NodeShareLedger(self.slru.share_min)
+        self.node_share = NodeShareLedger(self.share.share_min)
         self.multi_agentic_evict = (
             MultiAgenticEvict(self.multi_agentic, self._node_tag)
             if self.multi_agentic.enabled
@@ -183,7 +183,7 @@ class HeterCacheStrategy(EvictionStrategy):
     def is_aged(self, node) -> bool:
         """节点是否已老化：按生效标签取 TTL，0 表示该类型不老化。"""
         tag = self._node_tag(node)
-        ttl = self.slru.ageing_ttl_s[tag.queue_name]
+        ttl = self.share.ageing_ttl_s[tag.queue_name]
         if ttl <= 0:
             return False
         if tag is HeterCacheNodeTag.QSTRUCT and (

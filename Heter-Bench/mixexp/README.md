@@ -115,7 +115,7 @@ mkdir -p mixexp/result/exp3/chat
 
 # 1) 起 server（hc_full 臂；arms_exp3.tsv 的 policy / policy_config 原样搬过来）
 POLICY=heter_cache MAX_TOTAL_TOKENS=198000 \
-  POLICY_CONFIG='{"value":{"tau_s":120.0,"floor_tokens":2048.0},"rr":{"fair_rr":true,"kappa":0.5,"min_retain_tokens":512,"min_retain_frac":0.3},"slru":{"share_min":2},"mt":{"enabled":true}}' \
+  POLICY_CONFIG='{"value":{"tau_s":120.0,"floor_tokens":2048.0},"rr":{"fair_rr":true,"kappa":0.5,"min_retain_tokens":512,"min_retain_frac":0.3},"share":{"share_min":2},"mt":{"enabled":true}}' \
   EXTRA_ARGS="--kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.85" \
   LOG=mixexp/result/exp3/chat/server_full_hc_full.log \
   bash scripts/serve.sh          # 前台；另开终端等 curl -sf .../health 返回 200

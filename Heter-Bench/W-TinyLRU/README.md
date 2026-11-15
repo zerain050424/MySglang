@@ -132,19 +132,19 @@ python -m wtl.replay --arm A3 --data-path data/synth_p2048_b10/session_data.json
 
 | 证据 | 来源 | 用途 |
 |---|---|---|
-| `victim_src`（`one_shot` / `qstruct` / `global`） | `HeterCacheStrategy._victim_sources` | **gate**：`one_shot` 占绝大多数说明一次性带在干活；`qstruct` 说明 SLRU 真的给了候选 |
-| `slru.share_counted / share_dedup` | `NodeShareLedger.stats()` | 跨会话共享数账本是否在工作（区分「跨会话复用」与「同一会话反复读」） |
-| `slru.slru_picks` | 同上 | SLRU 实际改写候选的次数（=0 说明没被行使） |
-| `slru_share_min` | `ShareParams.share_min` | 唯一旋钮，越大保护越难触发（A2 用不可达值当基线） |
-| `slru` 快照时间序列 | `wtl.struct_profile`（真机 JSONL） | 看记账/去重/接管速率是否随负载漂移 |
+| `victim_src`（`one_shot` / `qstruct` / `global`） | `HeterCacheStrategy._victim_sources` | **gate**：`one_shot` 占绝大多数说明一次性带在干活；`qstruct` 说明共享保护段真的给了候选 |
+| `share.share_counted / share_dedup` | `NodeShareLedger.stats()` | 跨会话共享数账本是否在工作（区分「跨会话复用」与「同一会话反复读」） |
+| `victim_src.qstruct` | `HeterCacheStrategy._victim_sources` | 共享保护段真的被行使的次数（=0 说明保护没生效） |
+| `share_min` | `ShareParams.share_min` | 唯一旋钮，越大保护越难触发（A2 用不可达值当基线） |
+| `share` 快照时间序列 | `wtl.struct_profile`（真机 JSONL） | 看记账/去重/接管速率是否随负载漂移 |
 | `evict_us_p50/p99` | 同上（包在 `evict()` 外计时） | 策略 CPU 开销护栏 |
 | `protected_cascade_deleted_tokens` | `_delete_leaf(is_victim=False)` + `region==3`（`not is_one_shot`） | 最大正确性风险的可观测证据（门控 G5） |
 
 ---
 
-## 4.0 淘汰策略：两带 SLRU（`slru`）
+## 4.0 淘汰策略：两带共享保护（`share`）
 
-框架侧唯一旋钮：`--radix-eviction-policy-config '{"slru": {"share_min": 2}}'`。
+框架侧唯一旋钮：`--radix-eviction-policy-config '{"share": {"share_min": 2}}'`。
 
 判定链条（**只看会话类型 + 跨会话共享数，不看 `queue_tag`**）：
 
@@ -166,7 +166,7 @@ python -m wtl.replay --arm A3 --data-path data/synth_p2048_b10/session_data.json
 | A0 | `lru` | 上游基线 |
 | A1 | `slru`（`protected_threshold=2`） | 上游分段 LRU 参照：按 `hit_count` 划分段位 |
 | A2 | `heter_cache` + `share_min=1000000` | 只有 one-shot 带、保护段不可达 → 隔离「保护机制」的贡献 |
-| **A3** | `heter_cache` + `share_min=2` | 主对象：两带 SLRU |
+| **A3** | `heter_cache` + `share_min=2` | 主对象：两带共享保护 |
 | A4 | `heter_cache` + `share_min=3` | 消融：要 3 个会话命中过才进保护段 |
 
 主负载 `D-SLRU`（`wtl/synth.py --scenario dslru`）：
@@ -225,8 +225,8 @@ python -m wtl.replay --arm A3 --data-path data/synth_p2048_b10/session_data.json
     "retention": {"ShareGPT": {"2048": {"n": 900, "full_rate": 0.91, "cover": 0.95}}},
     "regret": {"regret_rate": 0.021, "protected_waste_rate": 0.08,
                "protected_cascade_deleted_tokens": 0},
-    "slru": {"slru_picks": 812, "share_counted": 431, "share_dedup": 1204},
-    "slru_share_min": 2,
+    "share": {"share_counted": 431, "share_dedup": 1204, "aged_evicted": 0},
+    "share_min": 2,
     "victim_src": {"one_shot": 120000, "qstruct": 34000}
   },
   "rows": [{"ts":..,"task":..,"sid":..,"turn":..,"prompt_tokens":..,
@@ -284,7 +284,7 @@ python -m wtl.replay --arm A3 --data-path data/synth_p2048_b10/session_data.json
 | §5.2 场景 D-SLRU | `wtl/synth.py --scenario dslru` + `--data-dir` |
 | §6 消融矩阵 | `wtl/arms.py`（A0–A4）+ `scripts/run_online.sh` 的 `arm_policy` |
 | §8 判定 | `analyze.judge`：M1/M2/M3/M4-gate/M5 逐条 PASS/FAIL |
-| §10 前置检查 | `wtl/gate.py --arm A3`（G1–G5；G2 看 `slru.share_counted` 与 `slru.slru_picks`） |
+| §10 前置检查 | `wtl/gate.py --arm A3`（G1–G5；G2 看 `share.share_counted` 与 `victim_src.qstruct`） |
 
 ---
 

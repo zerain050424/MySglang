@@ -21,9 +21,9 @@
     sglang.srt.mem_cache.victim_override
     sglang.srt.mem_cache.heter_utils
 
-SLRU 的共享数账本不读时间（只读命中会话），但它的 ``pick()`` 与 MT 的权重都读
-`time.monotonic()`，因此本模块必须覆盖 `victim_override`；`evict_policy` 则因为
-配额校准与承压窗口判断也读时钟，同样需要覆盖。
+共享数账本不读时间（只读命中会话），但 MT 的权重读 `time.monotonic()`，因此本
+模块必须覆盖 `victim_override`；`evict_policy` 则因为 VD 衰减与承压窗口判断也
+读时钟，同样需要覆盖。
 """
 
 from __future__ import annotations

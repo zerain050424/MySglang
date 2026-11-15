@@ -5,7 +5,8 @@
 检查项
 ------
 G1 可复现         同配置跑两遍，逐请求明细必须完全一致（含 SimClock，无 wall-clock 依赖）
-G2 机制被行使     共享数被记账过（slru.share_counted>0）且 SLRU 给出过候选（slru_picks>0）
+G2 机制被行使     共享数被记账过（share.share_counted>0）且 struct 候选真的被选中过
+                  （victim_src.qstruct>0）
 G3 无压力不变性   pool/工作集 = 2.0 时 A0/A1/A2/A3 的 hit% 差 < 0.5pp（对照必须是平的）
 G4 后端忠实度     真 LRU 与镜像 LRU 在同一小 trace 上的 cached_len 一致率 ≥ 99.5%
 G5 上溯闸         A3 下受保护段（region 3）被「级联删除」的 token == 0（最大正确性风险）
@@ -113,18 +114,19 @@ def main(argv=None) -> int:
         # ---------------- G2 / G5 ----------------
         if r1 is not None and r1["backend"] == "real":
             s = r1["summary"]
-            slru = s.get("slru") or {}
+            share = s.get("share") or {}
             vsrc = s.get("victim_src") or {}
-            counted = int(slru.get("share_counted") or 0)
-            picks = int(slru.get("slru_picks") or 0)
+            counted = int(share.get("share_counted") or 0)
             q_evicted = float(vsrc.get("qstruct", 0.0) or 0.0)
             os_evicted = float(vsrc.get("one_shot", 0.0) or 0.0)
-            # 机制被行使 = 共享数真的被记账过 + SLRU 真的给出过候选
-            exercised = counted > 0 and picks > 0
+            # 机制被行使 = 共享数真的被记账过 + struct 候选真的被选中过
+            # （NodeShareLedger 不参与选点，没有独立的 picks 计数，
+            #   被行使的证据落在淘汰来源上）
+            exercised = counted > 0 and q_evicted > 0
             results.append(
                 ("G2", "机制被行使", "PASS" if exercised else "FAIL",
-                 f"share_counted={counted} share_dedup={slru.get('share_dedup')} "
-                 f"slru_picks={picks} share_min={s.get('slru_share_min')} "
+                 f"share_counted={counted} share_dedup={share.get('share_dedup')} "
+                 f"share_min={s.get('share_min')} "
                  f"one_shot_evicted={os_evicted:.0f} qstruct_evicted={q_evicted:.0f}")
             )
             cascade = (s.get("regret") or {}).get("protected_cascade_deleted_tokens", 0)
@@ -132,7 +134,7 @@ def main(argv=None) -> int:
                 ("G5", "上溯闸", "PASS" if cascade == 0 else "FAIL",
                  f"受保护前缀被级联删除 {cascade} tokens")
             )
-            payload["checks"].append({"id": "G2", "pass": exercised, "slru": slru,
+            payload["checks"].append({"id": "G2", "pass": exercised, "share": share,
                                       "victim_src": vsrc})
             payload["checks"].append({"id": "G5", "pass": cascade == 0,
                                       "protected_cascade_tokens": cascade})

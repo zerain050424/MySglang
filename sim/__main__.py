@@ -252,8 +252,8 @@ def _check_clock(sym) -> list:
         fails.append(f"match 没走虚拟时钟：{leaf.last_access_time}")
 
     # ---- 3.2 老化 TTL 在边界翻转 ----
-    chat_ttl = cache.eviction_strategy.slru.ageing_ttl_s["chat"]
-    agent_ttl = cache.eviction_strategy.slru.ageing_ttl_s["agentic"]
+    chat_ttl = cache.eviction_strategy.share.ageing_ttl_s["chat"]
+    agent_ttl = cache.eviction_strategy.share.ageing_ttl_s["agentic"]
     strategy = cache.eviction_strategy
 
     leaf.queue_tag = Tag.QCHAT

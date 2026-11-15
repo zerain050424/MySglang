@@ -42,7 +42,7 @@ echo "== [2/4] offline matrix（A0-A4 × 3 压力 × 3 负载 × 3 seed）"
   --prefix-stats result/prefix_stats.json \
   --jobs "${JOBS:-12}" || exit 1
 
-echo "== [2b/4] D-SLRU 主负载（两带 SLRU vs LRU vs 上游 SLRU）"
+echo "== [2b/4] D-SLRU 主负载（两带共享保护 vs LRU vs 上游 SLRU）"
 "$PY" -m wtl.synth --out-dir result/data/dslru --scenario dslru \
   --prefix-depth 2048 --variants 16 --sessions-per-template 5 --turns 3 \
   --blocks 8 --burst-sessions 384 --seed 42 || exit 1

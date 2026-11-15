@@ -1,4 +1,4 @@
-"""SLRU / one-shot 判定的 characterization tests。
+"""共享保护段 / one-shot 判定的 characterization tests。
 
 钉住四件事：
 
@@ -7,12 +7,12 @@
 2. **共享数达到阈值就退出一次性带**，即使创建者当初被判成 TRANS。
 3. **`queue_tag` 不参与判定**：QSTRUCT 标签救不了私有的 TRANS 节点，
    QTRANS 标签也不会把已被多次复用的节点拉回一次性带。
-4. **阈值同源**：`is_one_shot` 与 SLRU 的保护范围用同一个
+4. **阈值同源**：`is_one_shot` 与共享保护段用同一个
    `share_min`，且共用同一本会话账。
 5. **时间豁免（轴一）**：归属会话仍活跃（最近请求或节点最近访问不足
    `ONE_SHOT_IDLE_S`）的未匹配节点不进带；搁置满窗口后原判据生效。
 
-    python test/manual/test_slru_one_shot.py
+    python test/manual/test_share_one_shot.py
 """
 
 import os
@@ -44,7 +44,7 @@ def check(cond, msg):
 
 
 class FakeNode:
-    """TreeNode 的最小替身：只带 one-shot / SLRU 判定读的字段。"""
+    """TreeNode 的最小替身：只带 one-shot / 共享保护段判定读的字段。"""
 
     def __init__(self, session_id=None, tag=HeterCacheNodeTag.QTRANS, decode=False,
                  share_sessions=0, hit_count=0):
@@ -60,8 +60,8 @@ class FakeNode:
         self.hit_count = hit_count
 
 
-def _in_slru_scope(strategy, node) -> bool:
-    """节点是否落在 SLRU 的保护范围内。
+def _in_share_scope(strategy, node) -> bool:
+    """节点是否落在共享保护段内。
 
     判据即 is_aged / is_one_shot 里的那一对条件（会话类型 STRUCT 且共享数
     达标）；测试直接断言判据本身，不再借道一个无人调用的选点器。
@@ -75,7 +75,7 @@ def _in_slru_scope(strategy, node) -> bool:
     )
 
 
-def make_strategy(session_types, *, force_agentic=False, now=None, **slru):
+def make_strategy(session_types, *, force_agentic=False, now=None, **share):
     """构造策略 + 私有会话账（不污染进程级单例）。
 
     now: 时间源注入（轴一的时间豁免用假时钟控制窗口推进）；缺省用真实时钟，
@@ -83,7 +83,7 @@ def make_strategy(session_types, *, force_agentic=False, now=None, **slru):
     0.0，锚点为 0，豁免窗口天然满足，旧用例行为不变。
     """
     st = HeterCacheStrategy(
-        slru=slru or None,
+        share=share or None,
         force_agentic=force_agentic,
         now=now,
     )
@@ -180,13 +180,13 @@ def test_ledger_semantics():
     for _ in range(3):
         st.node_share.on_hit(node, "s1")
     check(node.share_sessions == 1, f"self re-reads must dedup, got {node.share_sessions}")
-    check(_in_slru_scope(st, node) is False, "private context must not be protected")
+    check(_in_share_scope(st, node) is False, "private context must not be protected")
 
     # 1 次外部命中即达阈值
     st.node_share.on_hit(node, "s2")
     check(node.share_sessions == 2, f"one foreign hit must reach min, got {node.share_sessions}")
     check(st.is_one_shot(node) is False, "cross-session template leaves the band")
-    check(_in_slru_scope(st, node) is True, "cross-session template is protected")
+    check(_in_share_scope(st, node) is True, "cross-session template is protected")
 
     # 无 session 的节点不记
     orphan = FakeNode(session_id=None)
@@ -206,17 +206,17 @@ def test_no_session_is_not_one_shot():
 
 def test_is_one_shot_and_pick_scope_agree():
     """同一阈值 + 同一本账：STRUCT 节点上两者互补。"""
-    print("[6] is_one_shot and SLRU scope are complementary")
+    print("[6] is_one_shot and share scope are complementary")
     st, _ = make_strategy({"s1": SessionType.STRUCT})
     node = FakeNode(session_id="s1")
 
-    check(_in_slru_scope(st, node) is False, "share=0 must not be SLRU-scoped")
+    check(_in_share_scope(st, node) is False, "share=0 must not be protected")
     check(st.is_one_shot(node) is True, "share=0 must be one-shot")
 
     for i in range(st.node_share.share_min):
         st.node_share.on_hit(node, f"z{i}")
-    check(_in_slru_scope(st, node) is True,
-          "at threshold the node becomes SLRU-scoped")
+    check(_in_share_scope(st, node) is True,
+          "at threshold the node becomes protected")
     check(st.is_one_shot(node) is False, "at threshold the node leaves the band")
 
 
@@ -240,12 +240,12 @@ def test_works_under_force_agentic():
 
 
 def test_share_min_is_single_knob():
-    """share_min 是唯一旋钮：配置 / one-shot / SLRU 三处同值。"""
-    print("[8] share_min drives config, one-shot and SLRU together")
+    """share_min 是唯一旋钮：配置 / one-shot / 保护段三处同值。"""
+    print("[8] share_min drives config, one-shot and protection together")
     st, _ = make_strategy({"s1": SessionType.STRUCT}, share_min=3)
     check(st.node_share.share_min == 3,
-          f"SLRU threshold must follow config, got {st.node_share.share_min}")
-    check(st.slru.share_min == 3, "ShareParams must carry the configured value")
+          f"share threshold must follow config, got {st.node_share.share_min}")
+    check(st.share.share_min == 3, "ShareParams must carry the configured value")
 
     node = FakeNode(session_id="s1")
     for k in (0, 1):
@@ -253,12 +253,12 @@ def test_share_min_is_single_knob():
         st.node_share.on_hit(node, f"o{k}")
     check(node.share_sessions == 2, f"share_sessions, got {node.share_sessions}")
     check(st.is_one_shot(node) is True, "share=2 is still one-shot when min=3")
-    check(_in_slru_scope(st, node) is False, "share=2 is not SLRU-scoped yet")
+    check(_in_share_scope(st, node) is False, "share=2 is not protected yet")
 
     st.node_share.on_hit(node, "o2")
     check(node.share_sessions == 3, f"share_sessions, got {node.share_sessions}")
     check(st.is_one_shot(node) is False, "share=3 leaves the one-shot band")
-    check(_in_slru_scope(st, node) is True, "share=3 is SLRU-scoped")
+    check(_in_share_scope(st, node) is True, "share=3 is protected")
 
     # 默认值：配置不写时两边都回落到 DEFAULT_SHARE_MIN
     d, _ = make_strategy({"s1": SessionType.STRUCT})
@@ -268,7 +268,7 @@ def test_share_min_is_single_knob():
 
     # 配置非法值由 ShareParams 拦住（<2 没有意义）
     try:
-        HeterCacheStrategy(slru={"share_min": 1})
+        HeterCacheStrategy(share={"share_min": 1})
     except ValueError as exc:
         check("share_min" in str(exc), f"unexpected message: {exc}")
     else:
