@@ -72,7 +72,7 @@ def _in_share_scope(strategy, node) -> bool:
 
 def build(force_agentic):
     # 按已兑现价值密度（VD）的跨队列淘汰
-    cfg = {"value": {"tau_s": 120.0, "floor_tokens": 2048.0}}
+    cfg = {"value": {"horizon_s": 120.0, "floor_tokens": 2048.0}}
     if force_agentic:
         cfg["force_agentic"] = True
     return HeterCacheRadixCache(

@@ -304,16 +304,19 @@ def test_fallback_is_seeded_random():
 
 
 def test_value_params_validation():
-    """VD 参数：时间常数与统计下限必须为正，seed 必须是 int；未知键报错。"""
-    print("[10] value params: positive tau/floor, int seed, unknown keys rejected")
+    """VD 参数：决策视野/平滑倍数/统计下限必须为正，seed 必须是 int；未知键报错。"""
+    print("[10] value params: horizon/smoothing/floor validated, unknown keys rejected")
     params = hu.QueueValueParams()
-    check(params.tau_s == hu.DEFAULT_VALUE_TAU_S,
-          f"default tau={params.tau_s}, want {hu.DEFAULT_VALUE_TAU_S}")
+    check(params.horizon_s == hu.DEFAULT_VALUE_HORIZON_S,
+          f"default horizon={params.horizon_s}, want {hu.DEFAULT_VALUE_HORIZON_S}")
+    check(params.smoothing_k == hu.DEFAULT_VALUE_SMOOTHING_K,
+          f"default k={params.smoothing_k}, want {hu.DEFAULT_VALUE_SMOOTHING_K}")
     check(params.floor_tokens == hu.DEFAULT_VALUE_FLOOR_TOKENS,
           f"default floor={params.floor_tokens}, want {hu.DEFAULT_VALUE_FLOOR_TOKENS}")
     for bad in (
-        {"tau_s": 0.0},
-        {"tau_s": -1.0},
+        {"horizon_s": 0.0},
+        {"horizon_s": -1.0},
+        {"smoothing_k": 0.5},
         {"floor_tokens": 0.0},
         {"seed": True},
         {"nope": 1},

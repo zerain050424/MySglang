@@ -23,7 +23,7 @@ from sim import bootstrap
 from sim.allocator import OutOfTokens, TokenAllocator, tree_tokens
 from sim.clock import VirtualClock
 
-VALUE = {"tau_s": 120.0, "floor_tokens": 2048.0}
+VALUE = {"horizon_s": 120.0, "floor_tokens": 2048.0}
 
 
 class _CheckAllocator:

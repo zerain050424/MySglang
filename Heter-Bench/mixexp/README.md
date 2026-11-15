@@ -1,7 +1,7 @@
 
 ---
 
-# mixexp · 混合负载实验套件
+# mixexp * 混合负载实验套件
 
 本实验套件（`exp3`）用于评估在四类异构负载混合且主导类变化的场景下，HeterCache（三队列 + 队内策略 + VD 仲裁）相比单策略（LRU / LFU / SLRU / T-LRU）的收益，以及各模块的消融贡献。
 
@@ -82,7 +82,7 @@ python mixexp/tools/build_exp3_data.py --mix scan --total-tokens 3e6
 | `hc_full` | heter_cache | 完整方案：三队列 + 队内策略 + VD 仲裁 |
 | `hc_norr` | heter_cache | 消融项：关闭会话轮询（chat 队内退化） |
 
-> 说明：当前版本已移除配额机制（无 cap 与 reservation）与权重（`weight.weights` 已整体删除）。跨队列淘汰顺序由已兑现价值密度 VD 决定：优先驱逐 `occ_q / (1 + VD_q)` 最大的队列，其中 VD 是过去 `tau_s` 内按队列统计的时间衰减命中量除以驻留量。VD=0（没有命中证据）时退化为按占用降序。
+> 说明：当前版本已移除配额机制（无 cap 与 reservation）与权重（`weight.weights` 已整体删除）。跨队列淘汰顺序由已兑现价值密度 VD 决定：优先驱逐 `occ_q / (1 + VD_q)` 最大的队列，其中 VD 是「未来 `horizon_s` 内每个驻留 token 的预期命中量」：各队列用自己的估计窗 `W_q = max(horizon_s, smoothing_k*T50_q)` 估命中速率，再投影回共享视野 `horizon_s`，因此三个队列的 VD 同量纲、可比较。VD=0（没有命中证据）时退化为按占用降序。
 
 ---
 
@@ -115,7 +115,7 @@ mkdir -p mixexp/result/exp3/chat
 
 # 1) 起 server（hc_full 臂；arms_exp3.tsv 的 policy / policy_config 原样搬过来）
 POLICY=heter_cache MAX_TOTAL_TOKENS=198000 \
-  POLICY_CONFIG='{"value":{"tau_s":120.0,"floor_tokens":2048.0},"rr":{"fair_rr":true,"kappa":0.5,"min_retain_tokens":512,"min_retain_frac":0.3},"share":{"share_min":2},"mt":{"enabled":true}}' \
+  POLICY_CONFIG='{"value":{"horizon_s":120.0,"floor_tokens":2048.0},"rr":{"fair_rr":true,"kappa":0.5,"min_retain_tokens":512,"min_retain_frac":0.3},"share":{"share_min":2},"mt":{"enabled":true}}' \
   EXTRA_ARGS="--kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.85" \
   LOG=mixexp/result/exp3/chat/server_full_hc_full.log \
   bash scripts/serve.sh          # 前台；另开终端等 curl -sf .../health 返回 200

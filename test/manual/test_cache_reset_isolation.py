@@ -53,7 +53,7 @@ CFG = {
     "force_agentic": True,
     "share": {"share_min": 2},
     # 按已兑现价值密度（VD）的跨队列淘汰
-    "value": {"tau_s": 120.0, "floor_tokens": 2048.0},
+    "value": {"horizon_s": 120.0, "floor_tokens": 2048.0},
 }
 
 

@@ -104,7 +104,7 @@ def _build(sym, *, now=None):
         mock_allocator=TokenAllocator(4096),
         page_size=1,
         eviction_policy="heter_cache",
-        eviction_policy_config={"value": {"tau_s": 120.0, "floor_tokens": 2048.0}},
+        eviction_policy_config={"value": {"horizon_s": 120.0, "floor_tokens": 2048.0}},
         now=now,
     )
 

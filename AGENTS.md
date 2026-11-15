@@ -157,8 +157,12 @@ Heter-Bench 文档里的历史数字与旧口径说明保留原文，只在需�
   HeterCache 没有跨队列可比的节点分数，退回任何默认序都是假语义。
 - 配额机制（caps / reservations / 充水 target / deadzone / chunk）已整体删除，
   跨队列淘汰只按已兑现价值密度 VD：`occ_q / (1 + VD_q)` 最大的队列先削。
-  VD 是过去 `tau_s` 内按队列的时间衰减命中量除以驻留量；权重（`weight.weights`）
-  已整体删除，`VD=0` 退化为按占用降序。
+  VD = 未来一个视野窗口内每个驻留 token 的预期命中量 ÷ max(occ, floor)，视野由
+  `value.horizon_s` 给出、**三个队列共享**；各队列只用自己的估计窗
+  `W_q = max(视野, k*T50_q)` 平滑命中速率，再投影回视野，所以量纲一致。
+  视野是政策、W_q 只是统计：不要把时间常数按队列拆开（稳态下等价于给队列加
+  隐性权重）。
+  权重（`weight.weights`）已整体删除，`VD=0` 退化为按占用降序。
   不要再引入任何硬上限或保底预留。
 - 全局复用分（`_reuse_score` / `victim_key`）已整体删除，不要以任何形式复活。
 - 观测三层已分离：`QueueOccupancyTracker`（账本）、`CacheTelemetry`（时钟+打点）、

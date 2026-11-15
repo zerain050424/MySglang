@@ -43,7 +43,7 @@ from sglang.srt.mem_cache.heter_cache.utils import (  # noqa: E402
 )
 
 # 按已兑现价值密度（VD）的跨队列淘汰：测试统一用默认时间常数与统计下限。
-VALUE_CFG = {"tau_s": 120.0, "floor_tokens": 2048.0}
+VALUE_CFG = {"horizon_s": 120.0, "floor_tokens": 2048.0}
 
 FAILS = []
 
@@ -211,7 +211,7 @@ def test_one_shot_still_drained_first():
             page_size=1,
             eviction_policy="heter_cache",
             eviction_policy_config={
-                "value": {"tau_s": 120.0, "floor_tokens": 2048.0}
+                "value": {"horizon_s": 120.0, "floor_tokens": 2048.0}
             },
         )
     )
@@ -268,7 +268,7 @@ def test_one_shot_order_by_tree_offset():
             page_size=1,
             eviction_policy="heter_cache",
             eviction_policy_config={
-                "value": {"tau_s": 120.0, "floor_tokens": 2048.0}
+                "value": {"horizon_s": 120.0, "floor_tokens": 2048.0}
             },
         )
     )
@@ -343,7 +343,7 @@ def test_one_shot_chain_stops_at_branch_and_lock():
                 page_size=1,
                 eviction_policy="heter_cache",
                 eviction_policy_config={
-                    "value": {"tau_s": 120.0, "floor_tokens": 2048.0}
+                    "value": {"horizon_s": 120.0, "floor_tokens": 2048.0}
                 },
             )
         )
@@ -417,7 +417,7 @@ def _sh_cache():
             page_size=1,
             eviction_policy="heter_cache",
             eviction_policy_config={
-                "value": {"tau_s": 120.0, "floor_tokens": 2048.0}
+                "value": {"horizon_s": 120.0, "floor_tokens": 2048.0}
             },
         )
     )
@@ -614,7 +614,7 @@ def test_decode_band_end_to_end():
                 token_to_kv_pool_allocator=None, page_size=1,
                 eviction_policy="heter_cache",
                 eviction_policy_config={
-                    "value": {"tau_s": 120.0, "floor_tokens": 2048.0}
+                    "value": {"horizon_s": 120.0, "floor_tokens": 2048.0}
                 },
             )
         )

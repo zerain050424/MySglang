@@ -383,10 +383,14 @@ class MultiAgenticParams:
 # 在 Stage 0 就被清掉，永远不会计入 VD 账本。
 VALUE_QUEUES = ("struct", "agentic", "chat")
 
-# VD 的时间常数：chat 的复用间隔中位数约 118s（_REUSE_CONFIG 的 e^4.77），
-# 取 120s 让"最近被复用过"在 chat 的一个典型间隔内可见；同时是 profile
-# 间隔（30s）的 4 倍，校准抖动不足以翻转排名。
-DEFAULT_VALUE_TAU_S = 120.0
+# VD 的决策视野（秒）：所有队列共享，VD 的量纲由它定义——未来一个视野窗口内
+# 每个驻留 token 预期换回的命中量。跨队列比较只在同一视野下成立，所以它是政策
+# 旋钮，不随队列变化。
+DEFAULT_VALUE_HORIZON_S = 120.0
+
+# VD 估计窗的平滑倍数 k：W_q = max(视野, k * T50_q)。W_q 只影响命中速率估计的
+# 方差，不改变比较尺度（投影回视野后速率估计与 k 无关）。
+DEFAULT_VALUE_SMOOTHING_K = 4.0
 
 # VD 分母的统计下限：低于这个驻留量时，一次命中的密度没有统计意义
 # （会把 1 token 的队列算成高价值）。它是估值下限，不是保留量。
@@ -401,18 +405,27 @@ class QueueValueParams:
     没有权重、没有 cap / reservation / deadzone / chunk。
 
     Attributes:
-        tau_s: 命中质量的时间常数（秒），越大越记得久。
+        horizon_s: 跨队列共享的决策视野 horizon（秒）。VD 的量纲由它定义：未来 horizon 秒
+            内每个驻留 token 预期换回的命中量。
+        smoothing_k: 估计窗的平滑倍数 k，W_q = max(horizon, k * T50_q)。只影响速率
+            估计的方差，不改变跨队列比较的尺度。
         floor_tokens: VD 分母的统计下限（token），不是保留量。
         seed: 兜底随机抽样的种子（同 seed 可复现）。
     """
 
-    tau_s: float = DEFAULT_VALUE_TAU_S
+    horizon_s: float = DEFAULT_VALUE_HORIZON_S
+    smoothing_k: float = DEFAULT_VALUE_SMOOTHING_K
     floor_tokens: float = DEFAULT_VALUE_FLOOR_TOKENS
     seed: int = 0
 
     def __post_init__(self):
-        if self.tau_s <= 0:
-            raise ValueError(f"value.tau_s must be > 0, got {self.tau_s}")
+        if self.horizon_s <= 0:
+            raise ValueError(f"value.horizon_s must be > 0, got {self.horizon_s}")
+        if self.smoothing_k < 1.0:
+            raise ValueError(
+                "value.smoothing_k must be >= 1 (W_q < horizon would push the estimator "
+                f"into the under-sampled regime), got {self.smoothing_k}"
+            )
         if self.floor_tokens <= 0:
             raise ValueError(
                 f"value.floor_tokens must be > 0, got {self.floor_tokens}"
@@ -497,6 +510,26 @@ _QUEUE_NAME = {
     HeterCacheNodeTag.QTRANS: "random",
 }
 _QUEUE_TO_TAG = {name: tag for tag, name in _QUEUE_NAME.items()}
+
+
+def reuse_interval_median(tag: HeterCacheNodeTag) -> Optional[float]:
+    """复用间隔的 lognormal 中位数 T50 = e^mu；无时间维度时返回 None。"""
+    cfg = tag.reuse_config
+    return None if cfg is None else math.exp(cfg[0])
+
+
+def estimation_window_s(queue: str, horizon_s: float, smoothing_k: float) -> float:
+    """VD 的估计窗 W_q = max(horizon, k * T50_q)，单位秒。
+
+    W_q 只用来平滑命中速率估计 ``r_q = H_q(W_q) / W_q``：窗口小于复用间隔
+    时，窗口里常常一次命中都没有，读数会在 0 与尖峰之间摆动。没有复用间隔
+    分布数据的队列（struct）直接回退 horizon，不给它拍一个无依据的常数。
+    """
+    tag = _QUEUE_TO_TAG.get(queue)
+    t50 = reuse_interval_median(tag) if tag is not None else None
+    if t50 is None:
+        return float(horizon_s)
+    return max(float(horizon_s), float(smoothing_k) * t50)
 
 # profile 的四列，顺序即打印顺序。
 # random 不参与跨队列仲裁：它整行都是 one-shot，在阶段 0 就被清掉。

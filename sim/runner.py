@@ -56,7 +56,8 @@ class SimConfig:
     """一次 run 的全部可调项。VD 参数只影响跨队列顺序，不参与队内排序。"""
 
     capacity: int = 4096
-    value_tau_s: float = 120.0
+    value_horizon_s: float = 120.0
+    value_smoothing_k: float = 4.0
     value_floor_tokens: float = 2048.0
     seed: int = 0
     page_size: int = 1
@@ -117,7 +118,8 @@ class Simulator:
         if cfg.eviction_policy == "heter_cache":
             policy_config = {
                 "value": {
-                    "tau_s": cfg.value_tau_s,
+                    "horizon_s": cfg.value_horizon_s,
+                    "smoothing_k": cfg.value_smoothing_k,
                     "floor_tokens": cfg.value_floor_tokens,
                     "seed": cfg.seed,
                 }

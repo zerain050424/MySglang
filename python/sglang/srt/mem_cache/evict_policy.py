@@ -138,7 +138,8 @@ class HeterCacheStrategy(EvictionStrategy):
 
         self.occupancy = QueueOccupancyTracker()
         self.realized = QueueValueTracker(
-            tau_s=self.value.tau_s,
+            horizon_s=self.value.horizon_s,
+            smoothing_k=self.value.smoothing_k,
             floor_tokens=self.value.floor_tokens,
             now=self._now,
         )
