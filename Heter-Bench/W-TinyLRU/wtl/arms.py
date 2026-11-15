@@ -11,7 +11,7 @@
 * ``A2`` 是「只有 one-shot 带」的基线（heter_cache + share_min 调到不可达），
   ``A3`` 是主对象（两带 SLRU：one-shot 带 + 跨会话保护），``A4`` 是阈值消融。
 
-共享数阈值只有一个旋钮 ``slru.share_min``（框架侧 ``SlruParams``）：
+共享数阈值只有一个旋钮 ``slru.share_min``（框架侧 ``ShareParams``）：
 它是「退出 one-shot 带 / 进入 SLRU 保护段」的分界，``share_min`` 越大保护越难触发。
 """
 
@@ -21,7 +21,7 @@ import dataclasses
 import json
 from typing import Dict, List, Optional
 
-# 框架侧默认值（与 sglang.srt.mem_cache.heter_utils.SlruParams 保持一致）
+# 框架侧默认值（与 sglang.srt.mem_cache.heter_utils.ShareParams 保持一致）
 DEFAULT_SHARE_MIN = 2
 # 不可达阈值：任何节点都进不了保护段 → 等价于「只有 one-shot 带」。
 BAND_ONLY_SHARE_MIN = 10 ** 6

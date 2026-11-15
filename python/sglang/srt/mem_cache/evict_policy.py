@@ -19,7 +19,7 @@ from sglang.srt.mem_cache.heter_utils import (
     MultiTurnParams,
     SessionRegistry,
     SessionType,
-    SlruParams,
+    ShareParams,
     QueueValueParams,
     HeterCacheNodeTag,
 )
@@ -121,7 +121,7 @@ class HeterCacheStrategy(EvictionStrategy):
         *,
         force_agentic: bool = False,
         rr: Union[RrParams, dict, None] = None,
-        slru: Union[SlruParams, dict, None] = None,
+        slru: Union[ShareParams, dict, None] = None,
         mt: Union[MultiTurnParams, dict, None] = None,
         multi_agentic: Union[MultiAgenticParams, dict, None] = None,
         value: Union[QueueValueParams, dict, None] = None,
@@ -130,7 +130,7 @@ class HeterCacheStrategy(EvictionStrategy):
         # 时间源可注入（单测用假时钟控制 one-shot 豁免窗口的推进）。
         self._now = now if now is not None else time.monotonic
         self.rr = RrParams.from_any(rr)
-        self.slru = SlruParams.from_any(slru)
+        self.slru = ShareParams.from_any(slru)
         self.mt = MultiTurnParams.from_any(mt)
         self.multi_agentic = MultiAgenticParams.from_any(multi_agentic)
         self.value = QueueValueParams.from_any(value)
@@ -157,13 +157,7 @@ class HeterCacheStrategy(EvictionStrategy):
         )
 
     def use_clock(self, now: Callable[[], float]) -> None:
-        """接管缓存层的时间源（默认墙钟下等价于无操作）。
-
-        节点时间戳由 ``RadixCache`` 盖（``CacheInitParams.now``），所以策略与它
-        持有的读时钟协作者（占用账本 / 遥测 / 会话账本 / 队内改写器）必须与缓存
-        同源；否则 ``is_aged`` / one-shot 豁免 / 承压校准窗口会拿假 now 去减真
-        时间戳，阈值全部失真。
-
+        """接管缓存层的时间源
         Args:
             now: 返回秒数的单调时钟。
         """
@@ -230,14 +224,11 @@ class HeterCacheStrategy(EvictionStrategy):
     # ---- 命中/淘汰记账 ----
 
     def record_hit(self, req, node, hit_tokens: int, by_queue: dict) -> None:
-        """记录一次命中：telemetry 按 rid 去重，VD 只吃首次命中的分队列命中量。
-        同一 rid 的 chunked prefill 会重复进入，去重由 telemetry 负责（它已按
-        MAX_SEEN_RIDS 限长）；只有它判定首次见到时才更新 VD，否则一个 32k
-        prompt 的 4 个 chunk 会被记 4 遍。
-
+        """记录一次命中：telemetry 按 rid 去重,同一 rid 的 chunked prefill 会重复进入，
+        去重由 telemetry 负责
         Args:
-            req: 请求对象（取 rid）。
-            node: 最深命中节点（telemetry 的单事件归因口径，保持历史可比）。
+            req: 请求对象
+            node: 最深命中节点
             hit_tokens: 本次命中的总 token 数。
             by_queue: ``{queue: tokens}``，按命中节点的标签拆分，供 VD 归因。
         """

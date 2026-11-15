@@ -135,7 +135,7 @@ python -m wtl.replay --arm A3 --data-path data/synth_p2048_b10/session_data.json
 | `victim_src`（`one_shot` / `qstruct` / `global`） | `HeterCacheStrategy._victim_sources` | **gate**：`one_shot` 占绝大多数说明一次性带在干活；`qstruct` 说明 SLRU 真的给了候选 |
 | `slru.share_counted / share_dedup` | `NodeShareLedger.stats()` | 跨会话共享数账本是否在工作（区分「跨会话复用」与「同一会话反复读」） |
 | `slru.slru_picks` | 同上 | SLRU 实际改写候选的次数（=0 说明没被行使） |
-| `slru_share_min` | `SlruParams.share_min` | 唯一旋钮，越大保护越难触发（A2 用不可达值当基线） |
+| `slru_share_min` | `ShareParams.share_min` | 唯一旋钮，越大保护越难触发（A2 用不可达值当基线） |
 | `slru` 快照时间序列 | `wtl.struct_profile`（真机 JSONL） | 看记账/去重/接管速率是否随负载漂移 |
 | `evict_us_p50/p99` | 同上（包在 `evict()` 外计时） | 策略 CPU 开销护栏 |
 | `protected_cascade_deleted_tokens` | `_delete_leaf(is_victim=False)` + `region==3`（`not is_one_shot`） | 最大正确性风险的可观测证据（门控 G5） |

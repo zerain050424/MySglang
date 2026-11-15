@@ -245,7 +245,7 @@ def test_share_min_is_single_knob():
     st, _ = make_strategy({"s1": SessionType.STRUCT}, share_min=3)
     check(st.node_share.share_min == 3,
           f"SLRU threshold must follow config, got {st.node_share.share_min}")
-    check(st.slru.share_min == 3, "SlruParams must carry the configured value")
+    check(st.slru.share_min == 3, "ShareParams must carry the configured value")
 
     node = FakeNode(session_id="s1")
     for k in (0, 1):
@@ -266,7 +266,7 @@ def test_share_min_is_single_knob():
           "default threshold must come from DEFAULT_SHARE_MIN")
     check(DEFAULT_SHARE_MIN == 2, "documented default is 2 (sessions <= 2)")
 
-    # 配置非法值由 SlruParams 拦住（<2 没有意义）
+    # 配置非法值由 ShareParams 拦住（<2 没有意义）
     try:
         HeterCacheStrategy(slru={"share_min": 1})
     except ValueError as exc:

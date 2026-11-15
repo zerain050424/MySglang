@@ -256,14 +256,14 @@ class RadixKey:
         return plain if self.extra_key is None else (self.extra_key, plain)
 
 
-class TreeNode: ## TreeNode 是基数树（RadixTree）的节点，每个节点代表一条路径上的一个片段（RadixKey），
-                # 并携带缓存值、访问统计、优先级等元信息，用于前缀缓存（prefix caching）场景。
+class TreeNode:
+
     counter = 0
 
     def __init__(
         self, id: Optional[int] = None, priority: int = 0, abs_start: int = 0
     ):
-        # ---- 基础基数树元信息（与策略无关）----
+        # ---- 基础基数树元信息----
         self.children = defaultdict(TreeNode)
         self.parent: TreeNode = None
         self.key: RadixKey = None
@@ -283,10 +283,9 @@ class TreeNode: ## TreeNode 是基数树（RadixTree）的节点，每个节点�
 
         # ---- HeterCache相关状态 ----
         self.abs_start = abs_start
-        self.queue_tag = HeterCacheNodeTag.QTRANS ## 负载类型
+        self.queue_tag = HeterCacheNodeTag.QTRANS  #归属队列类型
         self.is_decode = False
-        # HeterCache：节点归属的会话
-        self.session_id: Optional[str] = None
+        self.session_id: Optional[str] = None # 节点归属的会话
 
     @property
     def evicted(self): ## 节点是否已经被驱逐，判断依据是节点的值是否为None。
@@ -349,8 +348,7 @@ class RadixCache(BasePrefixCache):
             else None
         )
         self._heter = heter
-        # OPT 上界同样需要缓存的两件事：时间源（use map 的 tick 是秒，必须与
-        # 节点时间戳同源）与页大小（hash 分段粒度，错配会让每个块都查不到）。
+        # OPT上界同样需要缓存的两件事：时间源与页大小
         opt = (
             self.eviction_strategy
             if isinstance(self.eviction_strategy, OPTStrategy)
@@ -373,7 +371,7 @@ class RadixCache(BasePrefixCache):
 
             self._needs_capacity = True
             self.force_agentic = heter.force_agentic
-            # 共享数账本：读侧给判据（share_of），写侧只有命中与分裂两个回调。
+            # 会话共享数记录
             self.node_share = heter.node_share
             self._record_insert = heter.record_insert
         else:
@@ -386,11 +384,10 @@ class RadixCache(BasePrefixCache):
             self.node_share = None
             self._record_insert = None
 
-        # 回调按名字绑定一次：非 HeterCache 策略为 None，热路径只多一次判断。
-        self._split_observer = (
+        self.share_on_split = (
             heter.node_share.on_inserted if heter is not None else None
         )
-        self._hit_observer = heter.node_share.on_hit if heter is not None else None
+        self.share_on_hit = heter.node_share.on_hit if heter is not None else None
 
         self.evictable_leaves = set()
         self.session_registry = SessionRegistry.global_instance()
@@ -531,11 +528,11 @@ class RadixCache(BasePrefixCache):
         if len(key) == 0:
             return self._empty_match_result
 
-        # Q_struct 频数按不同请求计；会话类型另按 session 生命周期累计。
+        # Q_struct 频数按不同请求的数目计入;会话类型另按 session 生命周期累计。
         req = params.req
         rid = getattr(req, "rid", None) if req is not None else None
         session_id = getattr(req, "session_id", None) if req is not None else None
-        if self._hit_recorder is not None and session_id:
+        if self._heter is not None and session_id:
             prompt_ids = getattr(req, "origin_input_ids", None)
             self.session_registry.observe_request( ## 监测请求,进行分类
                 session_id,
@@ -612,7 +609,6 @@ class RadixCache(BasePrefixCache):
         # Radix Cache takes one ref in memory pool
         priority = req.priority or 0
         # 定位 prompt/output 边界，使 decode 部分节点可以单独标记；
-        # 不再要求客户端提供工作负载类型标签。
         decode_start = (len(req.origin_input_ids) // self.page_size) * self.page_size
         #请求写入后前缀链完整,缺口归零。
         self.session_registry.touch(
@@ -843,13 +839,12 @@ class RadixCache(BasePrefixCache):
         child_key = key.child_key(self.page_size) 
         ##获取当前key的前page_size个逻辑单位作为child_key，从offset=0开始
         value = []
-        # 命中量按节点标签分队列累计：跨队列的请求（共享 struct 前缀 + chat 尾巴）
-        # 归因到单个 tag 会把 VD 算偏，必须逐节点拆分。
+        # 命中量按节点标签分队列累计
         by_queue = {}
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key] ## 获取匹配的子节点
-            prefix_len = child.key.match(key, page_size=self.page_size) ##计算当前节点的key与子节点的key的匹配长度，返回匹配的逻辑单位数量，向下取整为page_size的整数倍
-            if prefix_len < len(child.key): ## 如果匹配长度小于子节点的key长度，说明匹配结束在子节点的中间，需要将子节点拆分为两个节点，一个表示匹配的前缀，一个表示剩余的后缀
+            prefix_len = child.key.match(key, page_size=self.page_size)
+            if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
                 self._record_cross_session_hit(session_id, new_node)
                 self._record_node_hit(
@@ -873,7 +868,7 @@ class RadixCache(BasePrefixCache):
         return value, node, by_queue
 
     def _record_cross_session_hit(self, session_id, node: TreeNode) -> None:
-        if self._hit_recorder is None or not session_id:
+        if self._heter is None or not session_id:
             return
         self.session_registry.record_cross_session_hit(
             session_id, getattr(node, "session_id", None)
@@ -887,18 +882,16 @@ class RadixCache(BasePrefixCache):
         session_id=None,
         by_queue=None,
     ) -> None:
-        """Apply the session's type to owned nodes; keep fork/shared tags sticky."""
         delta = access_time - node.last_access_time
         node.hit_count += 1
-        if self._hit_observer is not None:
-            self._hit_observer(node, session_id)
+        if self.share_on_hit is not None:
+            self.share_on_hit(node, session_id)
         state = (
             self.session_registry.get(session_id)
-            if self._hit_recorder is not None
+            if self._heter is not None
             else None
         )
         if self.force_agentic:
-            # 直达 agentic 队列：跳过 8s 间隔判定与 QSTRUCT 黏性。
             node.queue_tag = HeterCacheNodeTag.QAGENT
         elif node.queue_tag != HeterCacheNodeTag.QSTRUCT:
             if state is not None and state.session_type == SessionType.STRUCT:
@@ -918,7 +911,7 @@ class RadixCache(BasePrefixCache):
                 )
         node.last_access_time = access_time
         if by_queue is not None:
-            # 按追认后的 tag 记：occ 账本在下次 reconcile 也按新 tag 分区，
+            # 按追认后的 tag 记：occ 账本在下次reconcile也按新 tag 分区，
             # 分子分母同源，才不会在标签迁移的那一轮把 VD 算偏。
             queue = HeterCacheNodeTag.coerce(node.queue_tag).queue_name
             by_queue[queue] = by_queue.get(queue, 0) + len(node.value)
@@ -933,8 +926,6 @@ class RadixCache(BasePrefixCache):
        ):
            new_node = TreeNode(priority=child.priority)
            self._stamp(new_node)
-           # HeterCache：前缀一半继承原偏移，后缀一半整体后移 split_len。
-           # 必须在覆盖 child.abs_start 之前把旧值读出来。
            new_node.abs_start = child.abs_start
            child.abs_start = child.abs_start + split_len
            new_node.hit_count = child.hit_count
@@ -943,8 +934,7 @@ class RadixCache(BasePrefixCache):
            new_node.lock_ref = child.lock_ref
            new_node.key = child.key[:split_len]
            new_node.value = child.value[:split_len].clone()
-           # HeterCache metadata: prefix half inherits; suffix half is
-           # reclassified as decode when the split lands at/after decode_start.
+
            new_node.queue_tag = child.queue_tag
            new_node.is_decode = child.is_decode
            new_node.session_id = child.session_id
@@ -963,11 +953,8 @@ class RadixCache(BasePrefixCache):
            new_node.event_hash_value, child.event_hash_value = split_node_hash_value(
             child.event_hash_value, split_len, self.page_size
            )
-           # T-LRU：分裂不增加分支深度，新父节点继承 child 的高水位。
-           # 共享数账本的新父节点继承由 NodeShareLedger.on_inserted 完成（分裂
-           # 不改变「哪些请求经过这段前缀」，两半都继承），不再新增占位字段。
-           if self._split_observer is not None:
-               self._split_observer(new_node)
+           if self.share_on_split is not None:
+               self.share_on_split(new_node)
 
            return new_node
 
@@ -1022,7 +1009,6 @@ class RadixCache(BasePrefixCache):
                 child_key = key.child_key(self.page_size)
 
         if len(key): ## 如果还有剩余的key,说明没有匹配到子节点,需要创建新的子节点
-            # HeterCache：新片段从已匹配长度处开始（绝对偏移）。
             new_node = TreeNode(priority=priority, abs_start=total_prefix_length)
             self._stamp(new_node)
             new_node.parent = node

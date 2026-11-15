@@ -149,7 +149,7 @@ def session_type_to_node_tag(session_type: SessionType) -> HeterCacheNodeTag:
 # 拼错的键会在构造处报错——实验配置静默失效比启动失败更难查。
 #
 #   RrParams           : CHAT 会话级轮询（跨会话公平）
-#   SlruParams         : SLRU 的共享会话数阈值（决定 one-shot 分界与保护范围）
+#   ShareParams        : 共享会话数阈值（决定 one-shot 分界与保护范围）
 #   MultiTurnParams    : AGENTIC 带内复用间隔权重
 #   MultiAgenticParams : AGENTIC 带内复用分排序（与 MT 互斥）
 #   QueueValueParams   : 已兑现价值密度（VD）的时间尺度与统计下限
@@ -274,8 +274,8 @@ DEFAULT_AGEING_TTL_S = {
 
 
 @dataclasses.dataclass
-class SlruParams:
-    """SLRU 的共享会话数阈值与按类型的节点老化 TTL。
+class ShareParams:
+    """共享会话数阈值与按类型的节点老化 TTL。
 
     Attributes:
         share_min: 受保护的共享会话数阈值，必须 >= 2。
@@ -309,7 +309,7 @@ class SlruParams:
         self.ageing_ttl_s = merged
 
     @classmethod
-    def from_any(cls, value=None) -> "SlruParams":
+    def from_any(cls, value=None) -> "ShareParams":
         return _coerce_params(cls, value, name="slru")
 
     def as_dict(self) -> dict:

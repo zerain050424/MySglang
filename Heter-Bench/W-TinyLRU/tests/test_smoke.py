@@ -227,7 +227,7 @@ def test_analyze_offline_table():
 
 
 def test_arm_configs_match_framework():
-    """A2–A4 的 slru 配置必须能被框架的 SlruParams 接受。
+    """A2–A4 的 slru 配置必须能被框架的 ShareParams 接受。
 
     这条是**配置漂移保险**：如果框架改了参数名（如 share_min），这里第一时间红。
     没有 torch 时用「stub 顶层包 + 真实源码路径」的方式只导入纯 Python 模块。
@@ -248,7 +248,7 @@ def test_arm_configs_match_framework():
             sys.modules[f"sglang.{sub}"] = m
 
     try:
-        from sglang.srt.mem_cache.heter_utils import SlruParams
+        from sglang.srt.mem_cache.heter_utils import ShareParams
     except ImportError as exc:
         # 本地仓库可能停在旧版本（分支仓库在实验机上）：按 SKIP 处理，不判失败。
         print(f"  SKIP  {exc}（分支仓库上会跑）")
@@ -258,7 +258,7 @@ def test_arm_configs_match_framework():
         cfg = (arm.config or {}).get("slru")
         if cfg is None:
             continue
-        p = SlruParams.from_any(cfg)
+        p = ShareParams.from_any(cfg)
         assert p.share_min == cfg["share_min"]
 
 
