@@ -61,6 +61,9 @@ class SimConfig:
     seed: int = 0
     page_size: int = 1
     eviction_policy: str = "heter_cache"
+    # OPT 上界专用：离线 trace 生成的 `{block_hash: [使用时刻]}`。
+    # 只在 eviction_policy="opt" 时读；缺失即报错，不做静默退化。
+    opt_use_map: Optional[str] = None
     idle_ttl: float = 3600.0
     # 单请求无法在池里放下时的行为：
     #   "error" —— 抛 OutOfTokens（默认；逼调用方直面 trace/容量不匹配）；
@@ -110,22 +113,40 @@ class Simulator:
         self.clock = VirtualClock(0.0)
         self.alloc = TokenAllocator(cfg.capacity)
         self.req_pool = FakeReqToTokenPool(width)
-        self.cache = self.sym["HeterCacheRadixCache"].create_simulated(
-            mock_allocator=self.alloc,
-            mock_req_pool=self.req_pool,
-            page_size=cfg.page_size,
-            eviction_policy=cfg.eviction_policy,
-            eviction_policy_config={
+        # 策略参数按族分派：HeterCache 读 VD 参数，OPT 只读 use map。
+        if cfg.eviction_policy == "heter_cache":
+            policy_config = {
                 "value": {
                     "tau_s": cfg.value_tau_s,
                     "floor_tokens": cfg.value_floor_tokens,
                     "seed": cfg.seed,
                 }
-            },
+            }
+        elif cfg.eviction_policy == "opt":
+            if not cfg.opt_use_map:
+                raise ValueError(
+                    "eviction_policy='opt' requires SimConfig.opt_use_map "
+                    "(see sim/opt_map.build_use_map)"
+                )
+            policy_config = {
+                "use_map_path": cfg.opt_use_map,
+                "block_size": cfg.page_size,
+            }
+        else:
+            policy_config = None
+
+        self.cache = self.sym["HeterCacheRadixCache"].create_simulated(
+            mock_allocator=self.alloc,
+            mock_req_pool=self.req_pool,
+            page_size=cfg.page_size,
+            eviction_policy=cfg.eviction_policy,
+            eviction_policy_config=policy_config,
             now=self.clock,
         )
-        # 会话账本的空闲回收阈值（生产默认 3600s，虚拟时间下同样按秒算）
-        self.cache.session_registry.idle_ttl = cfg.idle_ttl
+        # 会话账本的空闲回收阈值（生产默认 3600s，虚拟时间下同样按秒算）。
+        # 非 HeterCache 策略不装账本，跳过。
+        if getattr(self.cache, "session_registry", None) is not None:
+            self.cache.session_registry.idle_ttl = cfg.idle_ttl
         self.records = []
         self.tasks = {}
         self._rid_seq = 0

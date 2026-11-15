@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+import bisect
+import dataclasses
+import json
 import logging
+import math
 import random
 import time
-from typing import TYPE_CHECKING, Callable, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Callable, Dict, Optional, Tuple, Union
 from sglang.srt.mem_cache.queue_selector import queue_order as _queue_order
 from sglang.srt.mem_cache.queue_selector import struct_tier
 from sglang.srt.mem_cache.heter_utils import (
@@ -319,3 +323,227 @@ class HeterCacheStrategy(EvictionStrategy):
         if not pool:
             return None
         return self._fallback_rng.choice(pool)
+
+
+# ---------------------------------------------------------------------------
+# 离线最优（OPT / Belady）：策略上界，不用于线上选择
+# ---------------------------------------------------------------------------
+#
+# 语义与 UniCache 的 OPT 一致：淘汰「下次被使用时刻最远」的块，永不复用者
+# 视为 ``+∞``（最先出）。区别只在数据面：
+#
+# * 不维护全局 ``PREFILL_CNT`` 游标。策略接口只有 ``get_priority(node)``，
+#   没有 tick 推进钩子；把 use map 存成「该前缀被使用的时刻（秒）」后，
+#   每次查询用 ``self._now()`` 二分即可，策略变成**只读无状态**，不 pop、
+#   不依赖调用顺序，重复调用结果相同。
+# * 块标识直接复用缓存自己的 SHA256 累进 hash（``compute_node_hash_values``
+#   写进 ``TreeNode.hash_value``），不另造一套 Python ``hash`` 体系。
+#
+# 因此这是「block 粒度贪心的近似上界」：淘汰单位仍是整个叶子节点，
+# 做不到 Belady 的逐块精确最优。
+
+
+@dataclasses.dataclass(frozen=True)
+class OptParams:
+    """OPT 上界的参数。
+
+    Attributes:
+        use_map_path: ``{block_hash: [使用时刻(秒), ...]}`` 的 JSON 路径。
+            必填：缺失时若静默退化成「全部 +∞」，OPT 就变成了任意序，
+            实验结果会看起来「跑通了」而实际没有上界语义。
+        block_size: use map 的切块粒度（token），必须与缓存 ``page_size``
+            一致；两者错配时 hash 分段不同 → 查询全部落空。
+        miss_warn: use map 未命中的比例超过该值时告警一次，用于发现
+            「粒度错配 / map 与负载不匹配」这类静默退化。
+    """
+
+    use_map_path: str
+    block_size: int = 1
+    miss_warn: float = 0.5
+
+    def __post_init__(self):
+        if not isinstance(self.use_map_path, str) or not self.use_map_path:
+            raise ValueError(
+                f"opt.use_map_path must be a non-empty str, got {self.use_map_path!r}"
+            )
+        if self.block_size <= 0:
+            raise ValueError(
+                f"opt.block_size must be > 0, got {self.block_size}"
+            )
+        if not isinstance(self.miss_warn, (int, float)) or not (
+            0.0 < self.miss_warn <= 1.0
+        ):
+            raise ValueError(
+                f"opt.miss_warn must be in (0, 1], got {self.miss_warn!r}"
+            )
+
+    @classmethod
+    def from_any(cls, value=None) -> "OptParams":
+        if isinstance(value, cls):
+            return value
+        if value is None:
+            raise ValueError(
+                "opt 策略必须提供 use_map_path（离线 trace 生成的块使用表）；"
+                "不做「缺表即全 +∞」的静默退化"
+            )
+        if not isinstance(value, dict):
+            raise TypeError(
+                f"opt params must be None/dict/{cls.__name__}, got {type(value).__name__}"
+            )
+        known = {f.name for f in dataclasses.fields(cls)}
+        unknown = set(value) - known
+        if unknown:
+            raise ValueError(
+                f"unknown opt params {sorted(unknown)}; known: {sorted(known)}"
+            )
+        return cls(**value)
+
+
+def load_use_map(path: str) -> Dict[str, Tuple[float, ...]]:
+    """读 ``{hash: [t, ...]}``，排序去重后转成不可变元组。
+
+    Args:
+        path: JSON 文件路径。
+
+    Returns:
+        ``{hash: (t0 <= t1 <= ...)}``。
+
+    Raises:
+        ValueError: 文件为空、没有可用的时间序列，或格式不是 dict。
+            空表必须显式失败：否则所有节点都拿 ``+∞``，淘汰顺序退化成
+            「谁被先遍历谁先出」。
+    """
+
+    with open(path, encoding="utf-8") as f:
+        raw = json.load(f)
+    if not isinstance(raw, dict):
+        raise ValueError(f"use map must be a JSON object, got {type(raw).__name__}")
+
+    table: Dict[str, Tuple[float, ...]] = {}
+    for block_hash, times in raw.items():
+        if not isinstance(times, (list, tuple)):
+            raise ValueError(
+                f"use map entry for {block_hash!r} must be a list, got {type(times).__name__}"
+            )
+        seq = tuple(sorted({float(t) for t in times}))
+        if seq:
+            table[str(block_hash)] = seq
+    if not table:
+        raise ValueError(f"use map at {path} carries no usable use times")
+    return table
+
+
+class OPTStrategy(EvictionStrategy):
+    """离线 Belady/OPT 上界：优先级 = 下次使用时刻的相反数。
+
+    ``RadixCache._evict`` 用 ``heapq`` 取**最小**优先级，所以返回
+    ``-next_use``：下次使用越远（含 ``+∞``）越先被淘汰，与 OPT 语义一致。
+
+    时间轴约定：use map 里的时刻与 ``self._now()`` 必须同源（生产是
+    ``time.monotonic``，仿真里是 ``VirtualClock``）。单个节点可能覆盖多个
+    page，取其所有 page 中**最早**的下次使用——保守侧，宁可少淘汰。
+    """
+
+    def __init__(
+        self,
+        *,
+        use_map_path: str,
+        block_size: int = 1,
+        miss_warn: float = 0.5,
+        now: Optional[Callable[[], float]] = None,
+    ):
+        self.params = OptParams.from_any(
+            {
+                "use_map_path": use_map_path,
+                "block_size": block_size,
+                "miss_warn": miss_warn,
+            }
+        )
+        self._use_map = load_use_map(self.params.use_map_path)
+        self._page_size = self.params.block_size
+        # 时间源可注入；缓存装配完会再推一次（见 RadixCache.__init__）。
+        self._now = now if now is not None else time.monotonic
+
+        # 退化可见性：命中率掉到 0 却没人发现是这类策略最贵的失败方式。
+        self._lookups = 0
+        self._misses = 0
+        self._warned = False
+
+    # ---- 协作者装配 -------------------------------------------------------
+    def use_clock(self, now: Callable[[], float]) -> None:
+        """接管缓存层的时间源（与 ``HeterCacheStrategy.use_clock`` 同一约定）。"""
+        self._now = now
+
+    def bind_page_size(self, page_size: int) -> None:
+        """校验 use map 的切块粒度与缓存页大小一致。
+
+        Raises:
+            ValueError: 不一致。分段不同 → 每个 hash 都查不到 → 全 ``+∞``。
+        """
+        if page_size != self.params.block_size:
+            raise ValueError(
+                "OPT use map block_size="
+                f"{self.params.block_size} does not match cache page_size={page_size}; "
+                "regenerate the use map with the same page size"
+            )
+        self._page_size = page_size
+
+    # ---- 查询 -------------------------------------------------------------
+    def _ensure_hash(self, node) -> list:
+        """补齐 ``node.hash_value``（含未计算的祖先）。
+
+        ``compute_node_hash_values`` 只读 ``parent.hash_value[-1]``：父链没算时
+        会静默退化成「没有上下文」的 hash，随后每个块都查不到。所以这里沿
+        父链**自根向下**逐层补算，而不是只算当前节点。
+        """
+        if node.hash_value is not None:
+            return node.hash_value
+
+        # 延迟导入：utils 依赖本模块（工厂表），模块级导入会成环。
+        from sglang.srt.mem_cache.utils import compute_node_hash_values
+
+        pending = []
+        cursor = node
+        while cursor is not None and cursor.hash_value is None:
+            pending.append(cursor)
+            cursor = cursor.parent
+        # 缓存层已经把 root 的 hash_value 置成 []，正常不会走到 root 之外。
+        for item in reversed(pending):
+            item.hash_value = compute_node_hash_values(item, self._page_size)
+        return node.hash_value
+
+    def _next_use(self, block_hash: str) -> float:
+        """该块严格晚于当前时刻的下次使用；没有则 ``+∞``。"""
+        times = self._use_map.get(block_hash)
+        if times is None:
+            self._misses += 1
+            self._maybe_warn()
+            return math.inf
+        # bisect_right：跳过所有 <= now 的已发生使用。
+        index = bisect.bisect_right(times, self._now())
+        return times[index] if index < len(times) else math.inf
+
+    def _maybe_warn(self) -> None:
+        self._lookups += 1
+        if self._warned or self._lookups < 1000:
+            return
+        ratio = self._misses / self._lookups
+        if ratio >= self.params.miss_warn:
+            self._warned = True
+            logger.warning(
+                "OPT use map miss ratio %.1f%% (%d/%d): block 粒度或负载与 map 不匹配，"
+                "OPT 已退化为「全 +∞」的任意序",
+                ratio * 100.0,
+                self._misses,
+                self._lookups,
+            )
+
+    def get_priority(self, node) -> Tuple[float, float, int]:
+        """返回 ``(-next_use, last_access_time, id)``，``heapq`` 取最小即淘汰。"""
+        hashes = self._ensure_hash(node)
+        next_use = min((self._next_use(h) for h in hashes), default=math.inf)
+        return (
+            -next_use,
+            float(getattr(node, "last_access_time", 0.0)),
+            int(getattr(node, "id", 0)),
+        )

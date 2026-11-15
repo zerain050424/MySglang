@@ -53,7 +53,7 @@ from sglang.srt.mem_cache.heter_utils import (
     HeterCacheNodeTag,
     session_type_to_node_tag,
 )
-from sglang.srt.mem_cache.evict_policy import HeterCacheStrategy
+from sglang.srt.mem_cache.evict_policy import HeterCacheStrategy, OPTStrategy
 from sglang.srt.mem_cache.utils import (
     get_eviction_strategy,
     split_node_hash_value,
@@ -349,6 +349,17 @@ class RadixCache(BasePrefixCache):
             else None
         )
         self._heter = heter
+        # OPT 上界同样需要缓存的两件事：时间源（use map 的 tick 是秒，必须与
+        # 节点时间戳同源）与页大小（hash 分段粒度，错配会让每个块都查不到）。
+        opt = (
+            self.eviction_strategy
+            if isinstance(self.eviction_strategy, OPTStrategy)
+            else None
+        )
+        self._opt = opt
+        if opt is not None:
+            opt.use_clock(self._now)
+            opt.bind_page_size(self.page_size)
         if heter is not None:
             # 策略的时间源由缓存接管：节点时间戳（TreeNode 创建 / match / insert）
             # 由本类盖，策略只做差值判断。两边不同源就是拿假 now 减真时间戳。

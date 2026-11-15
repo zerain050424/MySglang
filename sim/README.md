@@ -201,6 +201,38 @@ tools/sglang-simulator/src/sglang_simulator/simulation/sglang/radix_cache.py
 启动路径确实注册、真实 `HeterCacheRadixCache` 的三处时钟都等于 `StateManager`、
 老化 TTL 在 179.9/180.0 精确翻转、显式 clock 不被覆盖、hook 幂等。
 
+### OPT 上界：策略对比的天花板
+
+`eviction_policy="opt"` 是离线 Belady 上界，只用于给在线策略划天花板，不参与线上。
+
+```python
+from sim.opt_map import build_use_map, write_use_map
+write_use_map("/tmp/use_map.json", build_use_map(sessions, page_size=8))
+sim = Simulator(SimConfig(page_size=8, eviction_policy="opt",
+                          opt_use_map="/tmp/use_map.json"))
+```
+
+三件事必须同时成立，否则上限是假的：
+
+1. **hash 同源**：use map 的键必须与缓存写进 `TreeNode.hash_value` 的一致。生成器逐
+   page 调用同一个 `get_storage_hash_str(key, prior_hash)`，实测 `_misses == 0`
+   （`test_sim_opt.py::test_use_map_generation_matches_cache_hash`）。
+2. **时间同源**：use map 存的是 `Turn.t`（虚拟秒），`OPTStrategy` 用 `RadixCache._now`
+   二分查询——没有 UniCache 那种全局 `PREFILL_CNT` 游标，所以策略是**只读无状态**的，
+   重复调用结果相同、乱序也安全。
+3. **粒度同源**：`block_size` 必须等于缓存 `page_size`；错配时 `bind_page_size` 直接
+   `ValueError`，而不是静默让每个块都查不到。
+
+已知边界（写清楚，避免把它当「理论最优」）：
+
+- 淘汰单位仍是**整个叶子节点**（可跨多 page），不是 Belady 的逐块最优 → 近似上界；
+- 假定调度顺序不受淘汰影响（oracle 回放），真实系统里淘汰会改变排队与耗时；
+- use map 必填，空表/缺表直接报错——不做「全 +∞」的静默退化。
+
+验收：`test/manual/test_sim_opt.py`（10 passed，需 torch 的用例在 base conda 下自动 skip）。
+CPU 96 token 的构造 trace 上 `opt.hit_rate > lru.hit_rate`。该文件不能和
+`test_queue_selector.py` 这类「往 `sys.modules` 塞 stub 包」的测试同进程跑。
+
 ### 数据集接入（R1）：`session_data.jsonl → List[Session]`
 
 `sim/session_data.py` 逐字段对齐 `bench_heap.py` 的读取口径：
