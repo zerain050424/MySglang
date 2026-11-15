@@ -17,9 +17,9 @@
     sglang.srt.mem_cache.radix_cache
     sglang.srt.mem_cache.base_prefix_cache
     sglang.srt.mem_cache.evict_policy
-    sglang.srt.mem_cache.heter_cache_radix_cache
-    sglang.srt.mem_cache.victim_override
-    sglang.srt.mem_cache.heter_utils
+    sglang.srt.mem_cache.heter_cache.radix_cache
+    sglang.srt.mem_cache.heter_cache.override
+    sglang.srt.mem_cache.heter_cache.utils
 
 共享数账本不读时间（只读命中会话），但 MT 的权重读 `time.monotonic()`，因此本
 模块必须覆盖 `victim_override`；`evict_policy` 则因为 VD 衰减与承压窗口判断也
@@ -35,9 +35,9 @@ _PATCHED_MODULES = (
     "sglang.srt.mem_cache.radix_cache",
     "sglang.srt.mem_cache.base_prefix_cache",
     "sglang.srt.mem_cache.evict_policy",
-    "sglang.srt.mem_cache.heter_cache_radix_cache",
-    "sglang.srt.mem_cache.victim_override",
-    "sglang.srt.mem_cache.heter_utils",
+    "sglang.srt.mem_cache.heter_cache.radix_cache",
+    "sglang.srt.mem_cache.heter_cache.override",
+    "sglang.srt.mem_cache.heter_cache.utils",
 )
 
 _EPOCH = 1_700_000_000.0  # 固定墙钟起点：只为了让 time() 看起来合理，不参与排序

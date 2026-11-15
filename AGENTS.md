@@ -8,7 +8,7 @@
 用户会在同一个工作区并行提交。我曾三次在「按记忆中的 HEAD」操作时踩空：
 
 - `c8d061c 精简代码` 删掉了 `HeterCacheStrategy.get_priority`，我却在几轮之后才发现类无法实例化；
-- 同一天里 `heter_utils.py` 被并行改动两次；
+- 同一天里 `heter_cache/utils.py` 被并行改动两次；
 - 我「恢复」一个方法后，用户又删了一次。
 
 规则：
@@ -99,12 +99,14 @@ PYTHONPATH=$PWD/python python test/manual/test_session_type_classifier.py
 ```python
 for pkg in ("sglang", "sglang.srt"):
     m = types.ModuleType(pkg); m.__path__ = []; sys.modules[pkg] = m
-m = types.ModuleType("sglang.srt.mem_cache"); m.__path__ = ["python/sglang/srt/mem_cache"]
+m = types.ModuleType("sglang.srt.mem_cache"); m.__path__ = []
 sys.modules["sglang.srt.mem_cache"] = m
+h = types.ModuleType("sglang.srt.mem_cache.heter_cache"); h.__path__ = []
+sys.modules["sglang.srt.mem_cache.heter_cache"] = h
 ```
 
 **新增模块必须同步加进装载列表**，否则报 `No module named ...`。本轮为此改过两次：
-`queue_occupancy`、`heter_bench_bridge`。
+`heter_cache/occupancy`、`heter_cache/bench_bridge`。
 
 纯逻辑验证（不建真缓存）也能做：`HeterCacheRadixCache.__new__(cls)` 加假协作者，
 即可测 `_release_node` 的调用序列、`_observe_occupancy` 的时钟调度。
@@ -163,7 +165,11 @@ Heter-Bench 文档里的历史数字与旧口径说明保留原文，只在需�
   驱动层 `_observe_occupancy`（编排）。策略只做判据与裁决。
 - 策略无关的队列占用日志（`OccSampler` / `QueueOcc` / `TagOcc`）已删除，
   `[HeterCache profile]` 是队列占用的唯一出口。
-- 观测实现全部在 `Heter-Bench/`，sglang 侧只留 `heter_bench_bridge.py` 这一个桥
+- 观测实现全部在 `Heter-Bench/`，sglang 侧只留 `heter_cache/bench_bridge.py` 这一个桥
   （只做定位与导入；Heter-Bench 缺席时启动即报错，不留空实现）：
   `Heter-Bench/log/heter_logger.py`、`profile/{heter_profiler,cache_telemetry,node_label_logger}.py`。
   新增观测代码请放这里，不要放进 `python/sglang/srt/mem_cache/`。
+- 策略侧组件已收容在 `python/sglang/srt/mem_cache/heter_cache/`：`utils`（标签/参数/
+  `SessionRegistry`）、`selector`（判据与排序）、`occupancy`/`value`/`node_share`（三本账）、
+  `override`（队内改写器）、`radix_cache`（执行层）、`bench_bridge`（观测接缝）。
+  新增策略组件请放这里，不要散落在 `mem_cache/` 顶层。

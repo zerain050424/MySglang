@@ -9,7 +9,7 @@ from __future__ import annotations
 import time
 from typing import Callable, Dict, Optional
 
-from sglang.srt.mem_cache.heter_utils import VALUE_QUEUES
+from sglang.srt.mem_cache.heter_cache.utils import VALUE_QUEUES
 
 # 承压判据：可用容量占池容量的比例低于它，就把校准窗口缩短到
 # ``PRESSURE_WINDOW_S``。承压时水位变化最快，旧窗口会让仲裁按过期占用点名。

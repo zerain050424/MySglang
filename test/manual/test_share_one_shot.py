@@ -24,7 +24,7 @@ sys.path.insert(
 )
 
 from sglang.srt.mem_cache.evict_policy import HeterCacheStrategy  # noqa: E402
-from sglang.srt.mem_cache.heter_utils import (  # noqa: E402
+from sglang.srt.mem_cache.heter_cache.utils import (  # noqa: E402
     DEFAULT_SHARE_MIN,
     ONE_SHOT_IDLE_S,
     SessionRegistry,

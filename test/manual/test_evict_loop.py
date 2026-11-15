@@ -1,7 +1,7 @@
 """HeterCacheRadixCache.evict() 淘汰循环的回归测试（不需要 torch）。
 
 用 stub 顶替 `radix_cache` / `base_prefix_cache` / `registry` 这三个会拉起
-torch 的依赖，只加载 `heter_cache_radix_cache.py` 本体，再挂一棵假树。
+torch 的依赖，只加载 `heter_cache/radix_cache.py` 本体，再挂一棵假树。
 钉住四件事：
 
 1. **没有 one-shot 叶子时不会崩**：配额仲裁或随机兜底必须给出候选
@@ -22,6 +22,7 @@ import types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PY = os.path.join(HERE, "..", "..", "python")
+_HC = "sglang/srt/mem_cache/heter_cache"
 
 FAILS = []
 
@@ -47,7 +48,12 @@ def _load(name, relpath):
 
 
 def _install_stubs():
-    for name in ("sglang", "sglang.srt", "sglang.srt.mem_cache"):
+    for name in (
+        "sglang",
+        "sglang.srt",
+        "sglang.srt.mem_cache",
+        "sglang.srt.mem_cache.heter_cache",
+    ):
         m = types.ModuleType(name)
         m.__path__ = []
         sys.modules[name] = m
@@ -177,7 +183,7 @@ def make_cache(cache_cls, strategy, nodes):
     cache.kv_events = FakeEvents()
     cache.deleted = []
     cache.metrics = []
-    hu = sys.modules["sglang.srt.mem_cache.heter_utils"]
+    hu = sys.modules["sglang.srt.mem_cache.heter_cache.utils"]
     cache.root_node = FakeNode(None, hu.HeterCacheNodeTag.QTRANS)
     cache.root_node.ckey = "root"
     cache.evictable_leaves = set()
@@ -225,20 +231,17 @@ def _per_queue_token_count(self):
 
 def _bootstrap():
     _install_stubs()
-    _load("sglang.srt.mem_cache.heter_utils", "sglang/srt/mem_cache/heter_utils.py")
-    _load("sglang.srt.mem_cache.queue_occupancy", "sglang/srt/mem_cache/queue_occupancy.py")
-    # evict_policy 现在直接依赖 queue_selector 与 heter_bench_bridge（观测装配）：
+    _load("sglang.srt.mem_cache.heter_cache.utils", f"{_HC}/utils.py")
+    _load("sglang.srt.mem_cache.heter_cache.occupancy", f"{_HC}/occupancy.py")
+    # evict_policy 现在直接依赖 selector 与 bench_bridge（观测装配）：
     # 这两者必须先于它装载，否则包路径被 stub 掉后无法按名解析。
-    _load("sglang.srt.mem_cache.queue_value", "sglang/srt/mem_cache/queue_value.py")
-    _load("sglang.srt.mem_cache.queue_selector", "sglang/srt/mem_cache/queue_selector.py")
-    _load("sglang.srt.mem_cache.heter_bench_bridge", "sglang/srt/mem_cache/heter_bench_bridge.py")
-    _load("sglang.srt.mem_cache.node_share", "sglang/srt/mem_cache/node_share.py")
-    _load("sglang.srt.mem_cache.victim_override", "sglang/srt/mem_cache/victim_override.py")
+    _load("sglang.srt.mem_cache.heter_cache.value", f"{_HC}/value.py")
+    _load("sglang.srt.mem_cache.heter_cache.selector", f"{_HC}/selector.py")
+    _load("sglang.srt.mem_cache.heter_cache.bench_bridge", f"{_HC}/bench_bridge.py")
+    _load("sglang.srt.mem_cache.heter_cache.node_share", f"{_HC}/node_share.py")
+    _load("sglang.srt.mem_cache.heter_cache.override", f"{_HC}/override.py")
     ep = _load("sglang.srt.mem_cache.evict_policy", "sglang/srt/mem_cache/evict_policy.py")
-    shc = _load(
-        "sglang.srt.mem_cache.heter_cache_radix_cache",
-        "sglang/srt/mem_cache/heter_cache_radix_cache.py",
-    )
+    shc = _load("sglang.srt.mem_cache.heter_cache.radix_cache", f"{_HC}/radix_cache.py")
     cls = shc.HeterCacheRadixCache
     cls._delete_leaf = _delete_leaf
     cls.update_eviction_metrics = _update_eviction_metrics
@@ -248,8 +251,8 @@ def _bootstrap():
 
 def _strategy(ep, sessions, **share):
     st = ep.HeterCacheStrategy(share=share or None)
-    reg = sys.modules["sglang.srt.mem_cache.heter_utils"].SessionRegistry()
-    hu = sys.modules["sglang.srt.mem_cache.heter_utils"]
+    reg = sys.modules["sglang.srt.mem_cache.heter_cache.utils"].SessionRegistry()
+    hu = sys.modules["sglang.srt.mem_cache.heter_cache.utils"]
     for sid, stype in sessions.items():
         reg._sessions[sid] = hu.SessionState(session_id=sid, session_type=stype)
     st.session_registry = reg
@@ -265,7 +268,7 @@ def _seed_share(st, node, n):
 def test_no_one_shot_leaves_does_not_crash(ep, shc, base):
     """历史 P0：没有 one-shot 叶子时 victim 曾是 None / 陈旧节点。"""
     print("[1] no one-shot leaves: VD path still yields a victim")
-    hu = sys.modules["sglang.srt.mem_cache.heter_utils"]
+    hu = sys.modules["sglang.srt.mem_cache.heter_cache.utils"]
     st = _strategy(ep, {"a1": hu.SessionType.AGENTIC})
     nodes = [
         FakeNode("a1", hu.HeterCacheNodeTag.QAGENT, tokens=t)
@@ -292,7 +295,7 @@ def test_no_one_shot_leaves_does_not_crash(ep, shc, base):
 def test_victim_not_reused_across_rounds(ep, shc, base):
     """历史 P0：第二轮复用上一轮已删节点 → 二次释放 / 断言失败。"""
     print("[2] victim must be recomputed every round (no double delete)")
-    hu = sys.modules["sglang.srt.mem_cache.heter_utils"]
+    hu = sys.modules["sglang.srt.mem_cache.heter_cache.utils"]
     st = _strategy(ep, {"a1": hu.SessionType.AGENTIC})
     nodes = [
         FakeNode("a1", hu.HeterCacheNodeTag.QAGENT, tokens=16) for _ in range(4)
@@ -316,7 +319,7 @@ def test_victim_not_reused_across_rounds(ep, shc, base):
 def test_one_shot_band_first(ep, shc, base):
     """one-shot 叶子先走：不管位置深浅，一律先于受保护节点被清。"""
     print("[3] one-shot leaves are drained before protected ones")
-    hu = sys.modules["sglang.srt.mem_cache.heter_utils"]
+    hu = sys.modules["sglang.srt.mem_cache.heter_cache.utils"]
     st = _strategy(
         ep,
         {"t1": hu.SessionType.TRANS, "s1": hu.SessionType.STRUCT},
@@ -349,7 +352,7 @@ def test_one_shot_band_first(ep, shc, base):
 def test_share_rewrites_struct_candidate(ep, shc, base):
     """只有受保护的 struct 叶子时，VD 仲裁点名 struct 队，队内按段内 LRU 挑最久未访问的那片。"""
     print("[4] struct queue: VD arbitration names it, struct_tier picks the LRU-oldest")
-    hu = sys.modules["sglang.srt.mem_cache.heter_utils"]
+    hu = sys.modules["sglang.srt.mem_cache.heter_cache.utils"]
     st = _strategy(ep, {"s1": hu.SessionType.STRUCT})
     thr = st.node_share.share_min
     now = time.monotonic()
@@ -371,7 +374,7 @@ def test_share_rewrites_struct_candidate(ep, shc, base):
 def test_empty_tree_is_noop(ep, shc, base):
     """空树：直接返回 0，不报错。"""
     print("[5] empty tree returns 0")
-    hu = sys.modules["sglang.srt.mem_cache.heter_utils"]
+    hu = sys.modules["sglang.srt.mem_cache.heter_cache.utils"]
     st = _strategy(ep, {})
     cache = make_cache(shc.HeterCacheRadixCache, st, [])
     result = cache.evict(base.EvictParams(num_tokens=128))
@@ -382,7 +385,7 @@ def test_empty_tree_is_noop(ep, shc, base):
 def test_aged_struct_prefix_cascade(ep, shc, base):
     """老化 struct：前缀不是叶子时不动，最后一个子节点清理完后同轮级联剪掉。"""
     print("[6] aged struct prefix is swept by the one-shot cascade")
-    hu = sys.modules["sglang.srt.mem_cache.heter_utils"]
+    hu = sys.modules["sglang.srt.mem_cache.heter_cache.utils"]
     st = _strategy(ep, {"s1": hu.SessionType.STRUCT}, ageing_ttl_s={"struct": 120})
     now = time.monotonic()
     prefix = FakeNode(

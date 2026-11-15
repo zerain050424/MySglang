@@ -150,15 +150,15 @@ def load(force: bool = False) -> Dict[str, Any]:
     )
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.evict_policy import HeterCacheStrategy
-    from sglang.srt.mem_cache.heter_cache_radix_cache import HeterCacheRadixCache
-    from sglang.srt.mem_cache.heter_utils import (
+    from sglang.srt.mem_cache.heter_cache.radix_cache import HeterCacheRadixCache
+    from sglang.srt.mem_cache.heter_cache.utils import (
         HeterCacheNodeTag,
         QueueValueParams,
         SessionRegistry,
         SessionType,
         VALUE_QUEUES,
     )
-    from sglang.srt.mem_cache.queue_occupancy import QueueOccupancyTracker
+    from sglang.srt.mem_cache.heter_cache.occupancy import QueueOccupancyTracker
     from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 
     _LOADED = {

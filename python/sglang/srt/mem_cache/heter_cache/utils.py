@@ -3,9 +3,9 @@
 三个消费者都依赖这里，所以口径必须单点定义，避免"策略算一套、指标算一套"：
 
 * ``evict_policy``：跨队列仲裁与 one-shot 判定；
-* ``victim_override``：改写器的作用域、共享数阈值、会话类型，以及 agentic
+* ``override``：改写器的作用域、共享数阈值、会话类型，以及 agentic
   队内的复用分（lognormal 条件生存概率，``MultiAgenticEvict``）；
-* ``queue_selector`` / profile：队列标签、占用口径与已兑现价值密度（VD）。
+* ``selector`` / profile：队列标签、占用口径与已兑现价值密度（VD）。
 
 命名约定：``HeterCacheNodeTag`` 是**节点级**标签（KV 片段出生时盖章），
 ``SessionType`` 是**会话级**分类（由分类器推得）。两者经常不一致，判定归属时
@@ -397,7 +397,7 @@ DEFAULT_VALUE_FLOOR_TOKENS = 2048.0
 class QueueValueParams:
     """已兑现价值密度（VD）的参数。
 
-    跨队列仲裁只读 VD（``queue_selector.queue_order`` 的 ``occ/(1+VD)``），
+    跨队列仲裁只读 VD（``selector.queue_order`` 的 ``occ/(1+VD)``），
     没有权重、没有 cap / reservation / deadzone / chunk。
 
     Attributes:

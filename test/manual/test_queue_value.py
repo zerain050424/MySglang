@@ -1,6 +1,6 @@
 """已兑现价值密度（VD）账本单测（不需要 GPU / torch）。
 
-被测对象：`python/sglang/srt/mem_cache/queue_value.py`
+被测对象：`python/sglang/srt/mem_cache/heter_cache/value.py`
 
 口径：``VD_q = H_q / max(occ_q, floor)``，``H_q`` 是时间衰减的命中质量。
 本文件只测账本自身；仲裁顺序由 ``test_queue_selector.py`` 覆盖。
@@ -13,6 +13,7 @@ import types
 
 _ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
 _CACHE_DIR = os.path.join(_ROOT, "python", "sglang", "srt", "mem_cache")
+_HC_DIR = os.path.join(_CACHE_DIR, "heter_cache")
 
 FAILS = []
 
@@ -38,14 +39,19 @@ def _stub_package(name):
     sys.modules[name] = module
 
 
-for _pkg in ("sglang", "sglang.srt", "sglang.srt.mem_cache"):
+for _pkg in (
+    "sglang",
+    "sglang.srt",
+    "sglang.srt.mem_cache",
+    "sglang.srt.mem_cache.heter_cache",
+):
     _stub_package(_pkg)
 
 hu = _load(
-    "sglang.srt.mem_cache.heter_utils", os.path.join(_CACHE_DIR, "heter_utils.py")
+    "sglang.srt.mem_cache.heter_cache.utils", os.path.join(_HC_DIR, "utils.py")
 )
 qv = _load(
-    "sglang.srt.mem_cache.queue_value", os.path.join(_CACHE_DIR, "queue_value.py")
+    "sglang.srt.mem_cache.heter_cache.value", os.path.join(_HC_DIR, "value.py")
 )
 
 

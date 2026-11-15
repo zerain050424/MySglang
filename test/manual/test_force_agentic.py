@@ -30,10 +30,10 @@ from sglang.srt.mem_cache.base_prefix_cache import (  # noqa: E402
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams  # noqa: E402
 from sglang.srt.mem_cache.evict_policy import HeterCacheStrategy  # noqa: E402
 from sglang.srt.mem_cache.radix_cache import RadixKey  # noqa: E402
-from sglang.srt.mem_cache.heter_cache_radix_cache import (  # noqa: E402
+from sglang.srt.mem_cache.heter_cache.radix_cache import (  # noqa: E402
     HeterCacheRadixCache,
 )
-from sglang.srt.mem_cache.heter_utils import HeterCacheNodeTag  # noqa: E402
+from sglang.srt.mem_cache.heter_cache.utils import HeterCacheNodeTag  # noqa: E402
 
 FAILS = []
 QAGENT = HeterCacheNodeTag.QAGENT

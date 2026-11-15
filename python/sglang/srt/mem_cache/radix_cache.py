@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.heter_bench_bridge import start_node_label_logger
+from sglang.srt.mem_cache.heter_cache.bench_bridge import start_node_label_logger
 
 """
 Copyright 2023-2024 SGLang Team
@@ -47,7 +47,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.events import KVCacheEventRecorder
-from sglang.srt.mem_cache.heter_utils import (
+from sglang.srt.mem_cache.heter_cache.utils import (
     SessionRegistry,
     SessionType,
     HeterCacheNodeTag,

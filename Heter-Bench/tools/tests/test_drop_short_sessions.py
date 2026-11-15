@@ -13,7 +13,7 @@ import sys
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _TOOL = os.path.abspath(os.path.join(_HERE, "..", "drop_short_sessions.py"))
 _HETER_UTILS = os.path.abspath(
-    os.path.join(_HERE, "..", "..", "..", "python", "sglang", "srt", "mem_cache", "heter_utils.py")
+    os.path.join(_HERE, "..", "..", "..", "python", "sglang", "srt", "mem_cache", "heter_cache/utils.py")
 )
 
 

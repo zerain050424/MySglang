@@ -9,9 +9,9 @@ import math
 import random
 import time
 from typing import TYPE_CHECKING, Callable, Dict, Optional, Tuple, Union
-from sglang.srt.mem_cache.queue_selector import queue_order as _queue_order
-from sglang.srt.mem_cache.queue_selector import struct_tier
-from sglang.srt.mem_cache.heter_utils import (
+from sglang.srt.mem_cache.heter_cache.selector import queue_order as _queue_order
+from sglang.srt.mem_cache.heter_cache.selector import struct_tier
+from sglang.srt.mem_cache.heter_cache.utils import (
     node_num_tokens,
     ONE_SHOT_IDLE_S,
     RrParams,
@@ -23,15 +23,15 @@ from sglang.srt.mem_cache.heter_utils import (
     QueueValueParams,
     HeterCacheNodeTag,
 )
-from sglang.srt.mem_cache.queue_occupancy import QueueOccupancyTracker
-from sglang.srt.mem_cache.queue_value import QueueValueTracker
-from sglang.srt.mem_cache.node_share import NodeShareLedger
-from sglang.srt.mem_cache.victim_override import (
+from sglang.srt.mem_cache.heter_cache.occupancy import QueueOccupancyTracker
+from sglang.srt.mem_cache.heter_cache.value import QueueValueTracker
+from sglang.srt.mem_cache.heter_cache.node_share import NodeShareLedger
+from sglang.srt.mem_cache.heter_cache.override import (
     RrEvictPolicy,
     MultiAgenticEvict,
     MultiTurnEvictPolicy,
 )
-from sglang.srt.mem_cache.heter_bench_bridge import (
+from sglang.srt.mem_cache.heter_cache.bench_bridge import (
     CacheTelemetry,
     HeterProfiler,
 )
@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 
 
 
-# 节点口径统一在 heter_utils，避免策略/改写器/指标各算一套。
+# 节点口径统一在 heter_cache.utils，避免策略/改写器/指标各算一套。
 _node_num_tokens = node_num_tokens
 
 
@@ -177,7 +177,7 @@ class HeterCacheStrategy(EvictionStrategy):
     def get_priority(self, node: TreeNode) -> Tuple[int, float, float]:
         raise NotImplementedError(
             "HeterCacheStrategy has no single-node ordering; "
-            "use queue_weight arbitration (queue_selector.pick_victim) instead"
+            "use queue_weight arbitration (heter_cache.selector.pick_victim) instead"
         )
 
     def is_aged(self, node) -> bool:

@@ -1,7 +1,7 @@
 """节点共享会话数记账：一段 KV 被多少个不同的会话命中过。
 * HeterCacheStrategy.is_aged/is_one_shot：共享数达标的 struct 前缀
   不受老化与 one-shot 带影响；
-* queue_selector.struct_tier：struct 队内按共享数分档；
+* selector.struct_tier：struct 队内按共享数分档；
 * HeterProfiler.summary：只读stats()与share_min两项观测。
 """
 
@@ -10,7 +10,7 @@ from __future__ import annotations
 import weakref
 from typing import TYPE_CHECKING
 
-from sglang.srt.mem_cache.heter_utils import (
+from sglang.srt.mem_cache.heter_cache.utils import (
     DEFAULT_SHARE_MIN,
     SESSION_SHARE_MAX,
     session_bloom_bits,

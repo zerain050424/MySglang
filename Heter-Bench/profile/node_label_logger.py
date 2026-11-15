@@ -12,7 +12,7 @@
 统计（``eval/evaluate_node_labels.py`` / ``eval/evaluate_node_count.py``）。
 
 本模块属于实验脚手架，**不随 sglang 安装分发**：由
-``sglang/srt/mem_cache/heter_bench_bridge.py`` 按仓库根定位后加载；Heter-Bench
+``sglang/srt/mem_cache/heter_cache/bench_bridge.py`` 按仓库根定位后加载；Heter-Bench
 不在场时该桥退化为空实现。
 
 环境变量：
@@ -31,7 +31,7 @@ from typing import TYPE_CHECKING, Optional
 
 from heter_logger import heterlog
 
-from sglang.srt.mem_cache.heter_utils import SessionType
+from sglang.srt.mem_cache.heter_cache.utils import SessionType
 
 if TYPE_CHECKING:  # pragma: no cover - 仅类型检查，避免与缓存模块成环
     from sglang.srt.mem_cache.radix_cache import RadixCache

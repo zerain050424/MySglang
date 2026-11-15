@@ -27,7 +27,7 @@ TRANS，活到第 5 轮才切走。要做到逐请求口径，必须让分类器
 
 用法
 ----
-    # MULTI_TURN_MIN 从 heter_utils.py 读；输出 <in>.mt5.jsonl
+    # MULTI_TURN_MIN 从 heter_cache/utils.py 读；输出 <in>.mt5.jsonl
     python tools/drop_short_sessions.py --in \\
         TaskData/SharedGPT-multi-turn/Qwen2.5-7B-Instruct/ShareGPT_cleaned_valid_deduplicated_session_data.nosys.jsonl
 
@@ -56,16 +56,16 @@ from typing import Iterator, List, Optional, Tuple
 HERE = Path(__file__).resolve().parent
 BENCH_DIR = HERE.parent
 ROOT_DIR = BENCH_DIR.parent
-HETER_UTILS = ROOT_DIR / "python/sglang/srt/mem_cache/heter_utils.py"
+HETER_UTILS = ROOT_DIR / "python/sglang/srt/mem_cache/heter_cache/utils.py"
 
 _CONST_RE = re.compile(r"^\s*MULTI_TURN_MIN\s*=\s*(\d+)", re.MULTILINE)
 
 
 def multi_turn_min_from_source(path: Path = HETER_UTILS) -> Optional[int]:
-    """从 ``heter_utils.py`` 源码读 ``MULTI_TURN_MIN``。
+    """从 ``heter_cache/utils.py`` 源码读 ``MULTI_TURN_MIN``。
 
     只解析文本、不 import：本工具要在没有 torch / sglang 依赖链的机器上跑
-    （``import sglang.srt.mem_cache.heter_utils`` 会拉起整条 sglang 导入）。
+    （``import sglang.srt.mem_cache.heter_cache.utils`` 会拉起整条 sglang 导入）。
     """
     try:
         text = path.read_text(encoding="utf-8")
@@ -145,7 +145,7 @@ def main() -> int:
         "--min-turns",
         type=int,
         default=None,
-        help="保留的最小轮数；缺省读 heter_utils.py 的 MULTI_TURN_MIN",
+        help="保留的最小轮数；缺省读 heter_cache/utils.py 的 MULTI_TURN_MIN",
     )
     parser.add_argument("--dry-run", action="store_true", help="只统计，不写文件")
     parser.add_argument(

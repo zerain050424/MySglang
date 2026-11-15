@@ -43,12 +43,12 @@ REMOTE_TESTS = [
 # 预登记上传清单：策略/测量链路的全部文件，每次全量覆盖。
 UPLOAD = [
     "python/sglang/srt/mem_cache/evict_policy.py",
-    "python/sglang/srt/mem_cache/victim_override.py",
-    "python/sglang/srt/mem_cache/heter_utils.py",
-    "python/sglang/srt/mem_cache/queue_selector.py",
-    "python/sglang/srt/mem_cache/queue_occupancy.py",
-    "python/sglang/srt/mem_cache/heter_cache_radix_cache.py",
-    "python/sglang/srt/mem_cache/heter_bench_bridge.py",
+    "python/sglang/srt/mem_cache/heter_cache/override.py",
+    "python/sglang/srt/mem_cache/heter_cache/utils.py",
+    "python/sglang/srt/mem_cache/heter_cache/selector.py",
+    "python/sglang/srt/mem_cache/heter_cache/occupancy.py",
+    "python/sglang/srt/mem_cache/heter_cache/radix_cache.py",
+    "python/sglang/srt/mem_cache/heter_cache/bench_bridge.py",
     "Heter-Bench/scripts/bench_hetercache.py",
     "Heter-Bench/scripts/env.sh",
     "Heter-Bench/scripts/config.sh",

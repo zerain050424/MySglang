@@ -24,7 +24,7 @@ from __future__ import annotations
 import os
 import sys
 
-_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../../.."))
+_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../../../.."))
 _LOG_DIR = os.path.join(_ROOT, "Heter-Bench", "log")
 _PROFILE_DIR = os.path.join(_ROOT, "Heter-Bench", "profile")
 

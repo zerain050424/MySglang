@@ -92,7 +92,7 @@ def install(
     ) in ("1", "true", "True")
 
     try:
-        from sglang.srt.mem_cache.heter_cache_radix_cache import (
+        from sglang.srt.mem_cache.heter_cache.radix_cache import (
             HeterCacheRadixCache,
         )
     except Exception as exc:  # pragma: no cover

@@ -13,7 +13,7 @@ import math
 import time
 from typing import Callable, Dict, Optional
 
-from sglang.srt.mem_cache.heter_utils import (
+from sglang.srt.mem_cache.heter_cache.utils import (
     DEFAULT_VALUE_FLOOR_TOKENS,
     DEFAULT_VALUE_TAU_S,
     VALUE_QUEUES,

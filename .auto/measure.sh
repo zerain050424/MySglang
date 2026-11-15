@@ -12,10 +12,10 @@ cd "$(dirname "$0")/.."
 # 1) 语法快检（<1s，出错立即失败）
 python3 -m py_compile \
   python/sglang/srt/mem_cache/evict_policy.py \
-  python/sglang/srt/mem_cache/victim_override.py \
-  python/sglang/srt/mem_cache/heter_utils.py \
-  python/sglang/srt/mem_cache/queue_selector.py \
-  python/sglang/srt/mem_cache/heter_cache_radix_cache.py \
+  python/sglang/srt/mem_cache/heter_cache/override.py \
+  python/sglang/srt/mem_cache/heter_cache/utils.py \
+  python/sglang/srt/mem_cache/heter_cache/selector.py \
+  python/sglang/srt/mem_cache/heter_cache/radix_cache.py \
   .auto/remote_eval.py
 
 # 2) 远端配对测量

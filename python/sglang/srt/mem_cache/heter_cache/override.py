@@ -4,7 +4,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Dict, Iterable, Optional, Tuple
 import time
-from sglang.srt.mem_cache.heter_utils import (
+from sglang.srt.mem_cache.heter_cache.utils import (
     RrParams,
     SessionRegistry,
     HeterCacheNodeTag,
@@ -17,7 +17,7 @@ from sglang.srt.mem_cache.heter_utils import (
 
 if TYPE_CHECKING:  # pragma: no cover
     from sglang.srt.mem_cache.radix_cache import TreeNode
-    from sglang.srt.mem_cache.heter_utils import SessionState
+    from sglang.srt.mem_cache.heter_cache.utils import SessionState
 
 
 class VictimOverride(ABC):

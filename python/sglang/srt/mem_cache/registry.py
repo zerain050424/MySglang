@@ -147,7 +147,7 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
 
     if get_memory().enable_heter_cache:
         # HeterCache：RadixCache + 多级队列淘汰
-        from sglang.srt.mem_cache.heter_cache_radix_cache import (
+        from sglang.srt.mem_cache.heter_cache.radix_cache import (
             HeterCacheRadixCache,
         )
         return HeterCacheRadixCache(params)
@@ -285,7 +285,7 @@ def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
             )
 
     if get_memory().radix_eviction_policy == "heter_cache":
-        from sglang.srt.mem_cache.heter_cache_radix_cache import HeterCacheRadixCache
+        from sglang.srt.mem_cache.heter_cache.radix_cache import HeterCacheRadixCache
 
         # heter_cache 没有单节点优先级（get_priority 直接抛错）：它靠权重仲裁选受害者，
         # 而权重仲裁只在 HeterCacheRadixCache 的 evict 里。挂到其它树上会在第一次淘汰时

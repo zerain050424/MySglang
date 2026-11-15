@@ -109,7 +109,7 @@ class RealBackend:
             import torch  # noqa: F401
             radix = importlib.import_module("sglang.srt.mem_cache.radix_cache")
             cache_mod = importlib.import_module(
-                "sglang.srt.mem_cache.heter_cache_radix_cache"
+                "sglang.srt.mem_cache.heter_cache.radix_cache"
             )
             params_mod = importlib.import_module("sglang.srt.mem_cache.cache_init_params")
             base_mod = importlib.import_module("sglang.srt.mem_cache.base_prefix_cache")

@@ -2,16 +2,16 @@
 
 在原生 RadixCache 基础上叠加分带与按已兑现价值密度（VD）的跨队列淘汰：
 - 优先清理无复用价值的 One-shot 临时节点；
-- 可调度节点委托给 `queue_selector.pick_victim`，按 VD 仲裁。
+- 可调度节点委托给 `selector.pick_victim`，按 VD 仲裁。
 本模块专注执行层面的内存回收、Radix 树拓扑维护与级联修剪。
 """
 
 import logging
 import time
 
-from sglang.srt.mem_cache import queue_selector
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams, EvictResult
 from sglang.srt.mem_cache.evict_policy import HeterCacheStrategy
+from sglang.srt.mem_cache.heter_cache import selector
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.registry import register_radix_cache_backend
 
@@ -107,8 +107,8 @@ class HeterCacheRadixCache(RadixCache):
         )
 
     def _pick_victim(self, leaves):
-        """转发至 queue_selector 纯策略决策器。"""
-        return queue_selector.pick_victim(
+        """转发至 selector 纯策略决策器。"""
+        return selector.pick_victim(
             strategy=self.eviction_strategy, leaves=leaves
         )
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Tuple
 
-from sglang.srt.mem_cache.heter_utils import VALUE_QUEUES
+from sglang.srt.mem_cache.heter_cache.utils import VALUE_QUEUES
 
 
 def queue_order(

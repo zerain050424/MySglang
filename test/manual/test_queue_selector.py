@@ -1,6 +1,6 @@
 """按权重的跨队列淘汰：纯函数与策略接线单测（不需要 GPU / torch）。
 
-被测对象：`python/sglang/srt/mem_cache/queue_selector.py`
+被测对象：`python/sglang/srt/mem_cache/heter_cache/selector.py`
   queue_order     —— occ_q / (1 + VD_q) 降序
   pick_victim     —— Stage 0 one-shot → VD 仲裁 → 兜底
   struct_tier     —— STRUCT 两遍降级键
@@ -18,6 +18,7 @@ import types
 
 _ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
 _CACHE_DIR = os.path.join(_ROOT, "python", "sglang", "srt", "mem_cache")
+_HC_DIR = os.path.join(_CACHE_DIR, "heter_cache")
 
 
 def _load(name, path):
@@ -34,18 +35,38 @@ def _stub_package(name):
     sys.modules[name] = module
 
 
-for _pkg in ("sglang", "sglang.srt", "sglang.srt.mem_cache"):
+for _pkg in (
+    "sglang",
+    "sglang.srt",
+    "sglang.srt.mem_cache",
+    "sglang.srt.mem_cache.heter_cache",
+):
     _stub_package(_pkg)
 
-hu = _load("sglang.srt.mem_cache.heter_utils", os.path.join(_CACHE_DIR, "heter_utils.py"))
+hu = _load(
+    "sglang.srt.mem_cache.heter_cache.utils", os.path.join(_HC_DIR, "utils.py")
+)
 # 占用账本已独立成模块，evict_policy 直接依赖它
-_load("sglang.srt.mem_cache.queue_occupancy", os.path.join(_CACHE_DIR, "queue_occupancy.py"))
-_load("sglang.srt.mem_cache.queue_value", os.path.join(_CACHE_DIR, "queue_value.py"))
-qs = _load("sglang.srt.mem_cache.queue_selector", os.path.join(_CACHE_DIR, "queue_selector.py"))
+_load(
+    "sglang.srt.mem_cache.heter_cache.occupancy",
+    os.path.join(_HC_DIR, "occupancy.py"),
+)
+_load("sglang.srt.mem_cache.heter_cache.value", os.path.join(_HC_DIR, "value.py"))
+qs = _load(
+    "sglang.srt.mem_cache.heter_cache.selector", os.path.join(_HC_DIR, "selector.py")
+)
 # 共享数账本已独立成模块（evict_policy 直接依赖它）
-_load("sglang.srt.mem_cache.node_share", os.path.join(_CACHE_DIR, "node_share.py"))
-_load("sglang.srt.mem_cache.victim_override", os.path.join(_CACHE_DIR, "victim_override.py"))
-_load("sglang.srt.mem_cache.heter_bench_bridge", os.path.join(_CACHE_DIR, "heter_bench_bridge.py"))
+_load(
+    "sglang.srt.mem_cache.heter_cache.node_share",
+    os.path.join(_HC_DIR, "node_share.py"),
+)
+_load(
+    "sglang.srt.mem_cache.heter_cache.override", os.path.join(_HC_DIR, "override.py")
+)
+_load(
+    "sglang.srt.mem_cache.heter_cache.bench_bridge",
+    os.path.join(_HC_DIR, "bench_bridge.py"),
+)
 ep = _load("sglang.srt.mem_cache.evict_policy", os.path.join(_CACHE_DIR, "evict_policy.py"))
 
 FAILS = []

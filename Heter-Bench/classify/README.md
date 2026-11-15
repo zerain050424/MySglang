@@ -16,7 +16,7 @@
 - **预测**：`trans→random`、`struct→struct`、`chat→chat`、`agentic→agentic`。
   `trans` 是「未判定」，对单轮且无跨会话结构共享的会话它就是正确桶
   （策略侧把 `HeterCacheNodeTag.QTRANS.workload` 读作 `random`）。
-- **不复制规则**：重放直接调用生产代码 `python/sglang/srt/mem_cache/heter_utils.py`
+- **不复制规则**：重放直接调用生产代码 `python/sglang/srt/mem_cache/heter_cache/utils.py`
   的 `SessionRegistry`，评测的就是正在跑的规则，而不是它的替身。
 
 ## 目录
