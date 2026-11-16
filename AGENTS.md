@@ -89,8 +89,17 @@ base conda 的 `huggingface-hub==1.33.0` 与 `transformers` 要求的 `<1.0` 冲
 PYTHONPATH=$PWD/python python -m pytest -q \
   test/manual/test_queue_selector.py test/manual/test_share_one_shot.py
 PYTHONPATH=$PWD/python python test/manual/test_evict_loop.py     # ALL PASSED 才算过
+PYTHONPATH=$PWD/python python test/manual/test_chunked_hit_count.py   # 真 RadixCache.match_prefix
 PYTHONPATH=$PWD/python python test/manual/test_session_type_classifier.py
 ```
+
+`test_session_type_classifier.py` 里那 8 个碰 torch 的用例在本机会因上面的版本冲突
+失败（基线如此），不是被改坏了。
+
+**切变体时先关字节码缓存**：改动若是「同长度的一行」（例如把 `!= 0` 改成 `!= 1`），
+源文件 mtime 可能落在同一秒且 size 不变，Python 会复用旧 `.pyc`，测试结果与源码不符
+（本轮踩过一次：`test_evict_loop` 对着 `!= 1` 显示 ALL PASSED，清掉 `__pycache__` 后
+6 条失败）。跑对照实验用 `PYTHONDONTWRITEBYTECODE=1`，或先删对应 `.pyc`。
 
 ### 5.2 不依赖 torch 的验证手法
 

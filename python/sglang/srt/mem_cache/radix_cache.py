@@ -532,6 +532,11 @@ class RadixCache(BasePrefixCache):
         req = params.req
         rid = getattr(req, "rid", None) if req is not None else None
         session_id = getattr(req, "session_id", None) if req is not None else None
+        # chunked prefill 的「插完再回扫」是复核，不是复用：只返回索引，不记命中。
+        # 否则 hit_count 会被自己刚建的节点反复加分（chunk 越多加得越多），它就不
+        # 再是「被复用次数」；同时回扫没有 req，session_id is None 会落进 legacy
+        # 重标分支，按 delta<8s 把刚按会话类型盖好的队列标签重写成 QAGENT。
+        count_hits = not params.chunked
         if self._heter is not None and session_id:
             prompt_ids = getattr(req, "origin_input_ids", None)
             self.session_registry.observe_request( ## 监测请求,进行分类
@@ -541,14 +546,14 @@ class RadixCache(BasePrefixCache):
                 tool_call=getattr(req, "tool_call", None),
             )
         value, last_node, by_queue = self._match_prefix_helper(
-            self.root_node, key, rid, session_id
+            self.root_node, key, rid, session_id, count_hits=count_hits
         )
         if value:
             value = torch.cat(value)
         else:
             value = self._empty_match_result.device_indices
 
-        if self._hit_recorder is not None and params.req is not None:
+        if count_hits and self._hit_recorder is not None and params.req is not None:
             self._hit_recorder(params.req, last_node, value.numel(), by_queue)
         return MatchResult(
             device_indices=value,
@@ -671,7 +676,12 @@ class RadixCache(BasePrefixCache):
         radix_key, kv_indices, _ = self._adopt(req, req.get_fill_ids(), chunked=chunked)
 
         # The prefix indices could be updated, reuse it
-        match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
+        # 这次 match 只是取索引：节点是本请求刚插进去的（chunked=True 时
+        # `_insert_helper` 已经跳过了 bump），所以命中记账也要跳过，否则
+        # hit_count 会被自己的回扫加分，chunk 越多加得越多。
+        match_result = self.match_prefix(
+            MatchPrefixParams(key=radix_key, chunked=bool(chunked))
+        )
         new_indices, new_last_node = (
             match_result.device_indices,
             match_result.last_device_node,
@@ -831,8 +841,16 @@ class RadixCache(BasePrefixCache):
     ##### Internal Helper Functions #####
 
     def _match_prefix_helper(
-        self, node: TreeNode, key: RadixKey, rid=None, session_id=None
+        self, node: TreeNode, key: RadixKey, rid=None, session_id=None,
+        count_hits: bool = True,
     ): ## node：当前节点，key：要匹配的RadixKey
+        """沿树下行匹配，返回 (value, last_node, by_queue)。
+
+        Args:
+            count_hits: 是否记命中（hit_count / share / retag / by_queue）。
+                False 用于 chunked prefill 插完块后的回扫：那些节点是本请求
+                刚写入的，不是复用事件。
+        """
         access_time = self._now()
         node.last_access_time = access_time
 
@@ -846,19 +864,21 @@ class RadixCache(BasePrefixCache):
             prefix_len = child.key.match(key, page_size=self.page_size)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
-                self._record_cross_session_hit(session_id, new_node)
-                self._record_node_hit(
-                    new_node, access_time, rid, session_id, by_queue
-                )
+                if count_hits:
+                    self._record_cross_session_hit(session_id, new_node)
+                    self._record_node_hit(
+                        new_node, access_time, rid, session_id, by_queue
+                    )
                 value.append(new_node.value) ## 追加KV张量
                 node = new_node ## 将当前节点更新为新创建的节点
                 break
             else:
                 value.append(child.value) ## 完全匹配追加全量张量
-                self._record_cross_session_hit(session_id, child)
-                self._record_node_hit(
-                    child, access_time, rid, session_id, by_queue
-                )
+                if count_hits:
+                    self._record_cross_session_hit(session_id, child)
+                    self._record_node_hit(
+                        child, access_time, rid, session_id, by_queue
+                    )
                 node = child ## 将当前节点更新为子节点
                 key = key[prefix_len:] ## 将key截断为剩余未匹配的部分
 

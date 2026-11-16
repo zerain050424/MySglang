@@ -71,6 +71,16 @@ class MatchPrefixParams:
     cow_mamba: bool = False
     req: Optional[Req] = None
 
+    # Chunked prefill: 这次匹配是「刚写完就回扫」的复核，不是一次真正的复用。
+    # `cache_unfinished_req` 插完一块后会再走一遍 match_prefix，只为拿索引；此时
+    # 匹配到的节点里有本请求几毫秒前刚创建的那些。若照常走 `_record_node_hit`：
+    #   * `hit_count` 变成「被扫过多少遍」而不是「被复用多少次」，chunk 越多越大，
+    #     而 `is_one_shot` 正是靠它判「有没有被复用」；
+    #   * 回扫不带 req → `session_id is None` 会落进 legacy 重标分支，按
+    #     `delta < 8s` 把刚写好、按会话类型盖过章的节点重写成 QAGENT。
+    # True 时只返回索引，不记账、不改标签。
+    chunked: bool = False
+
 
 @dataclasses.dataclass
 class InsertParams:
