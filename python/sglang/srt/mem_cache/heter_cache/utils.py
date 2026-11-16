@@ -194,9 +194,9 @@ DEFAULT_SHARE_MIN = 2
 # 语义：TRANS/STRUCT、未被复用过的节点且共享数未达标时，若其归属会话仍活跃
 # ——最近一次请求（session.last_active）或节点最近一次被访问
 # （node.last_access_time）距今不足该窗口——不判 one-shot。
-# 「未被复用」的判据是 ``hit_count < 2``：一次请求自己的写路径就会给节点加 1 分
-# （chunked prefill 逐块回扫已由 ``MatchPrefixParams.chunked`` 排除），所以 0/1
-# 都还只是"自己写过"，真实复用一次至少 +2。
+# 「未被重读」的判据是 ``reuse_count == 0``：它只在 admission match（请求确定
+# KV 缺口的那次前缀匹配）里 +1，一次请求最多 +1，与 ``hit_count`` 无关——后者把
+# 写路径和匹配路径混在一起数，一次请求自己就能加 1。
 #
 # 机制依据（quick_wt1 / fast_mid 双重复现）：Stage 0 的清理节奏是秒级，而
 # 多轮会话的重访间隔是 6.1s（alfred）到 30~63s（chat）；仅凭 hit_count 判定

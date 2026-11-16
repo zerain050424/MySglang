@@ -1,30 +1,28 @@
-"""chunked prefill 的回扫不得计命中：`MatchPrefixParams.chunked` 的契约测试。
+"""`reuse_count` 的契约测试：只有 admission match 才算一次「重读」。
 
-背景（`radix_cache.py` 的三处写路径）：
+两个计数器各管一件事，不能混：
 
-* `cache_unfinished_req` 插完一块后会再走一次 `match_prefix`，只为拿索引；
-  此时匹配到的节点里有本请求刚创建的那些。若照常 `_record_node_hit`，
-  `hit_count` 就变成「被扫过多少遍」而不是「被复用多少次」——chunk 越多越
-  大，而 `HeterCacheStrategy.is_one_shot` 正是靠它判「有没有被复用」。
-* `cache_unfinished_req` 的 `chunked=False` 走 `_insert_helper` 时会把整条
-  prompt 路径 +1（`_inc_hit_count`），那一分是"自己写的自己走一遍"。
-* 真正的复用是「别的请求 prefill 时的 match」（+1）与「它自己结束时的
-  insert 回扫」（+1）。
+* `hit_count` —— 上游口径，数「写路径与匹配路径走过多少遍」。一次请求自己就会
+  加 1（chunked prefill 逐块回扫还会再加）。LFU / SLRU / unified 写穿判断读它，
+  HeterCache **不再**用它判 one-shot。
+* `reuse_count` —— 只数「请求确定自己 KV 缺口时的那次前缀匹配」，一次请求最多
+  +1。`is_one_shot` 只读它。
 
-所以本文件锁的是四条：`chunked=True` 不加分也不重标、`chunked=False` 照常加分、
-回扫幂等、`chunked` 缺省为 False（现有调用点行为不变）。
-
-顺带记一个本机踩过的坑：改完 `evict_policy.py` 里一行同长度的比较（`!= 0` →
-`!= 1`）后立刻重跑，Python 会因「源文件 mtime 落在同一秒且 size 不变」而复用
-旧 `.pyc`，测试看起来通过/失败都可能与源码不符。切变体时请设
-`PYTHONDONTWRITEBYTECODE=1` 或先清 `__pycache__`。
+所以要区分三种触达：
+  1. admission match（`schedule_batch` / `schedule_policy` 传 req 的那次）→ 两个都 +1；
+  2. `cache_unfinished_req` 插完块后的回扫（`count_reuse=False`）→ 只有 `hit_count` +1；
+  3. 写路径 `_insert_helper`（不经过 match）→ 只有 `hit_count` +1（`_inc_hit_count`）。
 
 不需要 GPU / 不需要 sglang 的完整导入链：`python/` 下的模块按路径装载，
 `mem_cache.utils` / `registry` / `metrics_collector` 等重依赖用 stub 顶掉
 （同 `test_queue_selector.py` 的手法，见 AGENTS.md 5.2）。
 
 跑法：
-    PYTHONPATH=$PWD/python python test/manual/test_chunked_hit_count.py
+    PYTHONPATH=$PWD/python python test/manual/test_reuse_count.py
+
+顺带记一个本机踩过的坑：改动若是「同长度的一行」（例如把 `!= 0` 改成 `!= 1`），
+源文件 mtime 可能落在同一秒且 size 不变，Python 会复用旧 `.pyc`，测试结果与源码
+不符。切变体时请设 `PYTHONDONTWRITEBYTECODE=1` 或先清 `__pycache__`。
 """
 
 import importlib.util
@@ -187,39 +185,24 @@ def _attach(cache, tokens):
     return node
 
 
-def _match(cache, tokens, chunked=False):
+def _match(cache, tokens, count_reuse=True):
     return cache.match_prefix(
         bpc.MatchPrefixParams(
-            key=rc.RadixKey(list(tokens), None), req=None, chunked=chunked
+            key=rc.RadixKey(list(tokens), None), req=None, count_reuse=count_reuse
         )
     )
 
 
-def test_contract_default_is_not_chunked():
-    """默认 False：现有全部调用点（scheduler 的真实匹配）行为不变。"""
-    print("[1] MatchPrefixParams.chunked defaults to False")
+def test_contract_default_counts_reuse():
+    """默认 True：现有全部 admission 调用点行为不变（不传就记重读）。"""
+    print("[1] MatchPrefixParams.count_reuse defaults to True")
     params = bpc.MatchPrefixParams(key=rc.RadixKey([1], None))
-    check(params.chunked is False, f"default must be False, got {params.chunked!r}")
+    check(params.count_reuse is True, f"default must be True, got {params.count_reuse!r}")
 
 
-def test_chunked_rescan_does_not_bump_hit_count():
-    """chunked=True 的回扫：hit_count 不动，也不产生 VD 归因。"""
-    print("[2] chunked rescan leaves hit_count untouched")
-    cache = _make_cache()
-    node = _attach(cache, [1, 2, 3])
-    feed = {}
-    cache._hit_recorder = lambda req, last, tokens, by_queue: feed.update(by_queue)
-
-    result = _match(cache, [1, 2, 3], chunked=True)
-    check(len(result.device_indices) == 3, "indices must still be returned")
-    check(result.last_device_node is node, "must still resolve the terminal node")
-    check(node.hit_count == 0, f"hit_count must stay 0, got {node.hit_count}")
-    check(not feed, f"chunked rescan must not feed VD attribution, got {feed}")
-
-
-def test_plain_match_still_bumps():
-    """chunked=False（真实复用）：照常 +1 并给出 by_queue。"""
-    print("[3] plain match still counts as a reuse")
+def test_admission_match_counts_both():
+    """admission match：reuse_count 与 hit_count 都 +1，并喂 VD 归因。"""
+    print("[2] an admission match counts as one reuse")
     cache = _make_cache()
     node = _attach(cache, [1, 2, 3])
     feed = {}
@@ -233,67 +216,76 @@ def test_plain_match_still_bumps():
     cache.match_prefix(
         bpc.MatchPrefixParams(key=rc.RadixKey([1, 2, 3], None), req=_Req())
     )
-    check(node.hit_count == 1, f"one reuse must be +1, got {node.hit_count}")
+    check(node.reuse_count == 1, f"reuse_count must be 1, got {node.reuse_count}")
+    check(node.hit_count == 1, f"hit_count must be 1, got {node.hit_count}")
     check(sum(feed.values()) == 3, f"VD attribution must see 3 tokens, got {feed}")
 
 
-def test_rescan_is_idempotent():
-    """多次回扫不得累加：chunked prefill 每块都会回扫一次。"""
-    print("[4] repeated rescans are idempotent")
+def test_rewalk_counts_only_hit_count():
+    """回扫（count_reuse=False）：hit_count 照上游口径 +1，reuse_count 不动。"""
+    print("[3] the post-insert rewalk counts hit_count only")
+    cache = _make_cache()
+    node = _attach(cache, [1, 2, 3])
+
+    _match(cache, [1, 2, 3], count_reuse=False)
+    check(node.reuse_count == 0,
+          f"a rewalk is not a reuse, got reuse_count={node.reuse_count}")
+    check(node.hit_count == 1,
+          f"hit_count must still follow the upstream rule, got {node.hit_count}")
+
+
+def test_rewalk_is_idempotent_for_reuse_count():
+    """连扫 5 次回扫：reuse_count 恒 0；再来一次 admission 才是 1。"""
+    print("[4] repeated rewaks do not accumulate reuse_count")
     cache = _make_cache()
     node = _attach(cache, [1, 2, 3])
     for _ in range(5):
-        _match(cache, [1, 2, 3], chunked=True)
-    check(node.hit_count == 0, f"5 rescans must not accumulate, got {node.hit_count}")
+        _match(cache, [1, 2, 3], count_reuse=False)
+    check(node.reuse_count == 0, f"5 rewaks must not count, got {node.reuse_count}")
 
-    _match(cache, [1, 2, 3])          # 一次真实匹配
+    _match(cache, [1, 2, 3])          # 一次 admission match
+    check(node.reuse_count == 1, f"one admission must be 1, got {node.reuse_count}")
     for _ in range(5):
-        _match(cache, [1, 2, 3], chunked=True)
-    check(node.hit_count == 1,
-          f"real hit + 5 rescans must be 1, got {node.hit_count}")
+        _match(cache, [1, 2, 3], count_reuse=False)
+    check(node.reuse_count == 1,
+          f"rewaks after an admission must not add, got {node.reuse_count}")
 
 
-def test_chunked_rescan_does_not_retag_or_touch():
-    """回扫连标签与时间戳都不该改：它们由 `_insert_helper` 在写路径上盖。
+def test_split_inherits_reuse_count():
+    """分裂出的父节点必须继承 reuse_count，否则命中过的段会被当成没命中。"""
+    print("[5] a split node inherits reuse_count")
 
-    `cache_unfinished_req` 的回扫不带 `req`，所以 `session_id is None` 会让
-    `_record_node_hit` 落到 legacy 分支，按 `delta < 8s` 把节点重写成 QAGENT。
-    刚写进去的节点 delta≈0 → 每个 chunk 都把 prompt 节点刷成 agentic。这是
-    回扫计命中的第二个（更贵的）副作用：不只 hit_count 失真，队列归属也被
-    覆盖，而 VD 的按队列归因与 `queue_order` 都吃这个标签。
-    """
-    print("[5] chunked rescan does not retag or restamp")
-    cache = _make_cache()  # now = 1000.0
-    # 挂一个真策略，让 legacy 重标分支真的可达。
-    cache._heter = ep.HeterCacheStrategy()
+    # (a) 回扫触发的分裂：只继承，不额外计数
+    cache = _make_cache()
+    node = _attach(cache, [1, 2, 3])
+    _match(cache, [1, 2, 3])                       # reuse_count = 1
+    check(node.reuse_count == 1, "sanity: one reuse")
+    split = _match(cache, [1, 2], count_reuse=False)
+    check(len(split.device_indices) == 2, "the short match must return 2 tokens")
+    parent = split.last_device_node
+    check(parent.reuse_count == 1,
+          f"inherited only (rewalk, no bump), got {parent.reuse_count}")
 
-    fresh = _attach(cache, [1, 2, 3])
-    fresh.queue_tag = hu.HeterCacheNodeTag.QCHAT
-    fresh.last_access_time = 1000.0  # delta≈0：legacy 分支会判 < 8s → QAGENT
-
-    old = _attach(cache, [4, 5, 6])
-    old.queue_tag = hu.HeterCacheNodeTag.QCHAT
-    old.last_access_time = 42.0      # 时间戳必须停在这个写路径值上
-
-    _match(cache, [1, 2, 3], chunked=True)
-    _match(cache, [4, 5, 6], chunked=True)
-
-    check(fresh.queue_tag is hu.HeterCacheNodeTag.QCHAT,
-          f"a just-written node must keep its tag, got {fresh.queue_tag}")
-    check(old.queue_tag is hu.HeterCacheNodeTag.QCHAT,
-          f"queue_tag must be untouched, got {old.queue_tag}")
-    check(fresh.last_access_time == 1000.0 and old.last_access_time == 42.0,
-          "node timestamps must stay at the write-path values, got "
-          f"{fresh.last_access_time} / {old.last_access_time}")
+    # (b) admission 触发的分裂：继承 + 本次重读
+    cache = _make_cache()
+    node = _attach(cache, [4, 5, 6])
+    _match(cache, [4, 5, 6])
+    split = _match(cache, [4, 5])
+    parent = split.last_device_node
+    check(parent.reuse_count == 2,
+          f"inherited 1 + this read 1 = 2, got {parent.reuse_count}")
+    child = next(iter(parent.children.values()))
+    check(child.reuse_count == 1,
+          f"the untouched child keeps its old count, got {child.reuse_count}")
 
 
 def main():
     tests = [
-        test_contract_default_is_not_chunked,
-        test_chunked_rescan_does_not_bump_hit_count,
-        test_plain_match_still_bumps,
-        test_rescan_is_idempotent,
-        test_chunked_rescan_does_not_retag_or_touch,
+        test_contract_default_counts_reuse,
+        test_admission_match_counts_both,
+        test_rewalk_counts_only_hit_count,
+        test_rewalk_is_idempotent_for_reuse_count,
+        test_split_inherits_reuse_count,
     ]
     for test in tests:
         try:

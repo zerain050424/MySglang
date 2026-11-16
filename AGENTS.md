@@ -89,7 +89,7 @@ base conda 的 `huggingface-hub==1.33.0` 与 `transformers` 要求的 `<1.0` 冲
 PYTHONPATH=$PWD/python python -m pytest -q \
   test/manual/test_queue_selector.py test/manual/test_share_one_shot.py
 PYTHONPATH=$PWD/python python test/manual/test_evict_loop.py     # ALL PASSED 才算过
-PYTHONPATH=$PWD/python python test/manual/test_chunked_hit_count.py   # 真 RadixCache.match_prefix
+PYTHONPATH=$PWD/python python test/manual/test_reuse_count.py        # 真 RadixCache.match_prefix
 PYTHONPATH=$PWD/python python test/manual/test_session_type_classifier.py
 ```
 
@@ -175,6 +175,13 @@ Heter-Bench 文档里的历史数字与旧口径说明保留原文，只在需�
   权重（`weight.weights`）已整体删除，`VD=0` 退化为按占用降序。
   不要再引入任何硬上限或保底预留。
 - 全局复用分（`_reuse_score` / `victim_key`）已整体删除，不要以任何形式复活。
+- **「有没有被重读」只认 `TreeNode.reuse_count`，不要再看 `hit_count`。**
+  `hit_count` 是上游口径，数「写路径 + 匹配路径走过多少遍」：一次请求自己就会
+  加 1（`_inc_hit_count`，写路径），chunked prefill 插完块后的回扫还会再加
+  （`cache_unfinished_req` → `match_prefix`）。拿它判 one-shot 等于让「是否已被
+  重读」取决于调度器 chunk 了几块。`reuse_count` 只在 admission match 里 +1
+  （`MatchPrefixParams.count_reuse`，回扫传 False），`_split_node` 时随
+  `hit_count` 一起继承。`hit_count` 继续服务 LFU / SLRU / unified 写穿判断。
 - 观测三层已分离：`QueueOccupancyTracker`（账本）、`CacheTelemetry`（时钟+打点）、
   驱动层 `_observe_occupancy`（编排）。策略只做判据与裁决。
 - 策略无关的队列占用日志（`OccSampler` / `QueueOcc` / `TagOcc`）已删除，

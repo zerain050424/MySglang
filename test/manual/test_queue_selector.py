@@ -491,7 +491,7 @@ def test_per_type_ageing_ttl():
         n = _leaf(tag, tokens, ts=now - age_s)
         for i in range(share):
             st.node_share.on_hit(n, f"{id(n)}-{i}")
-        n.hit_count = 1 if share else 0
+        n.reuse_count = 1 if share else 0
         return n
 
     aged = node(TAG["struct"], ttl["struct"] + 1, share=st.node_share.share_min)

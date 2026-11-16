@@ -195,25 +195,21 @@ class HeterCacheStrategy(EvictionStrategy):
         """判定节点是否属于 One-shot 带。
         标准：按类型 TTL 老化的节点，或
         属于 TRANS/STRUCT 且跨会话共享数未达到 share_min，
-        且从未被任何请求匹配过
+        且从未被任何请求重读过（`reuse_count == 0`）
         且归属会话已搁置超过 ONE_SHOT_IDLE_S
         若节点无会话元数据，保守返回 False 防止误删热前缀。
         """
-        # 老化必须先于 hit_count/share 的短路：共享前缀必然命中过且已达标。
+        # 老化必须先于 reuse_count/share 的短路：共享前缀必然被重读过且已达标。
         if self.is_aged(node):
             return True
         st = self.session_registry.get(getattr(node, "session_id", None))
         if st is None:
             return False
-        # 「从未被匹配过」的边界是 2，不是 0/1：`hit_count` 数的是写路径与匹配路径
-        # 走过这个节点的次数，一次请求自己就会给它加 1（chunked prefill 逐块回扫
-        # 那部分已在 match_prefix 里跳过，见 MatchPrefixParams.chunked）。
-        #   0 = 结束时才新建的 output / 非 chunked 建出的 prompt 节点；
-        #   1 = chunk 里建出、又被自己结束那次 insert 回扫一遍的 prompt 节点；
-        #   >=2 = 别的请求 prefill 时的 match（+1）与它结束时 insert 的回扫（+1）
-        #        —— 也就是真正被复用了一次。
-        if getattr(node, "hit_count", 0) >= 2:
-            # 内容已被再次用到：离开优先淘汰带
+        # 「有没有被重读」只看 reuse_count（只在 admission match 里 +1）。不看
+        # hit_count：那个计数器把写路径与匹配路径混在一起数——一次请求自己就会加
+        # 1、chunked prefill 逐块回扫还会再加，判据会退化成「调度器 chunk 了几块」。
+        if getattr(node, "reuse_count", 0) > 0:
+            # 内容已被再次读到：离开优先淘汰带
             return False
         # 时间豁免：会话还没凉，它的内容就还在可能的重访窗口内。
         anchor = max(st.last_active, getattr(node, "last_access_time", 0.0))
@@ -251,7 +247,7 @@ class HeterCacheStrategy(EvictionStrategy):
     def record_evict(self, node) -> None:
         """记录节点淘汰事件并扣减队列占用。
 
-        晋升（hit_count 跨过「被复用一次」的边界）会把节点从 one-shot
+        晋升（reuse_count 从 0 变 1）会把节点从 one-shot
         带挪进其标签队列，而该队列可能从未收到过对应的 insert 计入
         （one-shot 时 insert 跳过）——evict 会扣一个负项，直到下一次
         全树快照 reconcile 吸收。random 行仅作展示、不参与 VD 仲裁；

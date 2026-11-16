@@ -121,6 +121,7 @@ class FakeNode:
             time.monotonic() if last_access is None else last_access
         )
         self.hit_count = 0
+        self.reuse_count = 0
         self.is_decode = is_decode
         self.parent = None
         self.children = {}
@@ -397,7 +398,7 @@ def test_aged_struct_prefix_cascade(ep, shc, base):
     ]
     for i in range(st.node_share.share_min):
         st.node_share.on_hit(prefix, f"seed-{i}")
-    prefix.hit_count = 1
+    prefix.reuse_count = 1
     check(st.is_aged(prefix), "precondition: shared prefix is aged")
 
     cache = make_cache(shc.HeterCacheRadixCache, st, [])

@@ -3,10 +3,9 @@
 钉住四件事：
 
 1. **一次性判定只看「会话类型 + 跨会话共享数 + 是否被匹配过」**：
-   `one_shot = type ∈ {TRANS, STRUCT} and share_sessions < share_min and hit_count < 2`
-   （边界是 2 而不是 0/1：一次请求自己就会给节点加 1 分——chunk 里建出的 prompt
-   节点还会被它结束时那次 insert 再走一遍；真实复用一次至少 +2，见
-   `MatchPrefixParams.chunked` 与 `is_one_shot` 的注释）
+   `one_shot = type ∈ {TRANS, STRUCT} and share_sessions < share_min and reuse_count == 0`
+   （`reuse_count` 只在 admission match 里 +1；不用 `hit_count`——那个计数器把写路径
+   与匹配路径混在一起数，一次请求自己就能加 1，判据会退化成「调度器 chunk 了几块」）
 2. **共享数达到阈值就退出一次性带**，即使创建者当初被判成 TRANS。
 3. **`queue_tag` 不参与判定**：QSTRUCT 标签救不了私有的 TRANS 节点，
    QTRANS 标签也不会把已被多次复用的节点拉回一次性带。
@@ -50,7 +49,7 @@ class FakeNode:
     """TreeNode 的最小替身：只带 one-shot / 共享保护段判定读的字段。"""
 
     def __init__(self, session_id=None, tag=HeterCacheNodeTag.QTRANS, decode=False,
-                 share_sessions=0, hit_count=0):
+                 share_sessions=0, reuse_count=0):
         self.value = [0] * 16
         self.key = [0] * 16
         self.session_id = session_id
@@ -60,7 +59,7 @@ class FakeNode:
         self.session_bloom = 0
         self.abs_start = 0
         self.last_access_time = 0.0
-        self.hit_count = hit_count
+        self.reuse_count = reuse_count
 
 
 def _in_share_scope(strategy, node) -> bool:
@@ -279,53 +278,44 @@ def test_share_min_is_single_knob():
 
 
 def test_reused_nodes_leave_one_shot_band():
-    """F1：被复用过的 TRANS/STRUCT 节点离开 one-shot 带，边界是 hit_count >= 2。
+    """F1：被重读过的 TRANS/STRUCT 节点离开 one-shot 带，判据是 reuse_count > 0。
 
     机制背景：会话前 MULTI_TURN_MIN 轮创建的节点也带 TRANS/STRUCT 标签，
     仅凭类型+共享数判定会让它们在创建者下一轮重读到来之前就被扫描流清掉。
 
-    边界的由来：`hit_count` 数的是「被走过多少遍」，一次请求自己就会加至少 1 分
-    （chunked prefill 逐块回扫那部分已在 `match_prefix` 里跳过）：
-      0 = 结束时才新建的 output / 非 chunked 建出的 prompt；
-      1 = chunk 里建出、又被自己结束那次 insert 回扫一遍的 prompt；
-      >=2 = 真实复用一次（prefill match +1、结束 insert +1）。
-    所以 0/1 都必须留在带内，拿 0 或 1 当边界都会把「刚写进来还没人复用」的节点
-    送进 VD 队列，或把「已经复用过的」留在带里——前者取决于调度器是否 chunk。
+    判据只用 `reuse_count`（admission match 才 +1），不用 `hit_count`：后者把
+    写路径与匹配路径混在一起数（一次请求自己就 +1，chunked prefill 逐块回扫还
+    会再加），拿它当判据等于让「有没有被重读」取决于调度器 chunk 了几块。
     """
-    print("[9] F1: reused nodes (hit_count >= 2) leave the one-shot band")
+    print("[9] F1: reused nodes (reuse_count > 0) leave the one-shot band")
     st, _ = make_strategy({"t1": SessionType.TRANS, "s1": SessionType.STRUCT})
 
-    # TRANS share=0：0/1 都在带内（自己写自己扫），>=2 才算被复用
-    for count in (0, 1):
-        node = FakeNode(session_id="t1", hit_count=count)
-        check(st.is_one_shot(node) is True,
-              f"TRANS hit_count={count} must stay one-shot")
-    for count in (2, 3):
-        node = FakeNode(session_id="t1", hit_count=count)
+    fresh = FakeNode(session_id="t1", reuse_count=0)
+    check(st.is_one_shot(fresh) is True, "TRANS reuse_count=0 must stay one-shot")
+    for count in (1, 3):
+        node = FakeNode(session_id="t1", reuse_count=count)
         check(st.is_one_shot(node) is False,
-              f"TRANS hit_count={count} means reused -> leave the band")
+              f"TRANS reuse_count={count} means re-read -> leave the band")
 
-    # STRUCT share=0：同样被一次真实复用拯救
-    for count in (0, 1):
-        node = FakeNode(session_id="s1", tag=HeterCacheNodeTag.QSTRUCT, hit_count=count)
-        check(st.is_one_shot(node) is True,
-              f"STRUCT hit_count={count} share=0 must stay one-shot")
-    s_read = FakeNode(session_id="s1", tag=HeterCacheNodeTag.QSTRUCT, hit_count=2)
+    s_fresh = FakeNode(session_id="s1", tag=HeterCacheNodeTag.QSTRUCT, reuse_count=0)
+    check(st.is_one_shot(s_fresh) is True,
+          "STRUCT reuse_count=0 share=0 must stay one-shot")
+    s_read = FakeNode(session_id="s1", tag=HeterCacheNodeTag.QSTRUCT, reuse_count=1)
     check(st.is_one_shot(s_read) is False,
-          "STRUCT node reused once must leave the one-shot band")
+          "STRUCT node re-read once must leave the one-shot band")
 
-    # hit_count 不得推翻其它豁免：共享数达标的节点本来就不在带内
-    shared = FakeNode(session_id="t1", hit_count=0)
+    # reuse_count 不得推翻其它豁免：共享数达标的节点本来就不在带内
+    shared = FakeNode(session_id="t1", reuse_count=0)
     st.node_share.on_hit(shared, "other-0")
     st.node_share.on_hit(shared, "other-1")
     check(st.is_one_shot(shared) is False,
-          "share>=min exemption must survive the hit_count rule")
+          "share>=min exemption must survive the reuse_count rule")
 
 
 def test_active_session_exempt_until_idle():
     """轴一：活跃会话的未匹配节点不进 one-shot 带，搁置满窗口后才进。
 
-    机制依据：hit_count 证据的成立前提是节点先活过一个完整重访间隔，而
+    机制依据：reuse_count 证据的成立前提是节点先活过一个完整重访间隔，而
     Stage 0 的清理节奏是秒级、重访间隔是 6.1s（alfred）到 30~63s（chat）——
     仅凭 F1 的「未被复用」豁免，latch 在扫描流下几乎永不发生。
     """
@@ -338,7 +328,7 @@ def test_active_session_exempt_until_idle():
     reg._sessions["t1"].last_active = 980.0
     reg._sessions["s1"].last_active = 980.0
 
-    n = FakeNode(session_id="t1", hit_count=0)
+    n = FakeNode(session_id="t1", reuse_count=0)
     check(st.is_one_shot(n) is False,
           "a live session's unread node must be exempt from the band")
     clock["t"] = 980.0 + ONE_SHOT_IDLE_S - 1
@@ -349,7 +339,7 @@ def test_active_session_exempt_until_idle():
 
     # 锚点取 max(session.last_active, node.last_access_time)：请求间隙里
     # 新建的节点比会话账本新，由节点自身时间兜底。
-    m = FakeNode(session_id="t1", hit_count=0)
+    m = FakeNode(session_id="t1", reuse_count=0)
     m.last_access_time = 1050.0
     clock["t"] = 1050.0 + ONE_SHOT_IDLE_S - 1
     check(st.is_one_shot(m) is False,
@@ -360,13 +350,13 @@ def test_active_session_exempt_until_idle():
     # 豁免只延缓不推翻：过窗后原判据照常生效（F1 与共享豁免不变）
     reg._sessions["s1"].last_active = 0.0
     clock["t"] = 10_000.0
-    r = FakeNode(session_id="s1", tag=HeterCacheNodeTag.QSTRUCT, hit_count=0)
+    r = FakeNode(session_id="s1", tag=HeterCacheNodeTag.QSTRUCT, reuse_count=0)
     check(st.is_one_shot(r) is True,
           "idle STRUCT share=0 hit=0 is one-shot again")
-    r.hit_count = 2
+    r.reuse_count = 1
     check(st.is_one_shot(r) is False,
           "reuse evidence still overrides after expiry (F1 unchanged)")
-    shared = FakeNode(session_id="t1", hit_count=0)
+    shared = FakeNode(session_id="t1", reuse_count=0)
     for i in range(st.node_share.share_min):
         st.node_share.on_hit(shared, f"other-{i}")
     check(st.is_one_shot(shared) is False,

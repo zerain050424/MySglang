@@ -272,6 +272,11 @@ class TreeNode:
         self.last_access_time = time.monotonic()
         self.creation_time = time.monotonic()
         self.hit_count = 0
+        # 被「重读」的次数：只在 admission match（请求确定自己 KV 缺口的那次前缀
+        # 匹配）里自增，一次请求最多 +1。与 `hit_count` 分开：后者数的是「写路径
+        # 与匹配路径走过多少遍」（一次请求自己就能加 1、chunked prefill 逐块回扫还会
+        # 再加），把两种口径混在一个计数器里会让「有没有被重读」取决于调度器。
+        self.reuse_count = 0
         # store hash values of each pages
         self.hash_value: Optional[List[str]] = None 
         # Namespace-aware hashes used only for external KV events.
@@ -532,11 +537,6 @@ class RadixCache(BasePrefixCache):
         req = params.req
         rid = getattr(req, "rid", None) if req is not None else None
         session_id = getattr(req, "session_id", None) if req is not None else None
-        # chunked prefill 的「插完再回扫」是复核，不是复用：只返回索引，不记命中。
-        # 否则 hit_count 会被自己刚建的节点反复加分（chunk 越多加得越多），它就不
-        # 再是「被复用次数」；同时回扫没有 req，session_id is None 会落进 legacy
-        # 重标分支，按 delta<8s 把刚按会话类型盖好的队列标签重写成 QAGENT。
-        count_hits = not params.chunked
         if self._heter is not None and session_id:
             prompt_ids = getattr(req, "origin_input_ids", None)
             self.session_registry.observe_request( ## 监测请求,进行分类
@@ -546,14 +546,14 @@ class RadixCache(BasePrefixCache):
                 tool_call=getattr(req, "tool_call", None),
             )
         value, last_node, by_queue = self._match_prefix_helper(
-            self.root_node, key, rid, session_id, count_hits=count_hits
+            self.root_node, key, rid, session_id, count_reuse=params.count_reuse
         )
         if value:
             value = torch.cat(value)
         else:
             value = self._empty_match_result.device_indices
 
-        if count_hits and self._hit_recorder is not None and params.req is not None:
+        if self._hit_recorder is not None and params.req is not None:
             self._hit_recorder(params.req, last_node, value.numel(), by_queue)
         return MatchResult(
             device_indices=value,
@@ -676,11 +676,10 @@ class RadixCache(BasePrefixCache):
         radix_key, kv_indices, _ = self._adopt(req, req.get_fill_ids(), chunked=chunked)
 
         # The prefix indices could be updated, reuse it
-        # 这次 match 只是取索引：节点是本请求刚插进去的（chunked=True 时
-        # `_insert_helper` 已经跳过了 bump），所以命中记账也要跳过，否则
-        # hit_count 会被自己的回扫加分，chunk 越多加得越多。
+        # 这次 match 只为取索引：匹配到的是本请求刚插进去的节点，是复核不是重读，
+        # 所以不计 reuse_count（与是不是 chunked prefill 无关——插完就回扫一律不算）。
         match_result = self.match_prefix(
-            MatchPrefixParams(key=radix_key, chunked=bool(chunked))
+            MatchPrefixParams(key=radix_key, count_reuse=False)
         )
         new_indices, new_last_node = (
             match_result.device_indices,
@@ -842,14 +841,15 @@ class RadixCache(BasePrefixCache):
 
     def _match_prefix_helper(
         self, node: TreeNode, key: RadixKey, rid=None, session_id=None,
-        count_hits: bool = True,
+        count_reuse: bool = True,
     ): ## node：当前节点，key：要匹配的RadixKey
         """沿树下行匹配，返回 (value, last_node, by_queue)。
 
         Args:
-            count_hits: 是否记命中（hit_count / share / retag / by_queue）。
-                False 用于 chunked prefill 插完块后的回扫：那些节点是本请求
-                刚写入的，不是复用事件。
+            count_reuse: 是否把这次触达算作一次「重读」（`node.reuse_count += 1`）。
+                False 用于 `cache_unfinished_req` 插完块后的回扫：匹配到的是本请求
+                刚写入的节点，是复核不是重读。`hit_count` 不受它影响，仍按上游
+                口径在每次触达时递增。
         """
         access_time = self._now()
         node.last_access_time = access_time
@@ -864,21 +864,21 @@ class RadixCache(BasePrefixCache):
             prefix_len = child.key.match(key, page_size=self.page_size)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
-                if count_hits:
-                    self._record_cross_session_hit(session_id, new_node)
-                    self._record_node_hit(
-                        new_node, access_time, rid, session_id, by_queue
-                    )
+                self._record_cross_session_hit(session_id, new_node)
+                self._record_node_hit(
+                    new_node, access_time, rid, session_id, by_queue,
+                    count_reuse=count_reuse,
+                )
                 value.append(new_node.value) ## 追加KV张量
                 node = new_node ## 将当前节点更新为新创建的节点
                 break
             else:
                 value.append(child.value) ## 完全匹配追加全量张量
-                if count_hits:
-                    self._record_cross_session_hit(session_id, child)
-                    self._record_node_hit(
-                        child, access_time, rid, session_id, by_queue
-                    )
+                self._record_cross_session_hit(session_id, child)
+                self._record_node_hit(
+                    child, access_time, rid, session_id, by_queue,
+                    count_reuse=count_reuse,
+                )
                 node = child ## 将当前节点更新为子节点
                 key = key[prefix_len:] ## 将key截断为剩余未匹配的部分
 
@@ -901,9 +901,14 @@ class RadixCache(BasePrefixCache):
         rid=None,
         session_id=None,
         by_queue=None,
+        count_reuse: bool = True,
     ) -> None:
         delta = access_time - node.last_access_time
         node.hit_count += 1
+        if count_reuse:
+            # 「重读」只数 admission match：一次请求最多 +1，与它自己被写了多少遍
+            # （写路径的 `_inc_hit_count`）无关。
+            node.reuse_count += 1
         if self.share_on_hit is not None:
             self.share_on_hit(node, session_id)
         state = (
@@ -949,6 +954,7 @@ class RadixCache(BasePrefixCache):
            new_node.abs_start = child.abs_start
            child.abs_start = child.abs_start + split_len
            new_node.hit_count = child.hit_count
+           new_node.reuse_count = child.reuse_count
            new_node.children = {key[split_len:].child_key(self.page_size): child}
            new_node.parent = child.parent
            new_node.lock_ref = child.lock_ref
