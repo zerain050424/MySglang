@@ -173,6 +173,11 @@ class HeterCacheStrategy(EvictionStrategy):
             return HeterCacheNodeTag.QAGENT
         return HeterCacheNodeTag.coerce(getattr(node, "queue_tag", None))
 
+    def node_tag(self, node) -> HeterCacheNodeTag:
+        """节点生效标签（含 force_agentic 归并）。观测层读这个口径，
+        不要自己 coerce ``queue_tag``——那样 force_agentic 下回报的队列是假的。"""
+        return self._node_tag(node)
+
     def get_priority(self, node: TreeNode) -> Tuple[int, float, float]:
         raise NotImplementedError(
             "HeterCacheStrategy has no single-node ordering; "
@@ -205,9 +210,6 @@ class HeterCacheStrategy(EvictionStrategy):
         st = self.session_registry.get(getattr(node, "session_id", None))
         if st is None:
             return False
-        # 「有没有被重读」只看 reuse_count（只在 admission match 里 +1）。不看
-        # hit_count：那个计数器把写路径与匹配路径混在一起数——一次请求自己就会加
-        # 1、chunked prefill 逐块回扫还会再加，判据会退化成「调度器 chunk 了几块」。
         if getattr(node, "reuse_count", 0) > 0:
             # 内容已被再次读到：离开优先淘汰带
             return False

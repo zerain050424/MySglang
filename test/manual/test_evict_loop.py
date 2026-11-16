@@ -180,6 +180,11 @@ def make_cache(cache_cls, strategy, nodes):
     cache._hit_recorder = None
     cache._record_insert = None
     cache.force_agentic = False
+    # 后悔率账本归驱动层持有（__init__ 装配）；假缓存不启用，
+    # 但字段必须在，否则 evict() 里的 stamp 钩子会 AttributeError。
+    cache._regret = None
+    cache._regret_source = "unknown"
+    cache._now = time.monotonic
     cache.token_to_kv_pool_allocator = FakeAllocator()
     cache.kv_events = FakeEvents()
     cache.deleted = []

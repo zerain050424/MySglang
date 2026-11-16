@@ -4,6 +4,11 @@
 - 优先清理无复用价值的 One-shot 临时节点；
 - 可调度节点委托给 `selector.pick_victim`，按 VD 仲裁。
 本模块专注执行层面的内存回收、Radix 树拓扑维护与级联修剪。
+
+后悔率（regret）观测也挂在执行层：淘汰决策与 admission 匹配都只有这里
+同时拿得到树拓扑与 token 序列。树的读法（窗口截取、页号、命名空间）留在
+本模块；索引、归因、聚合与渲染在 Heter-Bench 的账本里，经由 ``bench_bridge``
+装配（``HETER_REGRET=1`` 时才有账本，未装配时所有钩子短路）。
 """
 
 import logging
@@ -11,7 +16,12 @@ import time
 
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams, EvictResult
 from sglang.srt.mem_cache.evict_policy import HeterCacheStrategy
-from sglang.srt.mem_cache.heter_cache import selector
+from sglang.srt.mem_cache.heter_cache import bench_bridge, selector
+from sglang.srt.mem_cache.heter_cache.bench_bridge import (
+    content_key,
+    heterlog,
+    namespace_key,
+)
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.registry import register_radix_cache_backend
 
@@ -20,6 +30,22 @@ logger = logging.getLogger(__name__)
 
 class HeterCacheRadixCache(RadixCache):
     """支持多队列分带、按已兑现价值密度淘汰的 RadixCache 实现。"""
+
+    def __init__(self, params):
+        super().__init__(params)
+        # 后悔率账本：只在 HETER_REGRET=1 时装配；未装配时本类所有 regret
+        # 钩子都以 ``is not None`` 短路，热路径零开销。
+        self._regret = bench_bridge.regret_from_env(now=self._now)
+        # 当前淘汰循环的裁决来源，由 evict() 在 _evict_one 之前写入：
+        # record_victim_source 是整条链释放完才调的，届时节点已经没了。
+        self._regret_source = "unknown"
+
+    def reset(self):
+        super().reset()
+        # 基类 __init__ 末尾会先调一次 reset，那时账本还没装配。
+        regret = getattr(self, "_regret", None)
+        if regret is not None:
+            regret.reset()
 
     def evict(self, params: EvictParams) -> EvictResult:
         """批量淘汰节点，直至释放至少 params.num_tokens 个 Token。
@@ -52,6 +78,9 @@ class HeterCacheRadixCache(RadixCache):
             victim, source = self._pick_victim(self.evictable_leaves)
             if victim is None:
                 break
+            # stamp 要挂在裁决来源上，而 record_victim_source 在链释放完之后
+            # 才调用；先存下来，_evict_one 内的树读法要用。
+            self._regret_source = source
             released = self._evict_one(victim)
             if released <= 0:
                 # 释放量为 0 表明节点状态异常，中止循环以防空转死锁（Spin）
@@ -105,6 +134,10 @@ class HeterCacheRadixCache(RadixCache):
             sched_occ=tracker.snapshot(),
             values=strategy.realized.densities(tracker.occ),
         )
+        if self._regret is not None:
+            # 与 profile 同拍输出：报告里的 join/tax 与占用读数同一时刻，
+            # 对照实验里可以直接按时间对齐。
+            heterlog.info("Regret", self._regret.emit())
 
     def _pick_victim(self, leaves):
         """转发至 selector 纯策略决策器。"""
@@ -140,11 +173,13 @@ class HeterCacheRadixCache(RadixCache):
         """
         total = 0
         cur = node
+        chain = 0
         strategy = self.eviction_strategy
         one_shot = strategy.is_one_shot(node)
         while True:
             parent = cur.parent
             total += self._release_node(cur)
+            chain += 1
             # 级联剪枝条件：整条祖先链均为未上锁且无其它分支的 One-shot 私有节点
             if (one_shot and parent is not None and parent is not self.root_node
                     and parent.lock_ref == 0 and not parent.children
@@ -152,7 +187,115 @@ class HeterCacheRadixCache(RadixCache):
                 cur = parent
                 continue
             break
+        if self._regret is not None:
+            # break 时的 cur 是被腾空的最浅节点：它的父节点未被释放，
+            # 上下文窗口仍可从树上读到；同一决策只落这一个 stamp。
+            self._stamp_eviction(node, cur, total, chain)
         return total
+
+    # ------------------------------------------------------------------
+    # 后悔率（regret）观测：树的读法在本模块，账本在 Heter-Bench。
+    # ------------------------------------------------------------------
+    def _stamp_eviction(self, victim, shallowest, span: int, chain: int) -> None:
+        """把一次淘汰决策记进后悔率账本。
+
+        Args:
+            victim: 仲裁选出的牺牲节点（决策归属：队列 / 共享数 / 未访问时长）。
+            shallowest: 本次级联释放的最浅节点（断点页所在，join 键取它的首页）。
+            span: 本次决策腾出的 token 总数。
+            chain: 本次级联释放的节点数。
+        """
+        regret = self._regret
+        strategy = self.eviction_strategy
+        if self.is_eagle or shallowest.key.is_bigram:
+            # bigram 视图下 token 位置是二元组序号，窗口截取与请求侧对不上；
+            # 记下来而不是静默丢样本。
+            regret.note_skip("evict:bigram")
+            return
+        window, base = self._regret_window(shallowest)
+        start = shallowest.abs_start
+        regret.on_evict(
+            key=content_key(
+                window,
+                start,
+                self.page_size,
+                base=base,
+                context=regret.context,
+                ns=namespace_key(
+                    shallowest.key.extra_key, shallowest.key.cache_salt
+                ),
+            ),
+            span=span,
+            source=self._regret_source,
+            queue=strategy.node_tag(victim).queue_name,
+            share=strategy.node_share.share_of(victim),
+            chain=chain,
+            depth=start // self.page_size,
+            elapsed=max(0.0, self._now() - victim.last_access_time),
+        )
+
+    def _regret_window(self, node):
+        """取节点首页及其前 ``regret.context`` 个 token 的连续窗口。
+
+        Args:
+            node: 断点页所在节点（必须尚未从树上摘除，父链完整）。
+
+        Returns:
+            ``(window, base)``：``window`` 是 token 列表，``window[0]`` 的绝对
+            位置是 ``base``；链首不足 context 个 token 时从根截取。
+        """
+        pos = node.abs_start
+        need = self._regret.context
+        segments = []
+        cursor = node.parent
+        while cursor is not None and need > 0 and len(cursor.key) > 0:
+            ids = cursor.key.raw_token_ids()
+            take = min(len(ids), need)
+            segments.append(ids[len(ids) - take:])
+            need -= take
+            cursor = cursor.parent
+        head = []
+        for segment in reversed(segments):
+            head.extend(segment)
+        head.extend(node.key.raw_token_ids()[: self.page_size])
+        # head = 祖先链尾部（页前上下文）+ 本页：base 对齐到上下文首 token，
+        # 与请求侧 content_key(全量 ids, page_start, base=0) 取到同一窗口。
+        return head, pos - (len(head) - self.page_size)
+
+    def match_prefix(self, params):
+        """admission 匹配后把断点页交给 regret 账本 join。
+
+        断点页 = 首个未命中页；它若在坟场里，这次 miss 就有明确的责任决策。
+        回扫（``count_reuse=False``）不是重读，不进税的分母也不参与 join。
+        """
+        result = super().match_prefix(params)
+        regret = self._regret
+        if regret is None or not params.count_reuse:
+            return result
+        key = params.key
+        if key.is_bigram or self.is_eagle:
+            regret.note_skip("request:bigram")
+            return result
+        key = key.page_aligned(self.page_size)
+        prompt = len(key)
+        matched = int(result.device_indices.numel())
+        recompute = prompt - matched
+        if recompute <= 0:
+            regret.on_request(key=None, recompute=0, prompt=prompt)
+            return result
+        window = key.raw_token_ids()
+        regret.on_request(
+            key=content_key(
+                window,
+                matched,
+                self.page_size,
+                context=regret.context,
+                ns=namespace_key(key.extra_key, key.cache_salt),
+            ),
+            recompute=recompute,
+            prompt=prompt,
+        )
+        return result
 
 
 def _heter_cache_factory(ctx):

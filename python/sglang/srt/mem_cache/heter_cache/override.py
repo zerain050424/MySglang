@@ -47,9 +47,6 @@ class ReuseScoreEvict(VictimOverride):
         reuse_score(node) = P(reuse in (a, a+H] | not reused by a)
                           = 1 - S(a+H)/S(a)
 
-    队列差异只体现在 ``queue`` 与节点生效标签的 ``reuse_config`` 上（chat
-    T50≈118s、agentic T50≈6.1s），排序口径完全一致：两个队列不存在各写一套
-    队内规则的可能。
     """
 
     name = "reuse"
