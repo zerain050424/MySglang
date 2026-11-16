@@ -334,7 +334,7 @@ DEFAULT_VALUE_FLOOR_TOKENS = 2048.0
 class QueueValueParams:
     """已兑现价值密度（VD）的参数。
 
-    跨队列仲裁只读 VD（``selector.queue_order`` 的 ``occ/(1+VD)``），
+    跨队列仲裁只读 VD（``selector.queue_order`` 按 VD 升序，占用不参与排序），
     没有权重、没有 cap / reservation / deadzone / chunk。
 
     Attributes:

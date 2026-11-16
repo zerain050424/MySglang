@@ -80,9 +80,9 @@ python mixexp/tools/build_exp3_data.py --mix scan --total-tokens 3e6
 |---|---|---|
 | `lru` | lru | 基础基线：全局单一 LRU |
 | `hc_full` | heter_cache | 完整方案：三队列 + 队内策略 + VD 仲裁 |
-| `hc_norr` | heter_cache | 消融项：关闭会话轮询（chat 队内退化） |
+| `hc_norr` | heter_cache | 消融项：关闭队内复用分排序（历史口径为关闭会话轮询） |
 
-> 说明：当前版本已移除配额机制（无 cap 与 reservation）与权重（`weight.weights` 已整体删除）。跨队列淘汰顺序由已兑现价值密度 VD 决定：优先驱逐 `occ_q / (1 + VD_q)` 最大的队列，其中 VD 是「未来 `horizon_s` 内每个驻留 token 的预期命中量」：各队列用自己的估计窗 `W_q = max(horizon_s, smoothing_k*T50_q)` 估命中速率，再投影回共享视野 `horizon_s`，因此三个队列的 VD 同量纲、可比较。VD=0（没有命中证据）时退化为按占用降序。
+> 说明：当前版本已移除配额机制（无 cap 与 reservation）与权重（`weight.weights` 已整体删除）。跨队列淘汰顺序由已兑现价值密度 VD 决定：优先驱逐 VD 最小的队列（占用不参与排序），其中 VD 是「未来 `horizon_s` 内每个驻留 token 的预期命中量」：各队列用自己的估计窗 `W_q = max(horizon_s, smoothing_k*T50_q)` 估命中速率，再投影回共享视野 `horizon_s`，因此三个队列的 VD 同量纲、可比较。VD=0（没有命中证据）时退化为按占用降序。
 
 ---
 

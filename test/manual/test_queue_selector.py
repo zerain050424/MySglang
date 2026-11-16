@@ -1,7 +1,7 @@
 """按权重的跨队列淘汰：纯函数与策略接线单测（不需要 GPU / torch）。
 
 被测对象：`python/sglang/srt/mem_cache/heter_cache/selector.py`
-  queue_order     —— occ_q / (1 + VD_q) 降序
+  queue_order     —— 纯 VD 升序（占用只做同分兜底）
   pick_victim     —— Stage 0 one-shot → VD 仲裁 → 兜底
   struct_tier     —— STRUCT 两遍降级键
 
@@ -114,24 +114,30 @@ def _strategy(**kw):
 
 
 def test_queue_order_by_value_density():
-    """occ/(1+VD) 降序：驻留量相对已兑现价值越大越先削；占用为 0 的队列不进入候选。"""
-    print("[1] order = occ/(1+VD), zero-occupancy queues are skipped")
+    """纯 VD 升序：密度最低的队列先削；占用不参与排序键，只做候选过滤与同分兜底。"""
+    print("[1] order = ascending VD, occupancy never in the sort key")
     occ = {"struct": 200, "agentic": 500, "chat": 300}
-    # 没有 VD 证据时退化为按占用降序（旧等权份额的形状）
+    # 没有 VD 证据时三队同分，退化为按占用降序（一次决策腾出更多 token）
     check(qs.queue_order(occ, {}) == ["agentic", "chat", "struct"],
           f"got {qs.queue_order(occ, {})}")
     check(qs.queue_order({"struct": 0, "agentic": 10, "chat": 0}, {}) == ["agentic"],
           "empty queues must not be candidates")
-    # 相同占用下，VD 高的队列被保护
+    # 同占用下最小 VD 先削，高 VD 被保护
     even = {"struct": 400, "agentic": 400, "chat": 400}
     vd = {"struct": 1.0, "agentic": 0.0, "chat": 0.0}
     check(qs.queue_order(even, vd) == ["agentic", "chat", "struct"],
           f"highest VD must be protected, got {qs.queue_order(even, vd)}")
-    # VD 足够大时能翻转 10 倍占用差
-    big = {"struct": 4000, "agentic": 400, "chat": 400}
-    check(qs.queue_order(big, {"struct": 20.0}) == ["agentic", "chat", "struct"],
-          f"VD must flip a 10x occupancy gap, got {qs.queue_order(big, {'struct': 20.0})}")
-    # 同比值按占用降序，再按 VALUE_QUEUES 声明顺序（确定性）
+    # 占用完全不参与主序：小的队列只要 VD 更低就先削
+    skew = {"struct": 10000, "agentic": 1000, "chat": 1000}
+    vd = {"struct": 0.05, "agentic": 0.01, "chat": 0.30}
+    check(qs.queue_order(skew, vd) == ["agentic", "struct", "chat"],
+          f"a 10x smaller queue with lower VD must be cut first, "
+          f"got {qs.queue_order(skew, vd)}")
+    # 反例校验：同样的占用/密度代入已删除的 occ/(1+VD) 会得到相反结论
+    legacy = sorted(hu.VALUE_QUEUES, key=lambda q: -skew[q] / (1.0 + vd[q]))
+    check(legacy[0] == "struct",
+          f"the removed occ/(1+VD) rule cut struct first, got {legacy}")
+    # 同 VD 按占用降序，再按声明顺序（确定性）
     tie = {"struct": 800, "agentic": 400, "chat": 400}
     check(qs.queue_order(tie, {}) == ["struct", "agentic", "chat"],
           f"ties break by occupancy then declaration order, got {qs.queue_order(tie, {})}")
@@ -262,7 +268,7 @@ def test_stage1_labels_and_skip():
                             "chat": {"total": 0, "one_shot": 0}}, capacity=1000)
     rank = st.queue_order()
     check(rank[0] == "struct",
-          f"struct has the highest occ/(1+VD) (900 vs 600), got {rank}")
+          f"all VD=0 -> biggest queue first (tie-break), got {rank}")
 
     # 第一名 struct 无候选（一个 struct 叶子都没给）-> 跳到 agentic
     agentic_node = _leaf(TAG["agentic"], 100)

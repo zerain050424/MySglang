@@ -108,7 +108,7 @@ class HeterCacheStrategy(EvictionStrategy):
     两层决策：
     1. 分带过滤：One-shot 节点优先清理，不计入 VD 账本；
        归属会话仍活跃的未匹配节点受时间豁免（ONE_SHOT_IDLE_S）保护，不进带。
-    2. VD 仲裁：按 ``occ_q / (1 + VD_q)`` 排出候选队列，再由队内策略决出牺牲节点。
+    2. VD 仲裁：按 VD 升序排出候选队列（只读密度，不含占用），再由队内策略决出牺牲节点。
        chat / agentic 共用一套队内口径：按复用概率升序（``ReuseScoreEvict``），
        只有 mu/sigma 随标签不同。
     """
@@ -282,7 +282,7 @@ class HeterCacheStrategy(EvictionStrategy):
     # ---- 跨队列仲裁（VD） ----
 
     def queue_order(self) -> list:
-        """按occ_q / (1 + VD_q)降序返回队列；越靠前越先削。"""
+        """按 VD 升序返回队列；越靠前（密度越低）越先削。"""
         occ = self.occupancy.occ
         return _queue_order(occ, self.realized.densities(occ))
 

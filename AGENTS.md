@@ -156,7 +156,8 @@ Heter-Bench 文档里的历史数字与旧口径说明保留原文，只在需�
 - `HeterCacheStrategy.get_priority` **保持继承基类 + 显式抛 `NotImplementedError`**：
   HeterCache 没有跨队列可比的节点分数，退回任何默认序都是假语义。
 - 配额机制（caps / reservations / 充水 target / deadzone / chunk）已整体删除，
-  跨队列淘汰只按已兑现价值密度 VD：`occ_q / (1 + VD_q)` 最大的队列先削。
+  跨队列淘汰只按已兑现价值密度 VD：VD 最小的队列先削（占用不参与排序键，
+  只在 VD 相同时按占用降序兜底）。把占用乘进排序键等价于一个隐式的按规模配额。
   VD = 未来一个视野窗口内每个驻留 token 的预期命中量 ÷ max(occ, floor)，视野由
   `value.horizon_s` 给出、**三个队列共享**；各队列只用自己的估计窗
   `W_q = max(视野, k*T50_q)` 平滑命中速率，再投影回视野，所以量纲一致。

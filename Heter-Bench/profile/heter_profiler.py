@@ -99,8 +99,8 @@ class HeterProfiler:
           sched / vd    : sched 是账本口径的可调度占用（排除 one-shot，含
                           locked）；vd 是该队列的价值密度——未来 horizon 内的预期
                           命中 / 驻留量（各队列用自己的估计窗估速率再投影回
-                          共享视野 horizon，故三列同量纲），淘汰顺序按
-                          ``sched / (1 + vd)`` 降序。
+                          共享视野 horizon，故三列同量纲），淘汰顺序是按
+                          vd 升序（占用不参与排序）；vd 相同时按 sched 降序。
 
         Σocc == schedulable + Σone_shot。
         多轮负载的 one_shot 恒为 0，不打印后缀；random 整行 one-shot。
