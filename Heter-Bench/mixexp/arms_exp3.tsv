@@ -1,6 +1,11 @@
 # exp3 方案清单
 # 全部使用同一份数据（TaskData/exp3）与同一组 server 参数（fp8 KV、mem-fraction 0.85）
 #
+# ! 历史口径：`rr` / `mt` / `multi_agentic` 三个参数组已删除（chat 与 agentic 现在
+#   共用 `reuse` 组，RR 已破坏性回退）。下面 hc_full / hc_norr 两行的配置原样保留为
+#   档案，重跑会在 HeterCacheStrategy 构造处报 TypeError（未知关键字）。
+#   现口径对照：hc_full ≈ {"reuse":{"enabled":true}}，hc_norr ≈ {"reuse":{"enabled":false}}。
+#
 #   lru      基线：全局单一最近性顺序
 #   hc_full  完整方案：三队列 + 队内策略 + VD 仲裁（agentic 队内走 MT 复用间隔）
 #   hc_norr  消融：只关会话轮询，其余与 hc_full 完全一致

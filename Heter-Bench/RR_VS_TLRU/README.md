@@ -33,6 +33,11 @@ victim 与搅拌流**都**被强制标成 QAGENT（`force_agentic`），所以�
 | `a0_control` | `{"force_agentic": true}` | 纯全局 `victim_key`（`_reuse_score` = lognormal 复用概率） |
 | `a1_rr` | `+ rr.fair_rr=true, kappa=0.5` | 会话级轮询，单会话最多削 `loss_cap(L)` |
 
+> **已下线（2026-11）**：RR 已从主干破坏性回退，`rr` / `mt` / `multi_agentic`
+> 三个参数组合并为 `reuse`，chat 与 agentic 共用同一套队内复用概率排序
+> （`ReuseScoreEvict`）。本文的 `a1_rr` 臂已无法构造（旧配置会在启动时报
+> TypeError），数字仅作历史对照。
+
 插件形态的 T-LRU 臂（原 `a2_tlru`，`{"tlru": {...}}` 分组）已从主干移除，
 归档在分支 `exp/tlru-plugin-arm`（对应 tag `pre-alpha-removal`）。
 原生 T-LRU 臂见下节 `a3_native_tlru` / `a4_tlru_t90` / `a5_tlru_t200`。

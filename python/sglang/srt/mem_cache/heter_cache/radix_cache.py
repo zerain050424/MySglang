@@ -101,7 +101,7 @@ class HeterCacheRadixCache(RadixCache):
             snapshot,
             self.session_registry.summary(),
             share_policy=strategy.node_share,
-            multi_agentic_policy=strategy.multi_agentic_evict,
+            reuse_policies=strategy.reuse_evicts,
             sched_occ=tracker.snapshot(),
             values=strategy.realized.densities(tracker.occ),
         )

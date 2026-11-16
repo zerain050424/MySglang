@@ -14,9 +14,8 @@ from sglang.srt.mem_cache.heter_cache.selector import struct_tier
 from sglang.srt.mem_cache.heter_cache.utils import (
     node_num_tokens,
     ONE_SHOT_IDLE_S,
-    RrParams,
-    MultiAgenticParams,
-    MultiTurnParams,
+    REUSE_QUEUES,
+    ReuseParams,
     SessionRegistry,
     SessionType,
     ShareParams,
@@ -26,11 +25,7 @@ from sglang.srt.mem_cache.heter_cache.utils import (
 from sglang.srt.mem_cache.heter_cache.occupancy import QueueOccupancyTracker
 from sglang.srt.mem_cache.heter_cache.value import QueueValueTracker
 from sglang.srt.mem_cache.heter_cache.node_share import NodeShareLedger
-from sglang.srt.mem_cache.heter_cache.override import (
-    RrEvictPolicy,
-    MultiAgenticEvict,
-    MultiTurnEvictPolicy,
-)
+from sglang.srt.mem_cache.heter_cache.override import ReuseScoreEvict
 from sglang.srt.mem_cache.heter_cache.bench_bridge import (
     CacheTelemetry,
     HeterProfiler,
@@ -114,25 +109,23 @@ class HeterCacheStrategy(EvictionStrategy):
     1. 分带过滤：One-shot 节点优先清理，不计入 VD 账本；
        归属会话仍活跃的未匹配节点受时间豁免（ONE_SHOT_IDLE_S）保护，不进带。
     2. VD 仲裁：按 ``occ_q / (1 + VD_q)`` 排出候选队列，再由队内策略决出牺牲节点。
+       chat / agentic 共用一套队内口径：按复用概率升序（``ReuseScoreEvict``），
+       只有 mu/sigma 随标签不同。
     """
 
     def __init__(
         self,
         *,
         force_agentic: bool = False,
-        rr: Union[RrParams, dict, None] = None,
         share: Union[ShareParams, dict, None] = None,
-        mt: Union[MultiTurnParams, dict, None] = None,
-        multi_agentic: Union[MultiAgenticParams, dict, None] = None,
+        reuse: Union[ReuseParams, dict, None] = None,
         value: Union[QueueValueParams, dict, None] = None,
         now: Optional[Callable[[], float]] = None,
     ):
         # 时间源可注入（单测用假时钟控制 one-shot 豁免窗口的推进）。
         self._now = now if now is not None else time.monotonic
-        self.rr = RrParams.from_any(rr)
         self.share = ShareParams.from_any(share)
-        self.mt = MultiTurnParams.from_any(mt)
-        self.multi_agentic = MultiAgenticParams.from_any(multi_agentic)
+        self.reuse = ReuseParams.from_any(reuse)
         self.value = QueueValueParams.from_any(value)
         self.force_agentic = bool(force_agentic)
 
@@ -148,13 +141,18 @@ class HeterCacheStrategy(EvictionStrategy):
         self.profiler = HeterProfiler()
         self.telemetry = CacheTelemetry(self.profiler)
 
-        self.rr_evict = RrEvictPolicy(self.rr) if self.rr.fair_rr else None
         self.session_registry = SessionRegistry.global_instance()
         self.node_share = NodeShareLedger(self.share.share_min)
-        self.multi_agentic_evict = (
-            MultiAgenticEvict(self.multi_agentic, self._node_tag)
-            if self.multi_agentic.enabled
-            else None
+        # chat / agentic 同一套复用分排序，各持一个实例只是为了分开计数与分队列筛池。
+        self.reuse_evicts = (
+            {
+                q: ReuseScoreEvict(
+                    self.reuse, HeterCacheNodeTag.from_queue(q), self._node_tag
+                )
+                for q in REUSE_QUEUES
+            }
+            if self.reuse.enabled
+            else {}
         )
 
     def use_clock(self, now: Callable[[], float]) -> None:
@@ -167,8 +165,8 @@ class HeterCacheStrategy(EvictionStrategy):
         self.telemetry.use_clock(now)
         self.realized.use_clock(now)
         self.session_registry.use_clock(now)
-        if self.multi_agentic_evict is not None:
-            self.multi_agentic_evict.use_clock(now)
+        for policy in self.reuse_evicts.values():
+            policy.use_clock(now)
 
     def _node_tag(self, node) -> HeterCacheNodeTag:
         if self.force_agentic:
@@ -301,12 +299,10 @@ class HeterCacheStrategy(EvictionStrategy):
             share_of = self.node_share.share_of
             share_min = self.node_share.share_min
             return min(pool, key=lambda n: struct_tier(n, share_of, share_min))
-        if queue == "agentic" and self.multi_agentic_evict is not None:
-            return self.multi_agentic_evict.pick(pool, self.session_registry)
-        if queue == "chat" and self.rr_evict is not None:
-            picked = self.rr_evict.pick(pool, self.session_registry)
-            if picked is not None:
-                return picked
+        reuse = self.reuse_evicts.get(queue)
+        if reuse is not None:
+            # chat / agentic 同一条路径：复用概率升序，只有 mu/sigma 随标签不同。
+            return reuse.pick(pool, self.session_registry)
         return None
 
     def fallback(self, leaves):

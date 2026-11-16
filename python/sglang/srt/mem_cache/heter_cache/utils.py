@@ -3,13 +3,13 @@
 三个消费者都依赖这里，所以口径必须单点定义，避免"策略算一套、指标算一套"：
 
 * ``evict_policy``：跨队列仲裁与 one-shot 判定；
-* ``override``：改写器的作用域、共享数阈值、会话类型，以及 agentic
-  队内的复用分（lognormal 条件生存概率，``MultiAgenticEvict``）；
+* ``override``：改写器的作用域、共享数阈值、会话类型，以及 chat/agentic
+  队内共用的复用分（lognormal 条件生存概率，``ReuseScoreEvict``）；
 * ``selector`` / profile：队列标签、占用口径与已兑现价值密度（VD）。
 
 命名约定：``HeterCacheNodeTag`` 是**节点级**标签（KV 片段出生时盖章），
 ``SessionType`` 是**会话级**分类（由分类器推得）。两者经常不一致，判定归属时
-必须明确用哪一个（见 ``is_one_shot`` 与 ``MultiTurnEvictPolicy.pick``）。
+必须明确用哪一个（见 ``is_one_shot`` 与 ``ReuseScoreEvict.pick``）。
 
 进程级状态只有一处：``SessionRegistry.global_instance()``。它被所有 radix cache
 实例共享，因此 ``clear()`` 是全局语义（这正是 ``/flush_cache`` 需要的）。
@@ -145,17 +145,12 @@ def session_type_to_node_tag(session_type: SessionType) -> HeterCacheNodeTag:
 #
 # 用 dataclass 而非裸 kwargs：让 eviction_policy_config 有层级、可校验、可整体
 # 传递。配置只接受分组形式
-# {"rr":{...},"share":{...},"mt":{...},"multi_agentic":{...},"value":{...}}，
+# {"reuse":{...},"share":{...},"value":{...}}，
 # 拼错的键会在构造处报错——实验配置静默失效比启动失败更难查。
 #
-#   RrParams           : CHAT 会话级轮询（跨会话公平）
+#   ReuseParams        : CHAT / AGENTIC 共用的队内复用分排序（两队列同一口径）
 #   ShareParams        : 共享会话数阈值（决定 one-shot 分界与保护范围）
-#   MultiTurnParams    : AGENTIC 带内复用间隔权重
-#   MultiAgenticParams : AGENTIC 带内复用分排序（与 MT 互斥）
 #   QueueValueParams   : 已兑现价值密度（VD）的时间尺度与统计下限
-# 用 dataclass 而不是裸 kwargs，是为了让 `eviction_policy_config` 有层级、能校验、能整体
-# 配置只接受 {"rr":{...},"share":{...},"mt":{...},"multi_agentic":{...},"value":{...}}
-# 分组形式。
 # ---------------------------------------------------------------------------
 
 
@@ -189,45 +184,6 @@ def _coerce_params(cls, value, *, name: str):
     raise TypeError(
         f"{name} must be {cls.__name__}, dict or None, got {type(value).__name__}."
     )
-
-
-@dataclasses.dataclass
-class RrParams:
-    """CHAT（多轮人工会话）队列的会话级轮询参数。
-
-    ``fair_rr`` 打开后，淘汰在会话之间轮询挑 victim，并用
-    ``RrEvictPolicy.loss_cap`` 限制单会话本轮可承受的 KV 缺口。
-
-    Attributes:
-        fair_rr: 会话轮询开关。
-        kappa: 单轮缺口上限的比例系数
-        min_retain_tokens: 每条会话至少保留的绝对 token 数。
-        min_retain_frac: 每条会话至少保留的比例（相对链长 L）。
-    """
-
-    fair_rr: bool = False  # CHAT 会话轮询开关
-    kappa: float = 0.5  # 单次缺口上限 = min(kappa*L, L-keep)
-    min_retain_tokens: int = 512  # 每条会话至少保留的 token
-    min_retain_frac: float = 0.3  # 每条会话至少保留的比例
-
-    def __post_init__(self):
-        if not 0.0 <= self.kappa <= 1.0:
-            raise ValueError(f"kappa must be in [0, 1], got {self.kappa}")
-        if self.min_retain_tokens < 0:
-            raise ValueError(
-                f"min_retain_tokens must be >= 0, got {self.min_retain_tokens}"
-            )
-        if not 0.0 <= self.min_retain_frac <= 1.0:
-            raise ValueError(
-                f"min_retain_frac must be in [0, 1], got {self.min_retain_frac}"
-            )
-
-    @classmethod
-    def from_any(cls, value=None) -> "RrParams":
-        return _coerce_params(cls, value, name="rr")
-
-    def as_dict(self) -> dict:
-        return dataclasses.asdict(self)
 
 
 # 跨会话模板的共享会话数阈值。
@@ -317,14 +273,20 @@ class ShareParams:
 
 
 @dataclasses.dataclass
-class MultiTurnParams:
-    """AGENTIC 队列带内改写器的参数。
+class ReuseParams:
+    """CHAT / AGENTIC 共用的队内复用分排序参数。
 
-    分数取P(reuse in (elapsed, elapsed+H] | not reused by elapsed)，
-    mu/sigma 来自 HeterCacheNodeTag.reuse_config。
+    两个队列用同一套公式与同一组旋钮，只有 mu/sigma 不同（按节点生效标签取
+    ``HeterCacheNodeTag.reuse_config``）：
+
+        score = P(reuse in (elapsed, elapsed + reuse_window_s] | not reused by elapsed)
+
+    分数越小越先淘汰。会话级轮询（RR）已整体删除：它的排序键是「最久没被削过」，
+    与「最不可能被复用」正交，会让刚起、30s 后必然回来的会话排在最前。
+
     Attributes:
-        enabled: 是否启用改写器。
-        reuse_window_s: 预测窗口H，即未来 H 秒内会不会被复用。
+        enabled: 是否启用复用分排序；关闭时 chat/agentic 队内弃权（走兜底）。
+        reuse_window_s: 预测窗口 H（秒）。
     """
 
     enabled: bool = True
@@ -332,48 +294,15 @@ class MultiTurnParams:
 
     def __post_init__(self):
         if not isinstance(self.enabled, bool):
-            raise ValueError(f"mt.enabled must be bool, got {self.enabled!r}")
+            raise ValueError(f"reuse.enabled must be bool, got {self.enabled!r}")
         if self.reuse_window_s <= 0:
             raise ValueError(
-                f"mt.reuse_window_s must be > 0, got {self.reuse_window_s}"
+                f"reuse.reuse_window_s must be > 0, got {self.reuse_window_s}"
             )
 
     @classmethod
-    def from_any(cls, value=None) -> "MultiTurnParams":
-        return _coerce_params(cls, value, name="multi-turn")
-
-    def as_dict(self) -> dict:
-        return dataclasses.asdict(self)
-
-
-@dataclasses.dataclass
-class MultiAgenticParams:
-    """Agentic 队列的复用分排序改写器参数。
-
-    打开后 agentic 队内选点改用复用分升序（1 - CDF(elapsed)，QAGENT 的
-    lognormal 参数）
-    Attributes:
-        enabled: 是否启用复用分排序。
-        reuse_window_s: 预测窗口 H（秒），与 ``mt.reuse_window_s`` 同义。
-    """
-
-    enabled: bool = False
-    reuse_window_s: float = DEFAULT_REUSE_WINDOW_S
-
-    def __post_init__(self):
-        if not isinstance(self.enabled, bool):
-            raise ValueError(
-                f"multi_agentic.enabled must be bool, got {self.enabled!r}"
-            )
-        if self.reuse_window_s <= 0:
-            raise ValueError(
-                "multi_agentic.reuse_window_s must be > 0, "
-                f"got {self.reuse_window_s}"
-            )
-
-    @classmethod
-    def from_any(cls, value=None) -> "MultiAgenticParams":
-        return _coerce_params(cls, value, name="multi-agentic")
+    def from_any(cls, value=None) -> "ReuseParams":
+        return _coerce_params(cls, value, name="reuse")
 
     def as_dict(self) -> dict:
         return dataclasses.asdict(self)
@@ -382,6 +311,10 @@ class MultiAgenticParams:
 # 参与跨队列仲裁的三级队列。`random` 不在此列：它整行都是 one-shot，
 # 在 Stage 0 就被清掉，永远不会计入 VD 账本。
 VALUE_QUEUES = ("struct", "agentic", "chat")
+
+# 队内按复用概率排序的两个队列：两者用同一套公式与同一组旋钮（``ReuseParams``），
+# 只有 mu/sigma 随标签不同（chat T50≈118s、agentic T50≈6.1s）。
+REUSE_QUEUES = ("chat", "agentic")
 
 # VD 的决策视野（秒）：所有队列共享，VD 的量纲由它定义——未来一个视野窗口内
 # 每个驻留 token 预期换回的命中量。跨队列比较只在同一视野下成立，所以它是政策
@@ -542,16 +475,6 @@ def node_num_tokens(node) -> int:
     return len(node.value) if node.value is not None else 0
 
 
-def node_end_offset(node) -> int:
-    """片段在整条序列中的绝对结束偏移"""
-    num_tokens = node_num_tokens(node)
-    abs_start = getattr(node, "abs_start", None)
-    if abs_start is None:
-        return num_tokens
-    return abs_start + num_tokens
-
-
-
 
 
 @dataclasses.dataclass
@@ -559,7 +482,7 @@ class SessionState:
     """单条会话的 KV 记账 + 分类证据。
     * KV记录：L（最近一次 prompt 长度）与d（当前缺口）。d只在
       两处变化——会话自己的请求写入时归零、其节点被删时累加
-      RR 的loss_cap直接读这两个值。
+      两者只用于观测（summary 的d_sum/d_p50/d_max 与告警），不参与选点。
     * 分类依据：classifier_gaps/turn_count/tool_call_count/
       cross_session_shared，只用于推session_type。
 

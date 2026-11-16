@@ -137,7 +137,7 @@ class CacheTelemetry:
         session_summary,
         *,
         share_policy,
-        multi_agentic_policy=None,
+        reuse_policies=None,
         sched_occ: dict = None,
         values: dict = None,
     ) -> None:
@@ -150,7 +150,7 @@ class CacheTelemetry:
             queue_occ,
             session_summary,
             share_policy=share_policy,
-            multi_agentic_policy=multi_agentic_policy,
+            reuse_policies=reuse_policies,
             sched_occ=sched_occ,
             values=values,
         )

@@ -129,7 +129,7 @@ def install(
                         cache._per_queue_token_count(),
                         cache.session_registry.summary(),
                         share_policy=strategy.node_share,
-                        multi_agentic_policy=strategy.multi_agentic_evict,
+                        reuse_policies=strategy.reuse_evicts,
                     )
                 except Exception:
                     rec["profile"] = None

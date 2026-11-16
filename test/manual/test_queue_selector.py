@@ -256,7 +256,7 @@ def test_stage0_one_shot_preempts_arbitration():
 def test_stage1_labels_and_skip():
     """Stage 1：按 VD 排序点名队列，出候选时标 value:<queue>，无候选则跳队。"""
     print("[8] stage 1: VD-ordered queues, labels and skip-on-empty")
-    st = ep.HeterCacheStrategy(multi_agentic={"enabled": True})
+    st = ep.HeterCacheStrategy()
     st.occupancy.reconcile({"struct": {"total": 900, "one_shot": 0},
                             "agentic": {"total": 600, "one_shot": 0},
                             "chat": {"total": 0, "one_shot": 0}}, capacity=1000)
@@ -285,7 +285,7 @@ def test_fallback_is_seeded_random():
     index = {id(n): i for i, n in enumerate(leaves)}
 
     def run(seed):
-        st = ep.HeterCacheStrategy(value={"seed": seed})
+        st = ep.HeterCacheStrategy(value={"seed": seed}, reuse={"enabled": False})
         st.occupancy.reset()  # 全 0 -> 没有任何队列有压力 -> 直接兜底
         picks = []
         for _ in range(6):
@@ -329,39 +329,60 @@ def test_value_params_validation():
             check(False, f"invalid value params must be rejected: {bad}")
 
 
-def test_multi_agentic_orders_by_reuse_score():
-    """MultiAgenticEvict：agentic 队内按复用分升序淘汰。"""
-    print("[11] multi_agentic: agentic pool ordered by reuse score")
-    st = _strategy(multi_agentic={"enabled": True})
-    check(st.multi_agentic_evict is not None,
-          "multi_agentic.enabled must build the picker")
+def test_reuse_picker_shared_by_chat_and_agentic():
+    """ReuseScoreEvict：chat / agentic 共用一套复用分排序，只有 mu/sigma 不同。"""
+    print("[11] reuse picker: chat and agentic share one ordering")
+    st = _strategy()  # 默认即启用：复用分是策略口径，不是实验开关
+    check(set(st.reuse_evicts) == {"chat", "agentic"},
+          f"both queues must be served, got {sorted(st.reuse_evicts)}")
+    chat_ev = st.reuse_evicts["chat"]
+    agentic_ev = st.reuse_evicts["agentic"]
+    check(chat_ev.params is st.reuse and agentic_ev.params is st.reuse,
+          "both queues must share the same ReuseParams (single 口径)")
+    check(chat_ev.queue is hu.HeterCacheNodeTag.QCHAT
+          and agentic_ev.queue is hu.HeterCacheNodeTag.QAGENT,
+          "each picker owns exactly one queue")
 
     now = time.monotonic()
     expired = _leaf(TAG["agentic"], 100, ts=now - 200)  # 复用窗口已过期（未到老化 TTL）
     fresh = _leaf(TAG["agentic"], 400, ts=now - 1)      # 刚写入，仍可能被复用
-    chat = _leaf(TAG["chat"], 10, ts=now - 3600)        # 不归本队
-    check(st.multi_agentic_evict.pick([expired, fresh, chat]) is expired,
+    chat = _leaf(TAG["chat"], 10, ts=now - 3600)        # 不归 agentic 队
+    check(agentic_ev.pick([expired, fresh, chat]) is expired,
           "lowest reuse score (oldest elapsed) must be evicted first")
+    check(chat_ev.pick([expired, fresh, chat]) is chat,
+          "the chat picker must ignore foreign queues")
 
     small = _leaf(TAG["agentic"], 10, ts=now - 200)
     large = _leaf(TAG["agentic"], 90, ts=now - 200)
-    check(st.multi_agentic_evict.pick([small, large]) is large,
+    check(agentic_ev.pick([small, large]) is large,
           "same reuse score must prefer the larger segment")
-    check(st.multi_agentic_evict.pick([]) is None, "empty pool must yield None")
+    check(agentic_ev.pick([]) is None, "empty pool must yield None")
+    check(agentic_ev.stats()["abstains"] == 1,
+          "abstains must be counted (picks=0 explains an idle queue in profile)")
 
-    # 关闭时整个改写器不构造：agentic 无队内 picker
-    off = _strategy()
-    check(off.multi_agentic_evict is None, "multi_agentic must be opt-in")
+    # 同一 elapsed 下两队列分数必须不同：唯一差异就是标签的 reuse_config。
+    p_chat = chat_ev.reuse_score(chat, now)
+    p_agentic = agentic_ev.reuse_score(expired, now)
+    check(p_chat != p_agentic,
+          f"per-queue mu/sigma must differ: chat={p_chat} agentic={p_agentic}")
+
+    # 关闭时两队列都弃权（保留为消融臂）
+    off = _strategy(reuse={"enabled": False})
+    check(off.reuse_evicts == {}
+          and off.queue_victim("chat", [chat]) is None
+          and off.queue_victim("agentic", [expired]) is None,
+          "reuse.enabled=False must make both queues abstain")
 
     # force_agentic：所有标签都归 agentic，评分必须用 QAGENT 的分布
-    fa = _strategy(force_agentic=True, multi_agentic={"enabled": True})
+    fa = _strategy(force_agentic=True)
     struct_expired = _leaf(TAG["struct"], 100, ts=now - 3600)
     expected = hu.reuse_window_probability(
         3600, hu.DEFAULT_REUSE_WINDOW_S, *hu.HeterCacheNodeTag.QAGENT.reuse_config
     )
-    check(abs(fa.multi_agentic_evict.reuse_score(struct_expired) - expected) < 1e-9,
+    fa_ev = fa.reuse_evicts["agentic"]
+    check(abs(fa_ev.reuse_score(struct_expired) - expected) < 1e-9,
           "force_agentic must score every node with the QAGENT distribution")
-    check(fa.multi_agentic_evict.pick([struct_expired]) is struct_expired,
+    check(fa_ev.pick([struct_expired]) is struct_expired,
           "force_agentic must pool every tag into the agentic band")
 
     # 接线：权重点名 agentic 时确实由本改写器出候选
@@ -373,36 +394,49 @@ def test_multi_agentic_orders_by_reuse_score():
           f"value:agentic must use the reuse score, got {source}")
 
 
-def test_queue_policy_assignment():
-    """队内策略归属：chat 走 RR，agentic 只由 multi_agentic 出候选。"""
-    print("[12] chat uses RR, agentic is served by multi_agentic only")
-    st = ep.HeterCacheStrategy(rr={"fair_rr": True})
-    check(st.rr_evict.queue is hu.HeterCacheNodeTag.QCHAT,
-          f"RR must own the chat queue, got {st.rr_evict.queue}")
-
+def test_chat_uses_reuse_score_not_round_robin():
+    """chat 队内与 agentic 同口径；RR 的轮询语义必须彻底消失。"""
+    print("[12] chat queue: reuse score, RR removed")
     now = time.monotonic()
-    c1 = _leaf(TAG["chat"], 100, ts=now - 10, session_id="swap-c1")
-    c2 = _leaf(TAG["chat"], 100, ts=now - 20, session_id="swap-c2")
-    for sid in ("swap-c1", "swap-c2"):
+    st = _strategy()
+    st.session_registry.clear()
+    # 两条活着的 chat 会话：一条刚写过（1 秒前），一条静置 120 秒——超过 chat 的
+    # 复用中位（T50≈118s）但还没到 180s 老化 TTL，所以仍在可调度带内、必须由
+    # 复用分而不是 Stage 0 决定谁先走。
+    fresh = _leaf(TAG["chat"], 100, ts=now - 1, session_id="reuse-c1")
+    stale = _leaf(TAG["chat"], 100, ts=now - 120, session_id="reuse-c2")
+    for sid in ("reuse-c1", "reuse-c2"):
         st.session_registry.touch(sid, f"r-{sid}", prompt_len=1000, now=now)
-    first = st.queue_victim("chat", [c1, c2])
-    second = st.queue_victim("chat", [c1, c2])
-    check({id(first), id(second)} == {id(c1), id(c2)},
-          "RR must rotate between the two chat sessions")
+    picks = [st.queue_victim("chat", [fresh, stale]) for _ in range(4)]
+    check(picks == [stale] * 4,
+          "chat must keep picking the least reusable session, not rotate")
 
-    off = ep.HeterCacheStrategy()
-    check(off.rr_evict is None and off.queue_victim("chat", [c1, c2]) is None,
-          "without fair_rr the chat queue abstains")
+    # 会话轮询的排序键（最久未被削过）已不存在：同一调用序列必须幂等。
+    check(picks[0] is picks[1],
+          "stale reuse ordering must be idempotent (no per-call rotation state)")
 
-    expired = _leaf(TAG["agentic"], 100, ts=now - 200, session_id="swap-a1")
-    fresh = _leaf(TAG["agentic"], 100, ts=now - 1, session_id="swap-a2")
-    check(st.multi_agentic_evict is None and
-          st.queue_victim("agentic", [expired, fresh]) is None,
-          "agentic must abstain when multi_agentic is off")
-    ma = ep.HeterCacheStrategy(
-        rr={"fair_rr": True}, multi_agentic={"enabled": True})
-    check(ma.queue_victim("agentic", [expired, fresh]) is expired,
-          "multi_agentic must pick the node whose reuse window already expired")
+    # 旧的 RR 参数组与改写器必须被删除，不能留下半开的后门。
+    for legacy in ({"rr": {"fair_rr": True}},
+                   {"mt": {"enabled": True}},
+                   {"multi_agentic": {"enabled": True}}):
+        try:
+            ep.HeterCacheStrategy(**legacy)
+        except TypeError:
+            pass
+        else:
+            check(False, f"legacy config key must be rejected loudly: {legacy}")
+    for name in ("RrParams", "MultiTurnParams", "MultiAgenticParams"):
+        check(not hasattr(hu, name), f"{name} must be deleted from utils")
+    for name in ("RrEvictPolicy", "MultiTurnEvictPolicy", "MultiAgenticEvict"):
+        check(not hasattr(ep, name), f"{name} must be deleted from evict_policy")
+
+    # chat 的接线：VD 点名 chat 时由复用分给出候选
+    st.occupancy.reconcile({"struct": {"total": 0, "one_shot": 0},
+                            "agentic": {"total": 0, "one_shot": 0},
+                            "chat": {"total": 900, "one_shot": 0}}, capacity=1000)
+    victim, source = qs.pick_victim(strategy=st, leaves=[fresh, stale])
+    check(victim is stale and source == "value:chat",
+          f"value:chat must use the reuse score, got {source}")
 
 
 def test_reuse_window_probability():
@@ -426,13 +460,14 @@ def test_reuse_window_probability():
     check(hu.reuse_window_probability(10 ** 9, H, mu, sigma) == 0.0,
           "underflowed survival must score 0, not raise")
 
-    st = _strategy(multi_agentic={"enabled": True})
+    st = _strategy()
     now = time.monotonic()
     young = _leaf(TAG["agentic"], 100, ts=now - 2)
     stale = _leaf(TAG["agentic"], 100, ts=now - 200)
-    check(st.multi_agentic_evict.pick([young, stale]) is stale,
+    ev = st.reuse_evicts["agentic"]
+    check(ev.pick([young, stale]) is stale,
           "the lowest future-reuse probability must be evicted first")
-    check(st.multi_agentic_evict.pick([young]) is young,
+    check(ev.pick([young]) is young,
           "a single candidate must still be picked")
 
 
@@ -520,8 +555,8 @@ def main():
         test_stage1_labels_and_skip,
         test_fallback_is_seeded_random,
         test_value_params_validation,
-        test_multi_agentic_orders_by_reuse_score,
-        test_queue_policy_assignment,
+        test_reuse_picker_shared_by_chat_and_agentic,
+        test_chat_uses_reuse_score_not_round_robin,
         test_reuse_window_probability,
         test_per_type_ageing_ttl,
     ]

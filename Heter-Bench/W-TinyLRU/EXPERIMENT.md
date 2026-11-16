@@ -36,6 +36,10 @@
 
 固定配置（所有臂一致，避免混入跨队列因素）：
 
+> **已下线（2026-11）**：下面的 `rr` / `tlru` 两组已不存在（RR 破坏性回退；
+> `alpha` 与队内补丁同样已删）。现口径的等价写法是
+> `{"reuse": {"enabled": false}}`（关掉 chat/agentic 队内复用概率排序）。
+
 ```jsonc
 {
   "alpha": {"update_interval": 1e9},   // 冻结 alpha 在线重平衡（不做跨队列仲裁）
