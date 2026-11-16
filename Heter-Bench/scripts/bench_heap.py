@@ -222,9 +222,28 @@ def build_hybrid_arrival_schedule(
 # 指标累计
 # --------------------------------------------------------------------------
 class Stats:
+    """统计窗内的累计量；预热窗（``--warmup-s``）内的请求只进 CSV，不进这里。
+
+    为什么要有预热窗：VD（已兑现价值密度）的读数是一个时间常数为 W_q 的指数
+    低通，W_q = max(horizon, k*T50_q)。chat 的 T50≈118s、k=4 → W_q≈472s，所以
+    前 472s 的 VD 被系统性低估 1-e^{-t/W_q} 倍（t=100s 时 5.2 倍，而 struct /
+    agentic 的 W=120s 只低估 1.8 倍）。这个差分偏差正好落在「chat 与 struct 谁
+    先削」这条边界上。预热不足时整段统计都跑在冷启动的瞬态里。
+    """
+
     def __init__(self) -> None:
         self.num_requests = 0
         self.num_sessions = 0
+        # 预热窗：截止时刻（time.time() 绝对时刻；None = 不设窗，全量计入）
+        self.warmup_until: Optional[float] = None
+        self.warmup_s = 0.0
+        self.warmup_requests = 0
+        self.warmup_sessions = 0
+        self.warmup_prompt_tokens = 0
+        # 完成的请求总数（含预热），只用于进度条与吞吐分母之外的观测
+        self.done_requests = 0
+        # 统计窗内第一个请求的完成时刻，用来算实测窗口长度
+        self.measured_since: Optional[float] = None
         self.prompt_tokens = 0
         self.cached_tokens = 0
         self.completion_tokens = 0
@@ -235,6 +254,15 @@ class Stats:
         self.per_task: Dict[str, Dict[str, int]] = {}
         # 逐请求明细（供 CSV 输出：TTFT vs 重算量逐点分析）
         self.rows: List[Dict[str, Any]] = []
+
+    def in_warmup(self, now_wall: float) -> bool:
+        """该时刻是否仍在预热窗内（按请求**完成**时刻判定）。"""
+        return self.warmup_until is not None and now_wall < self.warmup_until
+
+    def record_warmup(self, prompt_tokens: int) -> None:
+        """预热窗内完成的请求：只记计数，用于报告预热期的规模。"""
+        self.warmup_requests += 1
+        self.warmup_prompt_tokens += prompt_tokens
 
     def record_request(
         self,
@@ -305,6 +333,11 @@ class Stats:
             }
 
         return {
+            "warmup_s": self.warmup_s,
+            "warmup_requests": self.warmup_requests,
+            "warmup_sessions": self.warmup_sessions,
+            "warmup_prompt_tokens": self.warmup_prompt_tokens,
+            "done_requests": self.done_requests,
             "num_sessions": self.num_sessions,
             "num_requests": self.num_requests,
             "num_errors": self.errors,
@@ -576,6 +609,9 @@ class HeapEmitter:
 
         if idx < sess["num_turns"]:
             self._push_next_turn(turn=turn, finished_ts=now)
+        elif self._stats.in_warmup(time.time()):
+            # 整条会话在预热窗内跑完：计入 warmup_sessions，不进统计窗
+            self._stats.warmup_sessions += 1
         else:
             self._stats.record_session(turn.task_name)
         self._maybe_report_progress()
@@ -591,14 +627,25 @@ class HeapEmitter:
     ) -> None:
         prompt_tokens = r["prompt_tokens"]
         cached_tokens = r["cached_tokens"]
-        self._stats.record_request(
-            turn.task_name, prompt_tokens, cached_tokens, r["completion_tokens"]
-        )
-        if r["ttft"] is not None:
-            self._stats.ttfts.append(r["ttft"])
-        self._stats.e2es.append(r["e2e"])
+        # 预热窗按完成时刻切：一行明细的 ts 与这里的判定必须同源，否则 CSV 与
+        # JSON 汇总会切出两个不同的子集。
+        now_wall = time.time()
+        self._stats.done_requests += 1
+        warm = self._stats.in_warmup(now_wall)
+        if warm:
+            self._stats.record_warmup(prompt_tokens)
+        else:
+            if self._stats.measured_since is None:
+                self._stats.measured_since = now_wall
+            self._stats.record_request(
+                turn.task_name, prompt_tokens, cached_tokens, r["completion_tokens"]
+            )
+            if r["ttft"] is not None:
+                self._stats.ttfts.append(r["ttft"])
+            self._stats.e2es.append(r["e2e"])
         self._stats.rows.append(
             {
+                "warmup": warm,
                 "task": turn.task_name,
                 "phase": turn.task_cfg.get("phase"),
                 "session_id": turn.session["id"],
@@ -622,7 +669,7 @@ class HeapEmitter:
                 "send_lag_ms": round(lag_s * 1000, 3),
                 "queue_time_ms": r["queue_time_ms"],
                 "prefill_ms": r["prefill_ms"],
-                "ts": round(time.time(), 3),
+                "ts": round(now_wall, 3),
             }
         )
 
@@ -664,11 +711,11 @@ class HeapEmitter:
     # ---- 报告 ------------------------------------------------------------
     def _maybe_report_progress(self) -> None:
         every = self._args.progress_every
-        if not every or self._stats.num_requests % every:
+        if not every or self._stats.done_requests % every:
             return
         done, total = (
-            self._stats.num_requests,
-            self._stats.num_requests + len(self._heap),
+            self._stats.done_requests,
+            self._stats.done_requests + len(self._heap),
         )
         hit = (
             self._stats.cached_tokens / self._stats.prompt_tokens
@@ -742,6 +789,12 @@ async def main_async(args: argparse.Namespace) -> Tuple[Dict[str, Any], Stats]:
     )
 
     stats = Stats()
+    stats.warmup_s = max(0.0, float(args.warmup_s))
+    if stats.warmup_s > 0:
+        # 用与明细行同一个时钟（time.time）定截止时刻，避免 perf_counter 与墙钟
+        # 混用后 CSV 与汇总切出不同子集。
+        stats.warmup_until = time.time() + stats.warmup_s
+        print(f"[heap] warmup={stats.warmup_s:.0f}s（该窗口内的请求只进 CSV）")
     url = args.base_url.rstrip("/") + "/generate"
     started = time.perf_counter()
     async with aiohttp.ClientSession(
@@ -758,9 +811,22 @@ async def main_async(args: argparse.Namespace) -> Tuple[Dict[str, Any], Stats]:
     summary = stats.summary()
     summary.update(extra)
     summary["wall_time_s"] = round(wall_s, 2)
+    # 统计窗 = 总时长扣掉预热；吞吐与命中率都只在统计窗内可比。
+    measured_s = max(0.0, wall_s - stats.warmup_s)
+    summary["measured_wall_s"] = round(measured_s, 2)
     summary["request_throughput"] = (
-        round(stats.num_requests / wall_s, 2) if wall_s > 0 else None
+        round(stats.num_requests / measured_s, 2) if measured_s > 0 else None
     )
+    summary["warmup_ratio"] = (
+        round(stats.warmup_s / wall_s, 3) if wall_s > 0 else None
+    )
+    if stats.warmup_s > 0 and stats.num_requests == 0:
+        # 预热吃掉了整条 trace：汇总里没有任何样本，会被误读成 0% 命中率。
+        print(
+            f"[heap] 警告：预热 {stats.warmup_s:.0f}s 覆盖了整条 trace"
+            f"（总时长 {wall_s:.0f}s，统计窗内 0 个请求）。"
+            "请缩短 --warmup-s 或放大数据规模（max_record）。"
+        )
     summary["mode"] = "hybrid"
     summary["tasks_config"] = args.tasks_config
     summary["base_url"] = args.base_url
@@ -807,6 +873,17 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--seed", type=int, default=42, help="空窗 RNG 的兜底种子")
     p.add_argument("--timeout-s", type=float, default=1800.0, help="单请求超时（秒）")
+    p.add_argument(
+        "--warmup-s",
+        type=float,
+        default=0.0,
+        help=(
+            "预热窗（秒）：完成时刻早于 t0+该值的请求只进 CSV，不计入汇总。"
+            "VD 是时间常数为 W_q=max(horizon,k*T50) 的低通，t<W_q 时被系统性低估；"
+            "取 2*max(W_q) 才算收敛（缺省参数下 chat 的 W_q≈472s → 建议 1000）。"
+            "0=不设窗（旧口径，冷启动偏差留在统计里）。"
+        ),
+    )
     p.add_argument(
         "--progress-every", type=int, default=200, help="每 N 个请求打一行进度；0=关闭"
     )

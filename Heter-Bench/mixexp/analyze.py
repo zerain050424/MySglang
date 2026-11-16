@@ -68,6 +68,12 @@ def load_scale(directory: Path, scale: str) -> Dict[str, Dict[str, Any]]:
             "per_task": per_task,
             "prompt_tokens": sum(_as_float(r.get("prompt_tokens")) or 0.0 for r in runs),
             "errors": sum(int(r.get("num_errors") or 0) for r in runs),
+            # 预热口径：命中率只在统计窗内可比，窗口为 0 的结果不可与其他臂混排。
+            "warmup_s": (
+                sum(_as_float(r.get("warmup_s")) or 0.0 for r in runs) / len(runs)
+                if runs
+                else 0.0
+            ),
         }
     return arms
 
@@ -89,8 +95,8 @@ def render(scale: str, arms: Dict[str, Dict[str, Any]], tokens: Optional[float])
     )
 
     print(f"\n## {scale} 规模 · 结果\n")
-    print("| arm | 命中率 % | Δ vs best baseline | 最弱类 % | 类间差距 | ttft p50 ms | ttft p99 ms | e2e p99 ms | errors |")
-    print("|---|---|---|---|---|---|---|---|---|")
+    print("| arm | 命中率 % | Δ vs best baseline | 最弱类 % | 类间差距 | ttft p50 ms | ttft p99 ms | e2e p99 ms | warmup s | errors |")
+    print("|---|---|---|---|---|---|---|---|---|---|")
     for arm in sorted(arms, key=lambda a: -(arms[a]["hit"] or -1)):
         row = arms[arm]
         hit = row["hit"]
@@ -104,7 +110,8 @@ def render(scale: str, arms: Dict[str, Dict[str, Any]], tokens: Optional[float])
         spread = (max(per_task.values()) - weakest) if per_task else None
         print(
             f"| `{arm}` | {_fmt(hit)} | {delta} | {_fmt(weakest)} | {_fmt(spread)} "
-            f"| {_fmt(row['ttft50'])} | {_fmt(row['ttft99'])} | {_fmt(row['e2e99'])} | {row['errors']} |"
+            f"| {_fmt(row['ttft50'])} | {_fmt(row['ttft99'])} | {_fmt(row['e2e99'])} "
+            f"| {_fmt(row.get('warmup_s'), 0)} | {row['errors']} |"
         )
 
     print("\n### 判据\n")
@@ -143,6 +150,15 @@ def render(scale: str, arms: Dict[str, Dict[str, Any]], tokens: Optional[float])
             full["hit"] >= row["hit"] - 0.2,
             f"{full['hit']:.2f}% vs {row['hit']:.2f}%",
         ))
+
+    # 冷启动判据：VD 是时间常数 W_q 的低通，warmup < 2*max(W_q) 时统计窗里仍带着
+    # 系统性偏低的 VD 读数（chat 的 W_q≈472s，缺省参数下需要 ~1000s 预热）。
+    warm = full.get("warmup_s") or 0.0
+    checks.append((
+        "冷启动判据：预热 >= 2*max(W_q)（缺省参数下 1000s）",
+        warm >= 1000.0,
+        f"warmup={warm:.0f}s",
+    ))
 
     if tokens:
         total = full["prompt_tokens"]

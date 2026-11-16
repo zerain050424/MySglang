@@ -123,10 +123,12 @@ POLICY=heter_cache MAX_TOTAL_TOKENS=198000 \
   bash scripts/serve.sh          # 前台；另开终端等 curl -sf .../health 返回 200
 
 # 2) 压测一个 cell（轮间空窗按 lognormal 真实等待）
+#    --warmup-s 只丢弃「完成时刻 < t0+该值」的成绩，请求本身照发：预热靠 trace
+#    自己的前半段跑，不需要另造流量。缺省参数下取 1000（见下文“预热窗”）。
 "$PY" scripts/bench_heap.py \
   --tasks-config TaskData/exp3/chat/tasks.yaml \
   --base-url http://127.0.0.1:30000 \
-  --arrival-scale 1.0 --wait-scale 1.0 \
+  --arrival-scale 1.0 --wait-scale 1.0 --warmup-s 1000 \
   --output mixexp/result/exp3/chat/full_hc_full.json
 
 # 3) 换臂：lru 只把 POLICY 改成 lru（不带 POLICY_CONFIG）；
@@ -149,6 +151,47 @@ mixexp/result/exp3/<cell>/server_full_<arm>.log   server 日志（serve.sh 的 L
 旧的单比例组成（22/35/22/22）仍可用 `build_exp3_data.py` 不带 `--mix` 构造（legacy 模式，
 同样生成 tasks.yaml），产物输出至 `mixexp/result/exp3/`；相位模式（`--mode drift`）与其
 `configs/exp3/*.yaml` 随旧驱动一并删除。
+
+---
+
+## 六之二、预热窗（`--warmup-s`）
+
+**为什么必须有**：VD（已兑现价值密度）的读数是时间常数为 `W_q = max(horizon, k*T50_q)`
+的指数低通（`heter_cache/value.py`）。常数命中速率下累积量 `mass(t) = λ·W_q·(1-e^{-t/W_q})`，
+而 `materialize()` 按满窗 `W_q` 归一，所以在 `t < W_q` 时 VD 被低估 `1/(1-e^{-t/W_q})` 倍：
+
+| t | chat（W=472s） | struct / agentic（W=120s） |
+|---|---|---|
+| 60s | **8.4×** | 2.5× |
+| 100s | **5.2×** | 1.8× |
+| 472s | 1.6× | 1.0× |
+| 600s | 1.4× | 1.0× |
+
+各队列 W_q 不同 → 低估倍数不同（t=100s 时 chat 比另两队多压 2.9 倍），而 VD 只用于
+排序，所以这个**差分偏差**正好落在「chat 还是 struct 先削」这条边界上。另外三队 VD 都
+贴近 0 时排序退化成噪声，回退分支（按占用降序）会先削最大的那个队列——若 agentic 驻留
+量最大（alfred 单会话约 89k token），冷启动前 100 多秒先挨刀的正是密度最高的队列。
+
+| 队列 | T50 | `W_q = max(120, 4·T50)` | 2·W_q |
+|---|---|---|---|
+| chat | 117.9s | **471.6s** | **943s** |
+| agentic | 6.1s | 120s | 240s |
+| struct（无分布，回退 horizon） | — | 120s | 240s |
+
+**取 `--warmup-s 1000`**（≈ chat 的 2W_q，收敛到 1-e^-2 ≈ 86%）。
+
+**对 trace 长度的要求**：统计窗本身也要够长，否则只是把偏差换成了方差。建议
+`trace 总时长 ≥ 预热 + 2·W_max ≈ 4·W_max ≈ 1900s`。`mix_full`（4600 sessions，单轮
+1800s 到达期 + 多轮尾巴）刚好够；`mix_mid`（1100 sessions）不够，只能出趋势性结论。
+
+**报告口径**：结果 JSON 里因此同时有 `warmup_s` / `warmup_requests` / `warmup_sessions` /
+`done_requests`（全部）与 `num_requests` / `num_sessions` / `prompt_tokens`（统计窗内），
+`measured_wall_s` 与 `request_throughput` 均按统计窗计算；CSV 每行多一个 `warmup`
+布尔列，可直接自己重切窗口。`analyze.py` 会把 `warmup s` 列进表，并在
+`hc_full` 的预热 < 1000s 时判据报 ✗——**不同预热的臂不能混排**。
+
+**消融这一项本身**：`--warmup-s 0`（旧口径，冷启动偏差留在统计里）与 `1000` 两跑之差
+就是冷启动的代价，值得单独记一组。
 
 ---
 
