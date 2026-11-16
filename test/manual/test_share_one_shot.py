@@ -3,7 +3,10 @@
 钉住四件事：
 
 1. **一次性判定只看「会话类型 + 跨会话共享数 + 是否被匹配过」**：
-   `one_shot = type ∈ {TRANS, STRUCT} and share_sessions < share_min and hit_count == 0`
+   `one_shot = type ∈ {TRANS, STRUCT} and share_sessions < share_min and hit_count < 2`
+   （边界是 2 而不是 0/1：一次请求自己就会给节点加 1 分——chunk 里建出的 prompt
+   节点还会被它结束时那次 insert 再走一遍；真实复用一次至少 +2，见
+   `MatchPrefixParams.chunked` 与 `is_one_shot` 的注释）
 2. **共享数达到阈值就退出一次性带**，即使创建者当初被判成 TRANS。
 3. **`queue_tag` 不参与判定**：QSTRUCT 标签救不了私有的 TRANS 节点，
    QTRANS 标签也不会把已被多次复用的节点拉回一次性带。
@@ -275,32 +278,41 @@ def test_share_min_is_single_knob():
         check(False, "share_min=1 must be rejected")
 
 
-def test_once_read_leaves_one_shot_band():
-    """F1：hit_count>=1 的 TRANS/STRUCT 节点离开 one-shot 带。
+def test_reused_nodes_leave_one_shot_band():
+    """F1：被复用过的 TRANS/STRUCT 节点离开 one-shot 带，边界是 hit_count >= 2。
 
     机制背景：会话前 MULTI_TURN_MIN 轮创建的节点也带 TRANS/STRUCT 标签，
     仅凭类型+共享数判定会让它们在创建者下一轮重读到来之前就被扫描流清掉。
-    上游 SLRU 的 hit_count>=2 晋升同理（创建者自己的重读是合法证据）。
+
+    边界的由来：`hit_count` 数的是「被走过多少遍」，一次请求自己就会加至少 1 分
+    （chunked prefill 逐块回扫那部分已在 `match_prefix` 里跳过）：
+      0 = 结束时才新建的 output / 非 chunked 建出的 prompt；
+      1 = chunk 里建出、又被自己结束那次 insert 回扫一遍的 prompt；
+      >=2 = 真实复用一次（prefill match +1、结束 insert +1）。
+    所以 0/1 都必须留在带内，拿 0 或 1 当边界都会把「刚写进来还没人复用」的节点
+    送进 VD 队列，或把「已经复用过的」留在带里——前者取决于调度器是否 chunk。
     """
-    print("[9] F1: once-read nodes leave the one-shot band")
+    print("[9] F1: reused nodes (hit_count >= 2) leave the one-shot band")
     st, _ = make_strategy({"t1": SessionType.TRANS, "s1": SessionType.STRUCT})
 
-    # TRANS share=0：未被匹配过 -> one-shot；被匹配过一次 -> 不再是
-    fresh = FakeNode(session_id="t1", hit_count=0)
-    check(st.is_one_shot(fresh) is True, "TRANS hit_count=0 must stay one-shot")
-    read = FakeNode(session_id="t1", hit_count=1)
-    check(st.is_one_shot(read) is False,
-          "TRANS node matched once must leave the one-shot band")
-    read2 = FakeNode(session_id="t1", hit_count=3)
-    check(st.is_one_shot(read2) is False, "multiple matches also promote")
+    # TRANS share=0：0/1 都在带内（自己写自己扫），>=2 才算被复用
+    for count in (0, 1):
+        node = FakeNode(session_id="t1", hit_count=count)
+        check(st.is_one_shot(node) is True,
+              f"TRANS hit_count={count} must stay one-shot")
+    for count in (2, 3):
+        node = FakeNode(session_id="t1", hit_count=count)
+        check(st.is_one_shot(node) is False,
+              f"TRANS hit_count={count} means reused -> leave the band")
 
-    # STRUCT share=0：同样被一次匹配拯救（跨会话共享内容不再因带内冲刷早死）
-    s_fresh = FakeNode(session_id="s1", tag=HeterCacheNodeTag.QSTRUCT, hit_count=0)
-    check(st.is_one_shot(s_fresh) is True,
-          "STRUCT hit_count=0 share=0 must stay one-shot")
-    s_read = FakeNode(session_id="s1", tag=HeterCacheNodeTag.QSTRUCT, hit_count=1)
+    # STRUCT share=0：同样被一次真实复用拯救
+    for count in (0, 1):
+        node = FakeNode(session_id="s1", tag=HeterCacheNodeTag.QSTRUCT, hit_count=count)
+        check(st.is_one_shot(node) is True,
+              f"STRUCT hit_count={count} share=0 must stay one-shot")
+    s_read = FakeNode(session_id="s1", tag=HeterCacheNodeTag.QSTRUCT, hit_count=2)
     check(st.is_one_shot(s_read) is False,
-          "STRUCT node matched once must leave the one-shot band")
+          "STRUCT node reused once must leave the one-shot band")
 
     # hit_count 不得推翻其它豁免：共享数达标的节点本来就不在带内
     shared = FakeNode(session_id="t1", hit_count=0)
@@ -315,7 +327,7 @@ def test_active_session_exempt_until_idle():
 
     机制依据：hit_count 证据的成立前提是节点先活过一个完整重访间隔，而
     Stage 0 的清理节奏是秒级、重访间隔是 6.1s（alfred）到 30~63s（chat）——
-    仅凭 F1 的 hit_count==0 豁免，latch 在扫描流下几乎永不发生。
+    仅凭 F1 的「未被复用」豁免，latch 在扫描流下几乎永不发生。
     """
     print("[10] idle exemption: live sessions keep unread nodes out of the band")
     clock = {"t": 1000.0}
@@ -351,9 +363,9 @@ def test_active_session_exempt_until_idle():
     r = FakeNode(session_id="s1", tag=HeterCacheNodeTag.QSTRUCT, hit_count=0)
     check(st.is_one_shot(r) is True,
           "idle STRUCT share=0 hit=0 is one-shot again")
-    r.hit_count = 1
+    r.hit_count = 2
     check(st.is_one_shot(r) is False,
-          "hit evidence still overrides after expiry (F1 unchanged)")
+          "reuse evidence still overrides after expiry (F1 unchanged)")
     shared = FakeNode(session_id="t1", hit_count=0)
     for i in range(st.node_share.share_min):
         st.node_share.on_hit(shared, f"other-{i}")

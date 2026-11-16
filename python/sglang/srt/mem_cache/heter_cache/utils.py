@@ -191,13 +191,16 @@ DEFAULT_SHARE_MIN = 2
 
 # 一次性带的时间豁免窗口（秒）。
 #
-# 语义：TRANS/STRUCT、未被匹配过（hit_count == 0）且共享数未达标的节点，
-# 若其归属会话仍活跃——最近一次请求（session.last_active）或节点最近一次被
-# 访问（node.last_access_time）距今不足该窗口——不判 one-shot。
+# 语义：TRANS/STRUCT、未被复用过的节点且共享数未达标时，若其归属会话仍活跃
+# ——最近一次请求（session.last_active）或节点最近一次被访问
+# （node.last_access_time）距今不足该窗口——不判 one-shot。
+# 「未被复用」的判据是 ``hit_count < 2``：一次请求自己的写路径就会给节点加 1 分
+# （chunked prefill 逐块回扫已由 ``MatchPrefixParams.chunked`` 排除），所以 0/1
+# 都还只是"自己写过"，真实复用一次至少 +2。
 #
 # 机制依据（quick_wt1 / fast_mid 双重复现）：Stage 0 的清理节奏是秒级，而
-# 多轮会话的重访间隔是 6.1s（alfred）到 30~63s（chat）；仅凭 hit_count==0
-# 判定时,创建者自己的下一轮重读来不及发生，hit_count 证据永远立不起来
+# 多轮会话的重访间隔是 6.1s（alfred）到 30~63s（chat）；仅凭 hit_count 判定
+# 时,创建者自己的下一轮重读来不及发生，hit_count 证据永远立不起来
 # （实测 ShareGPT turn-1 命中 39.7%→7.5%，victim_src one_shot=157k）。
 # 取值覆盖实测重访间隔 p95：中位 30s、p90 44s、最大 63s → 90s。
 ONE_SHOT_IDLE_S = 90.0
