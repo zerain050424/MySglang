@@ -129,30 +129,23 @@ class HeterCacheRadixCache(RadixCache):
         return released
 
     def _evict_one(self, node) -> int:
-        """释放目标叶子节点，并对 One-shot 私有祖先链执行向上级联清理。
+        """释放**一个**叶子节点，不向上级联清理祖先链。
 
-        优化说明：
-        单轮会话的叶子被逐出后，其上游私有 Prompt 节点已失去复用价值。
-        若不级联清理，这些孤立祖先会在下一轮重新变为叶子引发反复单步淘汰。
-        沿祖先链向上连带删除，遇根节点、上锁节点或分叉点（含其它活跃子树）即止。
+        历史：曾沿 One-shot 私有祖先链向上级联删除（遇根 / 上锁 / 分叉即止）。
+        放弃级联的理由（exp3 scan cell 实测）：
+        * 放大不可控：one_shot 淘汰 14.57M 里只有 2.67M 是被选中的节点本身，
+          其余 11.9M 全是级联祖先——一次决策实际释放量是被选节点的 5.5 倍；
+        * 越过价值判断：级联只问「祖先是否也 one-shot」，实测连带删掉 2.88M
+          个 struct 标签 token，等于用 one-shot 的名义清掉了别的队列；
+        * 决策与结果不可归因：victim_sources 记的是选中的那个节点，释放量却
+          包含整条链，配额/密度账本没法按决策复盘。
+        现在退回「一次淘汰一个节点」：``evict()`` 的 while 循环本来就按
+        ``num_evicted < num_tokens`` 反复调用本方法，牺牲粒度回到节点级，
+        每一步都可归因、可复现。
 
-        单个节点的释放细节见 ``_release_node``；本方法只负责“往上走到哪”的判断。
+        单个节点的释放细节见 ``_release_node``。
         """
-        total = 0
-        cur = node
-        strategy = self.eviction_strategy
-        one_shot = strategy.is_one_shot(node)
-        while True:
-            parent = cur.parent
-            total += self._release_node(cur)
-            # 级联剪枝条件：整条祖先链均为未上锁且无其它分支的 One-shot 私有节点
-            if (one_shot and parent is not None and parent is not self.root_node
-                    and parent.lock_ref == 0 and not parent.children
-                    and strategy.is_one_shot(parent)):
-                cur = parent
-                continue
-            break
-        return total
+        return self._release_node(node)
 
 
 def _heter_cache_factory(ctx):

@@ -17,12 +17,27 @@ def observe(registry, sid, turn, at, prompt_len, tool_call=None):
     )
 
 
-def test_short_unshared_session_stays_trans_through_four_turns():
+def test_short_unshared_session_stays_trans_below_multi_turn_min():
+    """MULTI_TURN_MIN 以下恒为 TRANS；到阈值那一轮才按间隔/工具调用分类。
+
+    阈值已从 5 下调到 2（见 utils.py 注释）：多轮会话第 2 轮起就离开 TRANS，
+    否则前 4 轮插入的尾部会在 one-shot 带里被清（M1 早期轮死亡螺旋）。
+    """
     registry = SessionRegistry()
-    for turn in range(1, 5):
-        state = observe(registry, "short", turn, turn * 2.0, 500 + turn * 100)
-    assert state.turn_count == 4
-    assert state.session_type is SessionType.TRANS
+    state = observe(registry, "short", 1, 2.0, 600)
+    assert state.turn_count == 1
+    assert state.session_type is SessionType.TRANS, "1 轮必须仍是 TRANS"
+
+    # 到第 2 轮就参与分类：间隔 2s < GAP_SPLIT_S(15s) → 高频 → AGENTIC
+    state = observe(registry, "short", 2, 4.0, 700)
+    assert state.turn_count == SessionRegistry.MULTI_TURN_MIN == 2
+    assert state.session_type is SessionType.AGENTIC
+
+    # 同一调用序列里，间隔长的会话在第 2 轮判 CHAT
+    slow = SessionRegistry()
+    observe(slow, "slow", 1, 0.0, 600)
+    state = observe(slow, "slow", 2, 40.0, 700)
+    assert state.session_type is SessionType.CHAT
 
 
 def test_short_session_with_cross_session_prefix_is_struct():

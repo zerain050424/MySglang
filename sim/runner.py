@@ -58,7 +58,7 @@ class SimConfig:
     capacity: int = 4096
     value_horizon_s: float = 120.0
     value_smoothing_k: float = 4.0
-    value_floor_tokens: float = 2048.0
+    value_floor_tokens: float = 0.0
     seed: int = 0
     page_size: int = 1
     eviction_policy: str = "heter_cache"

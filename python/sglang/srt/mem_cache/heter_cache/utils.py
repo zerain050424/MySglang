@@ -198,20 +198,24 @@ DEFAULT_SHARE_MIN = 2
 # KV 缺口的那次前缀匹配）里 +1，一次请求最多 +1，与 ``hit_count`` 无关——后者把
 # 写路径和匹配路径混在一起数，一次请求自己就能加 1。
 #
-# 机制依据（quick_wt1 / fast_mid 双重复现）：Stage 0 的清理节奏是秒级，而
-# 多轮会话的重访间隔是 6.1s（alfred）到 30~63s（chat）；仅凭 hit_count 判定
-# 时,创建者自己的下一轮重读来不及发生，hit_count 证据永远立不起来
-# （实测 ShareGPT turn-1 命中 39.7%→7.5%，victim_src one_shot=157k）。
-# 取值覆盖实测重访间隔 p95：中位 30s、p90 44s、最大 63s → 90s。
-ONE_SHOT_IDLE_S = 90.0
+# 取值 20s（原 90s）。90s 的依据是「覆盖多轮会话重访间隔 p95（中位 30s、
+# p90 44s、最大 63s）」，但它同时让单次流量的豁免窗口远长于池周转时间：
+# exp3 scan cell 实测 apps 流入 1225 token/s、池 198k → 全程周转约 160s，
+# 于是任一时刻 apps 的整份足迹（≈110k，池的 55%）都还没到 90s，永远不进带；
+# 决策现场测到的带内 token 中位只有 27（叶子共 31,055），39.7% 的 evict 调用
+# 候选为空——one-shot 带形同虚设，缺口全部转嫁给 VD 仲裁的受害队列。
+# 20s 让「单次流量清运速度」重新压过「池周转速度」；多轮会话的重访保护由
+# 老化 TTL（struct 120s / chat 180s / agentic 300s）与会话类型判据承担，
+# 不依赖这个窗口。
+ONE_SHOT_IDLE_S = 20.0
 
 # 队内复用分的预测窗口 H（秒）：P(reuse in (a, a+H] | not reused by a)。
-# 与 ONE_SHOT_IDLE_S 同值（见上：它已经是实测重访间隔 p95 的覆盖窗口），
-# 但两者语义不同，改一个不会自动改另一个。
+# 与 ONE_SHOT_IDLE_S 是两件事：H 是预测窗口，仍按实测重访间隔 p95 取 90s；
+# ONE_SHOT_IDLE_S 是豁免窗口，已下调到 20s。改一个不会自动改另一个。
 DEFAULT_REUSE_WINDOW_S = 90.0
 
 # 按生效标签的老化阈值（秒）：节点超过该时长未被访问，即降级到 one-shot 带。
-# 值为 0 表示该类型不老化。全部取在 ONE_SHOT_IDLE_S(90s) 之上，避免与
+# 值为 0 表示该类型不老化。全部取在 ONE_SHOT_IDLE_S(20s) 之上，避免与
 # 会话时间豁免互相矛盾。取值按"该类型在实验里从活跃转冷的时间尺度"定：
 #   struct  120s：exp3 有 8 个前缀变体，单变体复用间隔 13~60s（主导 cell 13s /
 #           稳态 37s / 最冷配角 cell 60s）。120s 是冷 cell 的 2 倍：配角 cell
@@ -328,9 +332,17 @@ DEFAULT_VALUE_HORIZON_S = 120.0
 # 方差，不改变比较尺度（投影回视野后速率估计与 k 无关）。
 DEFAULT_VALUE_SMOOTHING_K = 4.0
 
-# VD 分母的统计下限：低于这个驻留量时，一次命中的密度没有统计意义
-# （会把 1 token 的队列算成高价值）。它是估值下限，不是保留量。
-DEFAULT_VALUE_FLOOR_TOKENS = 2048.0
+# VD 分母的统计下限。0 = 不做下限，密度就是 H/max(occ, 0)。
+#
+# 为什么不再用 2048：它把「小队列」系统性地算成低价值。exp3 scan cell 实测
+# agentic 驻留中位 530 token、真实密度 3.2（每驻留 token 每窗换回 3.2 个命中
+# token），除掉 floor 后只剩 0.684，与 struct 的 0.68 打平/略低，于是每次都
+# 先削它；削完 occ 更小、分母恒被 floor 顶住 → 密度恒低 → 正反馈饿死
+# （0.57M token 淘汰换掉 0.45M 命中，命中率 96.9%→77.8%）。
+# 反事实：floor=1 时同一批 982 次决策有 66% 不再选 agentic。
+# 它不是保留量，取下限也没有「1 token 队列被当成高价值」的实际风险：
+# 空队列（occ=0）不进入 queue_order 的候选，densities() 对 0 分母返回 0。
+DEFAULT_VALUE_FLOOR_TOKENS = 0.0
 
 
 @dataclasses.dataclass
@@ -362,9 +374,10 @@ class QueueValueParams:
                 "value.smoothing_k must be >= 1 (W_q < horizon would push the estimator "
                 f"into the under-sampled regime), got {self.smoothing_k}"
             )
-        if self.floor_tokens <= 0:
+        if self.floor_tokens < 0:
             raise ValueError(
-                f"value.floor_tokens must be > 0, got {self.floor_tokens}"
+                f"value.floor_tokens must be >= 0 (0 = 不做下限), "
+                f"got {self.floor_tokens}"
             )
         if not isinstance(self.seed, int) or isinstance(self.seed, bool):
             raise ValueError(f"value.seed must be int, got {self.seed!r}")
@@ -727,7 +740,17 @@ class SessionRegistry:
 
     GAP_WINDOW = 8          # 轮间间隔滑动窗口大小（采样最近 8 次）
     SWEEP_EVERY = 256       # 惰性回收周期：每 N 次 touch 触发一次 sweep
-    MULTI_TURN_MIN = 5      # 判定多轮的最小 turn 阈值
+    # 判定「多轮」的最小 turn 阈值。低于它一律 TRANS/STRUCT，于是这些节点在
+    # ONE_SHOT_IDLE_S 之后就有资格进 one-shot 带（见 is_one_shot 第 4 条）。
+    # 5 → 2 的动机（exp3 实测 + .auto/ideas.md 的 M1「早期轮死亡螺旋」）：
+    # 门槛 5 时，一个多轮会话前 4 轮插入的每轮新增尾部都还是 TRANS，空窗一到
+    # 就被清；而 turn k 的尾部正是 turn k+1 要命中的那截 → chat cell 的
+    # ShareGPT 从 0.416(90s 窗口) 掉到 0.325(20s 窗口)。降到 2 后只有第 1 轮
+    # 暴露（第 1 轮 prompt 只占该 cell token 的 1.2%，损失有界）。
+    # 代价：第 2 轮只有 1 个间隔样本就分类（GAP_SPLIT_S=15s），首轮空窗很短
+    # 的 chat 会话可能被判成 AGENTIC。数据侧的 drop_short_sessions 也读这个
+    # 常量（阈值单一来源），重造数据时 1 轮会话会重新进入 chat/agentic 源。
+    MULTI_TURN_MIN = 2
     GAP_SPLIT_S = 15.0      # Agent 与 Chat 的间隔判定临界值（秒）
     AGENTIC_CONTEXT_GROWTH_TOKENS = 1500  # 边界兜底：判定上下文持续暴涨的 token 阈值
 

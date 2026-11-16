@@ -113,11 +113,18 @@ class QueueValueTracker:
             self._snapshot[q] = mass * self._projection[q]
 
     def densities(self, occ: Dict[str, float]) -> Dict[str, float]:
-        """VD_q = 未来 horizon 内的预期命中 / max(occ_q, floor)；占用为 0 时按 floor 计算。"""
-        return {
-            q: self._snapshot[q] / max(float(occ.get(q, 0.0)), self._floor)
-            for q in VALUE_QUEUES
-        }
+        """VD_q = 未来 horizon 内的预期命中 / max(occ_q, floor)。
+
+        floor=0（默认）时就是 H/occ；occ=0 的队列没有驻留物可评密度，给 0
+        即可——它本来也不进 ``queue_order`` 的候选（候选过滤要求 occ>0），
+        所以这里返回 0 不会把空队列排到最前。除零保护对 floor=0 是必需的，
+        对 floor>0 是死分支。
+        """
+        out: Dict[str, float] = {}
+        for q in VALUE_QUEUES:
+            denom = max(float(occ.get(q, 0.0)), self._floor)
+            out[q] = self._snapshot[q] / denom if denom > 0.0 else 0.0
+        return out
 
     def snapshot(self) -> Dict[str, float]:
         return dict(self._snapshot)
