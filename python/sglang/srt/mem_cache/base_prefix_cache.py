@@ -76,8 +76,10 @@ class MatchPrefixParams:
     # 只在 admission match 里记：请求确定自己 KV 缺口时的那次前缀匹配。而
     # `cache_unfinished_req` 插完块后会再走一遍 match_prefix，只为拿索引，匹配到的
     # 节点里有本请求刚创建的那些——那是复核，不是重读，调用点传 False。
-    # 注意它只管 `reuse_count`：`hit_count` 仍按上游口径在每次触达时递增，LFU /
-    # SLRU / unified 写穿判断继续读它。
+    # 它管两件事：是否自增 `TreeNode.reuse_count`，以及是否允许改写 `queue_tag`
+    # （回扫没有会话上下文，按 delta<8s 猜出来的标签是假的）。
+    # `hit_count` 不受影响，仍按上游口径在每次触达时递增，LFU / SLRU / unified
+    # 写穿判断继续读它。
     count_reuse: bool = True
 
 

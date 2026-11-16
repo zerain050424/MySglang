@@ -279,6 +279,34 @@ def test_split_inherits_reuse_count():
           f"the untouched child keeps its old count, got {child.reuse_count}")
 
 
+def test_rewalk_does_not_retag():
+    """回扫不得改写 queue_tag：它没有会话上下文，legacy 分支会按 delta<8s 猜 QAGENT。
+
+    `cache_unfinished_req` 的回扫不带 req → `session_id is None`，`_record_node_hit`
+    会落进 `elif state is None or session_id is None:` 分支，把刚在 insert 时按会话
+    类型盖好章的节点改成 QAGENT（delta≈0）。这个假标签会同时带偏 VD 的按队列归因
+    与 `queue_order`，所以 `count_reuse=False` 时整段标签逻辑都要跳过。
+    """
+    print("[6] a rewalk never retags")
+    cache = _make_cache()  # now = 1000.0
+    # 挂一个真策略，让 legacy 重标分支真的可达。
+    cache._heter = ep.HeterCacheStrategy()
+
+    just_written = _attach(cache, [1, 2, 3])
+    just_written.queue_tag = hu.HeterCacheNodeTag.QCHAT
+    just_written.last_access_time = 1000.0  # delta≈0 → legacy 分支会判成 QAGENT
+
+    _match(cache, [1, 2, 3], count_reuse=False)
+    check(just_written.queue_tag is hu.HeterCacheNodeTag.QCHAT,
+          f"a rewalk must not retag, got {just_written.queue_tag}")
+
+    # 真读一次之后照常按会话类型改写（此处无 req，走 legacy → QAGENT，属预期）
+    _match(cache, [1, 2, 3])
+    check(just_written.queue_tag is hu.HeterCacheNodeTag.QAGENT,
+          "an admission match may still retag via the legacy branch, got "
+          f"{just_written.queue_tag}")
+
+
 def main():
     tests = [
         test_contract_default_counts_reuse,
@@ -286,6 +314,7 @@ def main():
         test_rewalk_counts_only_hit_count,
         test_rewalk_is_idempotent_for_reuse_count,
         test_split_inherits_reuse_count,
+        test_rewalk_does_not_retag,
     ]
     for test in tests:
         try:

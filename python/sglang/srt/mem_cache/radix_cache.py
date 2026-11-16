@@ -903,6 +903,13 @@ class RadixCache(BasePrefixCache):
         by_queue=None,
         count_reuse: bool = True,
     ) -> None:
+        """记录一次触达。
+
+        Args:
+            count_reuse: 这次触达是否算「重读」。True（admission match）才自增
+                `node.reuse_count`、才允许改写 `queue_tag`；回扫传 False。
+                `hit_count` 不受影响，仍按上游口径递增（LFU / SLRU 读它）。
+        """
         delta = access_time - node.last_access_time
         node.hit_count += 1
         if count_reuse:
@@ -916,24 +923,29 @@ class RadixCache(BasePrefixCache):
             if self._heter is not None
             else None
         )
-        if self.force_agentic:
-            node.queue_tag = HeterCacheNodeTag.QAGENT
-        elif node.queue_tag != HeterCacheNodeTag.QSTRUCT:
-            if state is not None and state.session_type == SessionType.STRUCT:
-                node.queue_tag = HeterCacheNodeTag.QSTRUCT
-            elif (
-                state is not None
-                and node.session_id == session_id
-                and state.session_type in (SessionType.AGENTIC, SessionType.CHAT)
-            ):
-                node.queue_tag = session_type_to_node_tag(state.session_type)
-            elif state is None or session_id is None or node.session_id is None:
-                # Preserve legacy behavior outside the session classifier.
-                node.queue_tag = (
-                    HeterCacheNodeTag.QAGENT
-                    if delta < 8.0
-                    else HeterCacheNodeTag.QCHAT
-                )
+        # 队列归属只在「真的有人读到这段前缀」时才可能改写。回扫（count_reuse=False）
+        # 没有会话上下文，session_id is None 会落进下面的 legacy 分支，按 delta<8s
+        # 把节点猜成 QAGENT——而它的标签在 insert 时已按会话类型盖过章，猜出来的
+        # 标签会把 VD 的按队列归因和 queue_order 一起带偏。
+        if count_reuse:
+            if self.force_agentic:
+                node.queue_tag = HeterCacheNodeTag.QAGENT
+            elif node.queue_tag != HeterCacheNodeTag.QSTRUCT:
+                if state is not None and state.session_type == SessionType.STRUCT:
+                    node.queue_tag = HeterCacheNodeTag.QSTRUCT
+                elif (
+                    state is not None
+                    and node.session_id == session_id
+                    and state.session_type in (SessionType.AGENTIC, SessionType.CHAT)
+                ):
+                    node.queue_tag = session_type_to_node_tag(state.session_type)
+                elif state is None or session_id is None or node.session_id is None:
+                    # Preserve legacy behavior outside the session classifier.
+                    node.queue_tag = (
+                        HeterCacheNodeTag.QAGENT
+                        if delta < 8.0
+                        else HeterCacheNodeTag.QCHAT
+                    )
         node.last_access_time = access_time
         if by_queue is not None:
             # 按追认后的 tag 记：occ 账本在下次reconcile也按新 tag 分区，
