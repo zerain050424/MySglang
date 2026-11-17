@@ -280,12 +280,16 @@ tools/sglang-simulator/src/sglang_simulator/simulation/sglang/radix_cache.py
 
 ```python
 from sim.opt_map import build_use_map, write_use_map
-write_use_map("/tmp/use_map.json", build_use_map(sessions, page_size=8))
+write_use_map(
+    "/tmp/use_map.json",
+    build_use_map(sessions, page_size=8,
+                  capacity_blocks=capacity // 8),
+)
 sim = Simulator(SimConfig(page_size=8, eviction_policy="opt",
                           opt_use_map="/tmp/use_map.json"))
 ```
 
-三件事必须同时成立，否则上限是假的：
+四件事必须同时成立，否则上限是假的：
 
 1. **hash 同源**：use map 的键必须与缓存写进 `TreeNode.hash_value` 的一致。生成器逐
    page 调用同一个 `get_storage_hash_str(key, prior_hash)`，实测 `_misses == 0`
@@ -295,6 +299,9 @@ sim = Simulator(SimConfig(page_size=8, eviction_policy="opt",
    重复调用结果相同、乱序也安全。
 3. **粒度同源**：`block_size` 必须等于缓存 `page_size`；错配时 `bind_page_size` 直接
    `ValueError`，而不是静默让每个块都查不到。
+4. **容量过滤**：`oversize="skip"` 时，`build_use_map(..., capacity_blocks=...)`
+   必须跳过整条 `prompt + response` 超过容量的 turn；否则 oracle 会为一个永远不会
+   发生的 reuse 保留块，上界被污染。
 
 已知边界（写清楚，避免把它当「理论最优」）：
 
@@ -302,7 +309,7 @@ sim = Simulator(SimConfig(page_size=8, eviction_policy="opt",
 - 假定调度顺序不受淘汰影响（oracle 回放），真实系统里淘汰会改变排队与耗时；
 - use map 必填，空表/缺表直接报错——不做「全 +∞」的静默退化。
 
-验收：`test/manual/test_sim_opt.py`（10 passed，需 torch 的用例在 base conda 下自动 skip）。
+验收：`test/manual/test_sim_opt.py`（需 torch 的用例在 base conda 下自动 skip）。
 CPU 96 token 的构造 trace 上 `opt.hit_rate > lru.hit_rate`。该文件不能和
 `test_queue_selector.py` 这类「往 `sys.modules` 塞 stub 包」的测试同进程跑。
 
@@ -397,6 +404,18 @@ print(upper.hit_rate)          # 上界
 
 指标里 `victim_sources` / `queue_hit` / `queue_evicted` / `sched_occ` 直接读生产对象
 （`eviction_strategy.profiler` 与 `occupancy`），只有逐请求命中率是新算的。
+
+另加两项与 PrefixSim 对齐的口径：
+
+- **compute saving**：`SimConfig(cost_model=...)` 按块位置给 prefill 成本
+  （`uniform` / `position` / `linear:A,B` / `table:FILE`；块成本按该块内的
+  token 数计入），`summary` 同时给出 `hit_rate` 与 `compute_saving_ratio`。
+  `uniform` 下两者严格相等；深层块更贵时，
+  两者可能排序不同。
+- **skipped 请求不进分母**：`oversize="skip"` 的请求仍在 `records` 里保留原始长度，
+  但不进入 `prompt_tokens` / `hit_tokens` / `per_type` / `per_task` 与
+  `compute_saving_ratio`；单独报告 `skipped_requests` 与
+  `skipped_prompt_tokens`。
 
 ### 保真对拍（M4）
 

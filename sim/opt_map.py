@@ -70,6 +70,7 @@ def build_use_map(
     extra_key: Optional[str] = None,
     with_response: bool = False,
     response_tokens: Optional[Dict[tuple, int]] = None,
+    capacity_blocks: Optional[int] = None,
 ) -> Dict[str, List[float]]:
     """把会话 trace 展开成 ``{block_hash: [使用时刻...]}``。
 
@@ -80,6 +81,10 @@ def build_use_map(
             和缓存的 ``page_size`` 相同。
         extra_key: 命名空间；与 ``CacheInitParams`` 的 ``extra_key`` 一致时
             hash 才能对上。仿真默认 ``None``。
+        capacity_blocks: 缓存能容纳的块数。给定后，整条 ``prompt + response``
+            超过该容量的 turn 被跳过，与 ``SimConfig(oversize="skip")`` 的
+            模拟器口径对齐；否则 oracle 会为永远不会发生的 reuse 保留块。
+            这里用总块数做保守预过滤（不依赖命中）。
         with_response: 把 response 段也写进表。树里
             ``_adopt(prompt + output)`` 确实存了它们，不写就会让这批页永远查不到
             （未命中率虚高、且「粒度错配」告警失去判别力）。**闭环 trace 必须开**。
@@ -98,6 +103,10 @@ def build_use_map(
 
     if page_size <= 0:
         raise ValueError(f"page_size must be > 0, got {page_size}")
+    if capacity_blocks is not None and capacity_blocks <= 0:
+        raise ValueError(
+            f"capacity_blocks must be > 0 or None, got {capacity_blocks}"
+        )
 
     # 延迟导入：这两个模块会拉起 torch，必须先在 bootstrap 里装好替身。
     from sim import bootstrap
@@ -146,6 +155,11 @@ def build_use_map(
                     tokens.extend([int(token)] * int(turn.out))
             if not tokens:
                 continue
+            if capacity_blocks is not None:
+                total_tokens = len(tokens) + turn.response_len
+                total_blocks = -(-total_tokens // page_size)
+                if total_blocks > capacity_blocks:
+                    continue
             for block_hash in _page_hashes(
                 tokens, page_size, hash_fn, RadixKey, extra_key
             ):
@@ -153,7 +167,8 @@ def build_use_map(
     if not table:
         raise ValueError(
             "use map is empty: every prompt was shorter than one page "
-            f"(page_size={page_size})?"
+            f"(page_size={page_size}) or every turn exceeded "
+            f"capacity_blocks={capacity_blocks}"
         )
     return table
 
