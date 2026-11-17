@@ -1,8 +1,7 @@
 # Heter-Bench 文档索引
 
 说明型和报告型文档集中在这里。**各目录的自述 README 不搬**——它们回答"这个目录怎么用"，
-跟着代码走更有用：`W-TinyLRU/README.md`、`classify/README.md`、`exp/README.md`、
-`RR_VS_TLRU/README.md`。
+跟着代码走更有用：`mixexp/README.md`、`mixgrid/README.md`、`classify/README.md`。
 
 ## 说明
 
@@ -15,13 +14,8 @@
 
 | 文件 | 内容 | 原位置 |
 |---|---|---|
-| [reports/rr_vs_tlru.md](reports/rr_vs_tlru.md) | RR-EVICT vs T-LRU：burst/pause 场景（小流量挤掉长挂起会话后集中回归） | `RR_VS_TLRU/对比结果.md` |
-| [reports/lru_vs_hetercache.md](reports/lru_vs_hetercache.md) | LRU vs HeterCache：搅拌压力下固定重访间隔、只扫池子周转速率 | `tailshot/LRU_VS_HETERCACHE.md` |
-| [reports/wtinylru_result.md](reports/wtinylru_result.md) | 两带 SLRU 淘汰：设计思路 / 负载设计 / 对照组 / 实验结果 | `W-TinyLRU/result.md` |
 | [reports/classify_min_share64.md](reports/classify_min_share64.md) | `min_share=64` 的会话分类三件套指标（最终判定 / 逐轮精度 / token 暴露） | `classify/SHARE64_SUMMARY.md` |
 | [reports/classify_system_prompt_ablation.md](reports/classify_system_prompt_ablation.md) | 去掉公共 Qwen system prompt 后重跑，与抬高 `min_share` 的等价性验证 | `classify/SYSTEM_PROMPT_ABLATION.md` |
-| [reports/design1.md](reports/design1.md) | Design1：计算感知的公平轮询淘汰（DRR + 视界加权） | `exp/Design1.md` |
-| [reports/exp_steps.md](reports/exp_steps.md) | `d_i` 的实施步骤（L1 只记账 / L2 换选择键） | `exp/step.md` |
 
 ## 约定
 

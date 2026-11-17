@@ -9,7 +9,6 @@
 Heter-Bench/
   README.md               # 本文件：怎么跑
   docs/                   # 说明与实验报告，索引见 docs/README.md
-  archive/                # 历史配置快照，仅供追溯
 
   scripts/                # 运行入口
     bench_heap.py         # 压测驱动：最小堆 + 真实墙钟，到点发、不等结束、空窗不占槽
@@ -27,10 +26,12 @@ Heter-Bench/
     drop_short_sessions.py               # 剔掉轮数 < MULTI_TURN_MIN 的会话，让 TRANS 只来自单轮负载
 
   mixexp/                 # 混合负载实验：四个「单类 token 主导」cell × 实验臂，见 mixexp/README.md
+  mixgrid/                # 配比网格实验：20 个 token 份额 mix × 容量/间隔，仿真器 + 真机双后端
+                          #   见 mixgrid/README.md（设计、判据、跑法）
   eval/                   # 离线评估：节点级 / token 级 / label 口径
   profile/  log/          # 观测实现 / 运行日志
-  classify/  exp/  tailshot/  RR_VS_TLRU/  W-TinyLRU/   # 实验目录
-  TaskData/               # 会话数据集
+  classify/               # 会话分类器（tools/strip_qwen_system.py 直接 import，不要删）
+  TaskData/               # 会话数据集 + 数据准备脚本
 ```
 
 ## 设计要点（为什么这样做）
@@ -60,7 +61,8 @@ Heter-Bench/
    驱动只接受 `--tasks-config`（yaml 里逐个 task 写 `data_path` / `lambda_rate` / `mu` / `sigma`
    / `max_record`），没有 `--data-path` / `--num-sessions` 这两个开关。冒烟用
    `mixexp/configs/mix_smoke.yaml`（四类各 10 条）；多轮源需先跑
-   `bash mixexp/prepare_data.sh` 生成 `.nosys.mt5.jsonl`（轮数 < 5 的会话会被剔掉）。
+   `bash mixexp/prepare_data.sh` 生成 `.nosys.mt<N>.jsonl`（`N` = 代码常量
+   `MULTI_TURN_MIN`，当前为 2；轮数 < N 的会话会被剔掉），不要硬编码后缀。
    **tokenizer 必须与 server 加载的模型一致**。
 3. **依赖**：`aiohttp`（sglang 环境已自带）。
 
@@ -154,15 +156,3 @@ source scripts/env.sh
 把 `serve.sh` 的 `POLICY` 换成 `lru` / `lfu` / `slru` / `heter_cache` 即可多基线对比
 （这些策略都在 `RADIX_EVICTION_POLICY_CHOICES` 里，无需 `--enable-heter-cache`）。
 
-## 四阶段负载自动预测准确率实验（已下线）
-
-这条实验的两个前提都不在了：
-
-- **驱动**：分阶段（`--phases-config`）模式随旧 driver 删除，`configs/phased_load_prediction*.yaml`
-  一并删除；`bench_heap.py` 只支持 `--tasks-config`。
-- **数据源**：原本依赖 server 侧 `SGLANG_QUEUE_OCC_LOG` 打印的 `[QueueOcc]` 日志，
-  该采样器已从 `radix_cache` 删除，现在只有 `[HeterCache profile]`（每 30s 一张按队列的
-  表，含 occ / hit / evicted / target / cap）。
-
-结论与历史数字见 `docs/reports/`；要恢复这条实验，需要补回相位调度、`[QueueOcc]` 采样器，
-以及窗口级评测脚本（`eval/evaluate_load_prediction.py` 已随本实验删除）。

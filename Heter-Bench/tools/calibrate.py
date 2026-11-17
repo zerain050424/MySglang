@@ -1,6 +1,6 @@
 """冷启动 prefill 标定：flush_cache 后逐长度测 TTFT，线性拟合出 prefill 速率。
 
-用法: python calibrate.py --base-url http://127.0.0.1:30000 --output result/tailshot/calib_lru.json
+用法: python calibrate.py --base-url http://127.0.0.1:30000 --output result/calib.json
 """
 import argparse, asyncio, json, random, time
 from pathlib import Path
@@ -73,7 +73,7 @@ async def main_async(args):
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--base-url", default="http://127.0.0.1:30000")
-    p.add_argument("--output", default="result/tailshot/calib.json")
+    p.add_argument("--output", default="result/calib.json")
     p.add_argument("--lengths", type=int, nargs="+",
                    default=[1000, 2000, 4000, 8000, 16000, 24000])
     p.add_argument("--reps", type=int, default=2)
