@@ -55,10 +55,23 @@ class FakeReqToTokenPool:
         return f"<FakeReqToTokenPool width={self.width}>"
 
 
-# Fallback response token when the trace has no response_ids: one unique id per
-# request, far above any real vocabulary. A shared token would make a replayed
-# prompt hit the previous response segment and understate tree size/occupancy.
-OUTPUT_SENTINEL_BASE = 1 << 40
+# Fallback response token when the trace carries no ``response_ids``（合成负载 /
+# 只给长度的数据）：每请求一个唯一 id，远高于任何真实词表。共用同一个 token 会让
+# 重放 prompt 命中上一次的 response 段，树规模与占用都被低估。
+#
+# 基址上界（两条都硬，改基址必须同时满足）：
+#   * ``hash_binding.cpp::checked_u32`` 只收 ``<= UINT32_MAX``。OPT 是唯一会给节点
+#     补算 ``TreeNode.hash_value`` 的策略，越界直接
+#     ``IndexError: token id does not fit in uint32``；
+#   * ``sim/opt_map._page_hashes`` 用 ``array("i")``（int32 有符号）切页。
+# 取两者的较小者 ⇒ ``基址 + 一次 run 的请求数 < 2**31``。``1<<30`` 距任何真实词表
+# （Qwen2.5 = 151k）还有 7000 倍余量。
+OUTPUT_SENTINEL_BASE = 1 << 30
+# 一次 run 的请求数上限（现有全量 cell 是 46k，取 100 万留余量）。
+MAX_SENTINEL_REQUESTS = 1 << 20
+assert OUTPUT_SENTINEL_BASE + MAX_SENTINEL_REQUESTS < 1 << 31, (
+    "response 哨兵必须同时安全于 C++ hash 的 uint32 与 opt_map 的 array('i')"
+)
 
 
 class SimReq:

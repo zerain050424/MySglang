@@ -283,7 +283,12 @@ class Emitter:
                 self.send_lags.append(now - due)
                 session = self._by_sid[sid]
                 turn = replace(session.turns[idx - 1], t=now)
-                pending = sim.begin(turn, sid, task_name=session.task_name)
+                pending = sim.begin(
+                    turn,
+                    sid,
+                    task_name=session.task_name,
+                    turn_idx=idx - 1,  # emitter 的 idx 是 1 基
+                )
                 finish = now + self.service(pending.prompt_len, pending.out_len)
                 heapq.heappush(
                     inflight, (finish, next(done_seq), pending, sid, idx)
@@ -300,7 +305,7 @@ class Emitter:
             sim.clock.advance_to(max(target, now))
             now = sim.clock()
 
-        result = SimResult(records=list(sim.records), summary=sim.summary())
+        result = sim.result()
         summary = result.summary or {}
         lags = sorted(self.send_lags)
         summary["emit"] = {

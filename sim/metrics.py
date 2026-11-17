@@ -15,7 +15,7 @@ import hashlib
 import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 
 @dataclass(frozen=True)
@@ -34,6 +34,12 @@ class RequestRecord:
     session_type: str
     task_name: str = ""
     skipped: bool = False
+    # 轮次下标与 response 段用的唯一哨兵：OPT 的 use map 要用它们把「派发时刻」
+    # 与 response 页的 token 还原到树上（见 ``SimResult.freeze_sessions`` /
+    # ``response_tokens``）。``-1`` / ``0`` 表示未知（旧 jsonl 或非逐轮驱动）。
+    # 不参与 ``line()``（指纹）与任何口径计算。
+    turn: int = -1
+    response_token: int = 0
 
     @property
     def hit_rate(self) -> float:
@@ -58,6 +64,10 @@ class SimResult:
 
     records: List[RequestRecord] = field(default_factory=list)
     summary: Dict = field(default_factory=dict)
+    # 本次 run 每个 ``(session_id, 轮次)`` 的**派发时刻**（虚拟秒）。
+    # 闭环调度只在运行中决定时刻、且不写回 ``Turn``（见 ``sim/schedule.py``），
+    # 所以 OPT 的 use map 必须从这里取时间轴。
+    dispatched: Dict[Tuple[str, int], float] = field(default_factory=dict)
 
     # ---- 常用聚合 ----
     @property
@@ -77,6 +87,74 @@ class SimResult:
             digest.update(record.line().encode("utf-8"))
             digest.update(b"\n")
         return digest.hexdigest()[:16]
+
+    # ---- 冻结时间轴（OPT 的 use map 需要决策时刻） ----
+    def freeze_sessions(self, sessions: List) -> List:
+        """把本次 run 的派发时刻回填进 ``Turn.t``，返回新的会话列表。
+
+        为什么需要：数据集加载出来的 ``Turn.t`` 是 0，闭环调度
+        （``run_scheduled`` / ``run_engine``）的时刻由发射器在运行中算出、
+        **不写回** —— 直接 ``build_use_map(sessions)`` 会得到全零时间轴，
+        ``OPTStrategy`` 于是把每个块都判成「不再使用」，静默退化成任意序。
+
+        为什么合法：同一份 ``tasks.yaml`` / seed / arrival-scale / wait-scale 下，
+        到达由 ``stable_seed`` 决定、服务时长只依赖 token 数，**与淘汰策略无关**，
+        所以这一次 run 采到的派发时刻就是重放时会发生的那条时间轴。
+
+        Args:
+            sessions: 本次 run 用的会话（顺序、数量必须与 run 一致）。
+
+        Returns:
+            ``Turn.t`` 已替换为新时刻的会话列表。
+
+        Raises:
+            ValueError: 有轮次没有派发时刻（run 不是逐轮驱动的，或传错了 trace）。
+        """
+        from sim.trace import Session, Turn
+
+        missing: List[Tuple[str, int]] = []
+        frozen = []
+        for session in sessions:
+            turns = []
+            for idx, turn in enumerate(session.turns):
+                t = self.dispatched.get((session.session_id, idx))
+                if t is None:
+                    missing.append((session.session_id, idx))
+                    turns.append(turn)
+                else:
+                    turns.append(
+                        Turn(
+                            t=float(t),
+                            prompt=turn.prompt,
+                            out=turn.out,
+                            tool_call=turn.tool_call,
+                            # 真实 response 必须带过去：树里要写它，下一轮 prompt
+                            # 也靠它命中（丢掉就等于退回 fallback 哨兵）
+                            response=getattr(turn, "response", None),
+                        )
+                    )
+            frozen.append(
+                Session(session.session_id, tuple(turns), session.task_name)
+            )
+        if missing:
+            raise ValueError(
+                f"{len(missing)} 轮没有派发时刻（例：{missing[:3]}）；"
+                "只有逐轮驱动的 run 会记录 dispatched，且不能用旧 jsonl 反推轮次"
+            )
+        return frozen
+
+    def response_tokens(self) -> Dict[Tuple[str, int], int]:
+        """``(session_id, 轮次) -> response 段哨兵``。
+
+        use map 要覆盖树里真正的 token：``_adopt(prompt + output)`` 里那 ``out``
+        个 token 是每请求唯一的哨兵，不写进表就会让这批页永远查不到（未命中率
+        被虚高、且「粒度错配」告警失去判别力）。
+        """
+        return {
+            (r.session_id, r.turn): r.response_token
+            for r in self.records
+            if r.turn >= 0 and r.response_token
+        }
 
     # ---- 输出 ----
     def to_jsonl(self, path) -> Path:

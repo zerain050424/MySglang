@@ -296,3 +296,137 @@ def test_dataset_response_gets_finite_next_use(tmp_path):
 def test_opt_requires_use_map():
     with pytest.raises(ValueError, match="opt_use_map"):
         Simulator(SimConfig(eviction_policy="opt", page_size=8)).run(_trace())
+
+
+# ---------------------------------------------------------------------------
+# 3. 闭环调度的 OPT 上界（冻结时间轴 + 覆盖 response 页）
+# ---------------------------------------------------------------------------
+from sim.opt_map import use_map_from_run  # noqa: E402
+from sim.req import OUTPUT_SENTINEL_BASE, MAX_SENTINEL_REQUESTS  # noqa: E402
+from sim.schedule import ServiceModel, TaskSpec  # noqa: E402
+
+
+def test_sentinel_fits_hash_and_int32():
+    """response 哨兵必须同时安全于 C++ hash 的 uint32 与 opt_map 的 array('i')。"""
+
+    top = OUTPUT_SENTINEL_BASE + MAX_SENTINEL_REQUESTS
+    assert OUTPUT_SENTINEL_BASE > 1 << 20, "必须远高于任何真实词表（Qwen2.5=151k）"
+    assert top < 1 << 31, "int32 有符号（sim/opt_map._page_hashes 用 array('i')）"
+    assert top < 1 << 32, "hash_binding.cpp::checked_u32"
+
+
+def _closed_loop_trace():
+    """两轮会话：第 2 轮重读第 1 轮的 32 token，外加一次性噪声制造压力。"""
+
+    a = _tok(1000, 32)
+    b = _tok(3000, 32)
+    u1 = _tok(5000, 40)
+    u2 = _tok(7000, 48)
+    return [
+        Session("s1", (Turn(0.0, a, 8), Turn(0.0, array("i", list(a) + list(b)), 8)),
+                "T"),
+        Session("s2", (Turn(0.0, u1, 8),), "T"),
+        # 一次性大请求：把 96 的池子顶爆，强制走淘汰，OPT 才有决策可比。
+        Session("s3", (Turn(0.0, u2, 8),), "T"),
+    ]
+
+
+def test_closed_loop_freeze_and_opt_upper_bound(tmp_path):
+    """闭环 run 的时刻不写回 Turn：必须 freeze 后再建表，否则 OPT 静默退化。"""
+
+    sessions = _closed_loop_trace()
+    specs = [TaskSpec.from_config({"name": "T", "lambda_rate": 1.0, "max_record": 10})]
+    service = ServiceModel(prefill_tokens_per_s=8000.0, decode_tokens_per_s=40.0)
+    # 96 = 刚好让 s2 触发一次淘汰（s1 的两轮占 72），OPT 才有决策可做。
+    cfg = dict(capacity=96, page_size=8, seed=0, oversize="skip")
+
+    lru = Simulator(SimConfig(eviction_policy="lru", **cfg))
+    run = lru.run_scheduled(sessions, specs, service=service, max_inflight=0)
+
+    assert sum(r.evicted for r in run.records) > 0, "这份 trace 必须有淘汰，否则测不到选择"
+
+    # 阻碍 1：原始 sessions 的 Turn.t 仍是加载值 0（闭环不写回）
+    assert all(t.t == 0.0 for s in sessions for t in s.turns)
+    # 出口：run.dispatched 记下了真实派发时刻
+    assert len(run.dispatched) == sum(len(s.turns) for s in sessions)
+    frozen = run.freeze_sessions(sessions)
+    assert all(t.t > 0.0 for s in frozen for t in s.turns), "冻结后必须有真实时刻"
+
+    # 阻碍 3：不带 response 页的表会大面积未命中；带上之后应为 0
+    plain = build_use_map(frozen, page_size=8)
+    full = use_map_from_run(run, sessions, page_size=8)
+    assert len(full) > len(plain), "response 页必须使表变大"
+
+    path = tmp_path / "use_map.json"
+    write_use_map(str(path), full)
+    opt = Simulator(
+        SimConfig(eviction_policy="opt", opt_use_map=str(path), **cfg)
+    )
+    opt_result = opt.run(frozen)
+    strategy = opt.cache.eviction_strategy
+
+    assert strategy._misses == 0, (
+        f"表与树的 token 口径不一致：{strategy._misses}/{strategy._lookups} 未命中"
+    )
+    assert opt_result.hit_rate >= run.hit_rate, (
+        f"OPT 应不低于同口径 LRU：opt={opt_result.hit_rate:.3f} lru={run.hit_rate:.3f}"
+    )
+
+
+def test_freeze_keeps_real_response_tokens(tmp_path):
+    """``freeze_sessions`` 不能把 ``Turn.response`` 丢掉。
+
+    丢了就等于退回 fallback 哨兵：树里写的不是真实 answer，下一轮 prompt
+    （= 上一轮 prompt + 上一轮 response）那一截永远命不中，OPT 也看不到它的下次
+    使用。这里用「表里必须出现 a+r 的每一页」来验证，不依赖淘汰是否发生。
+    """
+
+    from sim.opt_map import _page_hashes
+    from sglang.srt.mem_cache.radix_cache import RadixKey
+    from sglang.srt.mem_cache.utils import get_storage_hash_str
+
+    a = _tok(1000, 16)
+    r = _tok(2000, 8)
+    sessions = [Session("s1", (Turn(0.0, a, out=len(r), response=r),), "T")]
+    specs = [TaskSpec.from_config({"name": "T", "lambda_rate": 1.0})]
+    service = ServiceModel(prefill_tokens_per_s=8000.0, decode_tokens_per_s=40.0)
+
+    run = Simulator(
+        SimConfig(capacity=4096, page_size=8, eviction_policy="lru")
+    ).run_scheduled(sessions, specs, service=service, max_inflight=0)
+
+    frozen = run.freeze_sessions(sessions)
+    assert list(frozen[0].turns[0].response) == list(r), "冻结丢了真实 response"
+
+    table = use_map_from_run(run, sessions, page_size=8)
+    pages = _page_hashes(
+        list(a) + list(r), 8, lambda key, prior: get_storage_hash_str(key, prior),
+        RadixKey,
+    )
+    assert pages, "至少一页"
+    missing = [h for h in pages if h not in table]
+    assert not missing, f"真实 response 的页没进 use map：{len(missing)}/{len(pages)}"
+
+
+def test_use_map_from_run_requires_a_closed_loop_result(tmp_path):
+    """开环 run 也能冻结（时刻就是 Turn.t），但缺 response 哨兵的表必须报错。"""
+
+    sessions = _closed_loop_trace()
+    open_loop = Simulator(SimConfig(capacity=4096, page_size=8)).run(
+        [
+            Session(s.session_id, tuple(Turn(t=i + 1.0, prompt=tt.prompt, out=tt.out)
+                                        for i, tt in enumerate(s.turns)), s.task_name)
+            for s in sessions
+        ]
+    )
+    frozen = open_loop.freeze_sessions(
+        [
+            Session(s.session_id, tuple(Turn(t=i + 1.0, prompt=tt.prompt, out=tt.out)
+                                        for i, tt in enumerate(s.turns)), s.task_name)
+            for s in sessions
+        ]
+    )
+    assert all(t.t > 0.0 for s in frozen for t in s.turns)
+
+    with pytest.raises(ValueError, match="response_tokens"):
+        build_use_map(frozen, page_size=8, with_response=True)

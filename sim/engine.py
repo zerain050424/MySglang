@@ -356,6 +356,7 @@ class EngineSimulator:
                 queued.session_id,
                 rid=None,
                 task_name=queued.task_name,
+                turn_idx=queued.idx - 1,  # emitter 的 idx 是 1 基
             )
             if matched.need > self.sim.alloc.size:
                 pending = self.sim.begin_matched(matched)
@@ -472,6 +473,7 @@ class EngineSimulator:
                 queued.session_id,
                 rid=None,
                 task_name=queued.task_name,
+                turn_idx=queued.idx - 1,  # emitter 的 idx 是 1 基
             )
             pairs.append((queued, matched))
         pairs.sort(key=lambda pair: -pair[1].hit)
@@ -540,7 +542,7 @@ class EngineSimulator:
         arrival_scale: float,
         wait_scale: float,
     ) -> SimResult:
-        result = SimResult(records=list(self.sim.records), summary=self.sim.summary())
+        result = self.sim.result()
         lags = sorted(self._send_lags)
         summary = result.summary or {}
         summary["emit"] = {

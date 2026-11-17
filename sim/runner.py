@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from array import array
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import msgspec
 
@@ -51,6 +51,8 @@ class Pending:
     session_type: str
     task_name: str
     skipped: bool = False
+    turn: int = -1
+    response_token: int = 0
 
 
 @dataclass
@@ -94,6 +96,7 @@ class Matched(msgspec.Struct, frozen=True, kw_only=True):
     hit: int
     session_type: str
     task_name: str
+    turn: int = -1
 
 
 class Simulator:
@@ -118,6 +121,9 @@ class Simulator:
         self.cache = None
         self.records: List[RequestRecord] = []
         self.tasks: Dict[str, str] = {}
+        # (session_id, 轮次) -> 派发时刻；只有逐轮驱动（run / Emitter / Engine）
+        # 会填，OPT 的 use map 靠它冻结时间轴（见 SimResult.freeze_sessions）。
+        self._dispatched: Dict[Tuple[str, int], float] = {}
         self._rid_seq = 0
         self.inflight_tokens = 0
         self.inflight_token_peak = 0
@@ -175,6 +181,7 @@ class Simulator:
             self.cache.session_registry.idle_ttl = cfg.idle_ttl
         self.records = []
         self.tasks = {}
+        self._dispatched = {}
         self._rid_seq = 0
         self.inflight_tokens = 0
         self.inflight_token_peak = 0
@@ -188,14 +195,24 @@ class Simulator:
         session_id: str,
         rid: Optional[str] = None,
         task_name: str = "",
+        turn_idx: int = -1,
     ) -> "Matched":
-        """只做命中判定（含 ``observe_request``），不改变池账与锁。"""
+        """只做命中判定（含 ``observe_request``），不改变池账与锁。
+
+        Args:
+            turn_idx: 该轮在会话里的下标（**0 基**；emitter/engine 内部用 1 基，
+                调用处要 ``-1``）。``>= 0`` 时把本次派发时刻记进
+                ``self._dispatched``，供 ``result().freeze_sessions`` 还原
+                OPT 的 use map 时间轴。
+        """
 
         if self.cache is None:
             raise RuntimeError("先 prepare(width) 或直接用 run(sessions)")
 
         sym = self.sym
         self.clock.advance_to(turn.t)
+        if turn_idx >= 0:
+            self._dispatched[(session_id, int(turn_idx))] = float(turn.t)
         self._rid_seq += 1
         rid = rid or f"{session_id}#{self._rid_seq}"
 
@@ -238,6 +255,7 @@ class Simulator:
             hit=hit,
             session_type=session_type,
             task_name=task_name,
+            turn=int(turn_idx),
         )
 
     def _make_pending(
@@ -257,6 +275,10 @@ class Simulator:
             session_type=matched.session_type,
             task_name=matched.task_name,
             skipped=skipped,
+            turn=matched.turn,
+            response_token=(
+                int(matched.req.output_ids[0]) if matched.req.output_ids else 0
+            ),
         )
 
     def lock_matched(self, matched: "Matched") -> None:
@@ -344,6 +366,7 @@ class Simulator:
         session_id: str,
         rid: Optional[str] = None,
         task_name: str = "",
+        turn_idx: int = -1,
     ) -> "Pending":
         """请求到点：match → 挂锁 → 短缺即淘汰 → 预留；写树留到 :meth:`end`。
 
@@ -365,7 +388,9 @@ class Simulator:
             :class:`Pending`；必须交给 :meth:`end` 收尾（否则锁与槽位都漏）。
         """
 
-        return self.begin_matched(self._match(turn, session_id, rid, task_name))
+        return self.begin_matched(
+            self._match(turn, session_id, rid, task_name, turn_idx=turn_idx)
+        )
 
     def end(self, pending: "Pending") -> RequestRecord:
         """请求完成：写树 → 归还重复槽位 → 放锁（跳过的请求只出记录）。"""
@@ -407,6 +432,8 @@ class Simulator:
             session_type=pending.session_type,
             task_name=pending.task_name,
             skipped=pending.skipped,
+            turn=pending.turn,
+            response_token=pending.response_token,
         )
         self.records.append(record)  # 完成序，对齐 emitter 的 stats.rows
         return record
@@ -417,10 +444,13 @@ class Simulator:
         session_id: str,
         rid: Optional[str] = None,
         task_name: str = "",
+        turn_idx: int = -1,
     ) -> RequestRecord:
         """begin + 立即 end（顺序模型走这条；并发由 Emitter 分开调）。"""
 
-        return self.end(self.begin(turn, session_id, rid, task_name))
+        return self.end(
+            self.begin(turn, session_id, rid, task_name, turn_idx=turn_idx)
+        )
 
     def _assert_balanced(self, where: str = "") -> None:
         """池账 == 树内 token + 在飞未落树的 token。"""
@@ -458,9 +488,18 @@ class Simulator:
         )
         turns = {session.session_id: session.turns for session in sessions}
         for _t, sid, idx in events:
-            self.request(turns[sid][idx], sid, task_name=self.tasks[sid])
+            self.request(
+                turns[sid][idx], sid, task_name=self.tasks[sid], turn_idx=idx
+            )
 
-        return SimResult(records=list(self.records), summary=self.summary())
+        return self.result()
+
+    # ------------------------------------------------------------------ 产出
+    def result(self) -> SimResult:
+        """本次 run 的产出，连派发时刻一起给出（OPT 冻结时间轴要用）。"""
+        out = SimResult(records=list(self.records), summary=self.summary())
+        out.dispatched = dict(self._dispatched)
+        return out
 
     # ------------------------------------------------------------------ 汇总
     def summary(self) -> Dict:

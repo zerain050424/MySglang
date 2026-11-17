@@ -285,6 +285,53 @@ sim = Simulator(SimConfig(page_size=8, eviction_policy="opt",
 CPU 96 token 的构造 trace 上 `opt.hit_rate > lru.hit_rate`。该文件不能和
 `test_queue_selector.py` 这类「往 `sys.modules` 塞 stub 包」的测试同进程跑。
 
+### OPT 上界：一条可复现的流程（闭环调度）
+
+`eviction_policy="opt"` 的输入是 use map，而 use map 要的是**决策时刻**。数据集
+加载出来的 `Turn.t` 是 0，闭环调度（`run_scheduled` / `run_engine`）的时刻由发射器
+在运行中算出、**不写回** `Turn` —— 直接 `build_use_map(sessions)` 会得到全零时间轴，
+`OPTStrategy` 把每个块都判成「不再使用」，静默退化成任意序（命中率看起来正常，
+但已经不是上界了）。所以流程必须**先跑一次、冻结时间轴、再造表**：
+
+```python
+from sim.opt_map import use_map_from_run, write_use_map
+from sim.runner import SimConfig, Simulator
+
+PAGE, CAP = 8, 198_000
+
+# 1) 任意策略跑一次全量（这里用 lru；服务时长只依赖 token 数，与策略无关）
+run = Simulator(SimConfig(capacity=CAP, page_size=PAGE, eviction_policy="lru")).run_scheduled(
+    sessions, specs, service=service
+)
+
+# 2) 从这次 run 造表：冻结派发时刻 + 覆盖 prompt 与 response 页
+write_use_map("/tmp/use_map.json", use_map_from_run(run, sessions, page_size=PAGE))
+
+# 3) 同一条时间轴重放 OPT
+upper = Simulator(
+    SimConfig(capacity=CAP, page_size=PAGE, eviction_policy="opt",
+              opt_use_map="/tmp/use_map.json")
+).run(run.freeze_sessions(sessions))
+print(upper.hit_rate)          # 上界
+```
+
+四条硬约束（错任何一条都会静默退化，除了第 2 条是显式报错）：
+
+1. **时间同源**：`use_map_from_run` 只接受运行期采到的派发时刻
+   （`SimResult.dispatched`）。闭环 run 的到达由 `stable_seed` 决定、服务时长只依赖
+   token 数，所以同 seed/scale 重放时它就是重放会发生的那条时间轴。
+2. **粒度同源**：`page_size` 必须等于 `SimConfig.page_size`；不一致时
+   `bind_page_size` 直接 `ValueError`。
+3. **覆盖 response 页**：树里 `_adopt(prompt + output)` 存了 `out` 个**每请求唯一**
+   的哨兵 token。`use_map_from_run` 会把它们一并写进表（`with_response=True`），
+   否则这批页永远查不到、未命中率被虚高。
+4. **哨兵范围**：`OUTPUT_SENTINEL_BASE = 1 << 30`，上限由两处硬约束夹住——
+   `hash_binding.cpp` 的 `checked_u32`（≤ UINT32_MAX）与 `opt_map` 的 `array("i")`
+   （int32）。改了基址要同时满足 `基址 + 请求数 < 2**31`（见 `sim/req.py`）。
+
+判读：配置正确时 `strategy._misses / strategy._lookups` 应接近 0；`OPT` 的命中率
+必须 ≥ 所有臂。若两者都不成立，先查 page_size 与时间轴，不要把该数字当结果报。
+
 ### 数据集接入（R1）：`session_data.jsonl → List[Session]`
 
 `sim/session_data.py` 逐字段对齐 `bench_heap.py` 的读取口径：

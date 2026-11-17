@@ -35,7 +35,10 @@ def test_sim_req_uses_a_distinct_sentinel_per_request():
     assert set(a.output_ids) == {OUTPUT_SENTINEL_BASE + 1}
     assert set(b.output_ids) == {OUTPUT_SENTINEL_BASE + 2}
     assert a.output_ids != b.output_ids
-    assert OUTPUT_SENTINEL_BASE > 1 << 30  # 不可能撞上真实词表
+    # 远高于任何真实词表（Qwen2.5 = 151k），同时留出 int32/uint32 的余量：
+    # OPT 会拿它算 TreeNode.hash_value（C++ checked_u32），opt_map 用 array("i")。
+    assert OUTPUT_SENTINEL_BASE > 1 << 20
+    assert OUTPUT_SENTINEL_BASE + (1 << 20) < 1 << 31
 
 
 def test_identical_prompts_do_not_share_the_response_segment():
