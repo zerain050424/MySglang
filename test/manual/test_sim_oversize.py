@@ -71,8 +71,13 @@ def test_oversize_skip_counts_and_keeps_the_cache_consistent():
 
     assert [r.skipped for r in result.records] == [True, False]
     assert result.summary["skipped_requests"] == 1
-    # 跳过的请求仍然记了 prompt 长度（它确实被服务了，只是没缓存）
+    # The skipped record keeps its raw length for debugging, but the summary
+    # ratios only average served requests (PrefixSim's n_req_skipped rule).
     assert result.records[0].prompt_len == 500
+    assert result.summary["requests"] == 1
+    assert result.summary["total_requests"] == 2
+    assert result.summary["skipped_prompt_tokens"] == 500
+    assert result.summary["prompt_tokens"] == 100
     # 跳过的请求不落树：树里只有第二条的 100 token
     assert tree_tokens(sim.cache) == 100
     assert sim.alloc.used == tree_tokens(sim.cache) + sim.inflight_tokens

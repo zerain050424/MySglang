@@ -25,6 +25,7 @@ import msgspec
 from sim import bootstrap
 from sim.allocator import OutOfTokens, TokenAllocator, tree_tokens
 from sim.clock import VirtualClock
+from sim.cost import CostModel
 from sim.metrics import RequestRecord, SimResult, summarize
 from sim.req import OUTPUT_SENTINEL_BASE, FakeReqToTokenPool, SimReq
 from sim.trace import Session, Turn, max_total_len
@@ -63,6 +64,12 @@ class SimConfig:
     value_floor_tokens: float = 0.0
     seed: int = 0
     page_size: int = 1
+    # Per-block prefill cost model for the compute-saving metric.
+    # "uniform" makes compute_saving_ratio equal hit_rate.
+    cost_model: str = "uniform"
+    # Cheap post-eviction/post-request checks that a matched prefix was not
+    # dropped by the policy it is supposed to be pinned against.
+    verify: bool = True
     eviction_policy: str = "heter_cache"
     # OPT 上界专用：离线 trace 生成的 `{block_hash: [使用时刻]}`。
     # 只在 eviction_policy="opt" 时读；缺失即报错，不做静默退化。
@@ -123,6 +130,10 @@ class Simulator:
         self.inflight_token_peak = 0
         self.duplicate_insert_tokens = 0
         self.skipped_requests = 0
+        self.self_evictions = 0
+        self.unexpected_evictions = 0
+        self.cost_model = CostModel.parse(self.config.cost_model)
+        self._cost_prefix: List[float] = [0.0]
 
     # ------------------------------------------------------------------ 装配
     def prepare(self, width: int) -> None:
@@ -180,6 +191,14 @@ class Simulator:
         self.inflight_token_peak = 0
         self.duplicate_insert_tokens = 0
         self.skipped_requests = 0
+        self.self_evictions = 0
+        self.unexpected_evictions = 0
+        self.cost_model = CostModel.parse(cfg.cost_model)
+        max_blocks = (width + cfg.page_size - 1) // cfg.page_size
+        prefix = [0.0]
+        for index in range(max_blocks):
+            prefix.append(prefix[-1] + self.cost_model.cost(index))
+        self._cost_prefix = prefix
 
     # ------------------------------------------------------------------ 单请求
     def _match(
@@ -286,6 +305,12 @@ class Simulator:
             evicted = self.cache.evict(
                 sym["EvictParams"](num_tokens=int(shortfall))
             ).num_tokens_evicted
+            if matched.node.evicted:
+                self.self_evictions += 1
+                raise AssertionError(
+                    "evict removed a locked matched prefix: "
+                    f"rid={matched.rid} hit={matched.hit} shortfall={shortfall}"
+                )
         self.alloc.alloc(need)
 
         # 槽位已占、树里还没有：这段就是「在飞但未落树」的 KV
@@ -373,6 +398,11 @@ class Simulator:
         if not pending.skipped:
             req = pending.req
             need = pending.need
+            if self.config.verify and pending.node.evicted:
+                self.self_evictions += 1
+                raise AssertionError(
+                    f"matched prefix evicted before end: rid={pending.rid}"
+                )
 
             # 4) 写入树（含 touch / decode_start / prompt 边界分裂）
             tree_before = tree_tokens(self.cache)
@@ -394,6 +424,20 @@ class Simulator:
             self.cache.dec_lock_ref(pending.node)
             self._assert_balanced(where=f"end({pending.rid})")
 
+        page = self.config.page_size
+        # Block cost applies to every token in that block, so with a uniform
+        # model the ratio is exactly hit tokens / prompt tokens even when the
+        # prompt has a partial last page.
+        full_blocks, tail_tokens = divmod(pending.prompt_len, page)
+        full_blocks = min(full_blocks, len(self._cost_prefix) - 1)
+        total_cost = page * self._cost_prefix[full_blocks]
+        if tail_tokens:
+            total_cost += tail_tokens * self.cost_model.cost(full_blocks)
+        hit_full_blocks, hit_tail_tokens = divmod(pending.hit, page)
+        hit_full_blocks = min(hit_full_blocks, len(self._cost_prefix) - 1)
+        saved_cost = page * self._cost_prefix[hit_full_blocks]
+        if hit_tail_tokens:
+            saved_cost += hit_tail_tokens * self.cost_model.cost(hit_full_blocks)
         record = RequestRecord(
             t=pending.t,
             session_id=pending.session_id,
@@ -407,6 +451,8 @@ class Simulator:
             session_type=pending.session_type,
             task_name=pending.task_name,
             skipped=pending.skipped,
+            total_cost=total_cost,
+            saved_cost=saved_cost,
         )
         self.records.append(record)  # 完成序，对齐 emitter 的 stats.rows
         return record
@@ -465,14 +511,22 @@ class Simulator:
     # ------------------------------------------------------------------ 汇总
     def summary(self) -> Dict:
         strategy = self.cache.eviction_strategy
-        return summarize(
+        served = [record for record in self.records if not record.skipped]
+        summary = summarize(
             self.records,
             capacity=self.config.capacity,
             final_used=self.alloc.used,
-            sessions=len({r.session_id for r in self.records}),
+            sessions=len({record.session_id for record in served}),
             profiler=getattr(strategy, "profiler", None),
             occupancy=getattr(self.cache, "occupancy", None),
+            cost_model=str(self.cost_model),
         )
+        # _adopt only inserts; it never evicts, so a phase-3 eviction count is
+        # zero by construction. Keep it in the summary for PrefixSim parity.
+        summary["self_evictions"] = self.self_evictions
+        summary["unexpected_evictions"] = self.unexpected_evictions
+        summary["verify"] = self.config.verify
+        return summary
 
 
     # ------------------------------------------------------------------ 发射器口径

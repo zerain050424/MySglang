@@ -195,6 +195,25 @@ def _trace():
     ]
 
 
+def test_use_map_capacity_excludes_oversized_turns():
+    """A turn that can never be resident must not shape the OPT oracle."""
+
+    small = _tok(1000, 16)   # 2 blocks at page_size=8
+    large = _tok(2000, 80)   # 10 blocks, over capacity_blocks=4
+    sessions = [
+        Session("s1", (Turn(0.0, small, 0),)),
+        Session("s2", (Turn(10.0, large, 0),)),
+    ]
+    full = build_use_map(sessions, page_size=8)
+    filtered = build_use_map(sessions, page_size=8, capacity_blocks=4)
+    expected = build_use_map([sessions[0]], page_size=8)
+
+    assert len(full) > len(filtered)
+    assert filtered == expected
+    with pytest.raises(ValueError, match="capacity_blocks"):
+        build_use_map(sessions, page_size=8, capacity_blocks=0)
+
+
 def test_use_map_generation_matches_cache_hash(tmp_path):
     """生成器与缓存层必须算出同一组 hash；否则 OPT 静默全 +inf。"""
 

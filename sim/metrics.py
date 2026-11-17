@@ -15,7 +15,7 @@ import hashlib
 import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 
 @dataclass(frozen=True)
@@ -34,6 +34,8 @@ class RequestRecord:
     session_type: str
     task_name: str = ""
     skipped: bool = False
+    total_cost: float = 0.0
+    saved_cost: float = 0.0
 
     @property
     def hit_rate(self) -> float:
@@ -44,7 +46,8 @@ class RequestRecord:
         return (
             f"{self.t:.3f}|{self.session_id}|{self.rid}|{self.prompt_len}|"
             f"{self.out_len}|{self.hit}|{self.evicted}|{self.used}|"
-            f"{self.session_type}|{int(self.skipped)}"
+            f"{self.session_type}|{int(self.skipped)}|"
+            f"{self.total_cost:.1f}|{self.saved_cost:.1f}"
         )
 
 
@@ -61,13 +64,34 @@ class SimResult:
 
     # ---- 常用聚合 ----
     @property
+    def served(self) -> List[RequestRecord]:
+        return [r for r in self.records if not r.skipped]
+
+    @property
     def requests(self) -> int:
+        """Served requests; skipped requests are excluded from every ratio."""
+        return len(self.served)
+
+    @property
+    def total_requests(self) -> int:
         return len(self.records)
 
     @property
+    def skipped_requests(self) -> int:
+        return len(self.records) - len(self.served)
+
+    @property
     def hit_rate(self) -> float:
+        served = self.served
         return _ratio(
-            sum(r.hit for r in self.records), sum(r.prompt_len for r in self.records)
+            sum(r.hit for r in served), sum(r.prompt_len for r in served)
+        )
+
+    @property
+    def compute_saving_ratio(self) -> float:
+        served = self.served
+        return _ratio(
+            sum(r.saved_cost for r in served), sum(r.total_cost for r in served)
         )
 
     def fingerprint(self) -> str:
@@ -91,11 +115,16 @@ class SimResult:
         """人读摘要：整体命中率 + 按会话类型 + 淘汰来源。"""
         s = self.summary
         lines = [
-            f"  requests={s['requests']}  "
+            f"  requests={s['requests']}  skipped={s['skipped_requests']}  "
             f"prompt_tokens={s['prompt_tokens']}  hit_tokens={s['hit_tokens']}  "
             f"hit_rate={s['hit_rate']:.1%}",
+            f"  compute_saving={s['compute_saving_ratio']:.1%}  "
+            f"(saved {s['saved_cost']:.0f}/{s['total_cost']:.0f}, "
+            f"cost={s['cost_model']})",
             f"  capacity={s['capacity']}  used={s['final_used']}  "
-            f"evicted={s['evicted_tokens']}  skipped={s['skipped_requests']}  "
+            f"evicted={s['evicted_tokens']}  "
+            f"skipped_prompt_tokens={s['skipped_prompt_tokens']}  "
+            f"self_evict={s.get('self_evictions', 0)}  "
             f"sessions={s['sessions']}",
         ]
         for name, rec in sorted(s["per_type"].items()):
@@ -150,13 +179,25 @@ def summarize(
     sessions: int,
     profiler,
     occupancy,
+    cost_model: str = "uniform",
 ) -> Dict:
-    """把逐请求记录与策略累计量折成一份 dict。"""
+    """把逐请求记录与策略累计量折成一份 dict.
+
+    Skipped requests stay in ``records`` (they carry the raw hit/length for
+    debugging) but are excluded from every ratio; only served requests enter
+    ``prompt_tokens`` / ``hit_tokens`` / ``total_cost`` / ``per_type``.
+    """
+
+    served = [record for record in records if not record.skipped]
+    skipped = [record for record in records if record.skipped]
 
     per_type: Dict[str, Dict[str, float]] = {}
     per_task: Dict[str, Dict[str, float]] = {}
-    for record in records:
-        for table, key in ((per_type, record.session_type), (per_task, record.task_name)):
+    for record in served:
+        for table, key in (
+            (per_type, record.session_type),
+            (per_task, record.task_name),
+        ):
             if not key:
                 continue
             bucket = table.setdefault(
@@ -170,19 +211,27 @@ def summarize(
         for bucket in table.values():
             bucket["hit_rate"] = _ratio(bucket["hit_tokens"], bucket["prompt_tokens"])
 
-    prompt_tokens = sum(r.prompt_len for r in records)
-    hit_tokens = sum(r.hit for r in records)
+    prompt_tokens = sum(r.prompt_len for r in served)
+    hit_tokens = sum(r.hit for r in served)
+    total_cost = sum(r.total_cost for r in served)
+    saved_cost = sum(r.saved_cost for r in served)
     return {
-        "requests": len(records),
+        "requests": len(served),
+        "total_requests": len(records),
         "prompt_tokens": prompt_tokens,
         "hit_tokens": hit_tokens,
         "hit_rate": _ratio(hit_tokens, prompt_tokens),
+        "total_cost": total_cost,
+        "saved_cost": saved_cost,
+        "compute_saving_ratio": _ratio(saved_cost, total_cost),
+        "cost_model": cost_model,
         "per_type": per_type,
         "per_task": per_task,
         "capacity": capacity,
         "final_used": final_used,
-        "evicted_tokens": sum(r.evicted for r in records),
-        "skipped_requests": sum(1 for r in records if r.skipped),
+        "evicted_tokens": sum(r.evicted for r in served),
+        "skipped_requests": len(skipped),
+        "skipped_prompt_tokens": sum(r.prompt_len for r in skipped),
         "sessions": sessions,
         # 以下三项直接读生产对象，口径不复制
         "victim_sources": dict(getattr(profiler, "_victim_sources", {})),
