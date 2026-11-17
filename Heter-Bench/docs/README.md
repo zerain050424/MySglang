@@ -9,6 +9,7 @@
 |---|---|---|
 | [REPRODUCE.md](REPRODUCE.md) | 服务器复现流程（AutoDL + Qwen2.5-7B-Instruct）：环境、数据、起服务、跑实验 | `Heter-Bench/REPRODUCE.md` |
 | [benchmark.md](benchmark.md) | 完整 benchmark 指南：参数语义、矩阵跑法、指标口径、陷阱清单 | `Heter-Bench/benchmark.markdown` |
+| [sglang-simulator-hetercache.md](sglang-simulator-hetercache.md) | 用 SGLang Simulator 在 CPU-only 环境跑 HeterCache：环境、`sgl_kernel` 替身、trace 里的 `session_id`、实测有/无对照、已知边界 | 新增 |
 
 ## 实验报告
 
