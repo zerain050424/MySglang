@@ -115,6 +115,21 @@ class ServiceModel:
             + max(0, out_tokens) / self.decode_tokens_per_s
         )
 
+    def prefill(self, tokens: int) -> float:
+        """One prefill forward over a batch of ``tokens`` extend tokens."""
+
+        return self.prefill_base_s + max(0, tokens) / self.prefill_tokens_per_s
+
+    def decode_step(self) -> float:
+        """One decode step; every running request emits one token in parallel.
+
+        UniCache models TPOT as a constant, so the batch size does not scale the
+        step time. Per-request latency still differs because requests finish on
+        different steps.
+        """
+
+        return 1.0 / self.decode_tokens_per_s
+
     @classmethod
     def from_calibration(
         cls, path: str, *, decode_tokens_per_s: Optional[float] = None

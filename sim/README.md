@@ -78,6 +78,7 @@ print(result.render())          # 含 per-task 命中率
 | R2 | 发射规则：闭环轮次 + 服务时长模型 + arrival/wait scale | ✅（`sim/schedule.py`） |
 | R3 | 并发窗口：同刻 k 条在飞、锁持到完成、竞态可复现 | ✅（`Emitter(max_inflight=...)`） |
 | R4 | response 唯一哨兵 + 超大请求显式处理 | ✅（`sim/req.py`、`SimConfig(oversize=...)`） |
+| E1 | 引擎步调度：按 SGLang 的 prefill 预算成批准入 + chunked prefill + decode 步 | ✅（`sim/engine.py` + `test/manual/test_sim_engine.py`） |
 
 ### 分配器（M2）
 
@@ -172,6 +173,53 @@ result = Simulator(SimConfig(capacity=100_000)).run_scheduled(
 代价（写清楚，避免过度解读）：写树发生在**完成时刻**，生产在 chunked prefill 下
 是分块边写，所以本模型让前缀可见的时间略晚；这会使并发命中略低、`duplicate`
 略高。方向是保守的（不虚高命中率）。
+
+### 引擎步调度（`run_engine`）：按 SGLang 的 prefill 批处理
+
+`run_scheduled` 的 `max_inflight` 只控制「同时在飞几条」，请求仍是逐条 `begin`。
+SGLang 不是这样：每个 `engine.step` 先把已到请求放进 waiting queue，再由
+`PrefillAdder` 按 `max_prefill_tokens` / `chunked_prefill_size` / `max_running_requests`
+决定这一步能装多少条，整批一起 prefill；默认 `schedule_policy=fcfs`。
+
+`Simulator.run_engine(...)` 复刻这条路径：
+
+```python
+from sim.engine import EngineConfig
+
+result = Simulator(SimConfig(capacity=100_000)).run_engine(
+    sessions, specs,
+    scheduler=EngineConfig(
+        max_prefill_tokens=8192,
+        chunked_prefill_size=4096,   # -1 = 关闭 chunked prefill
+        max_running_requests=64,
+        schedule_policy="fcfs",     # 也支持 "lpm"
+    ),
+    service=service,
+)
+print(result.summary["emit"])   # steps / prefill_steps / max_prefill_batch_tokens
+```
+
+一步的语义：
+
+1. 把 `due <= now` 的轮次按到点序放进 waiting queue；
+2. 扫描 waiting，逐条命中、计预算、挂锁；**整批匹配/挂锁完再统一 evict/alloc**，
+   所以同批请求看不到彼此刚写入的前缀（与生产一致）；
+3. 跑一次 prefill forward（服务时长由 `ServiceModel.prefill(总 extend token)` 给），
+   超过 `chunked_prefill_size` 的请求留到下一步继续。`max_prefill_tokens` 是**软上限**：
+   与 SGLang 的 `add_one_req` 一样，装下最后一条才由 `budget_state()` 发现越界并停止，
+   所以一步的总 token 可以超过预算一条请求；
+4. 下一步优先推进 running batch 的 decode（每步每请求 1 token，TPOT 恒定）；
+   请求完成时才 `_adopt(prompt+output)` 落树。
+
+与生产 SGLang 的已知差异（都写在 `sim/engine.py` 顶部）：
+
+| 差异 | 原因 | 方向 |
+|---|---|---|
+| 不能直接 `import PrefillAdder` | 本机导入链会拉起 `transformers`；`sim/engine.py` 复刻的是 admission 子集 | 默认策略与预算公式对齐，细节分支（HiCache / SWA / Mamba / preemption）不建模 |
+| prefill 步不混 decode | chunked prefill 的 mixed batch 需要另一套 forward 时长模型 | 保守：decode 少推进一步 |
+| 准入时一次性预留 prompt+output | 沿用 `SimReq` 的既有口径，避免输出 token 水位与树账分叉 | 比生产更早占槽，压力略高 |
+| chunked prefill 不在每个 chunk 落树 | 沿用 `Simulator.end` 的完成时写树口径 | 前缀可见更晚，命中率略低（保守） |
+| LPM 不做 in-batch de-prioritisation | 只影响 waiting 排序，不影响批大小 | 命中率通常略低（更保守） |
 
 ### 上游 simulator 的时钟注入（已落地）
 

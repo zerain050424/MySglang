@@ -20,6 +20,8 @@ from array import array
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional
 
+import msgspec
+
 from sim import bootstrap
 from sim.allocator import OutOfTokens, TokenAllocator, tree_tokens
 from sim.clock import VirtualClock
@@ -70,6 +72,28 @@ class SimConfig:
     #   "error" —— 抛 OutOfTokens（默认；逼调用方直面 trace/容量不匹配）；
     #   "skip"  —— 跳过落树、计数后继续（生产用 chunked prefill / retraction 伺候）。
     oversize: str = "error"
+
+
+class Matched(msgspec.Struct, frozen=True, kw_only=True):
+    """``match_prefix`` 的结果，供批量调度先规划、再提交。
+
+    ``_match`` 只做命中判定与打点，不挂锁、不占槽，所以同一引擎步可以先为整批候选
+    算命中；选定后由 ``lock_matched`` 统一挂锁，再 ``_reserve_locked`` 统一淘汰/预留。
+    生产 ``get_new_batch_prefill`` 也是先 ``init_next_round_input`` 匹配、再由
+    ``PrefillAdder`` 决定是否入批，并在入批时 ``_req_inc_lock_ref``。
+    """
+
+    req: SimReq
+    node: object
+    need: int
+    t: float
+    session_id: str
+    rid: str
+    prompt_len: int
+    out_len: int
+    hit: int
+    session_type: str
+    task_name: str
 
 
 class Simulator:
@@ -158,32 +182,14 @@ class Simulator:
         self.skipped_requests = 0
 
     # ------------------------------------------------------------------ 单请求
-    def begin(
+    def _match(
         self,
         turn: Turn,
         session_id: str,
         rid: Optional[str] = None,
         task_name: str = "",
-    ) -> "Pending":
-        """请求到点：match → 挂锁 → 短缺即淘汰 → 预留；写树留到 :meth:`end`。
-
-        并发窗口里这一步和 ``end()`` 之间可能隔着别的请求，所以两件事必须分开：
-
-        * **写树在 end()**：生产里 KV 是请求结束时 ``cache_finished_req`` 才落树
-          （chunked prefill 例外）。若在 begin 写，同一时刻到点的后一条请求会命中
-          前一条刚写的前缀——竞态（racing）就消失了，命中率会虚高。
-        * **锁持到 end()**：生产里 ``inc_lock_ref`` 从 match 一直持到请求结束，
-          期间命中的前缀不可淘汰；提前放锁会让并发场景的占用与淘汰偏松。
-
-        Args:
-            turn: 本轮内容（``turn.t`` 是绝对时刻）。
-            session_id: 会话 id（同时用于分类与跨会话共享判定）。
-            rid: 请求 id；缺省 ``session_id#序号``，必须每请求唯一。
-            task_name: 负载名，仅用于 per-task 指标。
-
-        Returns:
-            :class:`Pending`；必须交给 :meth:`end` 收尾（否则锁与槽位都漏）。
-        """
+    ) -> "Matched":
+        """只做命中判定（含 ``observe_request``），不改变池账与锁。"""
 
         if self.cache is None:
             raise RuntimeError("先 prepare(width) 或直接用 run(sessions)")
@@ -217,73 +223,148 @@ class Simulator:
         total = len(full)
         need = total - hit
 
-        # 2) 挂锁 -> 3) 短缺即淘汰 -> 预留
-        node = matched.last_device_node
         state = self.cache.session_registry.get(session_id)
         session_type = state.session_type.value if state is not None else "none"
+        return Matched(
+            req=req,
+            node=matched.last_device_node,
+            need=need,
+            t=turn.t,
+            session_id=session_id,
+            rid=rid,
+            prompt_len=len(req.origin_input_ids),
+            out_len=len(req.output_ids),
+            hit=hit,
+            session_type=session_type,
+            task_name=task_name,
+        )
 
-        def _pending(skipped: bool, evicted: int) -> Pending:
-            return Pending(
-                req=req,
-                node=node,
-                need=need,
-                t=turn.t,
-                session_id=session_id,
-                rid=rid,
-                prompt_len=len(req.origin_input_ids),
-                out_len=len(req.output_ids),
-                hit=hit,
-                evicted=int(evicted),
-                session_type=session_type,
-                task_name=task_name,
-                skipped=skipped,
-            )
+    def _make_pending(
+        self, matched: "Matched", *, skipped: bool, evicted: int
+    ) -> "Pending":
+        return Pending(
+            req=matched.req,
+            node=matched.node,
+            need=matched.need,
+            t=matched.t,
+            session_id=matched.session_id,
+            rid=matched.rid,
+            prompt_len=matched.prompt_len,
+            out_len=matched.out_len,
+            hit=matched.hit,
+            evicted=int(evicted),
+            session_type=matched.session_type,
+            task_name=matched.task_name,
+            skipped=skipped,
+        )
 
+    def lock_matched(self, matched: "Matched") -> None:
+        """Pin a matched prefix without evicting or allocating anything.
+
+        Batch admission locks every candidate before the first eviction, so a
+        later candidate's match cannot be dropped by an earlier candidate's
+        shortfall. SGLang does the same with ``_req_inc_lock_ref`` inside
+        ``PrefillAdder.add_one_req``.
+        """
+
+        if self.cache is None:
+            raise RuntimeError("先 prepare(width) 或直接用 run(sessions)")
+        self.cache.inc_lock_ref(matched.node)
+
+    def _reserve_locked(self, matched: "Matched") -> "Pending":
+        """Evict the shortfall and reserve slots for an already-locked match."""
+
+        if self.cache is None:
+            raise RuntimeError("先 prepare(width) 或直接用 run(sessions)")
+
+        sym = self.sym
+        need = matched.need
+        shortfall = need - self.alloc.available_size()
+        evicted = 0
+        if shortfall > 0:
+            evicted = self.cache.evict(
+                sym["EvictParams"](num_tokens=int(shortfall))
+            ).num_tokens_evicted
+        self.alloc.alloc(need)
+
+        # 槽位已占、树里还没有：这段就是「在飞但未落树」的 KV
+        self.inflight_tokens += need
+        self.inflight_token_peak = max(self.inflight_token_peak, self.inflight_tokens)
+        self._assert_balanced(where=f"begin({matched.rid})")
+        return self._make_pending(matched, skipped=False, evicted=evicted)
+
+    def begin_matched(self, matched: "Matched") -> "Pending":
+        """提交一个已匹配的请求：挂锁 → 短缺即淘汰 → 预留。
+
+        批量调度里走 :meth:`lock_matched` + :meth:`_reserve_locked` 两段；这里
+        保留单条路径的异常处理。
+        """
+
+        if self.cache is None:
+            raise RuntimeError("先 prepare(width) 或直接用 run(sessions)")
+
+        need = matched.need
+        total = need + matched.hit
         if need > self.alloc.size:
             # 整条请求比池子还大：生产会拆 chunk / retraction，仿真装不下。
             if self.config.oversize != "skip":
                 raise OutOfTokens(
                     f"单请求 {total} token 超过池容量 {self.alloc.size}"
-                    f"（rid={rid} hit={hit} need={need}）；"
+                    f"（rid={matched.rid} hit={matched.hit} need={need}）；"
                     "生产会拆 chunk 重算，仿真请显式选择："
                     'SimConfig(oversize="skip") 跳过并计数，或调大 capacity'
                 )
             self.skipped_requests += 1
-            self._assert_balanced(where=f"skip({rid})")
-            return _pending(True, 0)
+            self._assert_balanced(where=f"skip({matched.rid})")
+            return self._make_pending(matched, skipped=True, evicted=0)
 
-        self.cache.inc_lock_ref(node)
-        evicted = 0
+        self.lock_matched(matched)
         try:
-            shortfall = need - self.alloc.available_size()
-            if shortfall > 0:
-                evicted = self.cache.evict(
-                    sym["EvictParams"](num_tokens=int(shortfall))
-                ).num_tokens_evicted
-            try:
-                self.alloc.alloc(need)
-            except OutOfTokens as exc:
-                # 淘汰也腾不出来（例如槽位全被别的在飞请求锁着）
-                if self.config.oversize != "skip":
-                    raise OutOfTokens(
-                        f"{exc}（rid={rid} total={total} hit={hit} need={need}）——"
-                        "仿真不模拟 retraction（生产会拆分/重算），"
-                        "请调大 capacity 或 SimConfig(oversize=\"skip\")"
-                    ) from exc
-                self.cache.dec_lock_ref(node)
-                self.skipped_requests += 1
-                self._assert_balanced(where=f"skip({rid})")
-                return _pending(True, evicted)
+            return self._reserve_locked(matched)
+        except OutOfTokens as exc:
+            # 淘汰也腾不出来（例如槽位全被别的在飞请求锁着）
+            self.cache.dec_lock_ref(matched.node)
+            if self.config.oversize != "skip":
+                raise OutOfTokens(
+                    f"{exc}（rid={matched.rid} total={total} hit={matched.hit} "
+                    f"need={need}）——仿真不模拟 retraction（生产会拆分/重算），"
+                    "请调大 capacity 或 SimConfig(oversize=\"skip\")"
+                ) from exc
+            self.skipped_requests += 1
+            self._assert_balanced(where=f"skip({matched.rid})")
+            return self._make_pending(matched, skipped=True, evicted=0)
         except BaseException:
-            self.cache.dec_lock_ref(node)  # 失败也要放锁，否则后续 evict 全被挡住
+            self.cache.dec_lock_ref(matched.node)
             raise
 
-        # 槽位已占、树里还没有：这段就是「在飞但未落树」的 KV
-        self.inflight_tokens += need
-        self.inflight_token_peak = max(self.inflight_token_peak, self.inflight_tokens)
+    def begin(
+        self,
+        turn: Turn,
+        session_id: str,
+        rid: Optional[str] = None,
+        task_name: str = "",
+    ) -> "Pending":
+        """请求到点：match → 挂锁 → 短缺即淘汰 → 预留；写树留到 :meth:`end`。
 
-        self._assert_balanced(where=f"begin({rid})")
-        return _pending(False, evicted)
+        并发窗口里这一步和 ``end()`` 之间可能隔着别的请求，所以两件事必须分开：
+
+        * **写树在 end()**：生产里 KV 是请求结束时 ``cache_finished_req`` 才落树
+          （chunked prefill 例外）。若在 begin 写，同一时刻到点的后一条请求会命中
+          前一条刚写的前缀——竞态（racing）就消失了，命中率会虚高。
+        * **锁持到 end()**：生产里 ``inc_lock_ref`` 从 match 一直持到请求结束，
+          期间命中的前缀不可淘汰；提前放锁会让并发场景的占用与淘汰偏松。
+
+        Args:
+            turn: 本轮内容（``turn.t`` 是绝对时刻）。
+            session_id: 会话 id（同时用于分类与跨会话共享判定）。
+            rid: 请求 id；缺省 ``session_id#序号``，必须每请求唯一。
+            task_name: 负载名，仅用于 per-task 指标。
+
+        Returns:
+            :class:`Pending`；必须交给 :meth:`end` 收尾（否则锁与槽位都漏）。
+        """
+
+        return self.begin_matched(self._match(turn, session_id, rid, task_name))
 
     def end(self, pending: "Pending") -> RequestRecord:
         """请求完成：写树 → 归还重复槽位 → 放锁（跳过的请求只出记录）。"""
@@ -420,6 +501,34 @@ class Simulator:
             wait_scale=wait_scale,
             max_inflight=max_inflight,
         )
+
+    # ------------------------------------------------------------------ 引擎步口径
+    def run_engine(
+        self,
+        sessions: Iterable[Session],
+        specs: Iterable,
+        *,
+        scheduler=None,
+        service=None,
+        arrival_scale: float = 1.0,
+        wait_scale: float = 1.0,
+    ) -> SimResult:
+        """按 SGLang 的 engine.step 口径跑：每步先成批 prefill，再推进 decode。
+
+        与 ``run_scheduled`` 的区别是并发不再由 ``max_inflight`` 逐条放行，而是由
+        ``scheduler.max_prefill_tokens`` / ``chunked_prefill_size`` /
+        ``max_running_requests`` 决定这一步能装多少条请求（见 ``sim.engine``）。
+        """
+
+        from sim.engine import EngineConfig, EngineSimulator
+
+        return EngineSimulator(
+            self,
+            sessions,
+            specs,
+            scheduler=scheduler or EngineConfig(),
+            service=service,
+        ).run(arrival_scale=arrival_scale, wait_scale=wait_scale)
 
 
 def run_synthetic(config: Optional[SimConfig] = None, **trace_kwargs) -> SimResult:
