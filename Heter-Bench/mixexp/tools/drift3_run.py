@@ -331,6 +331,14 @@ def summarize_phases(plan, res):
             "switch_cost_pp": round((hr(head) - steady) * 100, 2) if head else None,
             "dominant_class": dom,
             "t90_s": t90,
+            # 300s 分箱命中率：相位内是否还在爬升（判"瞬态 vs 永久损失"的直接证据）
+            "bins_300s": [
+                [int(b * 300), round(sum(x.hit for x in sel
+                                         if int((x.t - lo) // 300) == b)
+                                     / max(1, sum(x.prompt_len for x in sel
+                                                  if int((x.t - lo) // 300) == b)), 4)]
+                for b in range(int((hi - lo) // 300))
+            ],
         }
     return out
 

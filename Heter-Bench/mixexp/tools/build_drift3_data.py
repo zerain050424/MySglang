@@ -31,14 +31,23 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parents[2]      # Heter-Bench/
 ROOT = HERE.parent                               # repo root
 
-# 时间轴（虚拟秒）：warmup 300 + 3×1200 + cooldown 300
-SLICES = (
-    ("warmup", 300.0, 0.0),
-    ("p1", 1200.0, 300.0),
-    ("p2", 1200.0, 1500.0),
-    ("p3", 1200.0, 2700.0),
-    ("cooldown", 300.0, 3900.0),
-)
+# 时间轴（虚拟秒）：warmup 300 + 3×phase + cooldown 300。phase 长度由 --phase-s 给
+# （1200 = 原设计；2400 用来分辨"瞬态 vs 永久损失"，见 drift3_report.md §4.7）。
+EDGE_S = 300.0
+PHASE_S = 1200.0
+
+
+def make_slices(phase_s: float = PHASE_S, edge_s: float = EDGE_S):
+    return (
+        ("warmup", edge_s, 0.0),
+        ("p1", phase_s, edge_s),
+        ("p2", phase_s, edge_s + phase_s),
+        ("p3", phase_s, edge_s + 2 * phase_s),
+        ("cooldown", edge_s, edge_s + 3 * phase_s),
+    )
+
+
+SLICES = make_slices()
 TOTAL_S = SLICES[-1][2] + SLICES[-1][1]
 
 # 每相位 token 预算（exp3 标定 ≈2100 tok/s）
@@ -154,7 +163,13 @@ def main(argv=None) -> int:
     ap.add_argument("--out", default="TaskData/drift3")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--force", action="store_true", help="覆盖已有输出目录")
+    ap.add_argument("--phase-s", type=float, default=PHASE_S,
+                    help="三个主导相位各自的长度（秒）；1200=原设计，2400=瞬态检验")
     args = ap.parse_args(argv)
+
+    global SLICES, TOTAL_S
+    SLICES = make_slices(args.phase_s)
+    TOTAL_S = SLICES[-1][2] + SLICES[-1][1]
 
     out_root = HERE / args.out
     if out_root.exists() and not args.force and not args.dry_run:
@@ -242,7 +257,7 @@ def main(argv=None) -> int:
 
         lines = [
             f"# drift3 · 背景（trans）注入速率 = {bg:g}×（1× 时 trans 占 25% token）",
-            f"# 时间轴：warmup 300s → p1 1200s → p2 1200s → p3 1200s → cooldown 300s",
+            f"# 时间轴：warmup {EDGE_S:g}s → p1/p2/p3 各 {args.phase_s:g}s → cooldown {EDGE_S:g}s",
             f"# 生成器：mixexp/tools/build_drift3_data.py（勿手改）",
             "tasks:",
         ]
