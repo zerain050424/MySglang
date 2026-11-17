@@ -39,3 +39,24 @@ def test_opt_is_accepted_by_the_server_cli():
         ["--model-path", "/tmp/_sim_opt_cli_probe", "--radix-eviction-policy", "opt"]
     )
     assert args.radix_eviction_policy == "opt"
+
+
+def test_chain_lru_is_accepted_by_the_server_cli():
+    """``--radix-eviction-policy chain_lru`` 同样必须在 argparse 阶段被接受。"""
+
+    from sglang.srt.arg_groups.choices import RADIX_EVICTION_POLICY_CHOICES
+
+    assert "chain_lru" in RADIX_EVICTION_POLICY_CHOICES
+
+    server_args = pytest.importorskip("sglang.srt.server_args")
+    parser = argparse.ArgumentParser()
+    server_args.ServerArgs.add_cli_args(parser)
+    args = parser.parse_args(
+        [
+            "--model-path",
+            "/tmp/_sim_opt_cli_probe",
+            "--radix-eviction-policy",
+            "chain_lru",
+        ]
+    )
+    assert args.radix_eviction_policy == "chain_lru"

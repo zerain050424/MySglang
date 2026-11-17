@@ -120,10 +120,11 @@ def pct(xs, p):
     return xs[min(len(xs) - 1, max(0, int(round(p / 100 * (len(xs) - 1)))))]
 
 
-def run_arm(sessions, specs, policy, cap, use_map=None):
+def run_arm(sessions, specs, policy, cap, use_map=None, policy_config=None):
     ARRIVAL.clear()
     sim = Simulator(SimConfig(capacity=cap, page_size=PAGE, eviction_policy=policy,
-                              opt_use_map=use_map, seed=0, oversize="skip"))
+                              opt_use_map=use_map, policy_config=policy_config,
+                              seed=0, oversize="skip"))
     svc = ServiceModel(prefill_base_s=0.0, prefill_tokens_per_s=RATE, decode_tokens_per_s=40.0)
     res = sim.run_engine(sessions, specs, scheduler=EngineConfig(schedule_policy="fcfs"),
                          service=svc)
@@ -178,6 +179,12 @@ def main(argv=None):
     ap.add_argument("--hot-gap", type=float, default=3.0)
     ap.add_argument("--warm-gap", type=float, default=45.0)
     ap.add_argument("--arms", default="lru,heter_cache,opt")
+    ap.add_argument("--floor", type=int, default=4096,
+                    help="chain_lru：浅段保护下限（token）")
+    ap.add_argument("--weight", type=float, default=0.01,
+                    help="chain_lru：缺口罚斜率（秒/token）")
+    ap.add_argument("--gate", default="rerode", choices=["none", "rerode"],
+                    help="chain_lru：浅段保护证据门（rerode=只护被重读过的链）")
     ap.add_argument("--json", default="")
     a = ap.parse_args(argv)
 
@@ -187,9 +194,11 @@ def main(argv=None):
           f"warm={a.n_warm}×8 轮(gap {a.warm_gap}s, 私有 12k) "
           f"cold={a.n_cold}×1 ({a.tpl} 共享 + {a.tail} 私有)")
     out = {}
+    chain_cfg = {"floor_tokens": a.floor, "weight": a.weight, "gate": a.gate}
     for arm in [x for x in a.arms.split(",") if x]:
         if arm != "opt":
-            res, rows = run_arm(sessions, specs, arm, a.cap)
+            cfg = chain_cfg if arm == "chain_lru" else None
+            res, rows = run_arm(sessions, specs, arm, a.cap, policy_config=cfg)
             out[arm] = report(arm, res, rows)
             if arm == "lru":
                 base_lru = res

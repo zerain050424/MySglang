@@ -102,6 +102,67 @@ class SLRUStrategy(EvictionStrategy):
         return (is_protected, node.last_access_time)
 
 
+class ChainLRUStrategy(EvictionStrategy):
+    """LRU + 链形修正：浅段优先保护、砍链尾（victim 按下游依赖体量选）。
+
+    动机（tail-stress 诊断）：match 刷新的是整条匹配路径的 recency，一条私有
+    单子链要么全新要么全旧。链一旦成为全局最旧，``evict`` 里「叶子出堆 → 父
+    变新叶子再出堆」会一路剥穿——整链归零。归零后会话下轮 hit=0、整链重插、
+    再整链变旧被剥，进入死循环（tail-stress 上 warm 整链丢失 52%，P90 是 OPT
+    上界的 5 倍）。
+
+    两个修正只读树形与上游已有计数，不引新账本、不改 evict 循环：
+
+    * 浅段保护（``floor_tokens``）：淘汰叶子后，链上剩余前缀（root→parent 的
+      token 数）若低于下限，且这条链有重读证据，就把 ``weight × 缺口`` 秒加进
+      LRU 键——别的受害者必须比它还旧 ``weight × 缺口`` 秒才轮得到它。剥得越
+      深罚得越重，链在重读锚附近自然刹住；重读证据只认 ``reuse_count``
+      （admission match 计数），``hit_count`` 含写路径自增，会把刚写的段误判
+      成「被重读过」。
+    * 砍链尾（``tail_first``）：平票时先剥 ``remain`` 大的叶子——长链砍尾只损失
+      尾巴，短链砍根损失整链。
+    """
+
+    _GATES = ("none", "rerode")
+
+    def __init__(
+        self,
+        floor_tokens: int = 4096,
+        weight: float = 0.01,
+        gate: str = "rerode",
+        tail_first: bool = True,
+    ):
+        if floor_tokens < 0:
+            raise ValueError(f"floor_tokens must be >= 0, got {floor_tokens}")
+        if weight < 0:
+            raise ValueError(f"weight must be >= 0, got {weight}")
+        if gate not in self._GATES:
+            raise ValueError(f"gate must be one of {self._GATES}, got {gate!r}")
+        self.floor_tokens = int(floor_tokens)
+        self.weight = float(weight)
+        self.gate = gate
+        self.tail_first = bool(tail_first)
+
+    def get_priority(self, node: TreeNode) -> Tuple[float, float, int]:
+        lat = float(node.last_access_time)
+        # remain = 淘汰该叶子后链上仍连续缓存的前缀（root→parent 的 token 数）。
+        # 顺路收集重读证据：reuse_count 只在 admission match 里自增（回扫不算）。
+        remain = 0
+        rerode = getattr(node, "reuse_count", 0) > 0
+        cursor = node.parent
+        while cursor is not None and cursor.parent is not None:
+            remain += len(cursor.key)
+            rerode = rerode or getattr(cursor, "reuse_count", 0) > 0
+            cursor = cursor.parent
+        penalty = 0.0
+        if self.gate == "rerode" and not rerode:
+            penalty = 0.0
+        elif self.floor_tokens > 0 and remain < self.floor_tokens:
+            penalty = self.weight * (self.floor_tokens - remain)
+        tie = -float(remain) if self.tail_first else 0.0
+        return (lat + penalty, tie, int(getattr(node, "id", 0)))
+
+
 class HeterCacheStrategy(EvictionStrategy):
     """HeterCache 多队列缓存淘汰策略。
 

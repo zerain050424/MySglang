@@ -192,6 +192,8 @@ RADIX_EVICTION_POLICY_CHOICES = [
     # 缺它时 ``--radix-eviction-policy opt`` 在参数解析阶段就被拒，
     # mixexp/README §2 的「采时刻 → 造 use map → 重放」流程起不来。
     "opt",
+    # LRU + 链形修正（evict_policy.ChainLRUStrategy）：浅段优先保护、砍链尾。
+    "chain_lru",
 ]
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]

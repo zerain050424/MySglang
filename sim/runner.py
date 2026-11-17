@@ -81,6 +81,9 @@ class SimConfig:
     # dropped by the policy it is supposed to be pinned against.
     verify: bool = True
     eviction_policy: str = "heter_cache"
+    # 策略构造参数原样透传给缓存工厂；None = 按策略族默认分派（heter 读 VD 参数、
+    # opt 读 use map、其余无参）。用于实验臂带自己的参数（如 chain_lru 的 floor/weight）。
+    policy_config: Optional[dict] = None
     # OPT 上界专用：离线 trace 生成的 `{block_hash: [使用时刻]}`。
     # 只在 eviction_policy="opt" 时读；缺失即报错，不做静默退化。
     opt_use_map: Optional[str] = None
@@ -196,6 +199,8 @@ class Simulator:
                 "cost_map_path": cfg.opt_cost_map,
                 "cost_mode": cfg.opt_cost_mode,
             }
+        elif cfg.policy_config is not None:
+            policy_config = dict(cfg.policy_config)
         else:
             policy_config = None
 
