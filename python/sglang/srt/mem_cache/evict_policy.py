@@ -13,6 +13,7 @@ from sglang.srt.mem_cache.heter_cache.selector import queue_order as _queue_orde
 from sglang.srt.mem_cache.heter_cache.selector import struct_tier
 from sglang.srt.mem_cache.heter_cache.utils import (
     node_num_tokens,
+    reuse_window_probability,
     ONE_SHOT_IDLE_S,
     REUSE_QUEUES,
     ReuseParams,
@@ -128,6 +129,10 @@ class HeterCacheStrategy(EvictionStrategy):
         self.reuse = ReuseParams.from_any(reuse)
         self.value = QueueValueParams.from_any(value)
         self.force_agentic = bool(force_agentic)
+        # Stage 0 边界咨询的计数（观测用）：spared = 因预测回访而免于 one-shot 的
+        # 节点数；starved = 整带都被预测为回访、只能退回全带继续清运的次数。
+        self.one_shot_spared = 0
+        self.one_shot_starved = 0
 
         self.occupancy = QueueOccupancyTracker()
         self.realized = QueueValueTracker(
@@ -224,6 +229,37 @@ class HeterCacheStrategy(EvictionStrategy):
     def one_shot_key(self, node) -> tuple:
         """One-shot 带内淘汰排序：老化节点最优先，其余按访问时间升序"""
         return (0 if self.is_aged(node) else 1, node.last_access_time, node.id)
+
+    def one_shot_return_prob(self, node) -> Optional[float]:
+        """该候选在未来视野内被重新请求的概率；无复用间隔分布时返回 None。
+
+        用队列自己的 lognormal 条件生存概率（与 chat/agentic 队内排序同一套
+        mu/sigma），视野取三队列共享的 ``value.horizon_s``。struct/random 没有
+        时间维度可预测，返回 None 让调用方保持原口径。
+        """
+        cfg = self._node_tag(node).reuse_config
+        if cfg is None:
+            return None
+        elapsed = max(self._now() - node.last_access_time, 0.0)
+        return reuse_window_probability(elapsed, self.value.horizon_s, *cfg)
+
+    def one_shot_predicts_return(self, node, released: Optional[int] = None) -> bool:
+        """Stage 0 的边界咨询：预测命中量是否超过本次释放量的一定比例。
+
+        ``value.one_shot_guard_frac`` 为 0 时恒 False（关闭，热路径只多一次比较）。
+        当前 ``_evict_one`` 不级联、``released`` 就是节点自身长度，此时条件退化为
+        ``prob > frac``；保留 span 形式是为了将来若恢复级联释放，口径不变。
+        """
+        frac = self.value.one_shot_guard_frac
+        if frac <= 0.0:
+            return False
+        prob = self.one_shot_return_prob(node)
+        if prob is None:
+            return False
+        span = float(released if released else node_num_tokens(node))
+        if span <= 0.0:
+            return False
+        return prob * span > frac * span
 
     # ---- 命中/淘汰记账 ----
 

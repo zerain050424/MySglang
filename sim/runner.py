@@ -63,6 +63,9 @@ class SimConfig:
     value_horizon_s: float = 120.0
     value_smoothing_k: float = 4.0
     value_floor_tokens: float = 0.0
+    # Stage 0 边界咨询 VD 的门槛（0 = 关闭）：预测回访 token > frac × 释放 token
+    # 时不当 one-shot 清掉。只影响 one_shot 带，不影响 VD 仲裁本身。
+    one_shot_guard_frac: float = 0.0
     seed: int = 0
     page_size: int = 1
     eviction_policy: str = "heter_cache"
@@ -151,6 +154,7 @@ class Simulator:
                     "horizon_s": cfg.value_horizon_s,
                     "smoothing_k": cfg.value_smoothing_k,
                     "floor_tokens": cfg.value_floor_tokens,
+                    "one_shot_guard_frac": cfg.one_shot_guard_frac,
                     "seed": cfg.seed,
                 }
             }

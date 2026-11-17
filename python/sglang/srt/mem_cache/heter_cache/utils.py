@@ -359,12 +359,19 @@ class QueueValueParams:
             估计的方差，不改变跨队列比较的尺度。
         floor_tokens: VD 分母的统计下限（token），不是保留量。
         seed: 兜底随机抽样的种子（同 seed 可复现）。
+        one_shot_guard_frac: Stage 0 边界咨询 VD 的门槛，0 表示关闭（默认）。
+            one-shot 判据成立时，若该节点在未来视野内的**预测命中 token 数**超过
+            ``frac × 本次释放 token 数``，就不按 one-shot 清掉、退回 VD 候选。
+            预测用队列自己的复用间隔 lognormal（``reuse_window_probability``），
+            与 chat/agentic 队内排序同一套 mu/sigma；没有时间维度的队列
+            （struct/random）不参与咨询。
     """
 
     horizon_s: float = DEFAULT_VALUE_HORIZON_S
     smoothing_k: float = DEFAULT_VALUE_SMOOTHING_K
     floor_tokens: float = DEFAULT_VALUE_FLOOR_TOKENS
     seed: int = 0
+    one_shot_guard_frac: float = 0.0
 
     def __post_init__(self):
         if self.horizon_s <= 0:
@@ -381,6 +388,11 @@ class QueueValueParams:
             )
         if not isinstance(self.seed, int) or isinstance(self.seed, bool):
             raise ValueError(f"value.seed must be int, got {self.seed!r}")
+        if not 0.0 <= self.one_shot_guard_frac <= 1.0:
+            raise ValueError(
+                "value.one_shot_guard_frac must be in [0, 1] "
+                f"(0 = 关闭边界咨询), got {self.one_shot_guard_frac}"
+            )
 
     @classmethod
     def from_any(cls, value=None) -> "QueueValueParams":

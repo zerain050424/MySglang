@@ -445,6 +445,78 @@ def test_chat_uses_reuse_score_not_round_robin():
           f"value:chat must use the reuse score, got {source}")
 
 
+def test_one_shot_guard_consults_value():
+    """Stage 0 边界咨询：预测近期会回来的 one-shot 候选先留着，但绝不允许饿死清运。"""
+    print("[15] stage-0 guard consults the value model, never starves the band")
+    TAG_Q = hu.HeterCacheNodeTag
+    now = 1000.0
+    st = _strategy(now=lambda: now,
+                   value={"one_shot_guard_frac": 0.9, "horizon_s": 120.0})
+
+    def mk(tag, elapsed, sid):
+        node = _leaf(tag, 64, ts=now - elapsed, session_id=sid)
+        st.session_registry.touch(sid, "r1", prompt_len=64, now=0.0)
+        st.session_registry.get(sid).session_type = hu.SessionType.TRANS
+        return node
+
+    # agentic 的 T50≈6.1s：搁置 25s 的节点「下一个视野里会回来」的概率接近 1；
+    # chat 的 T50≈118s：搁置 40s 的节点远低于 0.9 ⇒ 该走的还是它。
+    hot = mk(TAG_Q.QAGENT, 25, "hot")     # 更「新」但被预测会回访
+    cold = mk(TAG_Q.QCHAT, 40, "cold")
+    check(st.one_shot_return_prob(hot) > 0.9,
+          f"precondition: hot prob={st.one_shot_return_prob(hot)}, want >0.9")
+    check(st.one_shot_return_prob(cold) < 0.9,
+          f"precondition: cold prob={st.one_shot_return_prob(cold)}, want <0.9")
+    check(st.is_one_shot(hot) and st.is_one_shot(cold),
+          "precondition: both are one-shot band members")
+
+    # 关闭时（frac=0，默认）：一行都不咨询，按原口径（更久未访问者优先）
+    off = _strategy(now=lambda: now)
+    victim, source = qs.pick_victim(strategy=off, leaves=[hot, cold])
+    check(victim is cold and source == "one_shot",
+          f"guard off must keep the old order, got {victim is cold}/{source}")
+    check(off.one_shot_spared == 0 and not off.one_shot_predicts_return(hot),
+          "guard off must not consult the value model at all")
+
+    # 打开时：hot 被留下，cold 成为牺牲者
+    victim, source = qs.pick_victim(strategy=st, leaves=[hot, cold])
+    check(victim is cold and source == "one_shot",
+          f"guarded pick must evict cold, got {victim is cold}/{source}")
+    check(st.one_shot_spared == 1, f"spared counter={st.one_shot_spared}, want 1")
+
+    # 整带都被预测回访：退回全带，不许返回 None（VD 单独用更差）
+    st2 = _strategy(now=lambda: now, value={"one_shot_guard_frac": 0.9})
+    a = mk(TAG_Q.QAGENT, 25, "a")
+    b = mk(TAG_Q.QAGENT, 30, "b")
+    victim, source = qs.pick_victim(strategy=st2, leaves=[a, b])
+    check(victim is not None and source == "one_shot",
+          f"a fully-guarded band must fall back, got {victim}/{source}")
+    check(st2.one_shot_starved == 1,
+          f"starved counter={st2.one_shot_starved}, want 1")
+    check(st2.one_shot_spared == 0, "nothing may be counted as spared on fallback")
+
+    # 没有复用间隔分布的队列（struct/random）不参与咨询
+    st3 = _strategy(now=lambda: now, value={"one_shot_guard_frac": 0.9})
+    plain = mk(TAG_Q.QSTRUCT, 400, "plain")
+    check(st3.is_one_shot(plain), "precondition: aged/cold struct is one-shot")
+    check(not st3.one_shot_predicts_return(plain),
+          "struct has no reuse-interval distribution: must not be consulted")
+    check(not st3.one_shot_predicts_return(plain, released=0),
+          "zero-span release must not be spared")
+
+    # 参数边界
+    try:
+        hu.QueueValueParams(one_shot_guard_frac=1.5)
+        false_(  "frac>1 must raise")
+    except ValueError:
+        pass
+
+
+def false_(msg):  # noqa: N802 —— 仅给上面的 check 兜底用
+    FAILS.append(msg)
+    print(f"  FAIL  {msg}")
+
+
 def test_reuse_window_probability():
     """复用分 = P(reuse in (a, a+H] | not reused by a)，不是 1 - CDF(a)。"""
     print("[13] reuse score is the conditional window probability")
@@ -565,6 +637,7 @@ def main():
         test_chat_uses_reuse_score_not_round_robin,
         test_reuse_window_probability,
         test_per_type_ageing_ttl,
+        test_one_shot_guard_consults_value,
     ]
     for t in tests:
         try:
