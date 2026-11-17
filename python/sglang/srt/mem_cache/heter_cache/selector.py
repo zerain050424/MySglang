@@ -40,17 +40,7 @@ def pick_victim(*, strategy, leaves):
     """
     one_shot = [n for n in leaves if strategy.is_one_shot(n)]
     if one_shot:
-        band = one_shot
-        if strategy.value.one_shot_guard_frac > 0.0:
-            # 边界咨询 VD：预测近期会回来的先不让它按 one-shot 清掉。
-            spared = [n for n in one_shot if not strategy.one_shot_predicts_return(n)]
-            if spared:
-                strategy.one_shot_spared += len(one_shot) - len(spared)
-                band = spared
-            else:
-                # 整带都被预测为回访：不许饿死清运通道，退回全带（VD 单独用更差）。
-                strategy.one_shot_starved += 1
-        return min(band, key=strategy.one_shot_key), "one_shot"
+        return min(one_shot, key=strategy.one_shot_key), "one_shot"
     if not leaves:
         return None, None
 
