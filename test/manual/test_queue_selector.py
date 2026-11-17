@@ -478,11 +478,13 @@ def test_reuse_window_probability():
 
 
 def test_per_type_ageing_ttl():
-    """按类型老化：struct < chat < agentic，random 永不老化；带内最优先。"""
-    print("[14] per-type ageing TTL: struct < chat < agentic, random off")
+    """按类型老化：struct < chat <= agentic，random 不老化；带内最优先。"""
+    print("[14] per-type ageing TTL: struct < chat <= agentic, random off")
     ttl = hu.DEFAULT_AGEING_TTL_S
-    check(ttl["struct"] < ttl["chat"] < ttl["agentic"],
+    check(ttl["struct"] < ttl["chat"],
           f"TTL must grow with re-prefill cost: {ttl}")
+    check(ttl["chat"] >= 300.0,
+          f"chat TTL is set by the drift3 sweep peak (>=300s), got {ttl['chat']}")
     check(ttl["random"] == 0, "random nodes are one-shot already; no ageing")
     st = _strategy()
     now = time.monotonic()
@@ -503,11 +505,11 @@ def test_per_type_ageing_ttl():
     check(not st.is_aged(node(TAG["struct"], ttl["struct"] + 1, share=0)),
           "unshared struct is left to the original 90s one-shot rule")
 
-    check(not st.is_aged(node(TAG["chat"], ttl["struct"] + 1)),
-          "chat must not age at the struct TTL")
+    check(not st.is_aged(node(TAG["chat"], ttl["chat"] - 1)),
+          "chat must not age before its own TTL")
     check(st.is_aged(node(TAG["chat"], ttl["chat"] + 1)), "chat ages at chat TTL")
-    check(not st.is_aged(node(TAG["agentic"], ttl["chat"] + 1)),
-          "agentic must not age at the chat TTL")
+    check(st.is_aged(node(TAG["agentic"], ttl["agentic"] + 1)),
+          "agentic ages at its own TTL")
     check(st.is_aged(node(TAG["agentic"], ttl["agentic"] + 1)),
           "agentic ages at the agentic TTL")
     check(not st.is_aged(_leaf(hu.HeterCacheNodeTag.QTRANS, 100, ts=now - 10 ** 6)),
