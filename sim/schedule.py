@@ -102,11 +102,14 @@ def _segment_offsets(spec: TaskSpec, n: int) -> List[float]:
         t = until
         if len(out) >= n:
             return out
-    # 时间轴结束后沿用最后一段的强度；若最后一段是静默段（λ=0），退回到
-    # 最后一个非零强度，避免 expovariate(0) 抛 OverflowError。
+    # 时间轴结束后怎么办，取决于最后一段：
+    #   * 最后一段**静默**（λ=0）⇒ 停在这里，返回已有的偏移。调用方按 ``zip``
+    #     配对会话与偏移，于是多出来的会话不会被发射——这正是「切片窗口外不注入」
+    #     需要的语义（drift3 的每 (类, slice) 任务都用它截尾）。
+    #   * 最后一段非静默 ⇒ 沿用它的强度继续放，保证「会话数用不完」时也能跑满。
     last_rate = segments[-1][1]
     if last_rate <= 0.0:
-        last_rate = next(rate for _until, rate in reversed(segments) if rate > 0.0)
+        return out
     while len(out) < n:
         t += rng.expovariate(last_rate)
         out.append(t)

@@ -95,6 +95,23 @@ def test_continuation_after_last_segment():
     assert 0.7 <= rate <= 1.4, rate
 
 
+def test_trailing_silent_segment_drops_overflow():
+    """末段静默 ⇒ 返回少于 n 的偏移（窗口外不发射，靠调用方的 zip 截尾）。"""
+
+    spec = _spec([(100.0, 1.0), (200.0, 0.0)])
+    offsets = _offsets(spec, 10_000)
+    assert 0 < len(offsets) < 10_000, len(offsets)
+    assert max(offsets) < 100.0, f"越界偏移未被截掉：{max(offsets)}"
+
+
+def test_leading_zero_segment_is_allowed():
+    """前导静默段（t<T0 不注入）合法，且第一跳落在 T0 之后。"""
+
+    spec = _spec([(60.0, 0.0), (160.0, 1.0)])
+    offsets = _offsets(spec, 50)
+    assert offsets and min(offsets) >= 60.0, min(offsets)
+
+
 def test_deterministic_for_same_seed():
     a = _offsets(_spec([(100.0, 0.5), (200.0, 2.0)], seed=42), 200)
     b = _offsets(_spec([(100.0, 0.5), (200.0, 2.0)], seed=42), 200)
