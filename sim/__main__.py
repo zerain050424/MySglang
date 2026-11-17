@@ -525,7 +525,7 @@ def _check_emitter() -> list:
 
 
 def _check_bounds() -> list:
-    """R4 验收：response 哨兵唯一 + 超大请求显式跳过。"""
+    """R4 验收：无 response 时哨兵唯一 + 超大请求显式跳过。"""
 
     print("[7] 边界（R4）")
     from sim.allocator import tree_tokens
@@ -546,7 +546,7 @@ def _check_bounds() -> list:
     # 两段 response 各写一份（共用一串 token 时只有 80）
     unique_ok = tree_tokens(sim.cache) == 64 + 16 + 16
     print(
-        f"    response  : 哨兵基址={OUTPUT_SENTINEL_BASE} "
+        f"    response  : fallback 哨兵基址={OUTPUT_SENTINEL_BASE} "
         f"dup={sim.duplicate_insert_tokens} tree={tree_tokens(sim.cache)} "
         f"(want 96){'' if unique_ok else '  <-- decode 段被合并'}"
     )

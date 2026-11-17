@@ -55,13 +55,9 @@ class FakeReqToTokenPool:
         return f"<FakeReqToTokenPool width={self.width}>"
 
 
-# response token 的哨兵基址：远高于任何真实词表，且每请求再加一个序号。
-#
-# 为什么不能用 0：生产里每轮生成的 token 不同，decode 段必然是新分支；若所有请求
-# 的 response 都用同一串 0，同一个 prompt 的重放会命中上一次的 response 段，
-# 树节点数与占用都会偏低（M4 的 need-vs-grew 差额就是它）。
-# 为什么不能用数据集 response_ids：下一轮的 prompt 后缀正是数据集的 response，
-# 若树里也存它，就会命中生产里必然 miss 的那一截（生产存的是模型自己生成的 token）。
+# Fallback response token when the trace has no response_ids: one unique id per
+# request, far above any real vocabulary. A shared token would make a replayed
+# prompt hit the previous response segment and understate tree size/occupancy.
 OUTPUT_SENTINEL_BASE = 1 << 40
 
 
@@ -89,12 +85,23 @@ class SimReq:
         priority: int = 0,
         tool_call: Optional[bool] = None,
         output_token: Optional[int] = None,
+        response_ids: Optional[Sequence[int]] = None,
     ) -> None:
         self.rid = rid
         self.session_id = session_id
         self.origin_input_ids = array("q", prompt)
-        token = OUTPUT_SENTINEL_BASE + 1 if output_token is None else int(output_token)
-        self.output_ids: List[int] = [token] * int(output_len)
+        if response_ids is not None:
+            if output_len and int(output_len) != len(response_ids):
+                raise ValueError(
+                    "response_ids length does not match output_len: "
+                    f"{len(response_ids)} != {output_len}"
+                )
+            self.output_ids: List[int] = [int(token) for token in response_ids]
+        else:
+            token = (
+                OUTPUT_SENTINEL_BASE + 1 if output_token is None else int(output_token)
+            )
+            self.output_ids = [token] * int(output_len)
         self.extra_key = None
         self.cache_salt = None
         self.priority = priority

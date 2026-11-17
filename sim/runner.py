@@ -206,6 +206,7 @@ class Simulator:
             turn.out,
             tool_call=turn.tool_call,
             output_token=OUTPUT_SENTINEL_BASE + self._rid_seq,
+            response_ids=turn.response,
         )
         # 仿真不建模请求自己的 kv 行（它只是树的引用）：声明整条已由树持有，
         # 于是 _adopt 收尾的「释放重复槽位」段为空，池账只跟树 + 在飞走。

@@ -1,4 +1,4 @@
-"""R4 验收：response 哨兵唯一 + 超大请求的显式处理。
+"""R4 验收：无 response 时哨兵唯一 + 超大请求的显式处理。
 
 两个都会静默改变树形，所以必须钉死：
 
@@ -47,7 +47,7 @@ def test_identical_prompts_do_not_share_the_response_segment():
     for i in range(2):
         sim.request(_turn(prompt, out=16), f"apps_{i}", task_name="chat")
 
-    assert sim.duplicate_insert_tokens == 0, "response 段被合并了（哨兵没生效）"
+    assert sim.duplicate_insert_tokens == 0, "response 段被合并了（fallback 哨兵没生效）"
     # prompt 共享 64；两段 response 各写 16（共用一串 0 时树里只有 80）
     assert tree_tokens(sim.cache) == 64 + 16 + 16
     assert sim.alloc.used == tree_tokens(sim.cache)

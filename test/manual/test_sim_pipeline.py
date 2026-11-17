@@ -12,6 +12,7 @@
 import json
 import os
 import sys
+from dataclasses import replace
 
 import pytest
 
@@ -21,6 +22,7 @@ sys.path.insert(0, ROOT)
 from sim.metrics import RequestRecord, summarize  # noqa: E402
 from sim.runner import SimConfig, Simulator  # noqa: E402
 from sim.session_data import load_task, load_tasks  # noqa: E402
+from sim.trace import Session  # noqa: E402
 
 
 def _session(sid, num_turns, turns):
@@ -62,9 +64,12 @@ def test_load_task_matches_emitter_semantics(trace_path):
     # prompt 是整段历史，且第二轮含上一轮的 response（64 + 3 = 67）
     assert list(multi.turns[0].prompt) == list(range(100, 164))
     assert list(multi.turns[1].prompt)[:67] == list(range(100, 164)) + [7, 8, 9]
-    # out 只取 response 长度
+    # out 是 response 长度，response token 本身也保留下来供回放
     assert multi.turns[0].out == 3
     assert multi.turns[1].out == 2
+    assert list(multi.turns[0].response) == [7, 8, 9]
+    assert list(multi.turns[1].response) == [1, 2]
+    assert multi.turns[0].response_len == 3
     # tool_call 取上一轮（第一轮没有上一轮 -> False；第二轮取第一轮的 True）
     assert multi.turns[0].tool_call is False
     assert multi.turns[1].tool_call is True
@@ -90,6 +95,34 @@ def test_load_tasks_relative_paths(tmp_path, trace_path):
     sessions = load_tasks(tasks, base_dir=str(tmp_path))
     assert {s.task_name for s in sessions} == {"chat"}
     assert len(sessions) == 2
+
+
+def test_dataset_response_is_reused_across_turns(trace_path):
+    """Turn.response makes the next turn hit prev prompt + prev response."""
+
+    sessions = load_task(trace_path, task_name="ShareGPT", shuffle=False)
+    result = Simulator(SimConfig(capacity=4096, seed=3)).run(sessions)
+    chat = [r for r in result.records if r.session_id == "ShareGPT-0"]
+    # turn 1 writes 64 prompt + 3 response; turn 2 matches all 67.
+    assert chat[1].hit == 67
+
+
+def test_sentinel_mode_misses_response_suffix(trace_path):
+    """Without response tokens the replay is deliberately pessimistic."""
+
+    sessions = load_task(trace_path, task_name="ShareGPT", shuffle=False)
+    stripped = [
+        Session(
+            session.session_id,
+            tuple(replace(turn, response=None) for turn in session.turns),
+            session.task_name,
+        )
+        for session in sessions
+    ]
+    result = Simulator(SimConfig(capacity=4096, seed=3)).run(stripped)
+    chat = [r for r in result.records if r.session_id == "ShareGPT-0"]
+    # turn 2 still stops at the 64-token prompt: sentinel != dataset response.
+    assert chat[1].hit == 64
 
 
 def test_per_task_metrics_grouped_separately(trace_path):

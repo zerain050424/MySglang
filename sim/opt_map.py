@@ -13,6 +13,9 @@ use map 可以在跑仿真之前独立生成，不需要先跑一遍淘汰。
 时间轴约定：存的是 ``Turn.t``（虚拟秒），与 ``RadixCache._now`` 同源。因此不需要
 UniCache 那种全局 ``PREFILL_CNT`` 游标，``OPTStrategy`` 用二分查询即可。
 
+``turn.prompt`` 是完整历史；离线回放保留 ``Turn.response`` 时，上一轮 response
+已经作为下一轮 prompt 的一部分出现，所以 response 块会自然拿到有限的下次使用。
+
 用法::
 
     from sim.opt_map import build_use_map, write_use_map

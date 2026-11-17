@@ -1,6 +1,7 @@
 """trace 结构 + 合成负载生成器。
 
-输入只要求一件事：**每轮一个时刻 + 一段 prompt token + 一个 response 长度**。
+输入只要求一件事：**每轮一个时刻 + 一段 prompt token + 一个 response**。
+response 可以是 token 序列（回放数据集时），也可以只给长度（合成负载）。
 不读任何数据集文件——真实 trace（ShareGPT / AgentBank / Codeparrot）由调用方
 转成同样的结构喂进来即可。
 
@@ -13,17 +14,25 @@ from __future__ import annotations
 import random
 from array import array
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 
 @dataclass(frozen=True)
 class Turn:
-    """一轮请求。``prompt`` 只含 prompt token，不含 response。"""
+    """一轮请求。``prompt`` 只含 prompt token，``response`` 是本轮生成的回答。"""
 
     t: float
     prompt: array
     out: int = 0
     tool_call: bool = False
+    # Dataset replay keeps the real response tokens so the next turn's prompt
+    # (prev prompt + prev response + new) can hit the response segment.
+    # None means the caller only knows the length; SimReq then uses a sentinel.
+    response: Optional[array] = None
+
+    @property
+    def response_len(self) -> int:
+        return len(self.response) if self.response is not None else self.out
 
 
 @dataclass(frozen=True)
@@ -50,7 +59,7 @@ def _tokens(values: Iterable[int]) -> array:
 def max_total_len(sessions: Iterable[Session]) -> int:
     """最长的一轮 ``prompt + response``，决定 req_to_token 需要多宽。"""
     return max(
-        (len(t.prompt) + t.out for s in sessions for t in s.turns),
+        (len(t.prompt) + t.response_len for s in sessions for t in s.turns),
         default=0,
     )
 

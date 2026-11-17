@@ -202,6 +202,57 @@ def test_opt_beats_lru_on_same_trace(tmp_path):
     )
 
 
+def test_dataset_response_gets_finite_next_use(tmp_path):
+    """With Turn.response the next turn hits the response block, and OPT sees it."""
+
+    a = _tok(1000, 32)
+    r = _tok(2000, 16)
+    b = _tok(3000, 16)
+    sessions = [
+        Session(
+            "s1",
+            (
+                Turn(0.0, a, out=len(r), response=r),
+                Turn(100.0, array("i", list(a) + list(r) + list(b)), out=0),
+            ),
+        )
+    ]
+    path = tmp_path / "use_map.json"
+    write_use_map(str(path), build_use_map(sessions, page_size=8))
+
+    sim = Simulator(
+        SimConfig(
+            capacity=4096,
+            page_size=8,
+            eviction_policy="opt",
+            opt_use_map=str(path),
+        )
+    )
+    result = sim.run(sessions)
+    assert [record.hit for record in result.records] == [0, len(a) + len(r)]
+    assert sim.cache.eviction_strategy._misses == 0
+
+    # Same trace without response tokens: turn 2 stops at the 32-token prompt.
+    sentinel = [
+        Session(
+            "s1",
+            (
+                Turn(0.0, a, out=len(r)),
+                Turn(100.0, array("i", list(a) + list(r) + list(b)), out=0),
+            ),
+        )
+    ]
+    miss = Simulator(
+        SimConfig(
+            capacity=4096,
+            page_size=8,
+            eviction_policy="opt",
+            opt_use_map=str(path),
+        )
+    ).run(sentinel)
+    assert [record.hit for record in miss.records] == [0, len(a)]
+
+
 def test_opt_requires_use_map():
     with pytest.raises(ValueError, match="opt_use_map"):
         Simulator(SimConfig(eviction_policy="opt", page_size=8)).run(_trace())

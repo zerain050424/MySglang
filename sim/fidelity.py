@@ -189,7 +189,7 @@ def run_fidelity(
 
     config = config or SimConfig(capacity=2048, seed=seed)
     events = stress_events(seed=seed, n=n)
-    width = max(len(turn.prompt) + turn.out for _t, _sid, turn in events)
+    width = max(len(turn.prompt) + turn.response_len for _t, _sid, turn in events)
 
     def one_pass() -> Tuple[List[str], Simulator]:
         sim = Simulator(config)

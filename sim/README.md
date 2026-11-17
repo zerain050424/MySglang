@@ -77,7 +77,7 @@ print(result.render())          # 含 per-task 命中率
 | R1 | 数据集接入：`session_data.jsonl → List[Session]` + per-task 指标 | ✅（`sim/session_data.py`） |
 | R2 | 发射规则：闭环轮次 + 服务时长模型 + arrival/wait scale | ✅（`sim/schedule.py`） |
 | R3 | 并发窗口：同刻 k 条在飞、锁持到完成、竞态可复现 | ✅（`Emitter(max_inflight=...)`） |
-| R4 | response 唯一哨兵 + 超大请求显式处理 | ✅（`sim/req.py`、`SimConfig(oversize=...)`） |
+| R4 | 数据集 response 优先 + 无 response 时哨兵回退 + 超大请求显式处理 | ✅（`Turn.response`、`sim/req.py`、`SimConfig(oversize=...)`） |
 | E1 | 引擎步调度：按 SGLang 的 prefill 预算成批准入 + chunked prefill + decode 步 | ✅（`sim/engine.py` + `test/manual/test_sim_engine.py`） |
 
 ### 分配器（M2）
@@ -135,11 +135,15 @@ result = Simulator(SimConfig(capacity=100_000)).run_scheduled(
 
 两处会静默改变树形，所以显式建模：
 
-1. **response token 每请求唯一**（`sim/req.py::OUTPUT_SENTINEL_BASE`）。
-   若所有请求共用一串 token，同一个 prompt 的重放会命中上一次的 response 段，
-   树节点数/占用/`duplicate` 统计全偏低。也不能用数据集的 `response_ids`：
-   下一轮的 prompt 后缀正是它，用了反而会命中生产里必然 miss 的那一截
-   （生产存的是模型自己生成的 token）。
+1. **response token：优先用数据集的 `response_ids`**（`Turn.response`）。
+   离线回放的 token 流就是数据集本身：第 k+1 轮 prompt 正是
+   `第 k 轮 prompt + 第 k 轮 response + 新增内容`，所以 response 段可以被命中。
+   `load_task` 保留 `response_ids`，`SimReq` 直接用它写树。
+   只有没有 `response_ids` 的 trace（合成负载、只给 `out` 长度的数据）才回退到
+   每请求唯一哨兵（`sim/req.py::OUTPUT_SENTINEL_BASE`）。哨兵能避免
+   「模型实际生成 ≠ 数据集回答」时的假命中，但会少算 response 复用；适合做悲观对照。
+   该口径依赖 `turn_{k+1}.prompt` 以 `turn_k.prompt + turn_k.response` 开头；
+   切换数据集前应先用会话数据检查这个前缀覆盖率。
 2. **超大请求**：`SimConfig(oversize=...)`
    - `"error"`（默认）：抛 `OutOfTokens`，带 rid/total/capacity——逼调用方别用
      小池子跑大会话；
@@ -288,15 +292,16 @@ CPU 96 token 的构造 trace 上 `opt.hit_rate > lru.hit_rate`。该文件不能
 | 字段 | 来源 | 依据 |
 |---|---|---|
 | `prompt` | `turn_i.input_ids` 整段历史 | emitter 直发 `input_ids`（`bench_heap:_resolve_prompt_ids` 返回值恒等数据集） |
+| `response` | `turn_i.response_ids` | 离线回放用数据集回答写树，下一轮 prompt 才能命中 response 段 |
 | `out` | `len(turn_i.response_ids)` | emitter 只发 `max_new_tokens` |
 | `tool_call` | **上一轮**的 `tool_call`（第 1 轮为 False） | emitter payload：`sess[f"turn_{idx-1}"].get("tool_call") if idx > 1 else None` |
 | `task_name` | tasks_config 的 `name` | emitter 的 `per_task` 口径 |
 
 打乱/截断/轮数过滤也同口径：`load_task(..., shuffle=True, seed=seed+task_id, max_record=..., min_turns=...)`。
 
-由此得到一条推论：第 k+1 轮的 prompt 后缀是**数据集的** response，而生产树里存的是
-**模型实际生成的** token，两者一般不同 ⇒ 那一截必然 miss。仿真器把 response 写成
-每请求唯一的哨兵 id，正是为了让这件事也成立。
+第 k+1 轮的 prompt 是 `第 k 轮 prompt + 第 k 轮 response + 新增内容`。回放保留
+`response_ids`，所以 response 段能在下一轮命中；没有 `response_ids` 的 trace 才退回
+每请求唯一哨兵。哨兵是悲观口径，适合「模型实际生成 ≠ 数据集回答」的敏感性对照。
 
 指标同时给出两套分组：`per_type`（session_type，策略视角）与 `per_task`
 （tasks_config 的 name，emitter 视角）。

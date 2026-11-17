@@ -12,14 +12,15 @@
 1. **prompt 用整段历史**：``turn_i.input_ids`` 本身就是完整历史（服务端直发
    input_ids），**不是**「上一轮 prompt + 上一轮 response + 本轮新增」自己拼的。
    emitter 也发这一份（``_resolve_prompt_ids`` 的返回值恒等于数据集）。
-2. **response 只取长度**：emitter 发 ``max_new_tokens = len(response_ids)``，
-   服务端自己生成 token；仿真同样只保留长度，不把数据集 response 写进树。
+2. **response 保留 token**：emitter 发 ``max_new_tokens = len(response_ids)``；
+   离线回放把 ``response_ids`` 一并带进 ``Turn.response``，因为数据集下一轮
+   prompt 就是 ``上一轮 prompt + 上一轮 response + 新增内容``，只有写入同一串
+   token，response 段才可能在下一轮命中。
 3. **tool_call 取上一轮**：emitter 的 payload 是
    ``sess[f"turn_{idx-1}"].get("tool_call") if idx > 1 else None``。
 
-⚠️ 由此得到一条容易看漏的推论：第 k+1 轮的 prompt 后缀是**数据集的** response，
-而生产树里存的是**模型实际生成的** token，两者一般不同 ⇒ 那一截必然 miss。
-仿真器把 response 写成每请求唯一的哨兵 id，正是为了让这件事也成立。
+没有 ``response_ids`` 的 trace（合成负载、只给长度的数据）仍回退到每请求唯一
+哨兵：哨兵能避免“模型实际生成 ≠ 数据集回答”时的假命中，但会少算 response 复用。
 """
 
 from __future__ import annotations
@@ -63,15 +64,16 @@ def _turns_of(session: Dict[str, Any]) -> tuple:
                 f"session {session.get('id')!r} 声明 num_turns={n}，但缺 turn_{idx}"
             )
         prompt = row.get("input_ids") or []
-        out = len(row.get("response_ids") or [])
+        response_ids = row.get("response_ids") or []
         prev = session.get(f"turn_{idx - 1}") if idx > 1 else None
         tool_call = prev.get("tool_call") if prev is not None else None
         turns.append(
             Turn(
                 t=0.0,
                 prompt=array("q", prompt),
-                out=int(out),
+                out=len(response_ids),
                 tool_call=bool(tool_call),
+                response=array("q", response_ids) if response_ids else None,
             )
         )
     return tuple(turns)
