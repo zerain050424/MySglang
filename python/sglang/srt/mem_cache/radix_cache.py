@@ -728,7 +728,12 @@ class RadixCache(BasePrefixCache):
 
         start_time = time.perf_counter()
         num_tokens = params.num_tokens
-        leaves = list(self.evictable_leaves)
+        # 排序后再进堆：``evictable_leaves`` 是 set，迭代序取决于对象地址，而
+        # 仿真里同一请求命中的节点时间戳完全相同（平票极多）——平票时 heapq 会
+        # 比较 nodes（``__lt__`` 比 last_access_time），输入序一变，淘汰序列就变，
+        # 同 seed 的两次 run 会得到不同 fingerprint。``TreeNode.id`` 是单调计数器，
+        # 按它排序把「平票选谁」固定下来（只影响平票，不改变策略语义）。
+        leaves = sorted(self.evictable_leaves, key=lambda node: node.id)
         eviction_heap = [
             (self.eviction_strategy.get_priority(node), node) for node in leaves
         ]
