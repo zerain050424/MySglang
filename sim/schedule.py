@@ -48,6 +48,72 @@ def stable_seed_from_str(s: str, base_seed: int = 0) -> int:
 
 
 # ---------------------------------------------------------------------------
+# 非齐次到达：分段常数强度
+# ---------------------------------------------------------------------------
+def check_segments(segments: Sequence[Tuple[float, float]]) -> None:
+    """校验 ``((until_s, lambda_rate), ...)``。
+
+    Raises:
+        ValueError: 空表、``until_s`` 非严格递增/非正、速率为负或全为 0。
+    """
+
+    if not segments:
+        raise ValueError("arrival.mode='segments' 需要非空的 arrival.segments")
+    prev = 0.0
+    for idx, (until, rate) in enumerate(segments):
+        if not (until > prev):
+            raise ValueError(
+                f"segments[{idx}].until_s={until} 必须严格大于前一段（{prev}）"
+            )
+        if rate < 0:
+            raise ValueError(f"segments[{idx}].lambda_rate={rate} 不能为负")
+        prev = until
+    if all(rate == 0 for _until, rate in segments):
+        raise ValueError("segments 的速率全为 0：不会有任何到达")
+
+
+def _segment_offsets(spec: TaskSpec, n: int) -> List[float]:
+    """分段常数强度的 Poisson 到达（非齐次 Poisson 的分段逆变换）。
+
+    段内 ``t += Exp(λ_k)``；若这一跳越过段尾，就丢掉它、把 ``t`` 截到段尾并
+    用新段的 λ 重抽——指数分布的无记忆性保证这与真实非齐次过程同分布。
+    ``λ=0`` 的段直接跳到段尾（无到达）。最后一段结束后沿用它的 λ 继续放，
+    因此会话数不足时不会卡死。
+
+    Returns:
+        升序偏移（虚拟秒），长度恰好 ``n``。
+    """
+
+    check_segments(spec.segments)
+    rng = random.Random(spec.rng_seed)
+    segments = spec.segments
+    out: List[float] = []
+    t = 0.0
+    for idx, (until, rate) in enumerate(segments):
+        if rate <= 0.0:
+            t = until
+            continue
+        while len(out) < n:
+            nxt = t + rng.expovariate(rate)
+            if nxt >= until:
+                break
+            out.append(nxt)
+            t = nxt
+        t = until
+        if len(out) >= n:
+            return out
+    # 时间轴结束后沿用最后一段的强度；若最后一段是静默段（λ=0），退回到
+    # 最后一个非零强度，避免 expovariate(0) 抛 OverflowError。
+    last_rate = segments[-1][1]
+    if last_rate <= 0.0:
+        last_rate = next(rate for _until, rate in reversed(segments) if rate > 0.0)
+    while len(out) < n:
+        t += rng.expovariate(last_rate)
+        out.append(t)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # 每个 task 的发射参数
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
@@ -60,13 +126,25 @@ class TaskSpec:
     sigma: float = 0.0
     seed: int = 42
     task_id: int = 0
-    arrival_mode: str = "poisson"  # poisson | fixed
+    arrival_mode: str = "poisson"  # poisson | fixed | segments
     arrival_offset_s: float = 0.0
     arrival_step_s: float = 0.05
+    # ``segments`` 模式：((until_s, lambda_rate), ...)，until_s 严格递增。
+    # lambda_rate=0 表示该段没有任何到达（构成漂移实验的"静默段"）。
+    segments: Tuple[Tuple[float, float], ...] = ()
 
     @classmethod
     def from_config(cls, task: Mapping) -> "TaskSpec":
         arrival = task.get("arrival") or {}
+        mode = str(arrival.get("mode", "poisson"))
+        segments: Tuple[Tuple[float, float], ...] = ()
+        if mode == "segments":
+            raw = arrival.get("segments") or []
+            segments = tuple(
+                (float(seg["until_s"]), float(seg.get("lambda_rate", 0.0)))
+                for seg in raw
+            )
+            check_segments(segments)
         return cls(
             name=task["name"],
             lambda_rate=float(task.get("lambda_rate", 1)),
@@ -74,9 +152,10 @@ class TaskSpec:
             sigma=float(task.get("sigma", 0.0)),
             seed=int(task.get("seed", 42)),
             task_id=int(task.get("task_id", 0)),
-            arrival_mode=str(arrival.get("mode", "poisson")),
+            arrival_mode=mode,
             arrival_offset_s=float(arrival.get("offset_s", 0.0)),
             arrival_step_s=float(arrival.get("step_s", 0.05)),
+            segments=segments,
         )
 
     @property
@@ -195,6 +274,8 @@ class Emitter:
             return [
                 spec.arrival_offset_s + spec.arrival_step_s * i for i in range(n)
             ]
+        if spec.arrival_mode == "segments":
+            return _segment_offsets(spec, n)
         if spec.arrival_mode != "poisson":
             raise ValueError(f"未知 arrival 模式：{spec.arrival_mode!r}")
         rng = random.Random(spec.rng_seed)  # emitter: generate_poisson_requests(seed+task_id)

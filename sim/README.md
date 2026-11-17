@@ -122,7 +122,7 @@ result = Simulator(SimConfig(capacity=100_000)).run_scheduled(
 
 | 规则 | 实现 |
 |---|---|
-| 首轮到达 | 每 task 独立 Poisson（`expovariate(λ)` 累加）或 `arrival.mode=fixed`（`offset + step*i`），乘 `arrival_scale` |
+| 首轮到达 | 每 task 独立 Poisson（`expovariate(λ)` 累加）、`arrival.mode=fixed`（`offset + step*i`）或 `arrival.mode=segments`（分段常数强度的非齐次 Poisson），乘 `arrival_scale` |
 | 轮间空窗 | `lognormal(mu, sigma) * wait_scale`，每 session 一条独立 RNG，seed = `stable_seed_from_str(sid, seed + task_id*1000)`（与 emitter 同式，金标对拍过） |
 | 轮次时刻 | **闭环**：`due = 本轮完成时刻 + 空窗`，而不是 trace 里写死的 t |
 | 服务时长 | `prefill_base + prompt/prefill_rate + out/decode_rate`，`prefill_*` 直读 `tools/calibrate.py` 产物 |
@@ -130,6 +130,27 @@ result = Simulator(SimConfig(capacity=100_000)).run_scheduled(
 为什么必须有服务时长模型：虚拟时钟里没有「读流完成」，没有它 `finished_ts` 就等于
 `开始时刻`，闭环退化成 0 延迟——`wait_scale`/lognormal 都对，但整条时间轴偏快，
 老化 TTL 与 one-shot 豁免会在错的时刻触发。
+
+#### 构成漂移：`arrival.mode=segments`
+
+同一 task 的注入速率按时段改掉，用来造「不同类轮流主导」的漂移负载
+（`Heter-Bench/mixexp/drift3_design.md`）：
+
+```yaml
+arrival:
+  mode: segments
+  segments:                       # ((until_s, lambda_rate), ...)，until_s 严格递增
+    - {until_s: 300,  lambda_rate: 0.17}   # warmup
+    - {until_s: 1500, lambda_rate: 0.56}   # P1 主导
+    - {until_s: 2700, lambda_rate: 0.00}   # 静默段：这一段不注入
+    - {until_s: 3900, lambda_rate: 0.10}
+```
+
+- 段内 `t += Exp(λ_k)`；若这一跳越过段尾，丢掉它、把 `t` 截到段尾并用新段的 λ 重抽
+  ——指数分布无记忆性保证与真实非齐次过程同分布；
+- `λ=0` 是**静默段**（无到达），不是"极慢"；
+- 会话数用不完时，时间轴结束后沿用最后一段的强度继续放（最后一段 λ=0 则退回最后一个非零强度）；
+- 同 seed 逐位可复现（RNG = `seed + task_id*1000`，与 `poisson` 同一条流）。
 
 ### 边界处理（R4）
 
