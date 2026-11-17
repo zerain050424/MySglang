@@ -25,25 +25,49 @@ PAGE = int(os.environ.get("PAGE", "8"))
 CAP = int(os.environ.get("CAP", "198000"))
 
 
-def build_tasks(plan_path):
+REVERSE_WINDOW = {"warmup": "cooldown", "cooldown": "warmup", "p1": "p3", "p3": "p1", "p2": "p2"}
+
+
+def build_tasks(plan_path, *, seed=42, reverse=False, only_slices=None, fixed_lam=None):
+    """把 plan 展开成 sim 的 tasks 列表。
+
+    Args:
+        seed: 会话加载/到达的种子。
+        reverse: 相位反转对照——数据切片与其 λ 一起搬到反相的窗口（窗口等长，
+            构成目标不变），用来检验"先 struct 还是先 agentic"的路径依赖。
+        only_slices: 只保留这些切片的（stationary 对照用，单切片铺满整条时间轴）。
+        fixed_lam: ``{cls: lam}``，给 stationary 对照用常数 λ 覆盖 plan 的 λ。
+    """
     plan = json.loads(pathlib.Path(plan_path).read_text(encoding="utf-8"))
     total = plan["total_s"]
     tasks = []
     for cls, meta in plan["classes"].items():
         for sl, spec in meta["per_slice"].items():
-            start = next(s["start_s"] for s in plan["slices"] if s["name"] == sl)
-            end = next(s["end_s"] for s in plan["slices"] if s["name"] == sl)
+            if only_slices is not None and sl not in only_slices:
+                continue
+            win = REVERSE_WINDOW[sl] if reverse else sl
+            start = next(s["start_s"] for s in plan["slices"] if s["name"] == win)
+            end = next(s["end_s"] for s in plan["slices"] if s["name"] == win)
+            lam = fixed_lam[cls] if fixed_lam else spec["lambda_rate"]
             segs = []
-            if start > 0:
-                segs.append({"until_s": start, "lambda_rate": 0.0})
-            segs.append({"until_s": end, "lambda_rate": spec["lambda_rate"]})
+            if only_slices is not None:
+                # stationary：只用这一片数据、从 0 铺到窗口末端，构成与目标相位
+                # 一致但**不切换**（用来把"漂移代价"从"构成效应"里剥出来）
+                secs = next(s["seconds"] for s in plan["slices"] if s["name"] == sl)
+                start = 0.0
+                end = secs
+                segs.append({"until_s": end, "lambda_rate": lam})
+            else:
+                if start > 0:
+                    segs.append({"until_s": start, "lambda_rate": 0.0})
+                segs.append({"until_s": end, "lambda_rate": lam})
             # 末段静默 ⇒ 窗口外的会话不发射（sim/schedule.py 的截尾语义）。
             # cooldown 的 end 恰好等于时间轴末端，也要补（否则 spill 到 4200s 之后）。
             segs.append({"until_s": max(total, end) + 1.0, "lambda_rate": 0.0})
             tasks.append({
                 "name": f"{cls}@{sl}", "task_id": len(tasks),
                 "data_path": spec["file"].replace("TaskData/", "TaskData/", 1),
-                "max_record": -1, "shuffle": False, "seed": 42,
+                "max_record": -1, "shuffle": False, "seed": seed,
                 "mu": meta["mu"], "sigma": meta["sigma"],
                 "arrival": {"mode": "segments", "segments": segs},
             })
@@ -232,24 +256,206 @@ def gate(plan, tasks, sessions, specs, engine, service):
     return 0 if not fails else 1
 
 
+
+
+# ---------------------------------------------------------------------------
+# 正式矩阵
+# ---------------------------------------------------------------------------
+def windows(plan):
+    return [(s["name"], s["start_s"], s["end_s"]) for s in plan["slices"]]
+
+
+def phase_of(plan, t):
+    for name, lo, hi in windows(plan):
+        if lo <= t < hi:
+            return name
+    return None
+
+
+def summarize_phases(plan, res):
+    """按相位聚合：分类型/分类命中、淘汰量、稳态与切换窗口、T90 恢复时间。"""
+
+    out = {}
+    recs = res.records
+    for name, lo, hi in windows(plan):
+        sel = [r for r in recs if lo <= r.t < hi]
+        if not sel:
+            continue
+        tot_prompt = sum(r.prompt_len for r in sel)
+        tot_hit = sum(r.hit for r in sel)
+        per_cls = {}
+        for r in sel:
+            cls = r.task_name.split("@")[0]
+            d = per_cls.setdefault(cls, [0, 0])
+            d[0] += r.hit
+            d[1] += r.prompt_len
+        per_type = {}
+        for r in sel:
+            d = per_type.setdefault(r.session_type, [0, 0])
+            d[0] += r.hit
+            d[1] += r.prompt_len
+        head = [r for r in sel if r.t < lo + 300.0]
+        tail = [r for r in sel if r.t >= hi - 300.0]
+        hr = lambda rows: (sum(x.hit for x in rows) / max(1, sum(x.prompt_len for x in rows)))
+        steady = hr(tail)
+        # 主导类（份额最大）的 T90：60s 滚动窗口首次进入 steady-2pp 且连续 3 窗
+        dom = max(per_cls.items(), key=lambda kv: kv[1][1])[0]
+        dom_bins, n_bins = {}, max(1, int((hi - lo) // 60))
+        for r in sel:
+            if r.task_name.split("@")[0] != dom:
+                continue
+            b = int((r.t - lo) // 60)
+            d = dom_bins.setdefault(b, [0, 0])
+            d[0] += r.hit
+            d[1] += r.prompt_len
+        dom_steady_rows = [r for r in sel
+                           if r.task_name.split("@")[0] == dom and r.t >= hi - 300.0]
+        dom_steady = hr(dom_steady_rows) if dom_steady_rows else 0.0
+        bins = [dom_bins.get(b, [0, 0]) for b in range(n_bins)]
+        rates = [h / p if p else None for h, p in bins]
+        t90 = None
+        for i in range(max(0, n_bins - 2)):
+            seq = rates[i:i + 3]
+            if all(x is not None and x >= dom_steady - 0.02 for x in seq):
+                t90 = i * 60
+                break
+        out[name] = {
+            "prompt_tokens": tot_prompt,
+            "hit_tokens": tot_hit,
+            "hit_rate": round(tot_hit / max(1, tot_prompt), 4),
+            "per_class": {k: round(v[0] / max(1, v[1]), 4) for k, v in sorted(per_cls.items())},
+            "per_class_tokens": {k: v[1] for k, v in sorted(per_cls.items())},
+            "per_type": {k: round(v[0] / max(1, v[1]), 4) for k, v in sorted(per_type.items())},
+            "evicted_tokens": sum(r.evicted for r in sel),
+            "steady_hit_rate": round(steady, 4),
+            "switch_cost_pp": round((hr(head) - steady) * 100, 2) if head else None,
+            "dominant_class": dom,
+            "t90_s": t90,
+        }
+    return out
+
+
+def plan_of_phase(plan, phase):
+    return {cls: meta["per_slice"][phase]["lambda_rate"]
+            for cls, meta in plan["classes"].items()}
+
+
+def matrix(a, engine, service):
+    plan_paths = a.plan if isinstance(a.plan, list) else [a.plan]
+    out_root = pathlib.Path(a.out or "/root/sim_runs/drift3")
+    out_root.mkdir(parents=True, exist_ok=True)
+    result = {}
+
+    for plan_path in plan_paths:
+        plan, tasks = build_tasks(plan_path, seed=a.seed)
+        sessions = load_tasks(tasks, base_dir=str(REPO / "Heter-Bench"))
+        specs = [TaskSpec.from_config(t) for t in tasks]
+        bg = plan["bg"]
+        print(f"\n[drift3] bg={bg}× seed={a.seed} sessions={len(sessions)} "
+              f"requests={sum(s.n_turns for s in sessions)}", flush=True)
+
+        arm_rows, base_res = {}, None
+        live = None
+        for arm in a.arms.split(","):
+            if arm != "opt":
+                res, info = run_once(sessions, specs, arm, engine=engine, service=service)
+                if base_res is None:
+                    base_res, live = res, [s for s in sessions if (s.session_id, 0) in res.dispatched]
+                arm_rows[arm] = {"info": info, "phases": summarize_phases(plan, res)}
+                print(f"  {arm:12s} hit={info['hit_rate']:.4f} "
+                      f"phases=" + " ".join(f"{k}={v['hit_rate']:.3f}"
+                                            for k, v in arm_rows[arm]["phases"].items()), flush=True)
+                continue
+            # OPT：时间轴取自 lru（时间轴对策略敏感 → 迭代到固定点）
+            src = base_res
+            for it in range(1, 4):
+                p = str(out_root / f"use_map_{bg:g}x_s{a.seed}_it{it}.json")
+                write_use_map(p, use_map_from_run(src, live, page_size=PAGE))
+                res, info = run_once(sessions, specs, "opt", use_map=p,
+                                     engine=engine, service=service)
+                common = set(src.dispatched) & set(res.dispatched)
+                ndiff = sum(1 for k in common
+                            if abs(src.dispatched[k] - res.dispatched[k]) > 1e-9)
+                if ndiff == 0:
+                    break
+                src = res
+            arm_rows["opt"] = {"info": dict(info, time_axis_iter=it, residual=ndiff),
+                               "phases": summarize_phases(plan, res)}
+            print(f"  {'opt':12s} hit={info['hit_rate']:.4f} iter={it} 残差={ndiff} "
+                  f"map_miss={info['map_misses']}/{info['map_lookups']}", flush=True)
+
+        cmp_ = {}
+        for ph in arm_rows.get("lru", {}).get("phases", {}):
+            cmp_[ph] = {
+                arm: arm_rows[arm]["phases"].get(ph, {}).get("hit_rate")
+                for arm in arm_rows
+            }
+            if "opt" in arm_rows and arm_rows[arm]["phases"].get(ph):
+                cmp_[ph]["opt_minus_heter"] = round(
+                    (arm_rows["opt"]["phases"][ph]["hit_rate"]
+                     - arm_rows["heter_cache"]["phases"][ph]["hit_rate"]) * 100, 2)
+
+        entry = {"bg": bg, "seed": a.seed, "arms": arm_rows, "phase_hit": cmp_}
+
+        # ---- stationary 对照：每个主导相位单独一条恒定构成 run ----
+        if a.stationary:
+            entry["stationary"] = {}
+            for ph in ("p1", "p2", "p3"):
+                st_tasks = build_tasks(plan_path, seed=a.seed, only_slices=(ph,),
+                                       fixed_lam=plan_of_phase(plan, ph))[1]
+                st_sessions = load_tasks(st_tasks, base_dir=str(REPO / "Heter-Bench"))
+                st_specs = [TaskSpec.from_config(t) for t in st_tasks]
+                row = {}
+                for arm in ("lru", "heter_cache"):
+                    r2, i2 = run_once(st_sessions, st_specs, arm, engine=engine, service=service)
+                    row[arm] = round(i2["hit_rate"], 4)
+                entry["stationary"][ph] = row
+                print(f"  stationary {ph}: {row}", flush=True)
+
+        # ---- 逆序对照（agentic → chat → struct）----
+        if a.reverse:
+            rv_plan, rv_tasks = build_tasks(plan_path, seed=a.seed, reverse=True)
+            rv_sessions = load_tasks(rv_tasks, base_dir=str(REPO / "Heter-Bench"))
+            rv_specs = [TaskSpec.from_config(t) for t in rv_tasks]
+            entry["reverse"] = {}
+            for arm in ("lru", "heter_cache"):
+                r3, i3 = run_once(rv_sessions, rv_specs, arm, engine=engine, service=service)
+                entry["reverse"][arm] = {"hit_rate": round(i3["hit_rate"], 4),
+                                         "phases": summarize_phases(rv_plan, r3)}
+                print(f"  reverse {arm}: hit={i3['hit_rate']:.4f}", flush=True)
+
+        result[f"bg_{bg:g}x_s{a.seed}"] = entry
+        (out_root / f"bg_{bg:g}x_s{a.seed}.json").write_text(
+            json.dumps(entry, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    (out_root / f"all_s{a.seed}.json").write_text(
+        json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"\n[drift3] done -> {out_root}", flush=True)
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
-    ap.add_argument("--plan", required=True)
+    ap.add_argument("--plan", required=True, nargs="+")
     ap.add_argument("--gate", action="store_true")
     ap.add_argument("--arms", default="lru,heter_cache,opt")
     ap.add_argument("--out", default="")
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--stationary", action="store_true", help="跑稳态构成对照")
+    ap.add_argument("--reverse", action="store_true", help="跑逆序路径依赖对照")
     a = ap.parse_args(argv)
 
-    plan, tasks = build_tasks(a.plan)
-    sessions = load_tasks(tasks, base_dir=str(REPO / "Heter-Bench"))
-    specs = [TaskSpec.from_config(t) for t in tasks]
     engine = EngineConfig(schedule_policy="fcfs")
     service = service_model()
+    if not a.gate:
+        return matrix(a, engine, service)
+
+    plan, tasks = build_tasks(a.plan[0], seed=a.seed)
+    sessions = load_tasks(tasks, base_dir=str(REPO / "Heter-Bench"))
+    specs = [TaskSpec.from_config(t) for t in tasks]
     print(f"[drift3] bg={plan['bg']}× sessions={len(sessions)} "
           f"requests={sum(s.n_turns for s in sessions)} tasks={len(tasks)}")
-    if a.gate:
-        return gate(plan, tasks, sessions, specs, engine, service)
-    raise SystemExit("正式矩阵模式未实现（先过 gate）")
+    return gate(plan, tasks, sessions, specs, engine, service)
 
 
 if __name__ == "__main__":
