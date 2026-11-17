@@ -506,7 +506,14 @@ class OPTStrategy(EvictionStrategy):
         return node.hash_value
 
     def _next_use(self, block_hash: str) -> float:
-        """该块严格晚于当前时刻的下次使用；没有则 ``+∞``。"""
+        """该块严格晚于当前时刻的下次使用；没有则 ``+∞``。
+
+        计数在这里逐次累加：``_lookups`` 是**查询次数**，``_misses`` 是其中查不到
+        的次数。二者都必须在同一条路径上各自独立计数，否则 `_misses/_lookups`
+        恒为 1.0——那会让「粒度错配」的告警变成「miss 过 1000 次」的探测器，
+        健康负载也照报 100%。
+        """
+        self._lookups += 1
         times = self._use_map.get(block_hash)
         if times is None:
             self._misses += 1
@@ -517,7 +524,7 @@ class OPTStrategy(EvictionStrategy):
         return times[index] if index < len(times) else math.inf
 
     def _maybe_warn(self) -> None:
-        self._lookups += 1
+        """只做判据（读 ``_lookups``/``_misses``），不改计数。"""
         if self._warned or self._lookups < 1000:
             return
         ratio = self._misses / self._lookups
