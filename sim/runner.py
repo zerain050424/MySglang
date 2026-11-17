@@ -84,6 +84,10 @@ class SimConfig:
     # OPT 上界专用：离线 trace 生成的 `{block_hash: [使用时刻]}`。
     # 只在 eviction_policy="opt" 时读；缺失即报错，不做静默退化。
     opt_use_map: Optional[str] = None
+    # 代价加权 OPT（上界诊断用）：$block_hash->cost$ 的表 + 排序口径。
+    # 空字符串 = 经典 hit-optimal Belady（默认，行为不变）。
+    opt_cost_map: str = ""
+    opt_cost_mode: str = "protect_deep"
     idle_ttl: float = 3600.0
     # 单请求无法在池里放下时的行为：
     #   "error" —— 抛 OutOfTokens（默认；逼调用方直面 trace/容量不匹配）；
@@ -189,6 +193,8 @@ class Simulator:
             policy_config = {
                 "use_map_path": cfg.opt_use_map,
                 "block_size": cfg.page_size,
+                "cost_map_path": cfg.opt_cost_map,
+                "cost_mode": cfg.opt_cost_mode,
             }
         else:
             policy_config = None

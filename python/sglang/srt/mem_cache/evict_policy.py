@@ -401,6 +401,13 @@ class OptParams:
     use_map_path: str
     block_size: int = 1
     miss_warn: float = 0.5
+    # 代价加权上界（可选）：``{block_hash: cost}`` 的 JSON。给了之后 OPT 的排序键
+    # 不再是「下次使用时刻」，而是按块重算代价缩放过的版本：
+    #   cost_mode="protect_deep"：key = -next_use / cost  （贵的块更晚被淘汰）
+    #   cost_mode="paper"       ：key = -next_use * cost  （论文 BeladyCompute 字面式）
+    # 空字符串 = 退化成经典 hit-optimal Belady，行为与本参数引入前逐位一致。
+    cost_map_path: str = ""
+    cost_mode: str = "protect_deep"
 
     def __post_init__(self):
         if not isinstance(self.use_map_path, str) or not self.use_map_path:
@@ -416,6 +423,15 @@ class OptParams:
         ):
             raise ValueError(
                 f"opt.miss_warn must be in (0, 1], got {self.miss_warn!r}"
+            )
+        if self.cost_mode not in ("protect_deep", "paper"):
+            raise ValueError(
+                "opt.cost_mode must be 'protect_deep' or 'paper', "
+                f"got {self.cost_mode!r}"
+            )
+        if not isinstance(self.cost_map_path, str):
+            raise ValueError(
+                f"opt.cost_map_path must be a str, got {self.cost_map_path!r}"
             )
 
     @classmethod
@@ -491,6 +507,8 @@ class OPTStrategy(EvictionStrategy):
         use_map_path: str,
         block_size: int = 1,
         miss_warn: float = 0.5,
+        cost_map_path: str = "",
+        cost_mode: str = "protect_deep",
         now: Optional[Callable[[], float]] = None,
     ):
         self.params = OptParams.from_any(
@@ -498,9 +516,21 @@ class OPTStrategy(EvictionStrategy):
                 "use_map_path": use_map_path,
                 "block_size": block_size,
                 "miss_warn": miss_warn,
+                "cost_map_path": cost_map_path,
+                "cost_mode": cost_mode,
             }
         )
         self._use_map = load_use_map(self.params.use_map_path)
+        self._cost_map: Dict[str, int] = {}
+        if self.params.cost_map_path:
+            with open(self.params.cost_map_path, encoding="utf-8") as f:
+                raw_costs = json.load(f)
+            if not isinstance(raw_costs, dict):
+                raise ValueError(
+                    "cost map must be a JSON object {block_hash: cost}, got "
+                    f"{type(raw_costs).__name__}"
+                )
+            self._cost_map = {str(k): int(v) for k, v in raw_costs.items()}
         self._page_size = self.params.block_size
         # 时间源可注入；缓存装配完会再推一次（见 RadixCache.__init__）。
         self._now = now if now is not None else time.monotonic
@@ -587,11 +617,27 @@ class OPTStrategy(EvictionStrategy):
             )
 
     def get_priority(self, node) -> Tuple[float, float, int]:
-        """返回 ``(-next_use, last_access_time, id)``，``heapq`` 取最小即淘汰。"""
+        """返回 ``(-next_use, last_access_time, id)``，``heapq`` 取最小即淘汰。
+
+        装配了 ``cost_map_path`` 时（代价加权上界），第一项换成
+        ``-next_use / cost``（``protect_deep``，贵的块更晚被淘汰）或
+        ``-next_use * cost``（``paper``）。代价取该节点覆盖各块的平均值——
+        节点是整段淘汰的，用它代表这段的价值密度。
+        """
         hashes = self._ensure_hash(node)
         next_use = min((self._next_use(h) for h in hashes), default=math.inf)
+        key = -next_use
+        if self._cost_map:
+            costs = [self._cost_map.get(h) for h in hashes]
+            known = [c for c in costs if c is not None and c > 0]
+            if known:
+                mean_cost = sum(known) / len(known)
+                if self.params.cost_mode == "protect_deep":
+                    key = -next_use / mean_cost
+                else:
+                    key = -next_use * mean_cost
         return (
-            -next_use,
+            key,
             float(getattr(node, "last_access_time", 0.0)),
             int(getattr(node, "id", 0)),
         )

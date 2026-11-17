@@ -71,6 +71,8 @@ def build_use_map(
     with_response: bool = False,
     response_tokens: Optional[Dict[tuple, int]] = None,
     capacity_blocks: Optional[int] = None,
+    cost_model=None,
+    cost_of: Optional[Dict[str, int]] = None,
 ) -> Dict[str, List[float]]:
     """把会话 trace 展开成 ``{block_hash: [使用时刻...]}``。
 
@@ -160,10 +162,14 @@ def build_use_map(
                 total_blocks = -(-total_tokens // page_size)
                 if total_blocks > capacity_blocks:
                     continue
-            for block_hash in _page_hashes(
-                tokens, page_size, hash_fn, RadixKey, extra_key
+            for block_index, block_hash in enumerate(
+                _page_hashes(tokens, page_size, hash_fn, RadixKey, extra_key)
             ):
                 table.setdefault(block_hash, []).append(float(turn.t))
+                if cost_of is not None and cost_model is not None:
+                    # 块代价只取决于它在 prompt 里的位置，所以同一个 hash 在
+                    # 任何请求里都得到同一个值；重复写没有副作用。
+                    cost_of[block_hash] = int(cost_model.cost(block_index))
     if not table:
         raise ValueError(
             "use map is empty: every prompt was shorter than one page "
@@ -178,6 +184,8 @@ def use_map_from_run(
     sessions: Iterable,
     *,
     page_size: int = 8,
+    cost_model=None,
+    cost_of: Optional[Dict[str, int]] = None,
 ) -> Dict[str, List[float]]:
     """一次闭环 run → 它的 use map（冻结时间轴 + 覆盖 response 页）。
 
@@ -203,6 +211,8 @@ def use_map_from_run(
         page_size=page_size,
         with_response=True,
         response_tokens=result.response_tokens(),
+        cost_model=cost_model,
+        cost_of=cost_of,
     )
 
 
@@ -211,3 +221,9 @@ def write_use_map(path: str, table: Dict[str, List[float]]) -> None:
 
     with open(path, "w", encoding="utf-8") as f:
         json.dump({k: table[k] for k in sorted(table)}, f)
+
+
+def write_block_costs(path: str, cost_of: Dict[str, int]) -> None:
+    """写 ``{block_hash: cost}``：代价加权 OPT 的输入（键排序，便于 diff）。"""
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({k: cost_of[k] for k in sorted(cost_of)}, f)
