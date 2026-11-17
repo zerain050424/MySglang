@@ -63,6 +63,14 @@ class SimConfig:
     value_horizon_s: float = 120.0
     value_smoothing_k: float = 4.0
     value_floor_tokens: float = 0.0
+    # 老化判据："queue_ttl"（历史口径：M 秒没被访问就老化）或
+    # "session_life"（方案 A：按该会话自己的轮间隔分布判"会话是否终结"）。
+    # session_ttl_* 只在该模式下生效，见 ShareParams。
+    ageing_mode: str = "queue_ttl"
+    session_ttl_k: float = 3.0
+    session_ttl_min_s: float = 60.0
+    session_ttl_max_s: float = 1800.0
+    session_ttl_min_gaps: int = 2
     seed: int = 0
     page_size: int = 1
     eviction_policy: str = "heter_cache"
@@ -147,6 +155,13 @@ class Simulator:
         # 策略参数按族分派：HeterCache 读 VD 参数，OPT 只读 use map。
         if cfg.eviction_policy == "heter_cache":
             policy_config = {
+                "share": {
+                    "ageing_mode": cfg.ageing_mode,
+                    "session_ttl_k": cfg.session_ttl_k,
+                    "session_ttl_min_s": cfg.session_ttl_min_s,
+                    "session_ttl_max_s": cfg.session_ttl_max_s,
+                    "session_ttl_min_gaps": cfg.session_ttl_min_gaps,
+                },
                 "value": {
                     "horizon_s": cfg.value_horizon_s,
                     "smoothing_k": cfg.value_smoothing_k,

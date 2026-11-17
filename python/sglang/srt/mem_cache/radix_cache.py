@@ -277,6 +277,12 @@ class TreeNode:
         # 与匹配路径走过多少遍」（一次请求自己就能加 1、chunked prefill 逐块回扫还会
         # 再加），把两种口径混在一个计数器里会让「有没有被重读」取决于调度器。
         self.reuse_count = 0
+        # 把「重读」拆成两种：`reuse_self` 是同会话的后续轮读到它（会话还活着、
+        # 内容在会话内复用），`reuse_cross` 是别的会话读到它（真·共享前缀）。
+        # 两者含义相反：self 说明「这个会话还会回来」，cross 说明「这段内容是模板」。
+        # 只记一个总数会让 one-shot 判据把「会话的下一轮还没来」误当成「永不复用」。
+        self.reuse_self = 0
+        self.reuse_cross = 0
         # store hash values of each pages
         self.hash_value: Optional[List[str]] = None 
         # Namespace-aware hashes used only for external KV events.
@@ -921,6 +927,10 @@ class RadixCache(BasePrefixCache):
             # 「重读」只数 admission match：一次请求最多 +1，与它自己被写了多少遍
             # （写路径的 `_inc_hit_count`）无关。
             node.reuse_count += 1
+            if session_id is not None and session_id == getattr(node, "session_id", None):
+                node.reuse_self += 1
+            else:
+                node.reuse_cross += 1
         if self.share_on_hit is not None:
             self.share_on_hit(node, session_id)
         state = (
@@ -972,6 +982,8 @@ class RadixCache(BasePrefixCache):
            child.abs_start = child.abs_start + split_len
            new_node.hit_count = child.hit_count
            new_node.reuse_count = child.reuse_count
+           new_node.reuse_self = child.reuse_self
+           new_node.reuse_cross = child.reuse_cross
            new_node.children = {key[split_len:].child_key(self.page_size): child}
            new_node.parent = child.parent
            new_node.lock_ref = child.lock_ref

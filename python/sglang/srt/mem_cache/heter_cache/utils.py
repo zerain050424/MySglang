@@ -254,6 +254,17 @@ class ShareParams:
     ageing_ttl_s: Dict[str, float] = dataclasses.field(
         default_factory=lambda: dict(DEFAULT_AGEING_TTL_S)
     )
+    # 老化判据的两种口径：
+    #   "queue_ttl"    —— 按队列 TTL（历史口径，节点"M 秒没被访问"就老化）
+    #   "session_life" —— 按会话寿命（方案 A）：只看该会话自己的轮间隔分布，
+    #                     超过 k×p90 才算终结；终结后的**私有**内容才可回收。
+    # 前者分不清"会话还活着只是这轮间隔长"，后者把"会话终结"当成唯一判据。
+    # struct 始终走 TTL：它是模板族，没有会话级证据（单轮、gaps 为空）。
+    ageing_mode: str = "queue_ttl"
+    session_ttl_k: float = 3.0
+    session_ttl_min_s: float = 60.0
+    session_ttl_max_s: float = 1800.0
+    session_ttl_min_gaps: int = 2
 
     def __post_init__(self):
         if self.share_min < 2:
@@ -266,6 +277,22 @@ class ShareParams:
             raise ValueError(
                 f"share.ageing_ttl_s has unknown queues {sorted(unknown)}; "
                 f"expected a subset of {list(QUEUE_NAMES)}."
+            )
+        if self.ageing_mode not in ("queue_ttl", "session_life"):
+            raise ValueError(
+                "share.ageing_mode must be 'queue_ttl' or 'session_life', "
+                f"got {self.ageing_mode!r}"
+            )
+        if self.session_ttl_k <= 0:
+            raise ValueError(f"share.session_ttl_k must be > 0, got {self.session_ttl_k}")
+        if self.session_ttl_min_s > self.session_ttl_max_s:
+            raise ValueError(
+                "share.session_ttl_min_s must be <= session_ttl_max_s, "
+                f"got {self.session_ttl_min_s} > {self.session_ttl_max_s}"
+            )
+        if self.session_ttl_min_gaps < 1:
+            raise ValueError(
+                f"share.session_ttl_min_gaps must be >= 1, got {self.session_ttl_min_gaps}"
             )
         merged = {**DEFAULT_AGEING_TTL_S, **self.ageing_ttl_s}
         for queue, ttl in merged.items():

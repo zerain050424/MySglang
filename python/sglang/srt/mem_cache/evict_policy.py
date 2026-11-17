@@ -185,16 +185,64 @@ class HeterCacheStrategy(EvictionStrategy):
         )
 
     def is_aged(self, node) -> bool:
-        """节点是否已老化：按生效标签取 TTL，0 表示该类型不老化。"""
+        """节点是否已老化。
+
+        两种口径（``share.ageing_mode``）：
+
+        * ``queue_ttl``：节点 ``TTL`` 秒未被访问即老化（历史口径）。
+        * ``session_life``：只看**该会话自己的轮间隔分布**，超过 ``k × p90`` 才算
+          会话终结；终结后的**私有**内容（跨会话共享数 < share_min）才可回收。
+          这样"会话还活着、只是这轮间隔长"不会被误判成永不复用——drift3 里
+          chat 的前缀有 59.5% 的 regret 就是被按队列的固定 TTL 误杀的。
+
+        struct 两种口径下都走 TTL：它是模板族、单轮、``gaps`` 为空，没有会话级
+        证据可用；私有 struct 本来归 one-shot 带管，不当模板老化。
+        """
         tag = self._node_tag(node)
-        ttl = self.share.ageing_ttl_s[tag.queue_name]
+        queue = tag.queue_name
+        if tag is HeterCacheNodeTag.QSTRUCT:
+            ttl = self.share.ageing_ttl_s[queue]
+            if ttl <= 0:
+                return False
+            if self.node_share.share_of(node) < self.node_share.share_min:
+                return False
+            return self._now() - node.last_access_time >= ttl
+        if self.share.ageing_mode == "session_life":
+            return self.session_expired(node)
+        ttl = self.share.ageing_ttl_s[queue]
         if ttl <= 0:
             return False
-        if tag is HeterCacheNodeTag.QSTRUCT and (
-            self.node_share.share_of(node) < self.node_share.share_min
-        ):
-            return False
         return self._now() - node.last_access_time >= ttl
+
+    def session_life_s(self, state) -> Optional[float]:
+        """该会话的存活上限（秒）：``k × 轮间隔 p90``，夹在 [min, max] 之间。
+
+        证据不足（观测到的轮间隔少于 ``session_ttl_min_gaps``）时返回 None，
+        调用方据此保守处理（不老化），避免用一条样本外推整条会话。
+        """
+        gaps = getattr(state, "gaps", None) or []
+        if len(gaps) < self.share.session_ttl_min_gaps:
+            return None
+        ordered = sorted(gaps)
+        idx = min(len(ordered) - 1, int(round(0.9 * (len(ordered) - 1))))
+        life = self.share.session_ttl_k * ordered[idx]
+        return min(max(life, self.share.session_ttl_min_s), self.share.session_ttl_max_s)
+
+    def session_expired(self, node) -> bool:
+        """会话是否已终结（方案 A 的判据本体）。
+
+        只回收私有内容：跨会话共享数达到 ``share_min`` 的节点即使归属会话终结，
+        别的会话还会读它，不能按老化清掉。
+        """
+        if self.node_share.share_of(node) >= self.node_share.share_min:
+            return False
+        state = self.session_registry.get(getattr(node, "session_id", None))
+        if state is None:
+            return False
+        life = self.session_life_s(state)
+        if life is None:
+            return False
+        return self._now() - state.last_active > life
 
     def is_one_shot(self, node) -> bool:
         """判定节点是否属于 One-shot 带。

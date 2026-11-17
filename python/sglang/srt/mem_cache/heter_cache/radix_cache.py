@@ -81,6 +81,10 @@ class HeterCacheRadixCache(RadixCache):
             # stamp 要挂在裁决来源上，而 record_victim_source 在链释放完之后
             # 才调用；先存下来，_evict_one 内的树读法要用。
             self._regret_source = source
+            if self._regret is not None:
+                # 后悔率账本：单节点淘汰没有级联，victim 就是断点页所在的最浅节点，
+                # chain=1。必须在 _evict_one 之前记 —— stamp 需要完整父链。
+                self._stamp_eviction(victim, victim, len(victim.value), 1)
             released = self._evict_one(victim)
             if released <= 0:
                 # 释放量为 0 表明节点状态异常，中止循环以防空转死锁（Spin）
