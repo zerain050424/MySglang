@@ -154,3 +154,79 @@ def test_max_prefill_bs_limits_one_step():
     emit = result.summary["emit"]
     assert emit["prefill_steps"] == 2
     assert emit["max_prefill_batch_size"] == 2
+
+
+# ---------------------------------------------------------------------------
+# LPM 的双重匹配：生产匹配两次，但 rid 相同
+# ---------------------------------------------------------------------------
+def _spec_named(name: str, offset: float) -> TaskSpec:
+    return TaskSpec(
+        name=name, arrival_mode="fixed", arrival_offset_s=offset, arrival_step_s=0.0
+    )
+
+
+def _lpm_warmup_run(schedule_policy: str):
+    """t=0 一条预热请求写 64 token 前缀，t=10 三条冷请求同时命中。
+
+    LPM 每步对每条 waiting **匹配两次**（`_compute_prefix_matches` 排序一次，
+    `init_next_round_input` 准入一次）——生产也是两次，但两次用的是**同一个
+    ``Req`` 对象，rid 相同**，所以 `SessionRegistry.observe_request` 与
+    `CacheTelemetry.on_hit` 的 rid 去重会吸收第二次。仿真若每次现编 rid，
+    这两处去重就失效了。
+    """
+
+    shared = list(range(64))
+    warm = Session(
+        "warm-0",
+        (Turn(t=0.0, prompt=array("q", shared + [9000]), out=0),),
+        task_name="warm",
+    )
+    cold = [
+        Session(
+            f"chat-{i}",
+            (Turn(t=0.0, prompt=array("q", shared + [9100 + i] * 4), out=0),),
+            task_name="chat",
+        )
+        for i in range(3)
+    ]
+    sim = Simulator(SimConfig(capacity=4096, seed=1))
+    result = sim.run_engine(
+        [warm, *cold],
+        [_spec_named("warm", 0.0), _spec_named("chat", 10.0)],
+        scheduler=EngineConfig(
+            max_prefill_tokens=4096, schedule_policy=schedule_policy
+        ),
+        service=SERVICE,
+    )
+    return sim, result
+
+
+@pytest.mark.parametrize("policy", ["fcfs", "lpm"])
+def test_lpm_matches_each_request_once_per_rid(policy):
+    """LPM 的排序匹配不能算成第二个请求：分类证据与命中账本各只记一次。"""
+
+    sim, result = _lpm_warmup_run(policy)
+
+    # 命中本身与排序策略无关：预热 miss，三条冷请求各命中 64。
+    assert [r.hit for r in result.records] == [0, 64, 64, 64]
+
+    # 症状 1：CacheTelemetry.on_hit 按 rid 去重 -> 同一请求不能计两次命中。
+    queue_hit = sum(result.summary["queue_hit"].values())
+    assert queue_hit == 3 * 64, (
+        f"{policy}: queue_hit={queue_hit}，期望 192"
+        "（LPM 的排序匹配用了新 rid，去重失效）"
+    )
+
+    # 症状 2：observe_request 按 rid 去重 -> turn_count 与轮间 gap 都不能翻倍。
+    registry = sim.cache.session_registry
+    for sid in ("warm-0", "chat-0", "chat-1", "chat-2"):
+        state = registry.get(sid)
+        assert state is not None, f"{sid} 没有会话账本"
+        assert state.turn_count == 1, (
+            f"{policy}: {sid} turn_count={state.turn_count}，期望 1"
+        )
+        # 第二次观察的 now 与第一次相同；若没去重会塞进一个 0 秒 gap，
+        # 把 CHAT/AGENTIC 的 GAP_SPLIT_S=15s 判定拉偏。
+        assert list(state.classifier_gaps) == [], (
+            f"{policy}: {sid} classifier_gaps={list(state.classifier_gaps)}，期望空"
+        )

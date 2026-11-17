@@ -368,6 +368,14 @@ PYTHONPATH=$PWD/python python -m pytest -q test/manual/test_sim_fidelity.py
 7. 会话账本的时钟也必须同源：`SessionRegistry.use_clock()` 由
    `HeterCacheStrategy.use_clock()` 从缓存层推下去。否则 `last_active` 是墙钟、
    `is_one_shot` 的时间豁免永远不成立，one-shot 带静默失效。
+8. **同一轮的多次匹配必须共用同一个 rid**（规则 2 的推论，`run_engine` 已强制）：
+   LPM 每步对一条 waiting 匹配两次（`_waiting_order` 排序 + `_admit_waiting` 准入，
+   对应生产的 `_compute_prefix_matches` + `init_next_round_input`），生产两次用的是
+   同一个 `Req`，靠 rid 去重吸收第二次。若每次现编 rid，`observe_request` 会把一条
+   请求记成两条（`turn_count` 翻倍 + 一个 0 秒 gap 进 `classifier_gaps`，
+   CHAT/AGENTIC 的 `GAP_SPLIT_S=15s` 判定被拉偏），`CacheTelemetry.on_hit` 也会把
+   命中 token 记两遍（`queue_hit` 与 VD 已兑现价值翻倍）。`_Queued.rid` 在到达时铸
+   一次，排序 / 准入 / `_trim_to_capacity` 退回复核三处共用。
 
 自检不变量（自检里已生效）：`alloc.used == cache.evictable_size() + cache.protected_size()`。
 

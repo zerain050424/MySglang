@@ -81,9 +81,21 @@ class EngineConfig(msgspec.Struct, frozen=True, kw_only=True):
 
 
 class _Queued:
-    """A turn that has arrived but has not been admitted yet."""
+    """A turn that has arrived but has not been admitted yet.
 
-    __slots__ = ("due", "idx", "session_id", "task_name", "turn")
+    ``rid`` is minted **once**, when the turn arrives, and is reused by every
+    match this turn goes through (policy ordering, admission, and the re-match
+    after :meth:`EngineSimulator._trim_to_capacity` returns it to the queue).
+    SGLang re-matches one waiting ``Req`` twice per step -- once in
+    ``_compute_prefix_matches`` to sort, once in ``init_next_round_input`` to
+    admit -- but both calls carry the same ``rid``, so the rid-keyed dedupe in
+    ``SessionRegistry.observe_request`` / ``CacheTelemetry.on_hit`` absorbs the
+    second one. Minting a fresh rid per match instead turns one request into
+    two: ``turn_count`` doubles, a spurious 0s gap lands in
+    ``classifier_gaps``, and hit tokens are counted twice in the VD ledger.
+    """
+
+    __slots__ = ("due", "idx", "rid", "session_id", "task_name", "turn")
 
     def __init__(
         self,
@@ -92,12 +104,14 @@ class _Queued:
         task_name: str,
         due: float,
         idx: int,
+        rid: str,
     ) -> None:
         self.turn = turn
         self.session_id = session_id
         self.task_name = task_name
         self.due = due
         self.idx = idx
+        self.rid = rid
 
 
 class _State:
@@ -180,6 +194,8 @@ class EngineSimulator:
         self.emitter = Emitter(sim, self.sessions, list(specs), self.service)
 
         self._seq = itertools.count()
+        # rid 一经到达即固定（见 _Queued）；格式与 Simulator.run 相同：``sid#n``。
+        self._rid_seq = itertools.count(1)
         self._wait_scale = 1.0
 
         # Step-level counters exposed through summary["emit"].
@@ -240,6 +256,7 @@ class EngineSimulator:
                         task_name=session.task_name,
                         due=due,
                         idx=idx,
+                        rid=f"{sid}#{next(self._rid_seq)}",
                     )
                 )
 
@@ -354,7 +371,9 @@ class EngineSimulator:
             matched = self.sim._match(
                 replace(queued.turn, t=now),
                 queued.session_id,
-                rid=None,
+                # Stable rid: SGLang's admission match re-uses the Req that the
+                # policy pass already matched, so rid-keyed dedupe applies.
+                rid=queued.rid,
                 task_name=queued.task_name,
             )
             if matched.need > self.sim.alloc.size:
@@ -465,12 +484,17 @@ class EngineSimulator:
         # SGLang's cache-aware LPM policy sorts by the longest matched prefix.
         # Its in-batch de-prioritisation pass builds a second radix tree; that
         # only affects ordering, so it is not reproduced here.
+        #
+        # Every waiting request is matched here, exactly like production's
+        # `_compute_prefix_matches` (which also passes `include_req=True`), and
+        # will be matched again at admission. Both matches share `queued.rid`,
+        # so `observe_request` / `on_hit` see one request, not two.
         pairs: list[tuple[_Queued, Matched]] = []
         for queued in waiting:
             matched = self.sim._match(
                 replace(queued.turn, t=now),
                 queued.session_id,
-                rid=None,
+                rid=queued.rid,
                 task_name=queued.task_name,
             )
             pairs.append((queued, matched))
