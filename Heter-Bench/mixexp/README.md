@@ -153,17 +153,14 @@ OPT = Belady 离线最优：淘汰下次使用时刻最远的块（`evict_policy
 `TreeNode.hash_value` 逐字一致（`sim/opt_map.py` 复用同一个 `get_storage_hash_str`）。
 在真实 server 上跑 OPT 的流程 = **先采一次到达时刻，离线造 use map，再带 map 重放**。
 
-### 2.0 前置改动
+### 2.0 前置改动（已落地）
 
-`opt` 还不在服务端 CLI 选项里（策略工厂已注册，只差选择列表）：
+`RADIX_EVICTION_POLICY_CHOICES`（`python/sglang/srt/arg_groups/choices.py:184`）已加入
+`"opt"`，`--radix-eviction-policy opt` 能过参数解析；回归见
+`test/manual/test_radix_eviction_policy_cli.py`。
 
-```python
-# python/sglang/srt/arg_groups/choices.py:184
-RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority", "tlru", "heter_cache"]
-#                                                                               ^ 加 "opt"
-```
-
-不加的话 `--radix-eviction-policy opt` 在参数解析阶段就被拒。
+旧版本缺这一项时，策略工厂明明注册了 `OPTStrategy`，服务却起不来
+（`invalid choice: 'opt'`），整条流程断在解析阶段。
 
 ### 2.1 采一次到达时刻（capture run）
 

@@ -181,7 +181,18 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "marlin",
 ]
 
-RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority", "tlru", "heter_cache"]
+RADIX_EVICTION_POLICY_CHOICES = [
+    "lru",
+    "lfu",
+    "slru",
+    "priority",
+    "tlru",
+    "heter_cache",
+    # 离线 Belady 上界（evict_policy.OPTStrategy）：只给实验用，不做线上淘汰。
+    # 缺它时 ``--radix-eviction-policy opt`` 在参数解析阶段就被拒，
+    # mixexp/README §2 的「采时刻 → 造 use map → 重放」流程起不来。
+    "opt",
+]
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
