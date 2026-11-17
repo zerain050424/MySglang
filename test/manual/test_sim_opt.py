@@ -93,6 +93,46 @@ def test_unknown_hash_counts_as_inf(tmp_path):
     assert opt.get_priority(FakeNode(["absent"]))[0] == -math.inf
 
 
+def test_miss_ratio_counts_every_lookup(tmp_path):
+    """``_misses/_lookups`` 必须是真实未命中率，而不是恒 1.0。
+
+    回归点：``_lookups`` 曾经只在 miss 分支（``_maybe_warn`` 内）自增，
+    两次自增落在同一条路径上 → 比率恒为 100%，健康负载也报「OPT 已退化」。
+    这里 90% 命中、20 万次查询，真实 miss≈3%，不应告警。
+    """
+    path = _write_map(tmp_path, {f"present-{i}": [110.0] for i in range(1)})
+    opt = OPTStrategy(use_map_path=path, block_size=1, now=lambda: 100.0)
+
+    total = 200_000
+    miss_every = 33  # ≈3% 未命中
+    for i in range(total):
+        node = FakeNode(["absent"] if i % miss_every == 0 else ["present-0"])
+        opt.get_priority(node)
+
+    expected_misses = len(range(0, total, miss_every))
+    assert opt._lookups == total, "每一次查询都必须计入 lookups"
+    assert opt._misses == expected_misses
+    ratio = opt._misses / opt._lookups
+    assert 0.0 < ratio < 0.05, ratio
+    assert opt._warned is False, "3% 未命中不该触发退化告警"
+
+
+def test_miss_ratio_warns_on_real_mismatch(tmp_path, caplog):
+    """真·粒度错配（这里 60% 查不到）必须告警，且打印的是真实比率。"""
+    path = _write_map(tmp_path, {"present-0": [110.0]})
+    opt = OPTStrategy(use_map_path=path, block_size=1, now=lambda: 100.0)
+
+    with caplog.at_level("WARNING", logger="sglang.srt.mem_cache.evict_policy"):
+        for i in range(2000):
+            opt.get_priority(FakeNode(["absent"] if i % 5 < 3 else ["present-0"]))
+
+    assert opt._lookups == 2000
+    assert opt._misses == 1200
+    assert opt._warned is True
+    assert "60.0%" in caplog.text, caplog.text
+    assert "100.0%" not in caplog.text
+
+
 def test_missing_or_empty_use_map_is_an_error(tmp_path):
     with pytest.raises(ValueError):
         OPTStrategy(use_map_path="", block_size=1)
