@@ -388,8 +388,12 @@ def test_empty_tree_is_noop(ep, shc, base):
     check(cache.deleted == [], "nothing to delete")
 
 
-def test_aged_struct_prefix_cascade(ep, shc, base):
-    """老化 struct：前缀不是叶子时不动，最后一个子节点清理完后同轮级联剪掉。"""
+def test_aged_struct_prefix_not_cascaded(ep, shc, base):
+    """老化 struct：前缀不是叶子时不动；子节点清完后**本轮也不级联**，留作下轮候选。
+
+    级联删除已整体移除（见 ``HeterCacheRadixCache._evict_one``）：一次淘汰只释放
+    一个节点，释放量可归因，且不会借 one-shot 的名义清掉别的队列的祖先。
+    """
     print("[6] aged struct prefix is swept by the one-shot cascade")
     hu = sys.modules["sglang.srt.mem_cache.heter_cache.utils"]
     st = _strategy(ep, {"s1": hu.SessionType.STRUCT}, ageing_ttl_s={"struct": 120})
@@ -416,13 +420,16 @@ def test_aged_struct_prefix_cascade(ep, shc, base):
         cache.evictable_leaves.add(kid)
 
     result = cache.evict(base.EvictParams(num_tokens=16))
-    check(result.num_tokens_evicted == 48,
-          f"two kids + cascaded prefix = 48 tokens, got {result.num_tokens_evicted}")
-    check(set(cache.deleted) == {kids[0], kids[1], prefix},
-          f"the aged prefix must be cascaded away, got {cache.deleted}")
-    check(st.node_share.aged_evicted == 32,
-          f"aged_evicted must count 32 prefix tokens, "
-          f"got {st.node_share.aged_evicted}")
+    check(result.num_tokens_evicted == 16,
+          f"two kids only = 16 tokens (no cascade), got {result.num_tokens_evicted}")
+    check(set(cache.deleted) == {kids[0], kids[1]},
+          f"only the two kids may be evicted, got {cache.deleted}")
+    check(st.node_share.aged_evicted == 0,
+          f"the prefix must survive this round, aged_evicted="
+          f"{st.node_share.aged_evicted}")
+    check(prefix.children == {} and prefix not in cache.deleted,
+          "the prefix must survive as a childless node (no cascade); "
+          f"children={list(prefix.children)}, deleted={cache.deleted}")
 
 
 def main():
@@ -433,7 +440,7 @@ def main():
         test_one_shot_band_first,
         test_share_rewrites_struct_candidate,
         test_empty_tree_is_noop,
-        test_aged_struct_prefix_cascade,
+        test_aged_struct_prefix_not_cascaded,
     ]
     for t in tests:
         try:

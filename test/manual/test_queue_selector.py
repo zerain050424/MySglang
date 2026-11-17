@@ -323,7 +323,7 @@ def test_value_params_validation():
         {"horizon_s": 0.0},
         {"horizon_s": -1.0},
         {"smoothing_k": 0.5},
-        {"floor_tokens": 0.0},
+        {"floor_tokens": -1.0},   # 0 是合法值（不做下限），负数才非法
         {"seed": True},
         {"nope": 1},
     ):

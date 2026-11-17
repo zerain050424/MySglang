@@ -320,7 +320,9 @@ def test_active_session_exempt_until_idle():
     仅凭 F1 的「未被复用」豁免，latch 在扫描流下几乎永不发生。
     """
     print("[10] idle exemption: live sessions keep unread nodes out of the band")
-    clock = {"t": 1000.0}
+    # 起点取「窗口的一半」而不是固定 1000：窗口从 90s 下调到 20s 后，原来
+    # last_active=980 / now=1000 正好等于 1 个窗口，会直接判进带。
+    clock = {"t": 980.0 + ONE_SHOT_IDLE_S / 2}
     st, reg = make_strategy(
         {"t1": SessionType.TRANS, "s1": SessionType.STRUCT},
         now=lambda: clock["t"],
@@ -374,7 +376,7 @@ def main():
         test_is_one_shot_and_pick_scope_agree,
         test_works_under_force_agentic,
         test_share_min_is_single_knob,
-        test_once_read_leaves_one_shot_band,
+        test_reused_nodes_leave_one_shot_band,
         test_active_session_exempt_until_idle,
     ]
     for t in tests:

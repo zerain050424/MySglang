@@ -23,7 +23,7 @@ from sim import bootstrap
 from sim.allocator import OutOfTokens, TokenAllocator, tree_tokens
 from sim.clock import VirtualClock
 
-VALUE = {"horizon_s": 120.0, "floor_tokens": 2048.0}
+VALUE = {"horizon_s": 120.0, "floor_tokens": 0.0}
 
 
 class _CheckAllocator:
@@ -279,7 +279,9 @@ def _check_clock(sym) -> list:
     if not ok:
         fails.append(f"agentic 老化边界错：{before} -> {after}")
 
-    # ---- 3.3 one-shot 时间豁免（ONE_SHOT_IDLE_S=90s）----
+    # ---- 3.3 one-shot 时间豁免（ONE_SHOT_IDLE_S，当前 20s）----
+    from sglang.srt.mem_cache.heter_cache.utils import ONE_SHOT_IDLE_S as _IDLE_S
+
     clock = VirtualClock(0.0)
     cache, _ = _build(sym, capacity=4096, now=clock)
     strategy = cache.eviction_strategy   # 新缓存新策略，时钟也跟着换了
@@ -290,12 +292,13 @@ def _check_clock(sym) -> list:
     one.queue_tag = Tag.QTRANS
     one.hit_count = 0
 
-    clock.advance_to(89.9)
+    clock.advance_to(_IDLE_S - 0.1)
     before = strategy.is_one_shot(one)
-    clock.advance_to(90.0)
+    clock.advance_to(_IDLE_S)
     after = strategy.is_one_shot(one)
     ok = (not before) and after
-    print(f"    one-shot  : t=89.9 {before} / t=90.0 {after} (want False/True){'' if ok else '  <-- 边界错'}")
+    print(f"    one-shot  : t={_IDLE_S - 0.1:g} {before} / t={_IDLE_S:g} {after} "
+          f"(want False/True){'' if ok else '  <-- 边界错'}")
     if not ok:
         fails.append(f"one-shot 豁免边界错：{before} -> {after}")
 
