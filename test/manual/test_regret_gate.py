@@ -41,7 +41,8 @@ def _real():
         import sglang.srt.mem_cache.heter_cache.utils as hu
         import sglang.srt.mem_cache.heter_cache.regret_gate as rg
         import sglang.srt.mem_cache.heter_cache.selector as qs
-        return ep, hu, rg, qs
+        import sglang.srt.mem_cache.heter_cache.override as ov
+        return ep, hu, rg, qs, ov
     except Exception:
         return None
 
@@ -64,8 +65,9 @@ if loaded is None:
     rg = _load("sglang.srt.mem_cache.heter_cache.regret_gate", os.path.join(_HC_DIR, "regret_gate.py"))
     qs = _load("sglang.srt.mem_cache.heter_cache.selector", os.path.join(_HC_DIR, "selector.py"))
     ep = _load("sglang.srt.mem_cache.evict_policy", os.path.join(_CACHE_DIR, "evict_policy.py"))
+    ov = _load("sglang.srt.mem_cache.heter_cache.override", os.path.join(_HC_DIR, "override.py"))
 else:
-    ep, hu, rg, qs = loaded
+    ep, hu, rg, qs, ov = loaded
 
 FAILS = []
 
@@ -262,6 +264,9 @@ def test_param_validation():
         {"retain_s": 60.0, "window_s": 120.0},   # retain < window
         {"max_stamps": 0},
         {"context": 0},
+        {"floor_tokens": -1},
+        {"weight": -0.1},
+        {"beta": -0.1},
     ):
         try:
             hu.RegretGateParams(**kwargs)
@@ -269,6 +274,151 @@ def test_param_validation():
             continue
         check(False, f"非法参数未拒绝：{kwargs}")
     check(hu.RegretGateParams().enabled is False, "默认 enabled=False")
+    check(hu.RegretGateParams().priced_fallback is False, "默认 priced_fallback=False")
+
+
+class _LeafNode:
+    """可弱引用的链节点替身（NodeShareLedger 是 WeakKeyDictionary）。"""
+
+    def __init__(self, nid, tokens, lat, rc, parent, sid, tag=None):
+        self.id = nid
+        self.key = [0] * tokens
+        self.last_access_time = lat
+        self.reuse_count = rc
+        self.parent = parent
+        self.session_id = sid
+        self.queue_tag = tag
+
+
+def _leaf_chain(segments, base_lat, tag=None):
+    """segments: [(tokens, reuse_count, session_id), ...] 从浅到深，返回叶子。"""
+    parent = None
+    for tokens, rc, sid in segments:
+        base_lat += 1.0
+        parent = _LeafNode(_FakeId.next(), tokens, base_lat, rc, parent, sid, tag)
+    return parent
+
+
+class _FakeId:
+    next_id = 0
+
+    @classmethod
+    def next(cls):
+        cls.next_id += 1
+        return cls.next_id
+
+
+def test_priced_fallback_beta_weighting():
+    """档 B：R 归因加权——同形状的两个叶子，历史亏得多的队列更贵。"""
+    print("[7] priced fallback: beta * R attribution weighting")
+    now = [1000.0]
+    g = _gate(now, window_s=1_000_000.0, retain_s=2_000_000.0, min_evicted=100)
+    # chat R≈0.8，agentic R=0
+    for i in range(10):
+        g.on_evict(key=2000 + i, queue="chat", span=1000)
+    for i in range(8):
+        g.on_request(key=2000 + i)
+    for i in range(10):
+        g.on_evict(key=3000 + i, queue="agentic", span=1000)
+
+    params = hu.RegretGateParams(enabled=True, priced_fallback=True,
+                                 floor_tokens=4096, weight=0.02, beta=1.0)
+    fb = ov.PricedFallback(params, g)
+
+    def mk_leaf(sid, tag=None):
+        # 两条同形状的单段链（remain=0，缺罚 = 0.02×4096），只差队列归属
+        return _LeafNode(_FakeId.next(), 1000, 10.0, 1, None, sid, tag=tag)
+
+    chat_leaf = mk_leaf("c1")
+    agentic_leaf = mk_leaf("a1")
+    chat_leaf.queue_tag = hu.HeterCacheNodeTag.QCHAT
+    agentic_leaf.queue_tag = hu.HeterCacheNodeTag.QAGENT
+    pick = fb.pick([chat_leaf, agentic_leaf])
+    check(pick is agentic_leaf,
+          f"R 高的队列叶子更贵 → 选便宜的 agentic 叶子: {pick is agentic_leaf}")
+
+    # β=0：纯形状定价，同形状叶子平票 → 由 id 定序，两叶价格相等
+    key_chat = ov.chain_leaf_key(
+        chat_leaf, floor_tokens=4096, weight=0.02, registry=None,
+        expired_of=None, weight_scale=1.0)
+    key_agentic = ov.chain_leaf_key(
+        agentic_leaf, floor_tokens=4096, weight=0.02, registry=None,
+        expired_of=None, weight_scale=1.0)
+    check(key_chat[0] == key_agentic[0] == 10.0 + 0.02 * 4096,
+          f"β=0 同形状同价：{key_chat[0]} / {key_agentic[0]}")
+
+
+def test_priced_fallback_routing():
+    """pick_victim：全弃权 + priced_fallback 装配 → 走 priced 兑底并标 priced 来源。"""
+    print("[8] pick_victim routes all-abstain to priced fallback")
+    now = [1000.0]
+    # k=0.5：阈值 = max(0.5, 0.5×中位数)，两队列 R≈0.9 都越过 → 全弃权
+    g = _gate(now, window_s=1_000_000.0, retain_s=2_000_000.0,
+              min_evicted=100, r_min=0.5, k=0.5,
+              priced_fallback=True, floor_tokens=4096, weight=0.02, beta=1.0)
+    # chat: R≈0.9 → 弃权；agentic: R≈0.9 → 弃权（全体弃权触发 priced 兑底）
+    for i in range(10):
+        g.on_evict(key=4000 + i, queue="chat", span=1000)
+    for i in range(9):
+        g.on_request(key=4000 + i)
+    for i in range(10):
+        g.on_evict(key=5000 + i, queue="agentic", span=1000)
+    for i in range(8):
+        g.on_request(key=5000 + i)   # agentic R=0.8，仍是 min-R
+
+    params = hu.RegretGateParams(enabled=True, priced_fallback=True,
+                                 floor_tokens=4096, weight=0.02, beta=1.0)
+    fb = ov.PricedFallback(params, g)
+    st = _FakeStrategy(["chat", "agentic"], {"chat": "V-CHAT", "agentic": "V-AG"},
+                       gate=g)
+    st.priced_fallback = fb
+    st.node_tag = lambda n: hu.HeterCacheNodeTag.coerce(getattr(n, "queue_tag", None))
+    st.session_registry = None
+
+    cheap = _LeafNode(_FakeId.next(), 1000, 5.0, 0, None, None,
+                      tag=hu.HeterCacheNodeTag.QAGENT)
+    victim, source = qs.pick_victim(strategy=st, leaves=[cheap])
+    check(source.startswith("priced:"), f"全弃权走 priced 兑底: {source}")
+    check(victim is cheap, "priced 兑底选中的叶子")
+    # min-R 档 A 路径保留为退路：priced 不装配时仍走 min-R
+    st2 = _FakeStrategy(["chat", "agentic"], {"agentic": "V-AG"}, gate=g)
+    st2.priced_fallback = None
+    st2.node_tag = st.node_tag
+    st2.session_registry = None
+    victim2, source2 = qs.pick_victim(strategy=st2, leaves=[cheap])
+    check(source2 == "value:agentic", f"无 priced 时回退 min-R 档 A: {source2}")
+
+
+def _strategy(chain_cfg, now):
+    return ep.HeterCacheStrategy(chain=chain_cfg, now=lambda: now[0])
+
+
+def test_chain_leaf_key_shared_with_chain_evict():
+    """口径单一来源：chain_leaf_key 与 ChainEvict.victim_key 同键。"""
+    print("[9] chain_leaf_key == ChainEvict.victim_key")
+    now = [1000.0]
+    st = _strategy({"enabled": True, "floor_tokens": 4096, "weight": 0.02}, now)
+    ce = st.chain_evicts.get("chat")
+    if ce is None:
+        print("  SKIP  chain 未装配，跳过同键断言")
+        return
+    leaf = _leaf_chain([(2000, 1, "s1"), (2000, 0, "s1")], 0.0,
+                       tag=hu.HeterCacheNodeTag.QCHAT)
+    hu.SessionRegistry.reset_global()
+    reg = hu.SessionRegistry.global_instance()
+    reg._sessions["s1"] = hu.SessionState(session_id="s1", gaps=[30.0])
+    ce.bind_registry(reg)
+    leaf.session_id = "s1"
+    leaf.parent.session_id = "s1"
+    k1 = ce.victim_key(leaf)
+    k2 = ov.chain_leaf_key(
+        leaf, floor_tokens=ce.params.floor_tokens, weight=ce.params.weight,
+        tail_first=ce.params.tail_first, registry=reg,
+        min_gaps=ce.params.min_gaps,
+        expired_of=st.session_expired if ce.params.expire_anchors else None,
+    )
+    check(k1 == k2, f"同键：{k1} != {k2}")
+    hu.SessionRegistry.reset_global()
 
 
 if __name__ == "__main__":
@@ -278,6 +428,9 @@ if __name__ == "__main__":
     test_overwrite_and_retention()
     test_pick_victim_gate_routing()
     test_param_validation()
+    test_priced_fallback_beta_weighting()
+    test_priced_fallback_routing()
+    test_chain_leaf_key_shared_with_chain_evict()
     if FAILS:
         print(f"\n{len(FAILS)} FAILED")
         sys.exit(1)

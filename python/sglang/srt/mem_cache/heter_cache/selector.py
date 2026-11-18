@@ -51,10 +51,19 @@ def pick_victim(*, strategy, leaves):
         return None, None
 
     gate = getattr(strategy, "regret_gate", None)
+    priced = getattr(strategy, "priced_fallback", None)
     order = strategy.queue_order()
     if gate is not None:
         passed = [queue for queue in order if not gate.abstain(queue, order)]
         if not passed:
+            # 档 B：全弃权 → 全树叶子按后悔归因加权的链形定价取最便宜
+            # （把随机 fallback 换成全局最便宜处下刀）。
+            if priced is not None:
+                victim = priced.pick(leaves, strategy.session_registry)
+                if victim is not None:
+                    queue = strategy.node_tag(victim).queue_name
+                    return victim, f"priced:{queue}"
+            # 档 A 路径保留作退路：min-R 队列 → 队内选人
             queue = gate.cheapest(order)
             if queue is not None:
                 victim = strategy.queue_victim(queue, leaves)

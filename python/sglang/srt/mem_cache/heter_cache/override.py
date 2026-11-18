@@ -132,6 +132,144 @@ class ReuseScoreEvict(VictimOverride):
         return f"<{type(self).__name__} name={self.name} queue={self.queue.queue_name}>"
 
 
+def _chain_walk(node) -> Tuple[list, int, int, int, set]:
+    """自叶向根遍历一条链：返回 (nodes, remain, full, rerode_depth, session_ids)。
+
+    remain = 淘汰该叶子后链上仍连续缓存的前缀（root→parent 的 token 数）；
+    rerode_depth = 链上最深重读节点的 root→node 深度（0 = 无重读）。
+    admission match 读连续前缀，重读集合就是链前缀，所以它等于该会话上次
+    被命中的前缀长度——下一轮要读的位置。
+    """
+    leaf_len = len(node.key)
+    nodes = [node]
+    session_ids = {getattr(node, "session_id", None)}
+    cursor = node.parent
+    while cursor is not None and cursor.parent is not None:
+        nodes.append(cursor)
+        session_ids.add(getattr(cursor, "session_id", None))
+        cursor = cursor.parent
+    full = sum(len(n.key) for n in nodes)
+    remain = full - leaf_len
+    rerode_depth = 0
+    depth = 0
+    for item in reversed(nodes):
+        depth += len(item.key)
+        if getattr(item, "reuse_count", 0) > 0:
+            rerode_depth = depth
+    return nodes, remain, full, rerode_depth, session_ids
+
+
+def chain_leaf_key(node, *, floor_tokens: int, weight: float,
+                   tail_first: bool = True, registry=None, min_gaps: int = 1,
+                   expired_of=None, weight_scale: float = 1.0,
+                   session_registry=None) -> Tuple[float, float, int]:
+    """链形定价键 ``(lat + penalty, -remain, id)``，``min`` 即淘汰。
+
+    ChainEvict（队内）与 PricedFallback（全弃权兑底）共用同一套定价，口径
+    单一来源：自适应锚 = max(floor 先验, 最深重读深度)；证据门 = 重读过 ∪
+    会话回来过（``registry`` 查 gaps ≥ min_gaps）；会话终结释放锚。
+
+    Args:
+        weight_scale: 罚斜率乘数。PricedFallback 用 ``1 + β·R_队列`` 做
+            后悔归因加权（历史亏得多的队列，锚罚更重）；队内改写器恒为 1。
+        session_registry: 未使用；保留参数位避免调用方分支（与 pick 签名对齐）。
+    """
+    lat = float(node.last_access_time)
+    nodes, remain, _full, rerode_depth, session_ids = _chain_walk(node)
+    anchor = max(floor_tokens, rerode_depth)
+    penalty = weight * weight_scale * max(0, anchor - remain)
+    # 证据门：重读过（rerode_depth>0）∪ 会话回来过；无证据不护，
+    # 否则一次性流量靠锚吃容量（四 cell 实测 gate=none 全线跌）。
+    if penalty > 0 and not rerode_depth:
+        returned = False
+        if registry is not None:
+            for sid in session_ids:
+                if not sid:
+                    continue
+                state = registry.get(sid)
+                if state is not None and len(state.gaps) >= min_gaps:
+                    returned = True
+                    break
+        if not returned:
+            penalty = 0.0
+    # 锚出口：路径上所有会话终结才释放（混合路径只要有一段活着就保守保留）。
+    if penalty > 0 and expired_of is not None:
+        if all(expired_of(item) for item in nodes):
+            penalty = 0.0
+    tie = -float(remain) if tail_first else 0.0
+    return (lat + penalty, tie, int(getattr(node, "id", 0)))
+
+
+class PricedFallback(VictimOverride):
+    """全弃权兑底的全局定价（档 B）：把「随机 fallback」换成「全树最便宜的叶子」。
+
+    背景（chain_shape_report.md §七）：档 A 的弃权门打断了 VD 把削减确定性
+    引向锚队的正反馈，但全弃权后的兑底是随机 fallback——warm 锚占叶子池大头
+    照样被随机削到（warm 整链停在 ~48%）。本类给 heter 补上 chain_lru 的
+    全局形状定价：每个候选叶子按 ``chain_leaf_key`` 定价，全树取最便宜；
+    罚斜率乘上 ``1 + β·R_队列``（弃权门的后悔归因）做加权——历史削了亏的
+    队列，锚罚更重，实测反馈与结构先验叠加。
+
+    Stage 0 已在 pick_victim 前面拦下 one-shot 叶子，本类的候选池不含它们。
+    """
+
+    name = "priced_fallback"
+
+    def __init__(self, params, gate, tag_of=None, expired_of=None) -> None:
+        self.params = params          # RegretGateParams（floor/weight/beta）
+        self._gate = gate             # RegretGate，提供 r(queue)
+        self._tag_of = tag_of or (
+            lambda node: HeterCacheNodeTag.coerce(getattr(node, "queue_tag", None))
+        )
+        self._expired_of = expired_of
+        self._registry = None
+        # ---- 观测 ----
+        self.picks = 0
+
+    def bind_registry(self, registry) -> None:
+        """接会话账本（与 ChainEvict.bind_registry 同约定）。"""
+        self._registry = registry
+
+    def pick(self, leaves, registry=None) -> Optional["TreeNode"]:
+        """全树叶子按后悔归因加权的链形定价取最便宜；空池弃权。"""
+        if registry is not None:
+            self._registry = registry
+        pool = [node for node in (leaves or ())]
+        if not pool:
+            return None
+        self.picks += 1
+        beta = self.params.beta
+        weight = self.params.weight
+
+        def price(node):
+            scale = 1.0
+            if beta > 0 and self._gate is not None:
+                r_q = self._gate.r(self._tag_of(node).queue_name)
+                if r_q is not None:
+                    scale = 1.0 + beta * r_q
+            return chain_leaf_key(
+                node,
+                floor_tokens=self.params.floor_tokens,
+                weight=weight,
+                tail_first=True,
+                registry=self._registry,
+                min_gaps=self.params.min_gaps,
+                expired_of=self._expired_of,
+                weight_scale=scale,
+            )
+
+        return min(pool, key=price)
+
+    def stats(self) -> Dict[str, float]:
+        return {"picks": self.picks}
+
+    def reset(self) -> None:
+        self.picks = 0
+
+    def __repr__(self) -> str:  # pragma: no cover - 调试用
+        return f"<{type(self).__name__} name={self.name}>"
+
+
 class ChainEvict(VictimOverride):
     """队内链形保护改写器（chat / agentic）：浅段优先保护、砍链尾。
 
@@ -178,57 +316,20 @@ class ChainEvict(VictimOverride):
     def victim_key(self, node):
         """(lat + penalty, -remain, id)；penalty 缺口以自适应锚为准。
 
-        一次自叶向根的遍历同时算出：remain（root→parent 的 token 数）、
-        重读边界深度、路径上的会话集合。reuse_count 只在 admission match 里
-        自增（回扫不算），``hit_count`` 含写路径自增，不作证据。
+        定价走 :func:`chain_leaf_key`（与 PricedFallback 共用，口径单一来源）。
+        reuse_count 只在 admission match 里自增（回扫不算），``hit_count``
+        含写路径自增，不作证据。
         """
-        lat = float(node.last_access_time)
-        leaf_len = len(node.key)
-        remain = 0
-        full = leaf_len
-        rerode_depth = 0  # 最深重读节点的 root→node 深度；0 = 链上无重读
-        session_ids = {getattr(node, "session_id", None)}
-        nodes = [node]
-        cursor = node.parent
-        while cursor is not None and cursor.parent is not None:
-            nodes.append(cursor)
-            full += len(cursor.key)
-            session_ids.add(getattr(cursor, "session_id", None))
-            cursor = cursor.parent
-        remain = full - leaf_len
-        # 自根向叶重放深度：depth(i) = root→nodes[i] 的 token 数。
-        # 取最后一个重读节点（= 最深）的深度；admission match 读连续前缀，
-        # 重读集合就是链前缀，所以它等于该会话上次被命中的前缀长度。
-        depth = 0
-        for item in reversed(nodes):
-            depth += len(item.key)
-            if getattr(item, "reuse_count", 0) > 0:
-                rerode_depth = depth
-
-        anchor = max(self.params.floor_tokens, rerode_depth)
-        penalty = self.params.weight * max(0, anchor - remain)
-        # 证据门：重读过（rerode_depth>0 即链上有重读节点）∪ 会话回来过。
-        # 无证据的链不享受保护，否则一次性流量靠锚吃容量（四 cell 实测 gate=none 全跌）。
-        if penalty > 0 and not rerode_depth:
-            registry = self._registry
-            returned = False
-            if registry is not None:
-                for sid in session_ids:
-                    if not sid:
-                        continue
-                    state = registry.get(sid)
-                    if state is not None and len(state.gaps) >= self.params.min_gaps:
-                        returned = True
-                        break
-            if not returned:
-                penalty = 0.0
-        # 锚出口：路径上所有会话都终结才释放（混合路径只要有一段活着就保守保留，
-        # 方向是多留、少剥，与目标同向）。共享段在 session_expired 里天然不终结。
-        if penalty > 0 and self.params.expire_anchors and self._expired_of is not None:
-            if all(self._expired_of(item) for item in nodes):
-                penalty = 0.0
-        tie = -float(remain) if self.params.tail_first else 0.0
-        return (lat + penalty, tie, int(getattr(node, "id", 0)))
+        return chain_leaf_key(
+            node,
+            floor_tokens=self.params.floor_tokens,
+            weight=self.params.weight,
+            tail_first=self.params.tail_first,
+            registry=self._registry,
+            min_gaps=self.params.min_gaps,
+            # expire_anchors=False 时不出手，与旧实现一致
+            expired_of=self._expired_of if self.params.expire_anchors else None,
+        )
 
     # ------------------------------------------------------------ 插件接口
 

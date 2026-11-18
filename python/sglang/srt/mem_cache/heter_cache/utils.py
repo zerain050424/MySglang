@@ -425,6 +425,15 @@ class RegretGateParams:
         context: content_key 的上下文 token 数，与 regret_ledger.CONTEXT_TOKENS
             同值——观测账本在场时以账本的为准（键同源才有 join），仅当账本缺席
             而本门单独启用时使用本值。
+
+    档 B（全弃权兑底的全局定价）：
+
+        priced_fallback: 全弃权后用「全树叶子按链形定价取最便宜」替代随机
+            fallback 与 min-R 跨队。定价 = lat + weight × (1 + β·R_队列) ×
+            max(0, 锚 − remain)，锚 = max(floor 先验, 最深重读深度)。
+        floor_tokens / weight / beta: 定价参数；β=0 退化为纯形状定价（与
+            chain_lru 同构），β>0 把实测后悔密度乘进锚罚（历史亏得多的队列
+            锚罚更重）。
     """
 
     enabled: bool = False
@@ -435,6 +444,11 @@ class RegretGateParams:
     retain_s: float = 900.0
     max_stamps: int = 200_000
     context: int = 16
+    priced_fallback: bool = False
+    floor_tokens: int = 8192
+    weight: float = 0.02
+    beta: float = 1.0
+    min_gaps: int = 1
 
     def __post_init__(self):
         if self.window_s <= 0:
@@ -456,6 +470,18 @@ class RegretGateParams:
             raise ValueError(f"regret_gate.max_stamps must be >= 1, got {self.max_stamps}")
         if self.context < 1:
             raise ValueError(f"regret_gate.context must be >= 1, got {self.context}")
+        if self.floor_tokens < 0:
+            raise ValueError(
+                f"regret_gate.floor_tokens must be >= 0, got {self.floor_tokens}"
+            )
+        if self.weight < 0:
+            raise ValueError(f"regret_gate.weight must be >= 0, got {self.weight}")
+        if self.beta < 0:
+            raise ValueError(f"regret_gate.beta must be >= 0, got {self.beta}")
+        if self.min_gaps < 1:
+            raise ValueError(
+                f"regret_gate.min_gaps must be >= 1, got {self.min_gaps}"
+            )
 
     @classmethod
     def from_any(cls, value=None) -> "RegretGateParams":

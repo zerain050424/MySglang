@@ -195,6 +195,11 @@ def main(argv=None):
                     help="heter_rgate：弃权阈值 = k × 已采样中位数")
     ap.add_argument("--rg-rmin", type=float, default=0.5,
                     help="heter_rgate：R 绝对下限")
+    ap.add_argument("--pf", action="store_true",
+                    help="heter_rgate：档 B——全弃权兑底换全局叶子定价")
+    ap.add_argument("--pf-floor", type=int, default=8192, help="档 B：锚下限先验")
+    ap.add_argument("--pf-weight", type=float, default=0.02, help="档 B：罚斜率")
+    ap.add_argument("--pf-beta", type=float, default=1.0, help="档 B：R 归因加权系数")
     ap.add_argument("--gate", default="rerode",
                     choices=["none", "rerode", "multiturn"],
                     help="chain_lru：浅段保护证据门（rerode=重读过；multiturn=再加会话回来过）")
@@ -214,6 +219,8 @@ def main(argv=None):
     }
     rgate_cfg = {
         "enabled": True, "window_s": a.rg_window, "k": a.rg_k, "r_min": a.rg_rmin,
+        "priced_fallback": a.pf, "floor_tokens": a.pf_floor,
+        "weight": a.pf_weight, "beta": a.pf_beta,
     }
     for arm in [x for x in a.arms.split(",") if x]:
         if arm != "opt":

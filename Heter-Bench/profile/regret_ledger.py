@@ -87,6 +87,8 @@ def _rule_of(source: str) -> str:
         return "struct_tier"
     if source == "value:fallback":
         return "random"
+    if source.startswith("priced:"):
+        return "priced_fallback"
     return "reuse"
 
 
