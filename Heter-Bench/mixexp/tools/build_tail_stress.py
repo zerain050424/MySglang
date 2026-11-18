@@ -121,15 +121,19 @@ def pct(xs, p):
 
 
 def run_arm(sessions, specs, policy, cap, use_map=None, policy_config=None,
-            chain_policy=None):
+            chain_policy=None, regret_gate=None):
     ARRIVAL.clear()
     sim = Simulator(SimConfig(capacity=cap, page_size=PAGE, eviction_policy=policy,
                               opt_use_map=use_map, policy_config=policy_config,
-                              chain_policy=chain_policy,
+                              chain_policy=chain_policy, regret_gate=regret_gate,
                               seed=0, oversize="skip"))
     svc = ServiceModel(prefill_base_s=0.0, prefill_tokens_per_s=RATE, decode_tokens_per_s=40.0)
     res = sim.run_engine(sessions, specs, scheduler=EngineConfig(schedule_policy="fcfs"),
                          service=svc)
+    st = sim.cache.eviction_strategy
+    run_arm.last_gate_stats = (
+        st.regret_gate.stats() if getattr(st, "regret_gate", None) else None
+    )
     rows = []
     for r in res.records:
         if r.skipped or r.turn < 0:
@@ -185,6 +189,12 @@ def main(argv=None):
                     help="chain_lru：浅段保护下限（token）")
     ap.add_argument("--weight", type=float, default=0.01,
                     help="chain_lru：缺口罚斜率（秒/token）")
+    ap.add_argument("--rg-window", type=float, default=120.0,
+                    help="heter_rgate：后悔滑窗 W（秒）")
+    ap.add_argument("--rg-k", type=float, default=1.0,
+                    help="heter_rgate：弃权阈值 = k × 已采样中位数")
+    ap.add_argument("--rg-rmin", type=float, default=0.5,
+                    help="heter_rgate：R 绝对下限")
     ap.add_argument("--gate", default="rerode",
                     choices=["none", "rerode", "multiturn"],
                     help="chain_lru：浅段保护证据门（rerode=重读过；multiturn=再加会话回来过）")
@@ -202,13 +212,19 @@ def main(argv=None):
         "enabled": True, "floor_tokens": a.floor, "weight": a.weight,
         "min_gaps": 1,
     }
+    rgate_cfg = {
+        "enabled": True, "window_s": a.rg_window, "k": a.rg_k, "r_min": a.rg_rmin,
+    }
     for arm in [x for x in a.arms.split(",") if x]:
         if arm != "opt":
             cfg = chain_cfg if arm == "chain_lru" else None
             cp = heter_chain_cfg if arm == "heter_chain" else None
-            real = "heter_cache" if arm == "heter_chain" else arm
+            rgc = rgate_cfg if arm == "heter_rgate" else None
+            real = "heter_cache" if arm in ("heter_chain", "heter_rgate") else arm
             res, rows = run_arm(sessions, specs, real, a.cap, policy_config=cfg,
-                                chain_policy=cp)
+                                chain_policy=cp, regret_gate=rgc)
+            if arm == "heter_rgate" and run_arm.last_gate_stats:
+                print("  [rgate]", run_arm.last_gate_stats, flush=True)
             out[arm] = report(arm, res, rows)
             if arm == "lru":
                 base_lru = res
