@@ -81,7 +81,25 @@ for c in scan struct chat agentic; do
 done
 ```
 
-## 三、已证否 / 禁忌（换配置前先看）
+## 三、SLA 乘数（类别公平旋钮，2026-11-18 实验）
+
+`sla: {queue: multiplier}` 乘在锚罚上（`penalty = weight × sla_q × 缺口`），
+用于「低频大块损失类被均值定价低估」的公平修正。**有效域很窄**：
+
+| 场景 | sla 配置 | 结果 |
+|---|---|---|
+| tail-stress（chat 占 18.8%，少数类） | chat=2.0, agentic=0.5 | **warm p90 1060→860（−19%）**，整体 p90 391/p99 1033，hot/cold/agentic 无损 ✔ |
+| chat cell（chat 占 60%，主导类） | chat=2.0 | **chat hit 62.6→54.6（−8pp）❌** |
+| chat cell | agentic=0.5 单独 | 62.29，无损 |
+| agentic cell（主导类降权） | agentic=0.5 | 82.78 vs 83.12（−0.34）❌ |
+| struct cell | 同上 | 82.86 vs 82.68（+0.18）✔ |
+
+**边界条件：SLA 乘数只能给少数类用。** 给主导类加保护 = 主削减来源
+「只进不出」，容量被挤占、削减集中到该类自己的 fresh/深段。死锚理论已证伪
+（session_ttl 扫 3 档数字逐位不变）；但借此补上了 chain_lru 的「会话终结
+释放锚」出口（ttl 判据与 heter 同口径，当前负载下未触发、无害）。
+
+## 四、已证否 / 禁忌（换配置前先看）
 
 * **深度代价加权**（cost-oracle gap ≤ 0）：不值做，勿复活；
 * **gate="none" 只在人造负载（tail-stress）最优**，真实混合负载四 cell 全线跌；
@@ -90,7 +108,7 @@ done
 * **β>1**：chat 锚罚过重、削减挤到别的池（cold hit 0.851 受损）；
 * **k=0.5 / r_min=0.1**：全弃权过敏，随机兜底乱削（p90 1218、p95 4677）。
 
-## 四、边界与未验
+## 五、边界与未验
 
 * chain_lru 的 chunked prefill 场景、`weight` 量纲校准（0.02 s/token 比真实
   prefill 速率高两个量级，换硬件要重调）、drift3、真机 bench 端到端；
