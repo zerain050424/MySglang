@@ -6,6 +6,11 @@
 1. [实验负载](#一实验负载)
 2. [OPT 上界](#二opt上界真实负载--真实推理框架)
 3. [regret rate](#三regret-rate淘汰后悔率)
+
+> **最优配置速查**：TTFT 优先部署用 chain_lru 全局版（tail-stress p90 404ms、
+> 四 cell 加权 66.25% 全胜 heter），heter 架构内最优为档 B 后悔门+全局定价
+> （p90 581ms、加权 64.42%，默认关）——参数、数字与复现命令见
+> [`best_configs.md`](best_configs.md)，全程推演见 [`chain_shape_report.md`](chain_shape_report.md)。
 ---
 
 ## 一、实验负载
