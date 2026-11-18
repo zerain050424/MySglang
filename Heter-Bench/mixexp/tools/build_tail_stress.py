@@ -120,10 +120,12 @@ def pct(xs, p):
     return xs[min(len(xs) - 1, max(0, int(round(p / 100 * (len(xs) - 1)))))]
 
 
-def run_arm(sessions, specs, policy, cap, use_map=None, policy_config=None):
+def run_arm(sessions, specs, policy, cap, use_map=None, policy_config=None,
+            chain_policy=None):
     ARRIVAL.clear()
     sim = Simulator(SimConfig(capacity=cap, page_size=PAGE, eviction_policy=policy,
                               opt_use_map=use_map, policy_config=policy_config,
+                              chain_policy=chain_policy,
                               seed=0, oversize="skip"))
     svc = ServiceModel(prefill_base_s=0.0, prefill_tokens_per_s=RATE, decode_tokens_per_s=40.0)
     res = sim.run_engine(sessions, specs, scheduler=EngineConfig(schedule_policy="fcfs"),
@@ -196,10 +198,17 @@ def main(argv=None):
           f"cold={a.n_cold}×1 ({a.tpl} 共享 + {a.tail} 私有)")
     out = {}
     chain_cfg = {"floor_tokens": a.floor, "weight": a.weight, "gate": a.gate}
+    heter_chain_cfg = {
+        "enabled": True, "floor_tokens": a.floor, "weight": a.weight,
+        "min_gaps": 1,
+    }
     for arm in [x for x in a.arms.split(",") if x]:
         if arm != "opt":
             cfg = chain_cfg if arm == "chain_lru" else None
-            res, rows = run_arm(sessions, specs, arm, a.cap, policy_config=cfg)
+            cp = heter_chain_cfg if arm == "heter_chain" else None
+            real = "heter_cache" if arm == "heter_chain" else arm
+            res, rows = run_arm(sessions, specs, real, a.cap, policy_config=cfg,
+                                chain_policy=cp)
             out[arm] = report(arm, res, rows)
             if arm == "lru":
                 base_lru = res
