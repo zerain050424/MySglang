@@ -87,6 +87,8 @@ class SimConfig:
     # heter_cache 专属：队内链形保护（ChainParams）的构造参数；None = 不装配
     # （chat/agentic 队内仍走 ReuseScoreEvict）。透传进 policy_config["chain"]。
     chain_policy: Optional[dict] = None
+    # heter_cache 专属：跨队列仲裁后悔弃权门（RegretGateParams）；None = 不装配。
+    regret_gate: Optional[dict] = None
     # OPT 上界专用：离线 trace 生成的 `{block_hash: [使用时刻]}`。
     # 只在 eviction_policy="opt" 时读；缺失即报错，不做静默退化。
     opt_use_map: Optional[str] = None
@@ -191,6 +193,11 @@ class Simulator:
                 },
                 **(
                     {"chain": cfg.chain_policy} if cfg.chain_policy is not None else {}
+                ),
+                **(
+                    {"regret_gate": cfg.regret_gate}
+                    if cfg.regret_gate is not None
+                    else {}
                 )
             }
         elif cfg.eviction_policy == "opt":

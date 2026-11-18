@@ -397,6 +397,74 @@ class ChainParams:
         return dataclasses.asdict(self)
 
 
+@dataclasses.dataclass
+class RegretGateParams:
+    """跨队列仲裁的后悔弃权门参数（档 A：VD 排序不动，R 做弃权）。
+
+    背景（mixexp/chain_shape_report.md §六）：tail-stress 实测账本证明，
+    Stage 0 已把垃圾流量吃干净（one_shot ≈ 冷尾巴全部写入量），但残余压力经
+    VD 路由到密度最低的队列（锚所在队）后被迫队内挑人，正反馈放大成整链重算
+    （warm 写入量被放大 2.4 倍）。本门给仲裁加实测反馈：
+
+        R_q = 窗口 W 内 join 回队列 q 的淘汰内容 token ÷ 同窗从 q 削掉的 token
+
+    削了没人回来读（冷尾巴）→ R≈0；削了锚（会话回来 miss）→ R 飙升 →
+    弃权跳队。正反馈在第一圈被打断，不再需要 floor/weight 调参。
+
+    Attributes:
+        enabled: 默认 False——不装配时 queue_order/queue_victim 行为逐位不变。
+        window_s: 滑窗 W（秒）。对齐 VD 的政策口径：视野是政策、窗口只是统计，
+            所有队列共用，不按队拆。
+        k: 弃权阈值 = k × 全体已采样队列 R 的中位数。
+        r_min: 绝对下限：R_q < r_min 永不弃权（正常 regime 不触发的保险）。
+        min_evicted: 采样下限：窗口内削掉量不足的队列不参与弃权判定
+            （避免 0/0 的空队列永远赢得 min-R 兜底）。
+        retain_s: stamp 保留时长（秒），须覆盖最大的会话轮间隔，
+            否则 join 不上、R 被低估。与 regret_ledger.DEFAULT_RETAIN_S 同值。
+        max_stamps: stamp 容量上限（FIFO），内存护栏。
+        context: content_key 的上下文 token 数，与 regret_ledger.CONTEXT_TOKENS
+            同值——观测账本在场时以账本的为准（键同源才有 join），仅当账本缺席
+            而本门单独启用时使用本值。
+    """
+
+    enabled: bool = False
+    window_s: float = 120.0
+    k: float = 1.0
+    r_min: float = 0.5
+    min_evicted: int = 4096
+    retain_s: float = 900.0
+    max_stamps: int = 200_000
+    context: int = 16
+
+    def __post_init__(self):
+        if self.window_s <= 0:
+            raise ValueError(f"regret_gate.window_s must be > 0, got {self.window_s}")
+        if self.k <= 0:
+            raise ValueError(f"regret_gate.k must be > 0, got {self.k}")
+        if not (0.0 <= self.r_min <= 1.0):
+            raise ValueError(f"regret_gate.r_min must be in [0, 1], got {self.r_min}")
+        if self.min_evicted < 0:
+            raise ValueError(
+                f"regret_gate.min_evicted must be >= 0, got {self.min_evicted}"
+            )
+        if self.retain_s < self.window_s:
+            raise ValueError(
+                f"regret_gate.retain_s ({self.retain_s}) must be >= window_s "
+                f"({self.window_s}): stamp 活得比窗口短会让 join 迟到丢失"
+            )
+        if self.max_stamps < 1:
+            raise ValueError(f"regret_gate.max_stamps must be >= 1, got {self.max_stamps}")
+        if self.context < 1:
+            raise ValueError(f"regret_gate.context must be >= 1, got {self.context}")
+
+    @classmethod
+    def from_any(cls, value=None) -> "RegretGateParams":
+        return _coerce_params(cls, value, name="regret_gate")
+
+    def as_dict(self) -> dict:
+        return dataclasses.asdict(self)
+
+
 # 参与跨队列仲裁的三级队列。`random` 不在此列：它整行都是 one-shot，
 # 在 Stage 0 就被清掉，永远不会计入 VD 账本。
 VALUE_QUEUES = ("struct", "agentic", "chat")

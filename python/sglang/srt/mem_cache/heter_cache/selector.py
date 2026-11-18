@@ -31,6 +31,12 @@ def queue_order(
 
 def pick_victim(*, strategy, leaves):
     """两级淘汰决策：Stage 0 one-shot → Stage 1 VD 仲裁 → 兜底。
+
+    装配了后悔弃权门（``strategy.regret_gate``，档 A）时 Stage 1 多一道：
+    按 VD 序逐队询问 R_q，超阈值的队列弃权跳过；全部弃权时按 min R_q
+    跨队裁决（全局最便宜处下刀）；无人采样则回退 VD 首队（现状）。
+    弃权门不改变 VD 的排序键，只决定「这个队列这一轮削不削」。
+
     Args:
         strategy: HeterCacheStrategy，提供 one-shot 判据、队列排序与队内选点。
         leaves: 当前可驱逐叶子节点集合。
@@ -44,7 +50,22 @@ def pick_victim(*, strategy, leaves):
     if not leaves:
         return None, None
 
-    for queue in strategy.queue_order():
+    gate = getattr(strategy, "regret_gate", None)
+    order = strategy.queue_order()
+    if gate is not None:
+        passed = [queue for queue in order if not gate.abstain(queue, order)]
+        if not passed:
+            queue = gate.cheapest(order)
+            if queue is not None:
+                victim = strategy.queue_victim(queue, leaves)
+                if victim is not None:
+                    return victim, f"value:{queue}"
+            # 最便宜队列的池内也无候选（或无人采样）→ 走全局兜底
+            return strategy.fallback(leaves), "value:fallback"
+    else:
+        passed = order
+
+    for queue in passed:
         victim = strategy.queue_victim(queue, leaves)
         if victim is not None:
             return victim, f"value:{queue}"

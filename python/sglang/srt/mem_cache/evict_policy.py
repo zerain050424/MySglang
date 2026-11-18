@@ -16,6 +16,7 @@ from sglang.srt.mem_cache.heter_cache.utils import (
     ONE_SHOT_IDLE_S,
     REUSE_QUEUES,
     ChainParams,
+    RegretGateParams,
     ReuseParams,
     SessionRegistry,
     SessionType,
@@ -27,6 +28,7 @@ from sglang.srt.mem_cache.heter_cache.occupancy import QueueOccupancyTracker
 from sglang.srt.mem_cache.heter_cache.value import QueueValueTracker
 from sglang.srt.mem_cache.heter_cache.node_share import NodeShareLedger
 from sglang.srt.mem_cache.heter_cache.override import ChainEvict, ReuseScoreEvict
+from sglang.srt.mem_cache.heter_cache.regret_gate import RegretGate
 from sglang.srt.mem_cache.heter_cache.bench_bridge import (
     CacheTelemetry,
     HeterProfiler,
@@ -212,6 +214,7 @@ class HeterCacheStrategy(EvictionStrategy):
         reuse: Union[ReuseParams, dict, None] = None,
         value: Union[QueueValueParams, dict, None] = None,
         chain: Union[ChainParams, dict, None] = None,
+        regret_gate: Union[RegretGateParams, dict, None] = None,
         now: Optional[Callable[[], float]] = None,
     ):
         # 时间源可注入（单测用假时钟控制 one-shot 豁免窗口的推进）。
@@ -249,6 +252,9 @@ class HeterCacheStrategy(EvictionStrategy):
             if self.reuse.enabled
             else {}
         )
+        # 后悔弃权门（档 A）：VD 排序不动，R 超阈值弃权；默认不装配。
+        rg_params = RegretGateParams.from_any(regret_gate)
+        self.regret_gate = RegretGate(rg_params) if rg_params.enabled else None
         # 链形保护只接管 chat/agentic（struct 的链形状是分叉不是深度，
         # 继续走 struct_tier；one-shot 带不变）。
         self.chain_evicts = (
@@ -279,6 +285,8 @@ class HeterCacheStrategy(EvictionStrategy):
             policy.use_clock(now)
         for policy in self.chain_evicts.values():
             policy.bind_registry(self.session_registry)
+        if self.regret_gate is not None:
+            self.regret_gate.use_clock(now)
 
     def _node_tag(self, node) -> HeterCacheNodeTag:
         if self.force_agentic:

@@ -65,6 +65,10 @@ if ep is None:
     _load("sglang.srt.mem_cache.heter_cache.node_share", os.path.join(_HC_DIR, "node_share.py"))
     _load("sglang.srt.mem_cache.heter_cache.override", os.path.join(_HC_DIR, "override.py"))
     _load("sglang.srt.mem_cache.heter_cache.bench_bridge", os.path.join(_HC_DIR, "bench_bridge.py"))
+    _load(
+        "sglang.srt.mem_cache.heter_cache.regret_gate",
+        os.path.join(_HC_DIR, "regret_gate.py"),
+    )
     ep = _load("sglang.srt.mem_cache.evict_policy", os.path.join(_CACHE_DIR, "evict_policy.py"))
 
 FAILS = []

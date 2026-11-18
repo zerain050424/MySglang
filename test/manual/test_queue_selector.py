@@ -35,39 +35,66 @@ def _stub_package(name):
     sys.modules[name] = module
 
 
-for _pkg in (
-    "sglang",
-    "sglang.srt",
-    "sglang.srt.mem_cache",
-    "sglang.srt.mem_cache.heter_cache",
-):
-    _stub_package(_pkg)
+def _real_modules():
+    """环境完整（torch 链能起来）时直接用真包，不污染 sys.modules。
 
-hu = _load(
-    "sglang.srt.mem_cache.heter_cache.utils", os.path.join(_HC_DIR, "utils.py")
-)
-# 占用账本已独立成模块，evict_policy 直接依赖它
-_load(
-    "sglang.srt.mem_cache.heter_cache.occupancy",
-    os.path.join(_HC_DIR, "occupancy.py"),
-)
-_load("sglang.srt.mem_cache.heter_cache.value", os.path.join(_HC_DIR, "value.py"))
-qs = _load(
-    "sglang.srt.mem_cache.heter_cache.selector", os.path.join(_HC_DIR, "selector.py")
-)
-# 共享数账本已独立成模块（evict_policy 直接依赖它）
-_load(
-    "sglang.srt.mem_cache.heter_cache.node_share",
-    os.path.join(_HC_DIR, "node_share.py"),
-)
-_load(
-    "sglang.srt.mem_cache.heter_cache.override", os.path.join(_HC_DIR, "override.py")
-)
-_load(
-    "sglang.srt.mem_cache.heter_cache.bench_bridge",
-    os.path.join(_HC_DIR, "bench_bridge.py"),
-)
-ep = _load("sglang.srt.mem_cache.evict_policy", os.path.join(_CACHE_DIR, "evict_policy.py"))
+    替身装载会往 sys.modules 里塞空壳包，同一进程里随后导入真 sglang 的
+    测试（如 test_sim_*）会被毒害。先试真导入，失败才装替身。
+    """
+    try:
+        import sglang.srt.mem_cache.evict_policy as ep
+        import sglang.srt.mem_cache.heter_cache.utils as hu
+        import sglang.srt.mem_cache.heter_cache.selector as qs
+        return ep, hu, qs
+    except Exception:
+        return None
+
+
+_loaded = _real_modules()
+if _loaded is not None:
+    ep, hu, qs = _loaded
+else:
+    for _pkg in (
+        "sglang",
+        "sglang.srt",
+        "sglang.srt.mem_cache",
+        "sglang.srt.mem_cache.heter_cache",
+    ):
+        _stub_package(_pkg)
+
+    hu = _load(
+        "sglang.srt.mem_cache.heter_cache.utils", os.path.join(_HC_DIR, "utils.py")
+    )
+    # 占用账本已独立成模块，evict_policy 直接依赖它
+    _load(
+        "sglang.srt.mem_cache.heter_cache.occupancy",
+        os.path.join(_HC_DIR, "occupancy.py"),
+    )
+    _load("sglang.srt.mem_cache.heter_cache.value", os.path.join(_HC_DIR, "value.py"))
+    qs = _load(
+        "sglang.srt.mem_cache.heter_cache.selector",
+        os.path.join(_HC_DIR, "selector.py"),
+    )
+    # 共享数账本已独立成模块（evict_policy 直接依赖它）
+    _load(
+        "sglang.srt.mem_cache.heter_cache.node_share",
+        os.path.join(_HC_DIR, "node_share.py"),
+    )
+    _load(
+        "sglang.srt.mem_cache.heter_cache.override",
+        os.path.join(_HC_DIR, "override.py"),
+    )
+    _load(
+        "sglang.srt.mem_cache.heter_cache.regret_gate",
+        os.path.join(_HC_DIR, "regret_gate.py"),
+    )
+    _load(
+        "sglang.srt.mem_cache.heter_cache.bench_bridge",
+        os.path.join(_HC_DIR, "bench_bridge.py"),
+    )
+    ep = _load(
+        "sglang.srt.mem_cache.evict_policy", os.path.join(_CACHE_DIR, "evict_policy.py")
+    )
 
 FAILS = []
 

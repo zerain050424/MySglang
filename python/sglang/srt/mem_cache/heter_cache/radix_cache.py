@@ -13,6 +13,7 @@
 
 import logging
 import time
+from typing import Optional
 
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams, EvictResult
 from sglang.srt.mem_cache.evict_policy import HeterCacheStrategy
@@ -36,6 +37,12 @@ class HeterCacheRadixCache(RadixCache):
         # 后悔率账本：只在 HETER_REGRET=1 时装配；未装配时本类所有 regret
         # 钩子都以 ``is not None`` 短路，热路径零开销。
         self._regret = bench_bridge.regret_from_env(now=self._now)
+        # 仲裁后悔弃权门（控制路径）：装配在策略上，这里只拿引用做接线。
+        self._rgate = (
+            self.eviction_strategy.regret_gate
+            if isinstance(self.eviction_strategy, HeterCacheStrategy)
+            else None
+        )
         # 当前淘汰循环的裁决来源，由 evict() 在 _evict_one 之前写入：
         # record_victim_source 是整条链释放完才调的，届时节点已经没了。
         self._regret_source = "unknown"
@@ -46,6 +53,9 @@ class HeterCacheRadixCache(RadixCache):
         regret = getattr(self, "_regret", None)
         if regret is not None:
             regret.reset()
+        rgate = getattr(self, "_rgate", None)
+        if rgate is not None:
+            rgate.reset()
 
     def evict(self, params: EvictParams) -> EvictResult:
         """批量淘汰节点，直至释放至少 params.num_tokens 个 Token。
@@ -81,10 +91,17 @@ class HeterCacheRadixCache(RadixCache):
             # stamp 要挂在裁决来源上，而 record_victim_source 在链释放完之后
             # 才调用；先存下来，_evict_one 内的树读法要用。
             self._regret_source = source
+            # 观测账本与弃权门必须在 _evict_one 之前记 —— stamp 需要完整父链。
+            # 单节点淘汰没有级联，victim 就是断点页所在的最浅节点，chain=1。
             if self._regret is not None:
-                # 后悔率账本：单节点淘汰没有级联，victim 就是断点页所在的最浅节点，
-                # chain=1。必须在 _evict_one 之前记 —— stamp 需要完整父链。
                 self._stamp_eviction(victim, victim, len(victim.value), 1)
+            if self._rgate is not None:
+                key = self._breakpoint_key(victim, self._rgate.params.context)
+                self._rgate.on_evict(
+                    key=key,
+                    queue=strategy.node_tag(victim).queue_name,
+                    span=len(victim.value),
+                )
             released = self._evict_one(victim)
             if released <= 0:
                 # 释放量为 0 表明节点状态异常，中止循环以防空转死锁（Spin）
@@ -203,19 +220,9 @@ class HeterCacheRadixCache(RadixCache):
             # 记下来而不是静默丢样本。
             regret.note_skip("evict:bigram")
             return
-        window, base = self._regret_window(shallowest)
         start = shallowest.abs_start
         regret.on_evict(
-            key=content_key(
-                window,
-                start,
-                self.page_size,
-                base=base,
-                context=regret.context,
-                ns=namespace_key(
-                    shallowest.key.extra_key, shallowest.key.cache_salt
-                ),
-            ),
+            key=self._breakpoint_key(shallowest, regret.context),
             span=span,
             source=self._regret_source,
             queue=strategy.node_tag(victim).queue_name,
@@ -225,18 +232,44 @@ class HeterCacheRadixCache(RadixCache):
             elapsed=max(0.0, self._now() - victim.last_access_time),
         )
 
-    def _regret_window(self, node):
-        """取节点首页及其前 ``regret.context`` 个 token 的连续窗口。
+    def _breakpoint_key(self, node, context: int) -> Optional[int]:
+        """断点页内容键：观测账本（regret）与仲裁弃权门（RegretGate）同源。
+
+        两侧的 join 全靠这个键对上；context 必须两侧一致——账本在场时以账本的
+        为准（调用方传 ``regret.context``），本门单独启用时才用门自己的参数。
 
         Args:
             node: 断点页所在节点（必须尚未从树上摘除，父链完整）。
+            context: 首页前随带的上下文 token 数。
+
+        Returns:
+            内容键；bigram/eagle 视角下返回 None（调用方各自记 skip）。
+        """
+        if self.is_eagle or node.key.is_bigram:
+            return None
+        window, base = self._regret_window(node, context)
+        return content_key(
+            window,
+            node.abs_start,
+            self.page_size,
+            base=base,
+            context=context,
+            ns=namespace_key(node.key.extra_key, node.key.cache_salt),
+        )
+
+    def _regret_window(self, node, context: int):
+        """取节点首页及其前 ``context`` 个 token 的连续窗口。
+
+        Args:
+            node: 断点页所在节点（必须尚未从树上摘除，父链完整）。
+            context: 首页前随带的上下文 token 数（观测账本与弃权门同值）。
 
         Returns:
             ``(window, base)``：``window`` 是 token 列表，``window[0]`` 的绝对
             位置是 ``base``；链首不足 context 个 token 时从根截取。
         """
         pos = node.abs_start
-        need = self._regret.context
+        need = context
         segments = []
         cursor = node.parent
         while cursor is not None and need > 0 and len(cursor.key) > 0:
@@ -261,31 +294,42 @@ class HeterCacheRadixCache(RadixCache):
         """
         result = super().match_prefix(params)
         regret = self._regret
-        if regret is None or not params.count_reuse:
+        gate = self._rgate
+        if (regret is None and gate is None) or not params.count_reuse:
             return result
         key = params.key
         if key.is_bigram or self.is_eagle:
-            regret.note_skip("request:bigram")
+            if regret is not None:
+                regret.note_skip("request:bigram")
+            if gate is not None:
+                gate.note_skip("request:bigram")
             return result
         key = key.page_aligned(self.page_size)
         prompt = len(key)
         matched = int(result.device_indices.numel())
         recompute = prompt - matched
         if recompute <= 0:
-            regret.on_request(key=None, recompute=0, prompt=prompt)
+            if regret is not None:
+                regret.on_request(key=None, recompute=0, prompt=prompt)
             return result
         window = key.raw_token_ids()
-        regret.on_request(
-            key=content_key(
-                window,
-                matched,
-                self.page_size,
-                context=regret.context,
-                ns=namespace_key(key.extra_key, key.cache_salt),
-            ),
-            recompute=recompute,
-            prompt=prompt,
+        # 观测账本与弃权门同键：context 以账本为准（在场时），键才对得上。
+        context = regret.context if regret is not None else gate.params.context
+        breakpoint_key = content_key(
+            window,
+            matched,
+            self.page_size,
+            context=context,
+            ns=namespace_key(key.extra_key, key.cache_salt),
         )
+        if regret is not None:
+            regret.on_request(
+                key=breakpoint_key,
+                recompute=recompute,
+                prompt=prompt,
+            )
+        if gate is not None:
+            gate.on_request(key=breakpoint_key)
         return result
 
 
