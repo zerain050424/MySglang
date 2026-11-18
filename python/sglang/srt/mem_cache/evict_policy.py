@@ -149,6 +149,7 @@ class ChainLRUStrategy(EvictionStrategy):
         gate: str = "rerode",
         tail_first: bool = True,
         min_gaps: int = 1,
+        sla: Optional[Dict[str, float]] = None,
     ):
         if floor_tokens < 0:
             raise ValueError(f"floor_tokens must be >= 0, got {floor_tokens}")
@@ -163,6 +164,26 @@ class ChainLRUStrategy(EvictionStrategy):
         self.gate = gate
         self.tail_first = bool(tail_first)
         self.min_gaps = int(min_gaps)
+        # 每队列 SLA 乘数：乘在锚罚上（penalty = weight × sla_q × 缺口），
+        # 类别公平旋钮——面向人、p90 敏感的类给大乘数，它的锚更难被削。
+        # 只作用于有重读/回来证据的链（证据门在前），一次性内容不受影响。
+        # 未列出的队列（含 untagged 的 trans/random）恒为 1.0。
+        self.sla: Dict[str, float] = {}
+        if sla is not None:
+            if not isinstance(sla, dict):
+                raise ValueError(f"sla must be a dict of queue->multiplier, got {sla!r}")
+            for queue, mult in sla.items():
+                try:
+                    mult = float(mult)
+                except (TypeError, ValueError):
+                    raise ValueError(
+                        f"sla[{queue!r}] must be a number, got {mult!r}"
+                    ) from None
+                if mult <= 0:
+                    raise ValueError(
+                        f"sla[{queue!r}] must be > 0, got {mult}"
+                    )
+                self.sla[str(queue)] = mult
 
     def _session_returned(self, session_id) -> bool:
         """归属会话是否已观测到 ≥ min_gaps 个轮间隔（= 至少回来过一次）。"""
@@ -194,7 +215,13 @@ class ChainLRUStrategy(EvictionStrategy):
         if self.gate != "none" and not evidence:
             penalty = 0.0
         elif self.floor_tokens > 0 and remain < self.floor_tokens:
-            penalty = self.weight * (self.floor_tokens - remain)
+            # SLA 乘数按叶子自己的队列归属取；未列出的队列恒 1.0。
+            queue = HeterCacheNodeTag.coerce(
+                getattr(node, "queue_tag", None)
+            ).queue_name
+            penalty = self.weight * self.sla.get(queue, 1.0) * (
+                self.floor_tokens - remain
+            )
         tie = -float(remain) if self.tail_first else 0.0
         return (lat + penalty, tie, int(getattr(node, "id", 0)))
 

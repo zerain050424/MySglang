@@ -116,7 +116,8 @@ class _Node:
 
     _next_id = 0
 
-    def __init__(self, tokens, lat, reuse_count=0, hit_count=0, parent=None):
+    def __init__(self, tokens, lat, reuse_count=0, hit_count=0, parent=None,
+                 session_id=None, queue_tag=None):
         _Node._next_id += 1
         self.id = _Node._next_id
         self.key = [0] * tokens
@@ -124,6 +125,8 @@ class _Node:
         self.reuse_count = reuse_count
         self.hit_count = hit_count
         self.parent = parent
+        self.session_id = session_id
+        self.queue_tag = queue_tag
 
 
 def _chain(specs, base_lat):
@@ -247,6 +250,52 @@ def test_multiturn_gate():
     hu.SessionRegistry.reset_global()
 
 
+def test_sla_multiplier():
+    """per-queue SLA 乘数：同形状两叶，SLA 大的队列锚更贵；未列出队列恒 1。"""
+    hu.SessionRegistry.reset_global()
+    reg = hu.SessionRegistry.global_instance()
+    reg._sessions["c1"] = hu.SessionState(session_id="c1", gaps=[45.0])
+    reg._sessions["a1"] = hu.SessionState(session_id="a1", gaps=[6.0])
+
+    TAG_CHAT = hu.HeterCacheNodeTag.QCHAT
+    TAG_AGENTIC = hu.HeterCacheNodeTag.QAGENT
+
+    def mk(sid, tag, lat):
+        return _Node(1500, lat, reuse_count=0, parent=None,
+                     session_id=sid, queue_tag=tag)
+
+    leaf_chat = mk("c1", TAG_CHAT, 10.0)
+    leaf_agentic = mk("a1", TAG_AGENTIC, 10.0)
+    s = ep.ChainLRUStrategy(floor_tokens=4096, weight=0.02, gate="none",
+                            sla={"chat": 2.0})
+    # 同形状（remain=0），chat 罚 = 0.02×2×4096，agentic 罚 = 0.02×1×4096
+    k_chat = s.get_priority(leaf_chat)
+    k_agentic = s.get_priority(leaf_agentic)
+    check(abs(k_chat[0] - (10.0 + 0.02 * 2.0 * 4096)) < 1e-9,
+          f"sla_chat=2 → 罚加倍：{k_chat[0]}")
+    check(abs(k_agentic[0] - (10.0 + 0.02 * 4096)) < 1e-9,
+          f"未列出队列恒 1：{k_agentic[0]}")
+    check(k_chat[0] > k_agentic[0], "SLA 大的队列更难被削")
+
+    # 证据门仍然在前：rerode 门下无证据的链不享受 SLA 保护
+    s2 = ep.ChainLRUStrategy(floor_tokens=4096, weight=0.02, gate="rerode",
+                             sla={"chat": 2.0})
+    leaf_noev = mk("c9", TAG_CHAT, 10.0)   # 会话未回来过（gaps 空）
+    reg._sessions["c9"] = hu.SessionState(session_id="c9", gaps=[])
+    k_noev = s2.get_priority(leaf_noev)
+    check(k_noev[0] == 10.0, f"无证据不享受 SLA 保护：{k_noev[0]}")
+    hu.SessionRegistry.reset_global()
+
+
+def test_param_validation_with_sla():
+    for sla in ({"chat": 0}, {"chat": -1.0}, {"chat": "x"}, ["chat"]):
+        try:
+            ep.ChainLRUStrategy(sla=sla)
+        except ValueError:
+            continue
+        check(False, f"非法 sla 未拒绝：{sla}")
+
+
 def test_param_validation():
     for kwargs in (
         {"floor_tokens": -1},
@@ -266,6 +315,8 @@ if __name__ == "__main__":
     test_rerode_gate()
     test_multiturn_gate()
     test_tail_first_tiebreak()
+    test_sla_multiplier()
+    test_param_validation_with_sla()
     test_param_validation()
     if FAILS:
         print(f"\n{len(FAILS)} FAILED")
