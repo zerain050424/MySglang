@@ -114,16 +114,26 @@ class ChainLRUStrategy(EvictionStrategy):
     两个修正只读树形与上游已有计数，不引新账本、不改 evict 循环：
 
     * 浅段保护（``floor_tokens``）：淘汰叶子后，链上剩余前缀（root→parent 的
-      token 数）若低于下限，且这条链有重读证据，就把 ``weight × 缺口`` 秒加进
-      LRU 键——别的受害者必须比它还旧 ``weight × 缺口`` 秒才轮得到它。剥得越
-      深罚得越重，链在重读锚附近自然刹住；重读证据只认 ``reuse_count``
-      （admission match 计数），``hit_count`` 含写路径自增，会把刚写的段误判
-      成「被重读过」。
+      token 数）若低于下限，且这条链有「会被回来」的证据，就把
+      ``weight × 缺口`` 秒加进 LRU 键——别的受害者必须比它还旧
+      ``weight × 缺口`` 秒才轮得到它。剥得越深罚得越重，链在锚附近自然刹住。
+      证据门 ``gate`` 三档（四 cell + tail-stress 实测见
+      mixexp/chain_shape_report.md §四/§五）：
+      - ``rerode``：路径上有 ``reuse_count > 0`` 的节点（被重读过）。证据只认
+        ``reuse_count``（admission match 计数），``hit_count`` 含写路径自增，
+        会把刚写的段误判成「被重读过」。真实混合负载上必需（不然一次性冲刷
+        链的死锚吃容量），但会漏掉「还没被重读过、但会回来」的链——
+        tail-stress 的 warm 第 1 轮出生即裸奔。
+      - ``multiturn``：在 ``rerode`` 之外补上「归属会话已观测到 ≥ ``min_gaps``
+        个轮间隔」——会回来过一次是「还会再回来」最强的可观测信号，恰好补上
+        rerode 漏掉的第一轮。需要节点带 ``session_id``（查 SessionRegistry）。
+      - ``none``：不看证据，一律护。只在「全流量都会回来」的人造负载
+        （tail-stress）上最优，真实混合负载会积累死锚（四 cell 全跌）。
     * 砍链尾（``tail_first``）：平票时先剥 ``remain`` 大的叶子——长链砍尾只损失
       尾巴，短链砍根损失整链。
     """
 
-    _GATES = ("none", "rerode")
+    _GATES = ("none", "rerode", "multiturn")
 
     def __init__(
         self,
@@ -131,6 +141,7 @@ class ChainLRUStrategy(EvictionStrategy):
         weight: float = 0.01,
         gate: str = "rerode",
         tail_first: bool = True,
+        min_gaps: int = 1,
     ):
         if floor_tokens < 0:
             raise ValueError(f"floor_tokens must be >= 0, got {floor_tokens}")
@@ -138,24 +149,42 @@ class ChainLRUStrategy(EvictionStrategy):
             raise ValueError(f"weight must be >= 0, got {weight}")
         if gate not in self._GATES:
             raise ValueError(f"gate must be one of {self._GATES}, got {gate!r}")
+        if min_gaps < 1:
+            raise ValueError(f"min_gaps must be >= 1, got {min_gaps}")
         self.floor_tokens = int(floor_tokens)
         self.weight = float(weight)
         self.gate = gate
         self.tail_first = bool(tail_first)
+        self.min_gaps = int(min_gaps)
+
+    def _session_returned(self, session_id) -> bool:
+        """归属会话是否已观测到 ≥ min_gaps 个轮间隔（= 至少回来过一次）。"""
+        if not session_id:
+            return False
+        state = SessionRegistry.global_instance().get(session_id)
+        return state is not None and len(state.gaps) >= self.min_gaps
 
     def get_priority(self, node: TreeNode) -> Tuple[float, float, int]:
         lat = float(node.last_access_time)
         # remain = 淘汰该叶子后链上仍连续缓存的前缀（root→parent 的 token 数）。
-        # 顺路收集重读证据：reuse_count 只在 admission match 里自增（回扫不算）。
+        # 顺路收集证据：reuse_count 只在 admission match 里自增（回扫不算）；
+        # multiturn 门补看节点归属会话的轮间隔观测。
         remain = 0
         rerode = getattr(node, "reuse_count", 0) > 0
+        session_ids = {getattr(node, "session_id", None)}
         cursor = node.parent
         while cursor is not None and cursor.parent is not None:
             remain += len(cursor.key)
             rerode = rerode or getattr(cursor, "reuse_count", 0) > 0
+            session_ids.add(getattr(cursor, "session_id", None))
             cursor = cursor.parent
+        evidence = rerode
+        if not evidence and self.gate == "multiturn":
+            evidence = any(
+                self._session_returned(sid) for sid in session_ids if sid
+            )
         penalty = 0.0
-        if self.gate == "rerode" and not rerode:
+        if self.gate != "none" and not evidence:
             penalty = 0.0
         elif self.floor_tokens > 0 and remain < self.floor_tokens:
             penalty = self.weight * (self.floor_tokens - remain)

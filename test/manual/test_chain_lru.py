@@ -62,6 +62,14 @@ if ep is None:
         _stub_package(_pkg)
 
 if ep is None:
+    hu = _load(
+        "sglang.srt.mem_cache.heter_cache.utils",
+        os.path.join(_HC_DIR, "utils.py"),
+    )
+else:
+    import sglang.srt.mem_cache.heter_cache.utils as hu
+
+if ep is None:
     _load("sglang.srt.mem_cache.heter_cache.utils", os.path.join(_HC_DIR, "utils.py"))
     _load(
         "sglang.srt.mem_cache.heter_cache.occupancy",
@@ -192,11 +200,55 @@ def test_tail_first_tiebreak():
     check(key[0] == short.last_access_time, f"floor=0 无罚：{key}")
 
 
+def test_multiturn_gate():
+    """gate="multiturn"：rerode 之外，归属会话已观测到轮间隔也护。
+
+    场景：tail-stress 的 warm 第 1 轮——链还没被重读过（reuse_count=0），
+    但会话已经回来过一次（gaps ≥ 1）。rerode 门下它裸奔，multiturn 门下被护。
+    """
+    hu.SessionRegistry.reset_global()
+    reg = hu.SessionRegistry.global_instance()  # 策略读的是进程单例
+    reg._sessions["warm-1"] = hu.SessionState(session_id="warm-1", gaps=[45.0])
+    reg._sessions["cold-1"] = hu.SessionState(session_id="cold-1", gaps=[])
+
+    leaf = _chain([(1500, 0, 1), (1500, 0, 1)], 0.0)
+    leaf.session_id = "warm-1"
+    leaf.parent.session_id = "warm-1"
+    s = ep.ChainLRUStrategy(floor_tokens=4096, weight=0.02, gate="multiturn")
+    key = s.get_priority(leaf)
+    check(key[0] > leaf.last_access_time, f"会话回来过 → 护浅段：{key}")
+
+    # 单轮会话（gaps 为空）：不护
+    leaf2 = _chain([(1500, 0, 1), (1500, 0, 1)], 0.0)
+    leaf2.session_id = "cold-1"
+    leaf2.parent.session_id = "cold-1"
+    key2 = s.get_priority(leaf2)
+    check(
+        key2[0] == leaf2.last_access_time,
+        f"单轮会话不被 multiturn 门护：{key2}",
+    )
+
+    # 无 session_id 的节点：退化为 rerode 证据
+    leaf3 = _chain([(1500, 0, 1), (1500, 0, 1)], 0.0)
+    key3 = s.get_priority(leaf3)
+    check(
+        key3[0] == leaf3.last_access_time,
+        f"无 session_id 且无重读 → 不护：{key3}",
+    )
+
+    # rerode 证据仍在 multiturn 门下生效
+    leaf4 = _chain([(1500, 1, 2), (1500, 0, 1)], 0.0)
+    key4 = s.get_priority(leaf4)
+    check(key4[0] > leaf4.last_access_time, f"重读证据仍生效：{key4}")
+    hu.SessionRegistry.reset_global()
+
+
 def test_param_validation():
     for kwargs in (
         {"floor_tokens": -1},
         {"weight": -0.1},
         {"gate": "whatever"},
+        {"min_gaps": 0},
     ):
         try:
             ep.ChainLRUStrategy(**kwargs)
@@ -208,6 +260,7 @@ def test_param_validation():
 if __name__ == "__main__":
     test_floor_penalty_and_slope()
     test_rerode_gate()
+    test_multiturn_gate()
     test_tail_first_tiebreak()
     test_param_validation()
     if FAILS:
