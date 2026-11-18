@@ -15,6 +15,7 @@ from sglang.srt.mem_cache.heter_cache.utils import (
     node_num_tokens,
     ONE_SHOT_IDLE_S,
     REUSE_QUEUES,
+    ChainParams,
     ReuseParams,
     SessionRegistry,
     SessionType,
@@ -25,7 +26,7 @@ from sglang.srt.mem_cache.heter_cache.utils import (
 from sglang.srt.mem_cache.heter_cache.occupancy import QueueOccupancyTracker
 from sglang.srt.mem_cache.heter_cache.value import QueueValueTracker
 from sglang.srt.mem_cache.heter_cache.node_share import NodeShareLedger
-from sglang.srt.mem_cache.heter_cache.override import ReuseScoreEvict
+from sglang.srt.mem_cache.heter_cache.override import ChainEvict, ReuseScoreEvict
 from sglang.srt.mem_cache.heter_cache.bench_bridge import (
     CacheTelemetry,
     HeterProfiler,
@@ -210,6 +211,7 @@ class HeterCacheStrategy(EvictionStrategy):
         share: Union[ShareParams, dict, None] = None,
         reuse: Union[ReuseParams, dict, None] = None,
         value: Union[QueueValueParams, dict, None] = None,
+        chain: Union[ChainParams, dict, None] = None,
         now: Optional[Callable[[], float]] = None,
     ):
         # 时间源可注入（单测用假时钟控制 one-shot 豁免窗口的推进）。
@@ -217,6 +219,9 @@ class HeterCacheStrategy(EvictionStrategy):
         self.share = ShareParams.from_any(share)
         self.reuse = ReuseParams.from_any(reuse)
         self.value = QueueValueParams.from_any(value)
+        # 队内链形保护（chat/agentic）：默认不装配（enabled=False 时 chain_evicts
+        # 为空，queue_victim 仍走 ReuseScoreEvict，默认行为逐位不变）。
+        self.chain = ChainParams.from_any(chain)
         self.force_agentic = bool(force_agentic)
 
         self.occupancy = QueueOccupancyTracker()
@@ -244,6 +249,21 @@ class HeterCacheStrategy(EvictionStrategy):
             if self.reuse.enabled
             else {}
         )
+        # 链形保护只接管 chat/agentic（struct 的链形状是分叉不是深度，
+        # 继续走 struct_tier；one-shot 带不变）。
+        self.chain_evicts = (
+            {
+                q: ChainEvict(
+                    self.chain,
+                    HeterCacheNodeTag.from_queue(q),
+                    tag_of=self._node_tag,
+                    expired_of=self.session_expired,
+                )
+                for q in REUSE_QUEUES
+            }
+            if self.chain.enabled
+            else {}
+        )
 
     def use_clock(self, now: Callable[[], float]) -> None:
         """接管缓存层的时间源
@@ -257,6 +277,8 @@ class HeterCacheStrategy(EvictionStrategy):
         self.session_registry.use_clock(now)
         for policy in self.reuse_evicts.values():
             policy.use_clock(now)
+        for policy in self.chain_evicts.values():
+            policy.bind_registry(self.session_registry)
 
     def _node_tag(self, node) -> HeterCacheNodeTag:
         if self.force_agentic:
@@ -442,6 +464,10 @@ class HeterCacheStrategy(EvictionStrategy):
             share_of = self.node_share.share_of
             share_min = self.node_share.share_min
             return min(pool, key=lambda n: struct_tier(n, share_of, share_min))
+        chain = self.chain_evicts.get(queue)
+        if chain is not None:
+            # 链形保护接管本队：浅段优先保护、砍链尾（ChainParams 文档）。
+            return chain.pick(pool, self.session_registry)
         reuse = self.reuse_evicts.get(queue)
         if reuse is not None:
             # chat / agentic 同一条路径：复用概率升序，只有 mu/sigma 随标签不同。

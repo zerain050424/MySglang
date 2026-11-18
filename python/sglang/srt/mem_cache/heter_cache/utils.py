@@ -346,6 +346,57 @@ class ReuseParams:
         return dataclasses.asdict(self)
 
 
+@dataclasses.dataclass
+class ChainParams:
+    """chat / agentic 队内的链形保护参数（chain_lru 的 heter 队内版）。
+
+    与独立策略 ``ChainLRUStrategy`` 同一条实测结论：match 刷新整条匹配路径的
+    recency，私有单子链要么全新要么全旧；链成为全局最旧后会被一路剥穿，
+    归零后进入「整链重插 → 再被剥穿」的死循环（tail-stress 实测 warm 整链丢失
+    52%，P90 是 OPT 上界的 5 倍）。队内版排序键 =
+    ``(last_access_time + penalty, -remain, node.id)``，``min`` 即淘汰：
+
+    * 自适应锚（区别于独立策略的全局 floor）：锚 = max(锚下限先验,
+      **链上最深重读节点的深度**)——重读边界 = 该会话上次被命中的前缀长度，
+      正是它下一轮要读的位置。罚 ``weight × (锚 − remain)`` 秒，剥得越深罚越重。
+    * 证据门固定为「重读过 ∪ 会话回来过」（四 cell 实测两档单门互堵，
+      multiturn 并集两头通吃，见 mixexp/chain_shape_report.md §五）；
+      会话终结（session_expired 口径）时释放锚，防死会话占着保护不放。
+    * 砍链尾：平票时先剥 remain 大的叶子（长链砍尾只损失尾巴）。
+
+    Attributes:
+        enabled: 默认 False——不装配时 chat/agentic 队内仍走 ReuseScoreEvict，
+            默认行为逐位不变。
+        floor_tokens: 锚下限先验（token）。0 = 纯自适应（只护重读边界）。
+        weight: 缺口罚斜率（秒/token）。
+        min_gaps: 「会话回来过」的最小轮间隔观测数（SessionRegistry.gaps）。
+        tail_first: 平票时是否先剥长链的尾。
+        expire_anchors: 会话终结是否释放锚（生产建议 True）。
+    """
+
+    enabled: bool = False
+    floor_tokens: int = 8192
+    weight: float = 0.02
+    min_gaps: int = 1
+    tail_first: bool = True
+    expire_anchors: bool = True
+
+    def __post_init__(self):
+        if self.floor_tokens < 0:
+            raise ValueError(f"chain.floor_tokens must be >= 0, got {self.floor_tokens}")
+        if self.weight < 0:
+            raise ValueError(f"chain.weight must be >= 0, got {self.weight}")
+        if self.min_gaps < 1:
+            raise ValueError(f"chain.min_gaps must be >= 1, got {self.min_gaps}")
+
+    @classmethod
+    def from_any(cls, value=None) -> "ChainParams":
+        return _coerce_params(cls, value, name="chain")
+
+    def as_dict(self) -> dict:
+        return dataclasses.asdict(self)
+
+
 # 参与跨队列仲裁的三级队列。`random` 不在此列：它整行都是 one-shot，
 # 在 Stage 0 就被清掉，永远不会计入 VD 账本。
 VALUE_QUEUES = ("struct", "agentic", "chat")

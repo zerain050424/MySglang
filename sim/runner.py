@@ -84,6 +84,9 @@ class SimConfig:
     # 策略构造参数原样透传给缓存工厂；None = 按策略族默认分派（heter 读 VD 参数、
     # opt 读 use map、其余无参）。用于实验臂带自己的参数（如 chain_lru 的 floor/weight）。
     policy_config: Optional[dict] = None
+    # heter_cache 专属：队内链形保护（ChainParams）的构造参数；None = 不装配
+    # （chat/agentic 队内仍走 ReuseScoreEvict）。透传进 policy_config["chain"]。
+    chain_policy: Optional[dict] = None
     # OPT 上界专用：离线 trace 生成的 `{block_hash: [使用时刻]}`。
     # 只在 eviction_policy="opt" 时读；缺失即报错，不做静默退化。
     opt_use_map: Optional[str] = None
@@ -185,7 +188,10 @@ class Simulator:
                     "smoothing_k": cfg.value_smoothing_k,
                     "floor_tokens": cfg.value_floor_tokens,
                     "seed": cfg.seed,
-                }
+                },
+                **(
+                    {"chain": cfg.chain_policy} if cfg.chain_policy is not None else {}
+                )
             }
         elif cfg.eviction_policy == "opt":
             if not cfg.opt_use_map:
