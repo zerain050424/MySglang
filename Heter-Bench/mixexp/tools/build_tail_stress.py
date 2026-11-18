@@ -225,9 +225,9 @@ def main(argv=None):
     for arm in [x for x in a.arms.split(",") if x]:
         if arm != "opt":
             cfg = chain_cfg if arm == "chain_lru" else None
-            cp = heter_chain_cfg if arm == "heter_chain" else None
-            rgc = rgate_cfg if arm == "heter_rgate" else None
-            real = "heter_cache" if arm in ("heter_chain", "heter_rgate") else arm
+            cp = heter_chain_cfg if arm in ("heter_chain", "heter_full") else None
+            rgc = rgate_cfg if arm in ("heter_rgate", "heter_full") else None
+            real = "heter_cache" if arm in ("heter_chain", "heter_rgate", "heter_full") else arm
             res, rows = run_arm(sessions, specs, real, a.cap, policy_config=cfg,
                                 chain_policy=cp, regret_gate=rgc)
             if arm == "heter_rgate" and run_arm.last_gate_stats:
