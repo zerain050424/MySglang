@@ -287,6 +287,40 @@ def test_sla_multiplier():
     hu.SessionRegistry.reset_global()
 
 
+def test_sla_expired_release():
+    """锚出口：SLA 放大的死锚在会话终结后释放；活会话/untagged 不释放。"""
+    hu.SessionRegistry.reset_global()
+    reg = hu.SessionRegistry.global_instance()
+    # c-dead：回来了两次（gaps=2），寿命 = 3×45=135s；last_active=100 → now=1000 已终结
+    reg._sessions["c-dead"] = hu.SessionState(session_id="c-dead", gaps=[45.0, 45.0], last_active=100.0)
+    reg._sessions["c-alive"] = hu.SessionState(session_id="c-alive", gaps=[45.0, 45.0], last_active=999.0)
+
+    TAG_CHAT = hu.HeterCacheNodeTag.QCHAT
+    s = ep.ChainLRUStrategy(floor_tokens=4096, weight=0.02, gate="none",
+                            sla={"chat": 2.0},
+                            session_ttl_k=3.0, session_ttl_min_s=60.0,
+                            session_ttl_max_s=1800.0)
+    s.use_clock(lambda: 1000.0)   # 虚拟时钟：与 state.last_active 同源
+
+    leaf_dead = _Node(1500, 10.0, reuse_count=1, parent=None,
+                      session_id="c-dead", queue_tag=TAG_CHAT)
+    k_dead = s.get_priority(leaf_dead)
+    check(k_dead[0] == 10.0, f"死会话锚释放：{k_dead[0]}")
+
+    leaf_alive = _Node(1500, 10.0, reuse_count=1, parent=None,
+                       session_id="c-alive", queue_tag=TAG_CHAT)
+    k_alive = s.get_priority(leaf_alive)
+    check(abs(k_alive[0] - (10.0 + 0.02 * 2.0 * 4096)) < 1e-9,
+          f"活会话锚保留且 SLA 生效：{k_alive[0]}")
+
+    leaf_none = _Node(1500, 10.0, reuse_count=1, parent=None,
+                      session_id=None, queue_tag=TAG_CHAT)
+    k_none = s.get_priority(leaf_none)
+    check(abs(k_none[0] - (10.0 + 0.02 * 2.0 * 4096)) < 1e-9,
+          f"untagged 链不释放（宁多留）：{k_none[0]}")
+    hu.SessionRegistry.reset_global()
+
+
 def test_param_validation_with_sla():
     for sla in ({"chat": 0}, {"chat": -1.0}, {"chat": "x"}, ["chat"]):
         try:
@@ -316,6 +350,7 @@ if __name__ == "__main__":
     test_multiturn_gate()
     test_tail_first_tiebreak()
     test_sla_multiplier()
+    test_sla_expired_release()
     test_param_validation_with_sla()
     test_param_validation()
     if FAILS:

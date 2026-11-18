@@ -195,6 +195,10 @@ def main(argv=None):
                     help="heter_rgate：弃权阈值 = k × 已采样中位数")
     ap.add_argument("--rg-rmin", type=float, default=0.5,
                     help="heter_rgate：R 绝对下限")
+    ap.add_argument("--sla-chat", type=float, default=1.0,
+                    help="chain_lru：chat 锚罚乘数（类别公平旋钮）")
+    ap.add_argument("--sla-agentic", type=float, default=1.0)
+    ap.add_argument("--sla-struct", type=float, default=1.0)
     ap.add_argument("--pf", action="store_true",
                     help="heter_rgate：档 B——全弃权兑底换全局叶子定价")
     ap.add_argument("--pf-floor", type=int, default=8192, help="档 B：锚下限先验")
@@ -212,7 +216,11 @@ def main(argv=None):
           f"warm={a.n_warm}×8 轮(gap {a.warm_gap}s, 私有 12k) "
           f"cold={a.n_cold}×1 ({a.tpl} 共享 + {a.tail} 私有)")
     out = {}
-    chain_cfg = {"floor_tokens": a.floor, "weight": a.weight, "gate": a.gate}
+    chain_cfg = {
+        "floor_tokens": a.floor, "weight": a.weight, "gate": a.gate,
+        "sla": {"chat": a.sla_chat, "agentic": a.sla_agentic,
+                "struct": a.sla_struct},
+    }
     heter_chain_cfg = {
         "enabled": True, "floor_tokens": a.floor, "weight": a.weight,
         "min_gaps": 1,

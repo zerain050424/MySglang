@@ -150,6 +150,9 @@ class ChainLRUStrategy(EvictionStrategy):
         tail_first: bool = True,
         min_gaps: int = 1,
         sla: Optional[Dict[str, float]] = None,
+        session_ttl_k: float = 3.0,
+        session_ttl_min_s: float = 60.0,
+        session_ttl_max_s: float = 1800.0,
     ):
         if floor_tokens < 0:
             raise ValueError(f"floor_tokens must be >= 0, got {floor_tokens}")
@@ -184,6 +187,24 @@ class ChainLRUStrategy(EvictionStrategy):
                         f"sla[{queue!r}] must be > 0, got {mult}"
                     )
                 self.sla[str(queue)] = mult
+        # 会话寿命参数（与 HeterCacheStrategy.session_life_s 同一口径）：
+        # 死会话的锚不释放会随 sla 放大成池级死重（chat cell 实测 sla_chat=2
+        # 时 chat hit 62.6→54.6，死锚占满池子）。
+        self.session_ttl_k = float(session_ttl_k)
+        self.session_ttl_min_s = float(session_ttl_min_s)
+        self.session_ttl_max_s = float(session_ttl_max_s)
+        if self.session_ttl_k <= 0 or self.session_ttl_min_s > self.session_ttl_max_s:
+            raise ValueError(
+                f"session_ttl_k must be > 0 and min_s <= max_s, got "
+                f"k={session_ttl_k}, min={session_ttl_min_s}, max={session_ttl_max_s}"
+            )
+        # 时钟源：缓存层装配后统一推（RadixCache.__init__ 的 use_clock 分发），
+        # 必须与节点时间戳同源，否则「超期」判断拿假 now 减真时间戳。
+        self._now = time.monotonic
+
+    def use_clock(self, now: Callable[[], float]) -> None:
+        """接管时间源（与 HeterCacheStrategy.use_clock 同一约定）。"""
+        self._now = now
 
     def _session_returned(self, session_id) -> bool:
         """归属会话是否已观测到 ≥ min_gaps 个轮间隔（= 至少回来过一次）。"""
@@ -191,6 +212,28 @@ class ChainLRUStrategy(EvictionStrategy):
             return False
         state = SessionRegistry.global_instance().get(session_id)
         return state is not None and len(state.gaps) >= self.min_gaps
+
+    def _session_expired(self, session_id) -> bool:
+        """会话是否终结：寿命 = k × 轮间隔 p90（夹在 [min, max]），超期即终结。
+
+        与 HeterCacheStrategy.session_life_s 同一口径；证据不足（轮间隔样本
+        少于 2）不终结——保守侧，宁多留不少剥。
+        """
+        if not session_id:
+            return False
+        state = SessionRegistry.global_instance().get(session_id)
+        if state is None:
+            return False
+        gaps = getattr(state, "gaps", None) or []
+        if len(gaps) < 2:
+            return False
+        ordered = sorted(gaps)
+        idx = min(len(ordered) - 1, int(round(0.9 * (len(ordered) - 1))))
+        life = min(
+            max(self.session_ttl_k * ordered[idx], self.session_ttl_min_s),
+            self.session_ttl_max_s,
+        )
+        return self._now() - state.last_active > life
 
     def get_priority(self, node: TreeNode) -> Tuple[float, float, int]:
         lat = float(node.last_access_time)
@@ -222,6 +265,12 @@ class ChainLRUStrategy(EvictionStrategy):
             penalty = self.weight * self.sla.get(queue, 1.0) * (
                 self.floor_tokens - remain
             )
+            # 锚出口：归属会话终结 → 释放锚（死锚不随 SLA 放大成池级死重）。
+            # 至少要有一个已知会话才谈得上「全终结」；untagged 链不释放。
+            if penalty > 0:
+                known_sids = [s for s in session_ids if s]
+                if known_sids and all(self._session_expired(s) for s in known_sids):
+                    penalty = 0.0
         tie = -float(remain) if self.tail_first else 0.0
         return (lat + penalty, tie, int(getattr(node, "id", 0)))
 

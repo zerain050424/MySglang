@@ -369,6 +369,14 @@ class RadixCache(BasePrefixCache):
         if opt is not None:
             opt.use_clock(self._now)
             opt.bind_page_size(self.page_size)
+        # 任何声明了 use_clock 的策略都统一接缓存时钟：节点时间戳（TreeNode
+        # 创建 / match / insert）由本类盖，策略只做差值判断。两边不同源就是
+        # 拿假 now 减真时间戳。
+        generic_use_clock = getattr(self.eviction_strategy, "use_clock", None)
+        if callable(generic_use_clock) and not isinstance(
+            self.eviction_strategy, (HeterCacheStrategy, OPTStrategy)
+        ):
+            generic_use_clock(self._now)
         if heter is not None:
             # 策略的时间源由缓存接管：节点时间戳（TreeNode 创建 / match / insert）
             # 由本类盖，策略只做差值判断。两边不同源就是拿假 now 减真时间戳。
