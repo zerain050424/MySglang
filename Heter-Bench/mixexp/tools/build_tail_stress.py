@@ -183,8 +183,9 @@ def main(argv=None):
                     help="chain_lru：浅段保护下限（token）")
     ap.add_argument("--weight", type=float, default=0.01,
                     help="chain_lru：缺口罚斜率（秒/token）")
-    ap.add_argument("--gate", default="rerode", choices=["none", "rerode"],
-                    help="chain_lru：浅段保护证据门（rerode=只护被重读过的链）")
+    ap.add_argument("--gate", default="rerode",
+                    choices=["none", "rerode", "multiturn"],
+                    help="chain_lru：浅段保护证据门（rerode=重读过；multiturn=再加会话回来过）")
     ap.add_argument("--json", default="")
     a = ap.parse_args(argv)
 

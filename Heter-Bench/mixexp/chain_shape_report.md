@@ -1,10 +1,14 @@
-# chain_shape：按「下游依赖体量」选受害者——浅段优先保护、砍链尾（tail-stress 实测）
+# chain_shape：按「下游依赖体量」选受害者——浅段优先保护、砍链尾（tail-stress + 四 cell 实测）
 
-> 时间：2026-11-18 · 分支 `W1`（`00e8985` + 本批）· 载体 `sim/` engine 仿真器
+> 时间：2026-11-18 · 分支 `W1`（`00e8985` → `5d1f90e`）· 载体 `sim/` engine 仿真器
 > 目标：把「整条前缀丢失」变成「部分丢失」。这是 cost_oracle_gap 证否深度代价加权后，
 > 唯一还没证否、且 tail-stress 上有 920ms → 184ms 空间的方向。
 > 新策略：``--radix-eviction-policy chain_lru``（`ChainLRUStrategy`，全部 opt-in，
 > 不带参数时其他策略行为逐位不变）。
+>
+> **终态配置：``floor_tokens=8192, weight=0.02, gate=multiturn``** —— 两个靶子同时赢：
+> 四 cell 加权 66.25%（LRU 62.54 / heter 64.24 / OPT 上界 71.54），四 cell 全胜 heter；
+> tail-stress P90 920 → **404ms**（OPT 184，2.2×），warm 整链 52.2% → 23.8%。
 
 ---
 
@@ -67,7 +71,7 @@ victim 仍是叶子，排序键 = ``(lat + penalty, -remain, node.id)``，``heap
   ≈ 5~6k（warm hit 0.542 vs OPT 0.785）。它证明了「不剥穿」能拿走大部分 P90，
   但「锚多深才对」是 Belady 用未来知识解的，本策略只能靠 floor 全局近似。
 
-## 四、扫参与稳健性
+## 四、扫参与稳健性（tail-stress 本机）
 
 * **floor 6144~9216 × weight 0.02~0.03 是一个平台**（p90 420~530、warm 整链
   12.5~13%），不是单点运气。floor ≤ 2048 或 weight ≥ 0.1 开始劣化：
@@ -84,12 +88,43 @@ victim 仍是叶子，排序键 = ``(lat + penalty, -remain, node.id)``，``heap
   * ``cap=120k``（拥塞档，隔离性丢失）：p90 5233 → 3111ms，warm 整链 96.9% → 74.4%。
   两个压力更大的档位方向一致，无反向劣化，但绝对值都被排队污染，不作数。
 
-## 五、边界与下一步
+## 五、四 cell 验证（实验机 bitahub，`e4c7407`+`5d1f90e`）
 
-* **本机没有 exp3 四 cell 数据**，「其他负载不劣化」尚未验证——回归只能证明
-  默认行为不变（37 个 sim/CLI 回归全过）+ tail-stress 三档压力方向一致。
-  上实验机后应把 chain_lru 加进四 cell 矩阵复跑，重点看 scan（纯树形保护在
-  冲刷负载上等于给每条一次性链留 floor×驻留链数的死重，需要 gate 或容量证据）。
+同一驱动（`/root/sim_runs/sim_engine_cell_v2.py`，page=8、cap=198k、FCFS、seed=0，
+与 `exp3_cells_ttl300.md` 完全同口径；LRU/heter/OPT 行取自同盘 `engine_full/` 现有结果）：
+
+| cell | LRU | heter(TTL300) | **chain_lru** | OPT 上界 |
+|---|---|---|---|---|
+| scan（均衡） | 29.65% | 33.59% | **36.09%**（+2.50 vs heter） | 38.42% |
+| struct 主导 | 81.64% | 82.41% | **82.68%**（+0.27） | 83.49% |
+| chat 主导 | 57.28% | 58.07% | **62.61%**（**+4.54**） | 79.45% |
+| agentic 主导 | 81.07% | 82.36% | **83.12%**（+0.76） | 84.43% |
+| **加权** | **62.54%** | **64.24%** | **66.25%** | 71.54% |
+
+四 cell 全胜 heter，加权 **+2.01pp**（heter 对 LRU 只有 +1.69pp）；距 OPT 上界 5.29pp。
+
+### 两个证据门的冲突（重要发现）
+
+gate 是这条策略唯一的「负载敏感旋钮」，三档在两个靶子上方向相反：
+
+| gate | tail-stress p90 | 四 cell 加权 | 解释 |
+|---|---|---|---|
+| none | **421ms**（最优） | 全线跌（scan −1.54pp…） | 无证据一律护：一次性冲刷链的死锚吃容量 |
+| rerode | 724ms（只修一半） | 64.74%（小胜 heter） | 漏掉「还没被重读过、但会回来」的链（warm 第 1 轮出生裸奔） |
+| **multiturn** | **404ms** | **66.25%** | 重读过 ∪ 会话已回来过（观测到 ≥1 个轮间隔）——两者互堵对方的洞 |
+
+multiturn 的物理含义：**「会回来过一次」是「还会再回来」最强的可观测信号**，
+恰好补上 rerode 漏掉的第一轮；而冲刷/一次性链（gaps 空）不护，死锚问题消失。
+这等于把 heter 的会话分类证据用在了树形保护的门上，但只做「是否续命」一个判断，
+不做 one-shot 判定——heter 在 tail-stress 上翻车（P90 1620ms）的正是那个判定。
+
+floor 在 multiturn 门下可以放大：8192 → 16384 时 scan 继续升（36.96%），但 chat
+过 8192 后回落（62.61 → 61.41），取 8192~10240 为工作点（加权 66.25/66.26%）。
+
+## 六、边界与下一步
+
+* ~~本机没有 exp3 四 cell 数据，「其他负载不劣化」尚未验证~~ 已在实验机复跑
+  （§五），四 cell 全胜 heter。剩余未验：drift3、真机 bench 端到端。
 * 淘汰粒度是「轮段」节点（一条 warm 链 ≈ 8 节点 × ~1500 token），部分丢失的
   分辨率受此限制；页粒度剥链是另一个话题，不在这批里做。
 * ``get_priority`` 每次沿父链走到根（求 remain + 证据），代价 O(链深)。本负载
@@ -99,14 +134,21 @@ victim 仍是叶子，排序键 = ``(lat + penalty, -remain, node.id)``，``heap
   尾巴天然在深层（remain=7k）不受影响，但一般负载需要一个「锚老化」出口——
   与 heter 的 TTL/会话寿命判据合并是自然方向，这批不做。
 
-## 六、复现
+## 七、复现
 
 ```bash
 cd <repo-root>
 PYTHONPATH=$PWD:$PWD/python ~/venvs/sim/bin/python \
   Heter-Bench/mixexp/tools/build_tail_stress.py \
-  --arms lru,chain_lru,opt --floor 8192 --weight 0.02 --gate none
+  --arms lru,chain_lru,opt --floor 8192 --weight 0.02 --gate multiturn
 # 单测（不需要 torch）：python test/manual/test_chain_lru.py  → ALL PASSED
 # 回归：test_sim_determinism / test_sim_metrics / test_sim_opt / test_sim_oversize /
 #       test_radix_eviction_policy_cli  → 37 passed
+#
+# 四 cell（实验机 bitahub /root/sg-unicache）：
+#   for c in scan struct chat agentic; do
+#     CELL=$c PAGE=8 CAP=198000 ARMS=chain_lru CHAIN_FLOOR=8192 \
+#     CHAIN_WEIGHT=0.02 CHAIN_GATE=multiturn OUT_DIR=/root/sim_runs/engine_chain/$c \
+#     /root/sl_old/bin/python -u /root/sim_runs/sim_engine_cell_v2.py
+#   done
 ```
