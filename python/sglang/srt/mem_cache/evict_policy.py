@@ -276,15 +276,7 @@ class ChainLRUStrategy(EvictionStrategy):
 
 
 class HeterCacheStrategy(EvictionStrategy):
-    """HeterCache 多队列缓存淘汰策略。
-
-    两层决策：
-    1. 分带过滤：One-shot 节点优先清理，不计入 VD 账本；
-       归属会话仍活跃的未匹配节点受时间豁免（ONE_SHOT_IDLE_S）保护，不进带。
-    2. VD 仲裁：按 VD 升序排出候选队列（只读密度，不含占用），再由队内策略决出牺牲节点。
-       chat / agentic 共用一套队内口径：按复用概率升序（``ReuseScoreEvict``），
-       只有 mu/sigma 随标签不同。
-    """
+    """HeterCache 多队列缓存淘汰策略：One-shot 分带清理 + VD 跨队列仲裁。"""
 
     def __init__(
         self,
@@ -297,13 +289,10 @@ class HeterCacheStrategy(EvictionStrategy):
         regret_gate: Union[RegretGateParams, dict, None] = None,
         now: Optional[Callable[[], float]] = None,
     ):
-        # 时间源可注入（单测用假时钟控制 one-shot 豁免窗口的推进）。
         self._now = now if now is not None else time.monotonic
         self.share = ShareParams.from_any(share)
         self.reuse = ReuseParams.from_any(reuse)
         self.value = QueueValueParams.from_any(value)
-        # 队内链形保护（chat/agentic）：默认不装配（enabled=False 时 chain_evicts
-        # 为空，queue_victim 仍走 ReuseScoreEvict，默认行为逐位不变）。
         self.chain = ChainParams.from_any(chain)
         self.force_agentic = bool(force_agentic)
 
@@ -321,35 +310,34 @@ class HeterCacheStrategy(EvictionStrategy):
 
         self.session_registry = SessionRegistry.global_instance()
         self.node_share = NodeShareLedger(self.share.share_min)
-        # chat / agentic 同一套复用分排序，各持一个实例只是为了分开计数与分队列筛池。
         self.reuse_evicts = (
             {
                 q: ReuseScoreEvict(
-                    self.reuse, HeterCacheNodeTag.from_queue(q), self._node_tag
+                    self.reuse, HeterCacheNodeTag.from_queue(q), self.node_tag
                 )
                 for q in REUSE_QUEUES
             }
             if self.reuse.enabled
             else {}
         )
-        # 后悔弃权门（档 A）：VD 排序不动，R 超阈值弃权；默认不装配。
         rg_params = RegretGateParams.from_any(regret_gate)
         self.regret_gate = RegretGate(rg_params) if rg_params.enabled else None
-        # 档 B：全弃权兑底的全局叶子定价（priced_fallback=True 时装配）。
         self.priced_fallback = (
-            PricedFallback(rg_params, self.regret_gate, self._node_tag,
-                           expired_of=self.session_expired)
+            PricedFallback(
+                rg_params,
+                self.regret_gate,
+                self.node_tag,
+                expired_of=self.session_expired,
+            )
             if (rg_params.enabled and rg_params.priced_fallback)
             else None
         )
-        # 链形保护只接管 chat/agentic（struct 的链形状是分叉不是深度，
-        # 继续走 struct_tier；one-shot 带不变）。
         self.chain_evicts = (
             {
                 q: ChainEvict(
                     self.chain,
                     HeterCacheNodeTag.from_queue(q),
-                    tag_of=self._node_tag,
+                    tag_of=self.node_tag,
                     expired_of=self.session_expired,
                 )
                 for q in REUSE_QUEUES
@@ -359,10 +347,7 @@ class HeterCacheStrategy(EvictionStrategy):
         )
 
     def use_clock(self, now: Callable[[], float]) -> None:
-        """接管缓存层的时间源
-        Args:
-            now: 返回秒数的单调时钟。
-        """
+        """同步缓存层单调时钟到所有子组件。"""
         self._now = now
         self.occupancy.use_clock(now)
         self.telemetry.use_clock(now)
@@ -377,15 +362,11 @@ class HeterCacheStrategy(EvictionStrategy):
         if self.priced_fallback is not None:
             self.priced_fallback.bind_registry(self.session_registry)
 
-    def _node_tag(self, node) -> HeterCacheNodeTag:
+    def node_tag(self, node) -> HeterCacheNodeTag:
+        """返回节点生效标签（含 force_agentic 归并）。"""
         if self.force_agentic:
             return HeterCacheNodeTag.QAGENT
         return HeterCacheNodeTag.coerce(getattr(node, "queue_tag", None))
-
-    def node_tag(self, node) -> HeterCacheNodeTag:
-        """节点生效标签（含 force_agentic 归并）。观测层读这个口径，
-        不要自己 coerce ``queue_tag``——那样 force_agentic 下回报的队列是假的。"""
-        return self._node_tag(node)
 
     def get_priority(self, node: TreeNode) -> Tuple[int, float, float]:
         raise NotImplementedError(
@@ -393,42 +374,25 @@ class HeterCacheStrategy(EvictionStrategy):
             "use queue_weight arbitration (heter_cache.selector.pick_victim) instead"
         )
 
-    def is_aged(self, node) -> bool:
-        """节点是否已老化。
-
-        两种口径（``share.ageing_mode``）：
-
-        * ``queue_ttl``：节点 ``TTL`` 秒未被访问即老化（历史口径）。
-        * ``session_life``：只看**该会话自己的轮间隔分布**，超过 ``k × p90`` 才算
-          会话终结；终结后的**私有**内容（跨会话共享数 < share_min）才可回收。
-          这样"会话还活着、只是这轮间隔长"不会被误判成永不复用——drift3 里
-          chat 的前缀有 59.5% 的 regret 就是被按队列的固定 TTL 误杀的。
-
-        struct 两种口径下都走 TTL：它是模板族、单轮、``gaps`` 为空，没有会话级
-        证据可用；私有 struct 本来归 one-shot 带管，不当模板老化。
-        """
-        tag = self._node_tag(node)
-        queue = tag.queue_name
-        if tag is HeterCacheNodeTag.QSTRUCT:
-            ttl = self.share.ageing_ttl_s[queue]
-            if ttl <= 0:
-                return False
-            if self.node_share.share_of(node) < self.node_share.share_min:
-                return False
-            return self._now() - node.last_access_time >= ttl
-        if self.share.ageing_mode == "session_life":
-            return self.session_expired(node)
-        ttl = self.share.ageing_ttl_s[queue]
-        if ttl <= 0:
+    def _is_struct_aged(self, node) -> bool:
+        """struct 节点仅在达到跨会话共享阈值后按固定 TTL 老化。"""
+        ttl = self.share.ageing_ttl_s["struct"]
+        if ttl <= 0 or self.node_share.share_of(node) < self.node_share.share_min:
             return False
         return self._now() - node.last_access_time >= ttl
 
-    def session_life_s(self, state) -> Optional[float]:
-        """该会话的存活上限（秒）：``k × 轮间隔 p90``，夹在 [min, max] 之间。
+    def is_aged(self, node) -> bool:
+        """节点是否已老化（struct 走共享模板 TTL，其余走队列 TTL 或会话寿命）。"""
+        tag = self.node_tag(node)
+        if tag is HeterCacheNodeTag.QSTRUCT:
+            return self._is_struct_aged(node)
+        if self.share.ageing_mode == "session_life":
+            return self.session_expired(node)
+        ttl = self.share.ageing_ttl_s[tag.queue_name]
+        return ttl > 0 and (self._now() - node.last_access_time >= ttl)
 
-        证据不足（观测到的轮间隔少于 ``session_ttl_min_gaps``）时返回 None，
-        调用方据此保守处理（不老化），避免用一条样本外推整条会话。
-        """
+    def session_life_s(self, state) -> Optional[float]:
+        """会话存活上限（秒）：k * 轮间隔 p90，夹在 [min, max]；样本不足返回 None。"""
         gaps = getattr(state, "gaps", None) or []
         if len(gaps) < self.share.session_ttl_min_gaps:
             return None
@@ -438,39 +402,22 @@ class HeterCacheStrategy(EvictionStrategy):
         return min(max(life, self.share.session_ttl_min_s), self.share.session_ttl_max_s)
 
     def session_expired(self, node) -> bool:
-        """会话是否已终结（方案 A 的判据本体）。
-
-        只回收私有内容：跨会话共享数达到 ``share_min`` 的节点即使归属会话终结，
-        别的会话还会读它，不能按老化清掉。
-        """
+        """归属会话是否已终结（跨会话共享节点不受单会话终结影响）。"""
         if self.node_share.share_of(node) >= self.node_share.share_min:
             return False
         state = self.session_registry.get(getattr(node, "session_id", None))
         if state is None:
             return False
         life = self.session_life_s(state)
-        if life is None:
-            return False
-        return self._now() - state.last_active > life
+        return life is not None and (self._now() - state.last_active > life)
 
     def is_one_shot(self, node) -> bool:
-        """判定节点是否属于 One-shot 带。
-        标准：按类型 TTL 老化的节点，或
-        属于 TRANS/STRUCT 且跨会话共享数未达到 share_min，
-        且从未被任何请求重读过（`reuse_count == 0`）
-        且归属会话已搁置超过 ONE_SHOT_IDLE_S
-        若节点无会话元数据，保守返回 False 防止误删热前缀。
-        """
-        # 老化必须先于 reuse_count/share 的短路：共享前缀必然被重读过且已达标。
+        """判定节点是否进入 One-shot 优先清理带。"""
         if self.is_aged(node):
             return True
         st = self.session_registry.get(getattr(node, "session_id", None))
-        if st is None:
+        if st is None or getattr(node, "reuse_count", 0) > 0:
             return False
-        if getattr(node, "reuse_count", 0) > 0:
-            # 内容已被再次读到：离开优先淘汰带
-            return False
-        # 时间豁免：会话还没凉，它的内容就还在可能的重访窗口内。
         anchor = max(st.last_active, getattr(node, "last_access_time", 0.0))
         if self._now() - anchor < ONE_SHOT_IDLE_S:
             return False
@@ -479,22 +426,15 @@ class HeterCacheStrategy(EvictionStrategy):
         return st.session_type in (SessionType.TRANS, SessionType.STRUCT)
 
     def one_shot_key(self, node) -> tuple:
-        """One-shot 带内淘汰排序：老化节点最优先，其余按访问时间升序"""
+        """One-shot 带内淘汰排序：老化节点最优先，其余按访问时间升序。"""
         return (0 if self.is_aged(node) else 1, node.last_access_time, node.id)
 
     # ---- 命中/淘汰记账 ----
 
     def record_hit(self, req, node, hit_tokens: int, by_queue: dict) -> None:
-        """记录一次命中：telemetry 按 rid 去重,同一 rid 的 chunked prefill 会重复进入，
-        去重由 telemetry 负责
-        Args:
-            req: 请求对象
-            node: 最深命中节点
-            hit_tokens: 本次命中的总 token 数。
-            by_queue: ``{queue: tokens}``，按命中节点的标签拆分，供 VD 归因。
-        """
+        """记录一次命中；按 rid 去重后累加各队列已兑现命中量。"""
         first = self.telemetry.on_hit(
-            tag=self._node_tag(node),
+            tag=self.node_tag(node),
             hit_tokens=hit_tokens,
             req_id=getattr(req, "rid", None),
         )
@@ -504,28 +444,13 @@ class HeterCacheStrategy(EvictionStrategy):
             self.realized.on_hit(queue, tokens)
 
     def record_evict(self, node) -> None:
-        """记录节点淘汰事件并扣减队列占用。
-
-        晋升（reuse_count 从 0 变 1）会把节点从 one-shot
-        带挪进其标签队列，而该队列可能从未收到过对应的 insert 计入
-        （one-shot 时 insert 跳过）——evict 会扣一个负项，直到下一次
-        全树快照 reconcile 吸收。random 行仅作展示、不参与 VD 仲裁；
-        struct 行的短暂低估方向是少淘汰、多保留，与目标同向。
-
-        时间豁免引入反向漂移（轴一）：insert 时会话活跃被计入、evict 时
-        已过搁置窗口进入带内被跳过 → 占用短暂虚高，方向是「多淘汰」，
-        同样由 reconcile 吸收；承压时校准窗口为 QueueOccupancyTracker.PRESSURE_WINDOW_S
-        （默认 3s），漂移窗口有界。
-        """
+        """记录节点淘汰并扣减可调度队列占用（one-shot 节点不扣占用账本）。"""
         tokens = _node_num_tokens(node)
-        tag = self._node_tag(node)
-        queue = tag.queue_name
+        tag = self.node_tag(node)
         one_shot = self.is_one_shot(node)
-        # 仅维护非 one-shot 的三队列占用
         if not one_shot:
-            self.occupancy.evict(queue, tokens)
+            self.occupancy.evict(tag.queue_name, tokens)
         elif self.is_aged(node):
-            # 老化淘汰单独计数：否则与真正的一次性流量混在 one_shot 里。
             self.node_share.on_aged_evict(tokens)
         self.telemetry.on_evict(
             node_id=id(node), tag=tag, tokens=tokens, one_shot=one_shot
@@ -536,43 +461,37 @@ class HeterCacheStrategy(EvictionStrategy):
         self.telemetry.on_victim_source(source, tokens)
 
     def record_insert(self, node) -> None:
-        """新节点挂载时增量计入队列占用（仅新建节点调用，分裂不触发）。"""
+        """新节点挂载时增量计入队列占用（分裂不触发）。"""
         if self.is_one_shot(node):
             return
-        self.occupancy.insert(self._node_tag(node).queue_name, _node_num_tokens(node))
+        self.occupancy.insert(self.node_tag(node).queue_name, _node_num_tokens(node))
 
     # ---- 跨队列仲裁（VD） ----
 
     def queue_order(self) -> list:
-        """按 VD 升序返回队列；越靠前（密度越低）越先削。"""
+        """按 VD 升序返回队列；密度越低越先削。"""
         occ = self.occupancy.occ
         return _queue_order(occ, self.realized.densities(occ))
 
     def queue_victim(self, queue: str, leaves):
-        """在指定队列内挑一个淘汰节点；无合适候选返回 None"""
+        """在指定队列内挑一个淘汰节点；无合适候选返回 None。"""
         target = HeterCacheNodeTag.from_queue(queue)
         if target is None:
             return None
-        pool = [n for n in leaves if self._node_tag(n) is target]
+        pool = [n for n in leaves if self.node_tag(n) is target]
         if not pool:
             return None
         if queue == "struct":
-            # 模板分级淘汰：优先淘汰低共享度节点，同级按 LRU
             share_of = self.node_share.share_of
             share_min = self.node_share.share_min
             return min(pool, key=lambda n: struct_tier(n, share_of, share_min))
-        chain = self.chain_evicts.get(queue)
-        if chain is not None:
-            # 链形保护接管本队：浅段优先保护、砍链尾（ChainParams 文档）。
-            return chain.pick(pool, self.session_registry)
-        reuse = self.reuse_evicts.get(queue)
-        if reuse is not None:
-            # chat / agentic 同一条路径：复用概率升序，只有 mu/sigma 随标签不同。
-            return reuse.pick(pool, self.session_registry)
-        return None
+        policy = self.chain_evicts.get(queue) or self.reuse_evicts.get(queue)
+        if policy is None:
+            return None
+        return policy.pick(pool, self.session_registry)
 
     def fallback(self, leaves):
-        """所有队列均弃权时的均匀随机淘汰"""
+        """所有队列均弃权或无候选时的均匀随机淘汰。"""
         pool = sorted(leaves, key=lambda n: n.id)
         if not pool:
             return None

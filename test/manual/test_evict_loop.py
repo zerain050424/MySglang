@@ -245,6 +245,7 @@ def _bootstrap():
     _load("sglang.srt.mem_cache.heter_cache.selector", f"{_HC}/selector.py")
     _load("sglang.srt.mem_cache.heter_cache.bench_bridge", f"{_HC}/bench_bridge.py")
     _load("sglang.srt.mem_cache.heter_cache.node_share", f"{_HC}/node_share.py")
+    _load("sglang.srt.mem_cache.heter_cache.regret_gate", f"{_HC}/regret_gate.py")
     _load("sglang.srt.mem_cache.heter_cache.override", f"{_HC}/override.py")
     ep = _load("sglang.srt.mem_cache.evict_policy", "sglang/srt/mem_cache/evict_policy.py")
     shc = _load("sglang.srt.mem_cache.heter_cache.radix_cache", f"{_HC}/radix_cache.py")

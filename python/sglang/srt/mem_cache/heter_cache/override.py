@@ -133,12 +133,10 @@ class ReuseScoreEvict(VictimOverride):
 
 
 def _chain_walk(node) -> Tuple[list, int, int, int, set]:
-    """自叶向根遍历一条链：返回 (nodes, remain, full, rerode_depth, session_ids)。
+    """自叶向根遍历链条，返回 (nodes, remain, full, reread_depth, session_ids)。
 
-    remain = 淘汰该叶子后链上仍连续缓存的前缀（root→parent 的 token 数）；
-    rerode_depth = 链上最深重读节点的 root→node 深度（0 = 无重读）。
-    admission match 读连续前缀，重读集合就是链前缀，所以它等于该会话上次
-    被命中的前缀长度——下一轮要读的位置。
+    remain: 淘汰该叶子后链上仍连续缓存的前缀 token 数（root->parent）。
+    reread_depth: 链上最深重读节点的 root->node 深度（0 表示无重读）。
     """
     leaf_len = len(node.key)
     nodes = [node]
@@ -150,68 +148,60 @@ def _chain_walk(node) -> Tuple[list, int, int, int, set]:
         cursor = cursor.parent
     full = sum(len(n.key) for n in nodes)
     remain = full - leaf_len
-    rerode_depth = 0
+    reread_depth = 0
     depth = 0
     for item in reversed(nodes):
         depth += len(item.key)
         if getattr(item, "reuse_count", 0) > 0:
-            rerode_depth = depth
-    return nodes, remain, full, rerode_depth, session_ids
+            reread_depth = depth
+    return nodes, remain, full, reread_depth, session_ids
 
 
-def chain_leaf_key(node, *, floor_tokens: int, weight: float,
-                   tail_first: bool = True, registry=None, min_gaps: int = 1,
-                   expired_of=None, weight_scale: float = 1.0,
-                   session_registry=None) -> Tuple[float, float, int]:
-    """链形定价键 ``(lat + penalty, -remain, id)``，``min`` 即淘汰。
+def _has_return_evidence(session_ids: set, registry, min_gaps: int) -> bool:
+    """链上任一已知会话是否已观测到至少 min_gaps 次轮间回访。"""
+    if registry is None:
+        return False
+    for sid in session_ids:
+        if not sid:
+            continue
+        state = registry.get(sid)
+        if state is not None and len(state.gaps) >= min_gaps:
+            return True
+    return False
 
-    ChainEvict（队内）与 PricedFallback（全弃权兑底）共用同一套定价，口径
-    单一来源：自适应锚 = max(floor 先验, 最深重读深度)；证据门 = 重读过 ∪
-    会话回来过（``registry`` 查 gaps ≥ min_gaps）；会话终结释放锚。
 
-    Args:
-        weight_scale: 罚斜率乘数。PricedFallback 用 ``1 + β·R_队列`` 做
-            后悔归因加权（历史亏得多的队列，锚罚更重）；队内改写器恒为 1。
-        session_registry: 未使用；保留参数位避免调用方分支（与 pick 签名对齐）。
+def chain_leaf_key(
+    node,
+    *,
+    floor_tokens: int,
+    weight: float,
+    tail_first: bool = True,
+    registry=None,
+    min_gaps: int = 1,
+    expired_of=None,
+    weight_scale: float = 1.0,
+) -> Tuple[float, float, int]:
+    """链形定价键 (lat + penalty, -remain, id)，min 即淘汰。
+
+    ChainEvict 与 PricedFallback 共用同一套定价：
+    - 锚深 = max(floor_tokens, 最深重读深度)；
+    - 证据门 = 链上存在重读节点 或 会话有回访记录；无证据不保护；
+    - 锚出口 = 路径上所有会话均已终结时释放罚项。
     """
     lat = float(node.last_access_time)
-    nodes, remain, _full, rerode_depth, session_ids = _chain_walk(node)
-    anchor = max(floor_tokens, rerode_depth)
+    nodes, remain, _full, reread_depth, session_ids = _chain_walk(node)
+    anchor = max(floor_tokens, reread_depth)
     penalty = weight * weight_scale * max(0, anchor - remain)
-    # 证据门：重读过（rerode_depth>0）∪ 会话回来过；无证据不护，
-    # 否则一次性流量靠锚吃容量（四 cell 实测 gate=none 全线跌）。
-    if penalty > 0 and not rerode_depth:
-        returned = False
-        if registry is not None:
-            for sid in session_ids:
-                if not sid:
-                    continue
-                state = registry.get(sid)
-                if state is not None and len(state.gaps) >= min_gaps:
-                    returned = True
-                    break
-        if not returned:
-            penalty = 0.0
-    # 锚出口：路径上所有会话终结才释放（混合路径只要有一段活着就保守保留）。
-    if penalty > 0 and expired_of is not None:
-        if all(expired_of(item) for item in nodes):
-            penalty = 0.0
+    if penalty > 0 and not reread_depth and not _has_return_evidence(session_ids, registry, min_gaps):
+        penalty = 0.0
+    if penalty > 0 and expired_of is not None and all(expired_of(item) for item in nodes):
+        penalty = 0.0
     tie = -float(remain) if tail_first else 0.0
     return (lat + penalty, tie, int(getattr(node, "id", 0)))
 
 
 class PricedFallback(VictimOverride):
-    """全弃权兑底的全局定价（档 B）：把「随机 fallback」换成「全树最便宜的叶子」。
-
-    背景（chain_shape_report.md §七）：档 A 的弃权门打断了 VD 把削减确定性
-    引向锚队的正反馈，但全弃权后的兑底是随机 fallback——warm 锚占叶子池大头
-    照样被随机削到（warm 整链停在 ~48%）。本类给 heter 补上 chain_lru 的
-    全局形状定价：每个候选叶子按 ``chain_leaf_key`` 定价，全树取最便宜；
-    罚斜率乘上 ``1 + β·R_队列``（弃权门的后悔归因）做加权——历史削了亏的
-    队列，锚罚更重，实测反馈与结构先验叠加。
-
-    Stage 0 已在 pick_victim 前面拦下 one-shot 叶子，本类的候选池不含它们。
-    """
+    """全弃权时的全局链形定价兜底：用后悔归因加权的 chain_leaf_key 选全树最便宜叶子。"""
 
     name = "priced_fallback"
 

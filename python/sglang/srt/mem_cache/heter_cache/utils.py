@@ -189,49 +189,13 @@ def _coerce_params(cls, value, *, name: str):
 # 跨会话模板的共享会话数阈值。
 DEFAULT_SHARE_MIN = 2
 
-# 一次性带的时间豁免窗口（秒）。
-#
-# 语义：TRANS/STRUCT、未被复用过的节点且共享数未达标时，若其归属会话仍活跃
-# ——最近一次请求（session.last_active）或节点最近一次被访问
-# （node.last_access_time）距今不足该窗口——不判 one-shot。
-# 「未被重读」的判据是 ``reuse_count == 0``：它只在 admission match（请求确定
-# KV 缺口的那次前缀匹配）里 +1，一次请求最多 +1，与 ``hit_count`` 无关——后者把
-# 写路径和匹配路径混在一起数，一次请求自己就能加 1。
-#
-# 取值 20s（原 90s）。90s 的依据是「覆盖多轮会话重访间隔 p95（中位 30s、
-# p90 44s、最大 63s）」，但它同时让单次流量的豁免窗口远长于池周转时间：
-# exp3 scan cell 实测 apps 流入 1225 token/s、池 198k → 全程周转约 160s，
-# 于是任一时刻 apps 的整份足迹（≈110k，池的 55%）都还没到 90s，永远不进带；
-# 决策现场测到的带内 token 中位只有 27（叶子共 31,055），39.7% 的 evict 调用
-# 候选为空——one-shot 带形同虚设，缺口全部转嫁给 VD 仲裁的受害队列。
-# 20s 让「单次流量清运速度」重新压过「池周转速度」；多轮会话的重访保护由
-# 老化 TTL（struct 120s / chat 180s / agentic 300s）与会话类型判据承担，
-# 不依赖这个窗口。
+# 一次性带的时间豁免窗口（秒）：新写入的 TRANS/STRUCT 节点在归属会话活跃期内不进 one-shot 带。
 ONE_SHOT_IDLE_S = 20.0
 
 # 队内复用分的预测窗口 H（秒）：P(reuse in (a, a+H] | not reused by a)。
-# 与 ONE_SHOT_IDLE_S 是两件事：H 是预测窗口，仍按实测重访间隔 p95 取 90s；
-# ONE_SHOT_IDLE_S 是豁免窗口，已下调到 20s。改一个不会自动改另一个。
 DEFAULT_REUSE_WINDOW_S = 90.0
 
-# 按生效标签的老化阈值（秒）：节点超过该时长未被访问，即降级到 one-shot 带。
-# 值为 0 表示该类型不老化。全部取在 ONE_SHOT_IDLE_S(20s) 之上，避免与
-# 会话时间豁免互相矛盾。取值按"该类型在实验里从活跃转冷的时间尺度"定：
-#   struct  120s：exp3 有 8 个前缀变体，单变体复用间隔 13~60s（主导 cell 13s /
-#           稳态 37s / 最冷配角 cell 60s）。120s 是冷 cell 的 2 倍：配角 cell
-#           有 13.3% 的时间处于老化态（约 215 次/臂），稳态 3.9%，主导 cell
-#           0.01%（几乎不触发）；代价是重算 2k 前缀。
-#   chat    300s：原值 180s 是按 mt_vs_lru 的人速轮间（中位 30s、p95 63s）定的，
-#           但 drift3 走数据集原时间轴，实测轮间 T50≈118s、p95≈965s。drift3 的
-#           TTL 扫描是**倒 U**：60s 太狠（bg=1× −5.5pp）、180s 偏短、300s 为平台顶
-#           （bg 0.5/1/2 分别 +0.18/+0.15/+0.31pp vs 180s）、>1200s 等于关闭老化
-#           （数字与 TTL=0 逐位相同，−0.6~−1.0pp）。老化对 chat 是**承重结构**：
-#           关掉后陈旧前缀滞留池内、把 VD_chat 拉低，最后由队列级 VD 整队裁决，
-#           砍掉的是还活着的内容（P2 自身 −2.5~−3.0pp）。取 300s 兼顾两端。
-#   agentic 300s：rr_vs_tlru 的挂起窗口 60s、QAGENT 复用中位 6.1s。300s 是
-#           挂起窗口的 5 倍（burst/pause 实验仍安全），活跃会话不会触发；已结束
-#           会话（alfred 约 89k token）5 分钟内回收。
-#   random    0：整行本来就是 one-shot，老化没有增量。
+# 按生效标签的老化阈值（秒）：节点超过该时长未被访问即降级到 one-shot 带（0 表示不老化）。
 DEFAULT_AGEING_TTL_S = {
     "struct": 120.0,
     "chat": 300.0,
@@ -568,45 +532,26 @@ class QueueValueParams:
 
 @lru_cache(maxsize=8)
 def _cached_lognorm_params(mu: float, sigma: float):
-    """缓存 lognormal 的派生常数"""
+    """缓存 lognormal 的派生常数。"""
     return mu, sigma, sigma * math.sqrt(2.0)
 
 
-@lru_cache(maxsize=8)
-def _cached_lognorm_params_v1(mu: float, sigma: float):
-    """同上，但多返回两个供概率密度使用的常数。"""
-    inv_sigma = 1.0 / sigma
-    denom = sigma * math.sqrt(2.0)
-    norm_const = inv_sigma / math.sqrt(2.0 * math.pi)
-    return mu, sigma, inv_sigma, denom, norm_const
-
-
-def _cached_lognorm_prob(x: float, mu: float, sigma: float) -> float:
-    """lognormal 的 CDF（erf 近似）。与 ``_cached_lognorm_cdf`` 同值，保留给旧调用方。"""
-    if x <= 0:
-        return 0.0
-    mu, sigma, inv_sigma, denom, _ = _cached_lognorm_params_v1(mu, sigma)
-    z = (math.log(x) - mu) / denom
-    return 0.5 * (1.0 + math.erf(z))
-
-
 def _cached_lognorm_cdf(x: float, mu: float, sigma: float) -> float:
-    """lognormal 的 CDF（erf 近似，无 SciPy 依赖）。
-
-    x <= 0 直接返回 0：``math.log(0)`` 会抛错，而刚写入的节点必然出现 x=0。
-
-    Args:
-        x: 已经过的秒数。
-        mu, sigma: 分布参数，来自 ``HeterCacheNodeTag.reuse_config``。
-
-    Returns:
-        ``P(reuse_interval <= x)``，即"复用已经发生过"的概率。
-    """
+    """lognormal CDF（erf 近似）；x <= 0 时返回 0 避免 log(0)。"""
     if x <= 0:
         return 0.0
     mu, sigma, denom = _cached_lognorm_params(mu, sigma)
     z = (math.log(x) - mu) / denom
     return 0.5 * (1.0 + math.erf(z))
+
+
+def median(values: List[float]) -> float:
+    """计算非空数值序列的中位数。"""
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return float(ordered[mid])
+    return (ordered[mid - 1] + ordered[mid]) / 2.0
 
 
 def reuse_window_probability(
@@ -916,16 +861,7 @@ class SessionRegistry:
 
     GAP_WINDOW = 8          # 轮间间隔滑动窗口大小（采样最近 8 次）
     SWEEP_EVERY = 256       # 惰性回收周期：每 N 次 touch 触发一次 sweep
-    # 判定「多轮」的最小 turn 阈值。低于它一律 TRANS/STRUCT，于是这些节点在
-    # ONE_SHOT_IDLE_S 之后就有资格进 one-shot 带（见 is_one_shot 第 4 条）。
-    # 5 → 2 的动机（exp3 实测 + .auto/ideas.md 的 M1「早期轮死亡螺旋」）：
-    # 门槛 5 时，一个多轮会话前 4 轮插入的每轮新增尾部都还是 TRANS，空窗一到
-    # 就被清；而 turn k 的尾部正是 turn k+1 要命中的那截 → chat cell 的
-    # ShareGPT 从 0.416(90s 窗口) 掉到 0.325(20s 窗口)。降到 2 后只有第 1 轮
-    # 暴露（第 1 轮 prompt 只占该 cell token 的 1.2%，损失有界）。
-    # 代价：第 2 轮只有 1 个间隔样本就分类（GAP_SPLIT_S=15s），首轮空窗很短
-    # 的 chat 会话可能被判成 AGENTIC。数据侧的 drop_short_sessions 也读这个
-    # 常量（阈值单一来源），重造数据时 1 轮会话会重新进入 chat/agentic 源。
+    # 判定「多轮」的最小 turn 阈值；低于该值归为 TRANS/STRUCT。
     MULTI_TURN_MIN = 2
     GAP_SPLIT_S = 15.0      # Agent 与 Chat 的间隔判定临界值（秒）
     AGENTIC_CONTEXT_GROWTH_TOKENS = 1500  # 边界兜底：判定上下文持续暴涨的 token 阈值
@@ -978,6 +914,12 @@ class SessionRegistry:
         return len(self._sessions)
 
     # ---- 特征提取与分类 ----
+    def _get_or_create(self, session_id: str) -> SessionState:
+        st = self._sessions.get(session_id)
+        if st is None:
+            st = self._sessions[session_id] = SessionState(session_id=session_id)
+        return st
+
     def observe_request(
         self,
         session_id: Optional[str],
@@ -987,17 +929,11 @@ class SessionRegistry:
         tool_call=None,
         now: Optional[float] = None,
     ) -> Optional[SessionState]:
-        """记录请求特征并刷新分类。基于 rid 去重，规避 chunked prefill 重入。
-
-        注意：本方法仅更新分类特征，不更新 d/L 等缓存水位指标。
-        """
+        """记录请求特征并刷新分类，基于 rid 去重以规避 chunked prefill 重入。"""
         if not session_id:
             return None
         now = self._now() if now is None else now
-        st = self._sessions.get(session_id)
-        if st is None:
-            st = self._sessions[session_id] = SessionState(session_id=session_id)
-        # 同一请求的后续 chunk，跳过统计
+        st = self._get_or_create(session_id)
         if rid and rid == st.classifier_last_rid:
             return st
 
@@ -1018,38 +954,23 @@ class SessionRegistry:
     def record_cross_session_hit(
         self, session_id: Optional[str], owner_session_id: Optional[str]
     ) -> Optional[SessionState]:
-        """标记跨会话命中。用于将单轮短会话提升为 STRUCT（共享公共前缀）。"""
+        """标记跨会话命中，用于将单轮共享前缀会话归为 STRUCT。"""
         if not session_id or not owner_session_id or session_id == owner_session_id:
             return self.get(session_id)
-        st = self._sessions.get(session_id)
-        if st is None:
-            st = self._sessions[session_id] = SessionState(session_id=session_id)
+        st = self._get_or_create(session_id)
         st.cross_session_shared = True
         st.session_type = self._classify(st)
         return st
 
     @classmethod
     def _classify(cls, state: SessionState) -> SessionType:
-        """会话类型决策树：轮数 -> 工具调用 -> 交互间隔中位数 -> 上下文膨胀量。
-
-        判定优先级：
-        1. 轮数不足时，仅凭是否发生跨会话共享区分 STRUCT / TRANS。
-        2. 工具调用是强判定信号，命中直接归为 AGENTIC。
-        3. 间隔中位数区分机器与人类：短间隔判定为高频自主 Agent，长间隔判定为人工打字交互（CHAT）。
-        4. 临界值退避：若间隔处于分界线，依据 prompt 暴涨量区分。
-        """
+        """会话类型决策树：轮数 -> 工具调用 -> 交互间隔中位数 -> 上下文膨胀量。"""
         if state.turn_count < cls.MULTI_TURN_MIN:
             return SessionType.STRUCT if state.cross_session_shared else SessionType.TRANS
         if state.tool_call_count:
             return SessionType.AGENTIC
         if state.classifier_gaps:
-            ordered = sorted(state.classifier_gaps)
-            middle = len(ordered) // 2
-            median_gap = (
-                ordered[middle]
-                if len(ordered) % 2
-                else (ordered[middle - 1] + ordered[middle]) / 2
-            )
+            median_gap = median(state.classifier_gaps)
             if median_gap < cls.GAP_SPLIT_S:
                 return SessionType.AGENTIC
             if median_gap > cls.GAP_SPLIT_S:
@@ -1069,17 +990,13 @@ class SessionRegistry:
         prompt_len: int = 0,
         now: Optional[float] = None,
     ) -> Optional[SessionState]:
-        """新请求落盘时调用：重设有效链长 L，缺口 d 清零，重置活跃时钟。
-        d 强制置零:新 prompt 已经完整执行预填充，旧缺口带来的重计算开销已被吸收，不再递延。
-        """
+        """新请求落盘时调用：重设有效链长 L，缺口 d 清零，重置活跃时钟。"""
         if not session_id:
             return None
         now = self._now() if now is None else now
-        st = self._sessions.get(session_id)
-        if st is None:
-            st = self._sessions[session_id] = SessionState(session_id=session_id)
-        elif rid != st.last_rid and st.last_active > 0.0:
-            # 过滤 chunked prefill 重入，确保间隔反映真实的轮次交互延时
+        st = self._get_or_create(session_id)
+        if rid != st.last_rid and st.last_active > 0.0:
+            # 过滤 chunked prefill 重入，确保间隔反映真实轮次交互延时
             st.gaps.append(now - st.last_active)
             if len(st.gaps) > self.GAP_WINDOW:
                 del st.gaps[0]
@@ -1098,37 +1015,26 @@ class SessionRegistry:
         """KV 树挂载新节点时累加存活计数，供淘汰及 sweep 存活判定使用。"""
         if not session_id:
             return
-        st = self._sessions.get(session_id)
-        if st is None:
-            st = self._sessions[session_id] = SessionState(session_id=session_id)
+        st = self._get_or_create(session_id)
         st.node_count += 1
         st.attached += num_tokens
 
     def charge(self, node) -> None:
-        """KV 节点逐出时调用：累加会话缺口 d，递减节点计数。
-
-        约束说明：
-        淘汰孤儿分支或非连续节点时，d 可能会在短时间内高于当前实际链长 L，
-        此处将 d 上限截断为 L（缺口最大不会超过 prompt 自身）。
-        """
+        """KV 节点逐出时调用：累加会话缺口 d，递减节点计数。"""
         session_id = getattr(node, "session_id", None)
         if not session_id:
             return
         value = getattr(node, "value", None)
         num_tokens = len(value) if value is not None else 0
-        st = self._sessions.get(session_id)
-        if st is None:
-            st = self._sessions[session_id] = SessionState(session_id=session_id)
+        st = self._get_or_create(session_id)
         st.d += num_tokens
         st.charged += num_tokens
         if st.node_count > 0:
             st.node_count -= 1
-        # 探针在截断之前回调：截断后 d <= L 恒成立，
-        # “d > L + slack”的告警分支会永远进不去。
+        # 探针必须在截断之前回调：截断后 d <= L 恒成立，d > L + slack 分支将不可达
         on_charge = self._on_charge
         if on_charge is not None:
             on_charge(node, st, num_tokens)
-        # 裁剪脏缺口，保证物理含义一致性：d <= L
         if st.L and st.d > st.L:
             st.d = st.L
 

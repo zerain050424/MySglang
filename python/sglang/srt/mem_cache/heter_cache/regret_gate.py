@@ -1,33 +1,12 @@
-"""跨队列仲裁的后悔密度门（控制路径，档 A）。
-
-信号与决策规则见 ``RegretGateParams``（heter_cache/utils.py）。本模块只做
-仲裁需要的最小记账：
-
-* stamp：淘汰决策 → ``(内容键 → 队列归属, span)``。内容键由缓存层统一计算
-  传入（``HeterCacheRadixCache._breakpoint_key``），与观测账本
-  （Heter-Bench/profile/regret_ledger.py）同源——键不同源就没有 join。
-* join：admission miss 的断点页键查 stamp，命中则把该 stamp 的 span 记到
-  队列的后悔窗口，并把 stamp 摘除（一个 stamp 只归因一次，与账本的
-  ``hit_age`` 语义一致）。
-* R_q：窗口内 ``regret_sum / evicted_sum``；样本不足返回 ``None``。
-
-层位约束（AGENTS）：观测实现全部在 Heter-Bench，sglang 侧控制路径不依赖它。
-账本继续做观测报告；本门是控制路径的独立轻量计数器，两者定义一致、互不依赖
-（观测账本在场时 content_key 的 context 以账本为准，由缓存层统一传参保证）。
-
-无锁安全：所有入口只在调度主线程（match / evict）执行，与账本同一约束。
-"""
+"""跨队列仲裁的后悔弃权门：按滑窗后悔率 R_q = regret_sum / evicted_sum 过滤高后悔队列。"""
 
 from __future__ import annotations
 
 import time
 from collections import deque
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
-from sglang.srt.mem_cache.heter_cache.utils import RegretGateParams
-
-if TYPE_CHECKING:  # pragma: no cover
-    pass
+from sglang.srt.mem_cache.heter_cache.utils import RegretGateParams, median
 
 
 class RegretGate:
@@ -130,25 +109,17 @@ class RegretGate:
         return self._rg_sum.get(queue, 0) / evicted
 
     def abstain(self, queue: str, order: List[str]) -> bool:
-        """档 A 弃权判定：R_q ≥ max(r_min, k × 已采样队列 R 的中位数)。
-
-        已采样队列少于 2（没有对照）时不弃权——单队列的 R 没有参照系，
-        回退现状比瞎跳队安全。
-        """
-        decision = False
+        """弃权判定：R_q >= max(r_min, k * 已采样队列中位数)；已采样队列 < 2 时不弃权。"""
         r_q = self.r(queue)
-        if r_q is not None and r_q >= self.params.r_min:
-            sampled = [self.r(q) for q in order if self.sampled(q)]
-            if len(sampled) >= 2:
-                ordered = sorted(sampled)
-                mid = len(ordered) // 2
-                median = (
-                    ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2
-                )
-                decision = r_q > self.params.k * median
-        if decision:
+        if r_q is None or r_q < self.params.r_min:
+            return False
+        sampled = [self.r(q) for q in order if self.sampled(q)]
+        if len(sampled) < 2:
+            return False
+        if r_q > self.params.k * median(sampled):
             self.abstains[queue] = self.abstains.get(queue, 0) + 1
-        return decision
+            return True
+        return False
 
     def cheapest(self, order: List[str]) -> Optional[str]:
         """全弃权时的跨队兜底：已采样队列里 R 最小者；无人采样返回 None。"""
@@ -177,30 +148,28 @@ class RegretGate:
         table.setdefault(queue, deque()).append((ts, tokens))
         sums[queue] = sums.get(queue, 0) + tokens
 
+    @staticmethod
+    def _prune_window(
+        table: Dict[str, deque], sums: Dict[str, int], window: float, now: float
+    ) -> None:
+        for queue in list(table):
+            dq = table[queue]
+            while dq and now - dq[0][0] > window:
+                _, tokens = dq.popleft()
+                sums[queue] -= tokens
+            if not dq:
+                table.pop(queue, None)
+                sums.pop(queue, None)
+
     def _prune(self, now: float) -> None:
-        """过期维护：stamp 按 retain_s、窗口按 window_s。O(过期满的条数)。"""
+        """按 retain_s 清理过期 stamp，按 window_s 清理滑窗队列计数。"""
         retain = self.params.retain_s
         while self._order and now - self._order[0][0] > retain:
             _, key = self._order.popleft()
-            if self._stamps.pop(key, None) is not None:
-                pass  # 过期即消失；未 join 的 stamp 不产生后悔，无需回补
+            self._stamps.pop(key, None)
         window = self.params.window_s
-        for queue in list(self._ev):
-            dq = self._ev[queue]
-            while dq and now - dq[0][0] > window:
-                _, tokens = dq.popleft()
-                self._ev_sum[queue] -= tokens
-            if not dq:
-                self._ev.pop(queue, None)
-                self._ev_sum.pop(queue, None)
-        for queue in list(self._rg):
-            dq = self._rg[queue]
-            while dq and now - dq[0][0] > window:
-                _, tokens = dq.popleft()
-                self._rg_sum[queue] -= tokens
-            if not dq:
-                self._rg.pop(queue, None)
-                self._rg_sum.pop(queue, None)
+        self._prune_window(self._ev, self._ev_sum, window, now)
+        self._prune_window(self._rg, self._rg_sum, window, now)
 
     def __repr__(self) -> str:  # pragma: no cover - 调试用
         return f"<RegretGate window_s={self.params.window_s} joins={self.joins}>"

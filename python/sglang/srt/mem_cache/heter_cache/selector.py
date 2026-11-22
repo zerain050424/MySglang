@@ -29,20 +29,32 @@ def queue_order(
     return [q for *_, q in ranked]
 
 
-def pick_victim(*, strategy, leaves):
-    """两级淘汰决策：Stage 0 one-shot → Stage 1 VD 仲裁 → 兜底。
+def _pick_all_abstained(strategy, leaves, order, gate, priced):
+    """全部队列弃权时的跨队兜底：全局链形定价 -> 最小后悔率队列 -> 均匀随机。"""
+    if priced is not None:
+        victim = priced.pick(leaves, strategy.session_registry)
+        if victim is not None:
+            queue = strategy.node_tag(victim).queue_name
+            return victim, f"priced:{queue}"
+    queue = gate.cheapest(order)
+    if queue is not None:
+        victim = strategy.queue_victim(queue, leaves)
+        if victim is not None:
+            return victim, f"value:{queue}"
+    return strategy.fallback(leaves), "value:fallback"
 
-    装配了后悔弃权门（``strategy.regret_gate``，档 A）时 Stage 1 多一道：
-    按 VD 序逐队询问 R_q，超阈值的队列弃权跳过；全部弃权时按 min R_q
-    跨队裁决（全局最便宜处下刀）；无人采样则回退 VD 首队（现状）。
-    弃权门不改变 VD 的排序键，只决定「这个队列这一轮削不削」。
+
+def pick_victim(*, strategy, leaves):
+    """分层淘汰裁决：One-shot 优先 -> VD 排序（可选后悔弃权门）-> 队内选点 -> 兜底。
 
     Args:
         strategy: HeterCacheStrategy，提供 one-shot 判据、队列排序与队内选点。
         leaves: 当前可驱逐叶子节点集合。
+
     Returns:
-        (victim, source);ource ∈ {"one_shot", "value:<queue>",
-        "value:fallback"}。无候选时返回(None, None)。
+        (victim, source)，其中 source 属于
+        {"one_shot", "value:<queue>", "priced:<queue>", "value:fallback"}。
+        无候选时返回 (None, None)。
     """
     one_shot = [n for n in leaves if strategy.is_one_shot(n)]
     if one_shot:
@@ -56,21 +68,7 @@ def pick_victim(*, strategy, leaves):
     if gate is not None:
         passed = [queue for queue in order if not gate.abstain(queue, order)]
         if not passed:
-            # 档 B：全弃权 → 全树叶子按后悔归因加权的链形定价取最便宜
-            # （把随机 fallback 换成全局最便宜处下刀）。
-            if priced is not None:
-                victim = priced.pick(leaves, strategy.session_registry)
-                if victim is not None:
-                    queue = strategy.node_tag(victim).queue_name
-                    return victim, f"priced:{queue}"
-            # 档 A 路径保留作退路：min-R 队列 → 队内选人
-            queue = gate.cheapest(order)
-            if queue is not None:
-                victim = strategy.queue_victim(queue, leaves)
-                if victim is not None:
-                    return victim, f"value:{queue}"
-            # 最便宜队列的池内也无候选（或无人采样）→ 走全局兜底
-            return strategy.fallback(leaves), "value:fallback"
+            return _pick_all_abstained(strategy, leaves, order, gate, priced)
     else:
         passed = order
 

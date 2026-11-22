@@ -1,8 +1,4 @@
-"""节点共享会话数记账：一段 KV 被多少个不同的会话命中过。
-* HeterCacheStrategy.is_aged/is_one_shot：共享数达标的 struct 前缀
-  不受老化与 one-shot 带影响；
-* selector.struct_tier：struct 队内按共享数分档。
-"""
+"""节点跨会话共享数账本：记录每个节点被多少个不同会话命中过。"""
 
 from __future__ import annotations
 

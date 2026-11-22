@@ -1,8 +1,4 @@
-"""队列占用账本：各队列可调度占用的唯一写入口。
-* 触发位置:insert/evict;
-* 加上一条全量校准reconcile（吸收标签变更、one-shot 晋升等增量漂移）；
-* 读侧为occ与snapshot
-"""
+"""队列占用账本：维护各可调度队列的 token 占用，支持增量更新与全树快照校准。"""
 
 from __future__ import annotations
 
