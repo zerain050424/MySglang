@@ -317,14 +317,13 @@ def test_tokenized_tool_call_round_trips_through_msgpack():
     assert decoded.tool_call == call
 
 
-def test_emitter_passes_only_completed_tool_calls(monkeypatch):
+def test_emitter_passes_only_completed_tool_calls():
     """发射器只把**上一轮已结束**的工具调用透给本轮，避免未来信息泄漏。
 
     跑的是堆发射器的最小闭环：堆里只有该 session 的第 1 轮，空窗 wait_scale=0，
     第 1 轮结束后自动压回第 2 轮。
     """
     import asyncio
-    from argparse import Namespace
 
     bench_path = os.path.abspath(
         os.path.join(os.path.dirname(__file__), "..", "..", "Heter-Bench", "scripts")
@@ -336,17 +335,16 @@ def test_emitter_passes_only_completed_tool_calls(monkeypatch):
 
     async def fake_one_request(http, url, payload, timeout_s):
         sent_tool_calls.append(payload["tool_call"])
-        return {
-            "ttft": 0.01,
-            "e2e": 0.02,
-            "prompt_tokens": len(payload["input_ids"]),
-            "cached_tokens": 0,
-            "completion_tokens": 1,
-            "queue_time_ms": 0.0,
-            "prefill_ms": 0.0,
-        }
+        return bench_heap.RequestMetrics(
+            ttft=0.01,
+            e2e=0.02,
+            prompt_tokens=len(payload["input_ids"]),
+            cached_tokens=0,
+            completion_tokens=1,
+            queue_time_ms=0.0,
+            prefill_ms=0.0,
+        )
 
-    monkeypatch.setattr(bench_heap, "one_request", fake_one_request)
     first_call = {"action": "move_ahead"}
     session = {
         "id": "alfred_test_session",
@@ -366,13 +364,23 @@ def test_emitter_passes_only_completed_tool_calls(monkeypatch):
                 turn_idx=1,
             ),
         )
-        args = Namespace(
-            max_inflight=0, progress_every=0, timeout_s=1.0,
-            seed=42, mu=None, sigma=None, wait_scale=0.0,
+        config = bench_heap.EmitterConfig(
+            max_inflight=0,
+            progress_every=0,
+            timeout_s=1.0,
+            seed=42,
+            mu=None,
+            sigma=None,
+            wait_scale=0.0,
         )
         stats = bench_heap.Stats()
         emitter = bench_heap.HeapEmitter(
-            args=args, stats=stats, heap=heap, http=None, url="http://unused/generate"
+            config=config,
+            stats=stats,
+            heap=heap,
+            http=None,
+            url="http://unused/generate",
+            request_fn=fake_one_request,
         )
         await emitter.run()
         return stats
