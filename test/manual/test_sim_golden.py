@@ -55,26 +55,21 @@ def _build_fixture():
         max_prompt_len=1200,
     )
 
+    prime_lens = iter(k * 8 for k in range(11, 300) if k % 32 != 0)
     sessions: List[Session] = []
     for s in raw_sessions:
         tname = "struct" if s.session_id.startswith("Code-") else "random"
-        sessions.append(Session(s.session_id, s.turns, task_name=tname))
-
-    # 让 chat / agentic / multi_resp 的每段节点与 out_len 都有独特页对齐长度，
-    # 避免生产 ReuseScoreEvict (缺 node.id 平票键) 因同长叶子在同整秒下触发 set 遍历序依赖。
-    prime_lens = iter(
-        k * 8
-        for k in range(3, 300)
-        if k not in (8, 16, 24, 32, 40, 48, 64)
-    )
+        # 为每条单轮会话也赋予互异 out_len，避免 lpm 预 match 引发误分类后在 ReuseScoreEvict 内同长打平
+        turns = tuple(Turn(t=tr.t, prompt=tr.prompt, out=next(prime_lens)) for tr in s.turns)
+        sessions.append(Session(s.session_id, turns, task_name=tname))
     for i in range(3):
         base = 200_000 + i * 10_000
-        head_len = next(prime_lens) + 160
+        head_len = next(prime_lens) + 80
         head = array("q", range(base, base + head_len))
         t = 20.0 + i * 7.0
         turns = []
         for k in range(3):
-            extra = next(prime_lens) * k if k > 0 else 0
+            extra = (88 + (i * 3 + k) * 8) * k if k > 0 else 0
             prompt = head + array("q", [k + 1] * extra)
             out_len = next(prime_lens)
             turns.append(Turn(t=t, prompt=prompt, out=out_len))
@@ -83,12 +78,12 @@ def _build_fixture():
 
     for i in range(3):
         base = 300_000 + i * 10_000
-        head_len = next(prime_lens) + 160
+        head_len = next(prime_lens) + 80
         head = array("q", range(base, base + head_len))
         t = 12.0 + i * 5.0
         turns = []
         for k in range(4):
-            extra = (next(prime_lens) + 64) if k > 0 else 0
+            extra = (96 + (i * 4 + k) * 8) if k > 0 else 0
             if k > 0:
                 prompt = turns[-1].prompt + array("q", [10 + k] * extra)
             else:
@@ -101,11 +96,11 @@ def _build_fixture():
     # 额外加入带真实 response token 的多轮会话，覆盖渐进写树与 response 段命中
     for i in range(3):
         base = 900_000 + i * 10_000
-        p1 = array("q", range(base, base + 184 + i * 16))
-        r1 = array("q", range(base + 1000, base + 1048 + i * 8))
-        p2 = p1 + r1 + array("q", range(base + 2000, base + 2136 + i * 16))
+        p1 = array("q", range(base, base + 176 + i * 16))
+        r1 = array("q", range(base + 1000, base + 1032 + i * 8))
+        p2 = p1 + r1 + array("q", range(base + 2000, base + 2120 + i * 16))
         r2 = array("q", range(base + 3000, base + 3056 + i * 8))
-        p3 = p2 + r2 + array("q", range(base + 4000, base + 4152 + i * 24))
+        p3 = p2 + r2 + array("q", range(base + 4000, base + 4136 + i * 24))
         turns = (
             Turn(t=15.0 + i * 5.0, prompt=p1, out=len(r1), tool_call=False, response=r1),
             Turn(t=45.0 + i * 5.0, prompt=p2, out=len(r2), tool_call=True, response=r2),
@@ -137,28 +132,28 @@ def _build_fixture():
 
 
 SCENARIOS: List[Dict[str, Any]] = [
-    {"name": "replay_heter_p1", "mode": "replay", "capacity": 4096, "page_size": 1, "policy": "heter_cache"},
-    {"name": "replay_lru_p8", "mode": "replay", "capacity": 4096, "page_size": 8, "policy": "lru"},
-    {"name": "closed_inflight0_heter", "mode": "closed", "capacity": 4096, "page_size": 8, "policy": "heter_cache", "max_inflight": 0},
-    {"name": "closed_inflight1_heter", "mode": "closed", "capacity": 4096, "page_size": 8, "policy": "heter_cache", "max_inflight": 1},
+    {"name": "replay_heter_p1", "mode": "replay", "capacity": 4800, "page_size": 1, "policy": "heter_cache"},
+    {"name": "replay_lru_p8", "mode": "replay", "capacity": 4800, "page_size": 8, "policy": "lru"},
+    {"name": "closed_inflight0_heter", "mode": "closed", "capacity": 4800, "page_size": 8, "policy": "heter_cache", "max_inflight": 0},
+    {"name": "closed_inflight1_heter", "mode": "closed", "capacity": 4800, "page_size": 8, "policy": "heter_cache", "max_inflight": 1},
     {
         "name": "closed_inflight4_chain_lru",
         "mode": "closed",
-        "capacity": 4096,
+        "capacity": 4800,
         "page_size": 8,
         "policy": "chain_lru",
         "max_inflight": 4,
         "policy_config": {"floor_tokens": 256, "weight": 0.02},
     },
-    {"name": "engine_fcfs_lazy_prog", "mode": "engine", "capacity": 4096, "page_size": 8, "policy": "heter_cache", "schedule_policy": "fcfs", "chunk": 256, "lazy": True, "progressive": True},
-    {"name": "engine_fcfs_lazy_noprog", "mode": "engine", "capacity": 4096, "page_size": 8, "policy": "heter_cache", "schedule_policy": "fcfs", "chunk": 256, "lazy": True, "progressive": False},
-    {"name": "engine_fcfs_eager_prog", "mode": "engine", "capacity": 4096, "page_size": 8, "policy": "heter_cache", "schedule_policy": "fcfs", "chunk": 256, "lazy": False, "progressive": True},
-    {"name": "engine_fcfs_eager_noprog", "mode": "engine", "capacity": 4096, "page_size": 8, "policy": "heter_cache", "schedule_policy": "fcfs", "chunk": 256, "lazy": False, "progressive": False},
-    {"name": "engine_lpm_chunk256", "mode": "engine", "capacity": 4096, "page_size": 8, "policy": "heter_cache", "schedule_policy": "lpm", "chunk": 256, "lazy": True, "progressive": True},
+    {"name": "engine_fcfs_lazy_prog", "mode": "engine", "capacity": 4800, "page_size": 8, "policy": "heter_cache", "schedule_policy": "fcfs", "chunk": 256, "lazy": True, "progressive": True},
+    {"name": "engine_fcfs_lazy_noprog", "mode": "engine", "capacity": 4800, "page_size": 8, "policy": "heter_cache", "schedule_policy": "fcfs", "chunk": 256, "lazy": True, "progressive": False},
+    {"name": "engine_fcfs_eager_prog", "mode": "engine", "capacity": 4800, "page_size": 8, "policy": "heter_cache", "schedule_policy": "fcfs", "chunk": 256, "lazy": False, "progressive": True},
+    {"name": "engine_fcfs_eager_noprog", "mode": "engine", "capacity": 4800, "page_size": 8, "policy": "heter_cache", "schedule_policy": "fcfs", "chunk": 256, "lazy": False, "progressive": False},
+    {"name": "engine_lpm_chunk256", "mode": "engine", "capacity": 4800, "page_size": 8, "policy": "heter_cache", "schedule_policy": "lpm", "chunk": 256, "lazy": True, "progressive": True},
     {
         "name": "heter_regret_gate",
         "mode": "engine",
-        "capacity": 4096,
+        "capacity": 4800,
         "page_size": 8,
         "policy": "heter_cache",
         "schedule_policy": "fcfs",
@@ -176,7 +171,7 @@ SCENARIOS: List[Dict[str, Any]] = [
     {
         "name": "heter_chain_policy",
         "mode": "engine",
-        "capacity": 4096,
+        "capacity": 4800,
         "page_size": 8,
         "policy": "heter_cache",
         "schedule_policy": "fcfs",
@@ -185,10 +180,10 @@ SCENARIOS: List[Dict[str, Any]] = [
         "progressive": True,
         "chain_policy": {"enabled": True, "floor_tokens": 256, "weight": 0.02},
     },
-    {"name": "heter_session_life", "mode": "replay", "capacity": 4096, "page_size": 8, "policy": "heter_cache", "ageing_mode": "session_life"},
+    {"name": "heter_session_life", "mode": "replay", "capacity": 4800, "page_size": 8, "policy": "heter_cache", "ageing_mode": "session_life"},
     {"name": "oversize_skip", "mode": "replay", "capacity": 700, "page_size": 8, "policy": "heter_cache", "oversize": "skip"},
-    {"name": "cost_position", "mode": "replay", "capacity": 4096, "page_size": 8, "policy": "heter_cache", "cost_model": "position"},
-    {"name": "opt_frozen_chain", "mode": "opt", "capacity": 4096, "page_size": 8},
+    {"name": "cost_position", "mode": "replay", "capacity": 4800, "page_size": 8, "policy": "heter_cache", "cost_model": "position"},
+    {"name": "opt_frozen_chain", "mode": "opt", "capacity": 4800, "page_size": 8},
 ]
 
 
