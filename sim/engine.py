@@ -54,6 +54,8 @@ class EngineConfig(msgspec.Struct, frozen=True, kw_only=True):
     max_running_requests: int | None = None
     max_prefill_bs: int | None = None
     schedule_policy: str = "fcfs"
+    progressive_cache: bool = True
+    lazy_decode_alloc: bool = True
 
     def __post_init__(self) -> None:
         if self.max_prefill_tokens <= 0:
@@ -142,10 +144,10 @@ class _PrefillBudget:
 
     __slots__ = ("_offset", "alloc", "cache")
 
-    def __init__(self, alloc, cache) -> None:
+    def __init__(self, alloc, cache, reserved_offset: int = 0) -> None:
         self.alloc = alloc
         self.cache = cache
-        self._offset = 0
+        self._offset = int(reserved_offset)
 
     def remaining_total(self) -> int:
         return self.alloc.available_size() + self.cache.evictable_size() - self._offset
@@ -155,6 +157,16 @@ class _PrefillBudget:
 
     def reserve(self, need: int) -> None:
         self._offset += need
+
+
+def _unallocated_reserved(running: list[_State], chunked: _State | None) -> int:
+    """已准入请求尚未物理占槽的未来输出（或后续分块）余量。"""
+    states = list(running) + ([chunked] if chunked is not None else [])
+    return sum(
+        (s.matched.hit + s.matched.need) - s.pending.allocated_len
+        for s in states
+        if s.pending is not None and not s.pending.skipped
+    )
 
 
 class EngineSimulator:
@@ -283,17 +295,34 @@ class EngineSimulator:
         chunked: _State | None,
         heap: list[tuple[float, int, str, int]],
     ) -> tuple[float, _State | None] | None:
-        budget = _PrefillBudget(self.sim.alloc, self.sim.cache)
+        unallocated = _unallocated_reserved(running, chunked)
+        budget = _PrefillBudget(self.sim.alloc, self.sim.cache, reserved_offset=unallocated)
         self._waiting_peak = max(self._waiting_peak, len(waiting))
 
         admitted, skipped_any = self._admit_waiting(
             now, waiting, running, chunked, budget
         )
-        self._trim_to_capacity(admitted, waiting, now)
+        self._trim_to_capacity(admitted, waiting, now, reserved_offset=unallocated)
 
         try:
-            for state in admitted:
-                state.pending = self.sim._reserve_locked(state.matched)
+            if self.scheduler.lazy_decode_alloc:
+                if chunked is not None and chunked.pending is not None:
+                    self.sim.reserve_upto(
+                        chunked.pending,
+                        min(chunked.prompt_len, chunked.prefilled + chunked.charge),
+                    )
+                for state in admitted:
+                    pending = self.sim._make_pending(
+                        state.matched, skipped=False, evicted=0
+                    )
+                    self.sim.reserve_upto(
+                        pending,
+                        min(state.prompt_len, state.prefilled + state.charge),
+                    )
+                    state.pending = pending
+            else:
+                for state in admitted:
+                    state.pending = self.sim._reserve_locked(state.matched)
         except BaseException:
             for state in admitted:
                 if state.pending is None:
@@ -434,7 +463,11 @@ class EngineSimulator:
         return now, next_chunked
 
     def _trim_to_capacity(
-        self, admitted: list[_State], waiting: list[_Queued], now: float
+        self,
+        admitted: list[_State],
+        waiting: list[_Queued],
+        now: float,
+        reserved_offset: int = 0,
     ) -> None:
         """Drop tail candidates until the locked batch fits the live pool.
 
@@ -445,7 +478,11 @@ class EngineSimulator:
         """
 
         while admitted:
-            free = self.sim.alloc.available_size() + self.sim.cache.evictable_size()
+            free = (
+                self.sim.alloc.available_size()
+                + self.sim.cache.evictable_size()
+                - reserved_offset
+            )
             need = sum(state.matched.need for state in admitted)
             if need <= free:
                 return
@@ -489,11 +526,15 @@ class EngineSimulator:
     ) -> _State | None:
         state.prefilled = min(state.prompt_len, state.prefilled + state.charge)
         if state.prefilled < state.prompt_len:
+            if self.scheduler.progressive_cache:
+                self.sim.commit_upto(state.pending, state.prefilled, chunked=True)
             return state
         if state.out_len == 0:
             self.sim.end(state.pending)
             self._push_next_turn(state, now, heap)
         else:
+            if self.scheduler.progressive_cache:
+                self.sim.commit_upto(state.pending, state.prompt_len, chunked=False)
             running.append(state)
         return None
 
@@ -507,6 +548,10 @@ class EngineSimulator:
         finished: list[_State] = []
         for state in running:
             state.generated += 1
+            if self.scheduler.lazy_decode_alloc:
+                self.sim.reserve_upto(
+                    state.pending, state.prompt_len + state.generated
+                )
             if state.generated >= state.out_len:
                 finished.append(state)
         for state in finished:
@@ -553,6 +598,8 @@ class EngineSimulator:
                 "max_running_requests": self.scheduler.max_running_requests,
                 "max_prefill_bs": self.scheduler.max_prefill_bs,
                 "schedule_policy": self.scheduler.schedule_policy,
+                "progressive_cache": self.scheduler.progressive_cache,
+                "lazy_decode_alloc": self.scheduler.lazy_decode_alloc,
             },
             "wall_s": round(now, 3),
             "steps": self._steps,

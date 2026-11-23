@@ -54,6 +54,8 @@ class Pending:
     skipped: bool = False
     turn: int = -1
     response_token: int = 0
+    allocated_len: int = 0
+    committed_len: int = 0
 
 
 @dataclass
@@ -337,6 +339,8 @@ class Simulator:
             response_token=(
                 int(matched.req.output_ids[0]) if matched.req.output_ids else 0
             ),
+            allocated_len=matched.hit,
+            committed_len=matched.hit,
         )
 
     def lock_matched(self, matched: "Matched") -> None:
@@ -352,33 +356,89 @@ class Simulator:
             raise RuntimeError("先 prepare(width) 或直接用 run(sessions)")
         self.cache.inc_lock_ref(matched.node)
 
-    def _reserve_locked(self, matched: "Matched") -> "Pending":
-        """Evict the shortfall and reserve slots for an already-locked match."""
-
+    def reserve_upto(self, pending: "Pending", seq_len: int) -> int:
+        """将请求物理占槽水位推进到 seq_len 覆盖的页边界，按需触发 evict + alloc。"""
         if self.cache is None:
             raise RuntimeError("先 prepare(width) 或直接用 run(sessions)")
+        if pending.skipped:
+            return 0
 
-        sym = self.sym
-        need = matched.need
-        shortfall = need - self.alloc.available_size()
+        page = self.cache.page_size
+        total_aligned = pending.hit + pending.need
+        target = min(((int(seq_len) + page - 1) // page) * page, total_aligned)
+        delta = target - pending.allocated_len
+        if delta <= 0:
+            return 0
+
+        shortfall = delta - self.alloc.available_size()
         evicted = 0
         if shortfall > 0:
             evicted = self.cache.evict(
-                sym["EvictParams"](num_tokens=int(shortfall))
+                self.sym["EvictParams"](num_tokens=int(shortfall))
             ).num_tokens_evicted
-            if matched.node.evicted:
+            if pending.node.evicted:
                 self.self_evictions += 1
                 raise AssertionError(
                     "evict removed a locked matched prefix: "
-                    f"rid={matched.rid} hit={matched.hit} shortfall={shortfall}"
+                    f"rid={pending.rid} hit={pending.hit} shortfall={shortfall}"
                 )
-        self.alloc.alloc(need)
-
-        # 槽位已占、树里还没有：这段就是「在飞但未落树」的 KV
-        self.inflight_tokens += need
+        self.alloc.alloc(delta)
+        pending.allocated_len = target
+        pending.evicted += int(evicted)
+        self.inflight_tokens += delta
         self.inflight_token_peak = max(self.inflight_token_peak, self.inflight_tokens)
-        self._assert_balanced(where=f"begin({matched.rid})")
-        return self._make_pending(matched, skipped=False, evicted=evicted)
+        self._assert_balanced(where=f"reserve_upto({pending.rid}, {seq_len})")
+        return int(evicted)
+
+    def commit_upto(
+        self, pending: "Pending", seq_len: int, *, chunked: bool = False
+    ) -> None:
+        """将已算完的满页前缀增量写入 RadixCache，并将锁下移到新叶节点。"""
+        if self.cache is None:
+            raise RuntimeError("先 prepare(width) 或直接用 run(sessions)")
+        if pending.skipped:
+            return
+
+        page = self.cache.page_size
+        commit_len = min((int(seq_len) // page) * page, pending.allocated_len)
+        delta = commit_len - pending.committed_len
+        if delta <= 0:
+            return
+
+        req = pending.req
+        prefix_ids = req.fill_ids()[:commit_len]
+        tree_before = tree_tokens(self.cache)
+        radix_key, _, _ = self.cache._adopt(
+            req, prefix_ids, chunked=chunked, split_prompt=False
+        )
+        grew = tree_tokens(self.cache) - tree_before
+
+        self.inflight_tokens -= delta
+        if grew < delta:
+            self.alloc.release(delta - grew)
+            self.duplicate_insert_tokens += delta - grew
+        elif grew > delta:
+            raise AssertionError(
+                f"树增长超过本步提交量：grew={grew} > delta={delta} (rid={pending.rid})"
+            )
+
+        matched = self.cache.match_prefix(
+            self.sym["MatchPrefixParams"](key=radix_key, count_reuse=False)
+        )
+        new_node = matched.last_device_node
+        self.cache.inc_lock_ref(new_node)
+        self.cache.dec_lock_ref(pending.node)
+        pending.node = new_node
+        pending.committed_len = commit_len
+        self._assert_balanced(where=f"commit_upto({pending.rid}, {commit_len})")
+
+    def _reserve_locked(self, matched: "Matched") -> "Pending":
+        """Evict the shortfall and reserve slots for an already-locked match."""
+        if self.cache is None:
+            raise RuntimeError("先 prepare(width) 或直接用 run(sessions)")
+        pending = self._make_pending(matched, skipped=False, evicted=0)
+        self.reserve_upto(pending, matched.hit + matched.need)
+        return pending
 
     def begin_matched(self, matched: "Matched") -> "Pending":
         """提交一个已匹配的请求：挂锁 → 短缺即淘汰 → 预留。
@@ -461,7 +521,9 @@ class Simulator:
 
         if not pending.skipped:
             req = pending.req
-            need = pending.need
+            total_aligned = pending.hit + pending.need
+            if pending.allocated_len < total_aligned:
+                self.reserve_upto(pending, total_aligned)
             if self.config.verify and pending.node.evicted:
                 self.self_evictions += 1
                 raise AssertionError(
@@ -469,20 +531,27 @@ class Simulator:
                 )
 
             # 4) 写入树（含 touch / decode_start / prompt 边界分裂）
+            rem = pending.allocated_len - pending.committed_len
             tree_before = tree_tokens(self.cache)
-            self.cache._adopt(req, req.fill_ids(), split_prompt=True)
+            self.cache._adopt(
+                req,
+                req.fill_ids(),
+                chunked=(pending.committed_len > pending.hit),
+                split_prompt=True,
+            )
             grew = tree_tokens(self.cache) - tree_before
 
-            self.inflight_tokens -= need
-            if grew < need:
-                # 预留量是「全序列 - prompt 命中」，但等我们落树期间可能已有别的
-                # 请求先写入了同一段前缀（竞态），差额在这里归还并记为重复写入。
-                self.alloc.release(need - grew)
-                self.duplicate_insert_tokens += need - grew
-            elif grew > need:
+            self.inflight_tokens -= rem
+            if grew < rem:
+                # 预留量是「全序列 - 已提交」，但等待期间可能已有别的请求
+                # 先写入了同一段前缀（竞态），差额在这里归还并记为重复写入。
+                self.alloc.release(rem - grew)
+                self.duplicate_insert_tokens += rem - grew
+            elif grew > rem:
                 raise AssertionError(
-                    f"树增长超过预留：grew={grew} > need={need} (rid={pending.rid})"
+                    f"树增长超过预留：grew={grew} > need={rem} (rid={pending.rid})"
                 )
+            pending.committed_len = pending.allocated_len
 
             # 5) 放锁（生产：cache_finished_req 之后 unpin）
             self.cache.dec_lock_ref(pending.node)

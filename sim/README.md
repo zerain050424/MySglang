@@ -1,17 +1,12 @@
 # sim · HeterCache 离线前缀缓存仿真器
 
-在 **CPU** 上还原 sglang 的 radix 前缀缓存与 HeterCache 策略（三队列 + one-shot 带 +
-按已兑现价值密度（VD）跨队列淘汰 + 队内改写器）。目标不是「另写一个缓存」，而是**让生产代码原样跑**：
-树、标签、仲裁、账本全部 `import python/sglang/srt/mem_cache/`，本目录只做装配与驱动。
-
-> 现状：M0~M3 已完成。仿真器已在同一个 run 里重放四类混合会话并产出策略口径的
-> 指标（命中率 / victim 来源 / 队列占用）。保真对拍（M4）待做。
+在 **CPU** 上还原 sglang 的 radix 前缀缓存与 HeterCache 策略
 
 ## 快速开始
 
 ```bash
 cd /home/rain/MySglang
-python -m sim              # M0~M3 自检：装载 / 回路 / 时钟 / 驱动
+python -m sim              
 python -m sim --import-only
 python -m sim --verbose    # 保留策略 profile 日志（默认 quiet）
 ```
@@ -34,7 +29,7 @@ print(result.fingerprint())     # 同 seed 复现基线
 result.to_jsonl("out/run.jsonl")
 ```
 
-直接吃 Heter-Bench 的 `session_data.jsonl`（与 `bench_heap.py` 同口径）：
+直接输入真实数据集 Heter-Bench 的 `session_data.jsonl`（与 `bench_heap.py` 同口径）：
 
 ```python
 from sim.runner import SimConfig, Simulator
@@ -242,8 +237,8 @@ print(result.summary["emit"])   # steps / prefill_steps / max_prefill_batch_toke
 |---|---|---|
 | 不能直接 `import PrefillAdder` | 本机导入链会拉起 `transformers`；`sim/engine.py` 复刻的是 admission 子集 | 默认策略与预算公式对齐，细节分支（HiCache / SWA / Mamba / preemption）不建模 |
 | prefill 步不混 decode | chunked prefill 的 mixed batch 需要另一套 forward 时长模型 | 保守：decode 少推进一步 |
-| 准入时一次性预留 prompt+output | 沿用 `SimReq` 的既有口径，避免输出 token 水位与树账分叉 | 比生产更早占槽，压力略高 |
-| chunked prefill 不在每个 chunk 落树 | 沿用 `Simulator.end` 的完成时写树口径 | 前缀可见更晚，命中率略低（保守） |
+| 准入预算按 `prompt+output` 检查，物理分配按步推进（`lazy_decode_alloc=True`） | 在不引入 decode retraction 的前提下，把物理占槽与 `evict()` 推迟到每个分块与 decode 步 | 淘汰时机与显存水位压力与真机一致 |
+| 分块完成与转入 decode 时增量落树（`progressive_cache=True`） | 对齐生产 `cache_unfinished_req`：chunked prefill 块间与 decode 期间已算完前缀立即可命中并移锁 | 消除并发前缀可见延迟（可设 `False` 回退保守口径） |
 | LPM 不做 in-batch de-prioritisation | 只影响 waiting 排序，不影响批大小 | 命中率通常略低（更保守） |
 
 ### 上游 simulator 的时钟注入（已落地）
