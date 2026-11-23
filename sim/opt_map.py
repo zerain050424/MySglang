@@ -111,7 +111,7 @@ def build_use_map(
         )
 
     # 延迟导入：这两个模块会拉起 torch，必须先在 bootstrap 里装好替身。
-    from sim import bootstrap
+    from sim.core import bootstrap
 
     bootstrap.load()
     from sglang.srt.mem_cache.radix_cache import RadixKey

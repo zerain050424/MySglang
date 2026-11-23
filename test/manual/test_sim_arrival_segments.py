@@ -19,9 +19,9 @@ ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 sys.path.insert(0, os.path.join(ROOT, "python"))
 sys.path.insert(0, ROOT)
 
-schedule = pytest.importorskip("sim.schedule")
-TaskSpec = schedule.TaskSpec
-check_segments = schedule.check_segments
+arrival = pytest.importorskip("sim.workload.arrival")
+TaskSpec = arrival.TaskSpec
+check_segments = arrival.check_segments
 
 
 def _spec(segments, *, seed=42, task_id=0):
@@ -41,8 +41,7 @@ def _spec(segments, *, seed=42, task_id=0):
 
 
 def _offsets(spec, n):
-    # _arrival_offsets 只依赖 spec，不需要会话；借 Emitter 的未绑定方法。
-    return schedule.Emitter._arrival_offsets(None, spec, n)
+    return arrival.first_turn_offsets(spec, n)
 
 
 # ---------------------------------------------------------------------------

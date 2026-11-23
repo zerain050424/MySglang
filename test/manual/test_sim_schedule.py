@@ -22,14 +22,15 @@ import pytest
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, ROOT)
 
-from sim.runner import SimConfig, Simulator  # noqa: E402
-from sim.schedule import (  # noqa: E402
-    Emitter,
-    ServiceModel,
+from sim.core.config import SimConfig  # noqa: E402
+from sim.simulator import Simulator  # noqa: E402
+from sim.workload.arrival import (  # noqa: E402
     TaskSpec,
+    first_turn_offsets,
     stable_seed_from_str,
 )
-from sim.trace import Session, Turn  # noqa: E402
+from sim.workload.service import ServiceModel  # noqa: E402
+from sim.workload.trace import Session, Turn  # noqa: E402
 
 
 def _turn(prompt_len, out=0, base=0):
@@ -80,12 +81,14 @@ def test_closed_loop_next_turn_follows_completion():
         _session("ShareGPT-0", [_turn(100, out=10), _turn(200, out=0, base=500)])
     ]
     sim = Simulator(SimConfig(capacity=4096, seed=1))
-    result = sim.run_scheduled(sessions, [spec], service=SERVICE, arrival_scale=0.0)
+    result = sim.run_closed_loop(sessions, [spec], service=SERVICE, arrival_scale=0.0)
 
     service1 = SERVICE(100, 10)  # 1.0 + 1.0 = 2.0
     expected_t2 = service1 + math.exp(1.0)
     assert result.records[0].t == pytest.approx(0.0)
+    assert result.records[0].arrival_t == pytest.approx(0.0)
     assert result.records[1].t == pytest.approx(expected_t2)
+    assert result.records[1].arrival_t == pytest.approx(expected_t2)
     # wall 时间 = 第二轮的完成时刻（summary 里保留 3 位小数）
     assert result.summary["emit"]["wall_s"] == pytest.approx(
         round(expected_t2 + SERVICE(200, 0), 3)
@@ -103,13 +106,14 @@ def test_wait_scale_and_arrival_scale():
     )
     sessions = [_session(f"ShareGPT-{i}", [_turn(100, out=0)]) for i in range(3)]
 
-    fast = Simulator(SimConfig(capacity=4096)).run_scheduled(
+    fast = Simulator(SimConfig(capacity=4096)).run_closed_loop(
         sessions, [spec], service=SERVICE, arrival_scale=0.0, max_inflight=1
     )
     # 全部 t=0 到点：单通道排队 => 0, 1.0, 2.0（service(100,0)=1.0）
     assert [round(r.t, 3) for r in fast.records] == [0.0, 1.0, 2.0]
+    assert [round(r.arrival_t, 3) for r in fast.records] == [0.0, 0.0, 0.0]
 
-    scaled = Simulator(SimConfig(capacity=4096)).run_scheduled(
+    scaled = Simulator(SimConfig(capacity=4096)).run_closed_loop(
         sessions, [spec], service=SERVICE, arrival_scale=2.0, max_inflight=1
     )
     # 到点 0/20/40，均晚于前一条完成 => 直接按到点开始
@@ -118,10 +122,10 @@ def test_wait_scale_and_arrival_scale():
     # wait_scale 只影响轮间，不影响首轮
     spec2 = TaskSpec(name="chat", mu=1.0, sigma=0.0, lambda_rate=1.0, seed=3)
     multi = [_session("ShareGPT-0", [_turn(100), _turn(200, base=900)])]
-    one = Simulator(SimConfig(capacity=4096)).run_scheduled(
+    one = Simulator(SimConfig(capacity=4096)).run_closed_loop(
         multi, [spec2], service=SERVICE, arrival_scale=0.0, wait_scale=1.0
     )
-    two = Simulator(SimConfig(capacity=4096)).run_scheduled(
+    two = Simulator(SimConfig(capacity=4096)).run_closed_loop(
         multi, [spec2], service=SERVICE, arrival_scale=0.0, wait_scale=3.0
     )
     assert one.records[0].t == two.records[0].t == 0.0
@@ -129,8 +133,7 @@ def test_wait_scale_and_arrival_scale():
 
 
 def test_poisson_arrivals_and_send_lag():
-    emitter = Emitter(Simulator(SimConfig()), [], [TaskSpec(name="chat", lambda_rate=2.0)])
-    offsets = emitter._arrival_offsets(emitter.specs["chat"], 4000)
+    offsets = first_turn_offsets(TaskSpec(name="chat", lambda_rate=2.0), 4000)
     intervals = [b - a for a, b in zip(offsets, offsets[1:])]
     mean = sum(intervals) / len(intervals)
     assert mean == pytest.approx(0.5, rel=0.1)  # 1/lambda
@@ -142,7 +145,7 @@ def test_poisson_arrivals_and_send_lag():
         name="chat", arrival_mode="fixed", arrival_offset_s=0.0, arrival_step_s=0.0
     )
     sessions = [_session(f"ShareGPT-{i}", [_turn(100, out=0)]) for i in range(3)]
-    result = Simulator(SimConfig(capacity=4096)).run_scheduled(
+    result = Simulator(SimConfig(capacity=4096)).run_closed_loop(
         sessions, [spec], service=SERVICE, arrival_scale=1.0, max_inflight=1
     )
     lags = [round(r, 6) for r in [0.0, 1.0, 2.0]]
@@ -153,4 +156,4 @@ def test_poisson_arrivals_and_send_lag():
 def test_unknown_task_is_rejected():
     sessions = [_session("ShareGPT-0", [_turn(10)], task="nope")]
     with pytest.raises(ValueError, match="没有对应 TaskSpec"):
-        Simulator(SimConfig()).run_scheduled(sessions, [TaskSpec(name="chat")])
+        Simulator(SimConfig()).run_closed_loop(sessions, [TaskSpec(name="chat")])

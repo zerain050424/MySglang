@@ -1,9 +1,25 @@
-"""HeterCache 离线仿真器（CPU）。
+"""HeterCache 离线前缀缓存仿真器对外常用入口。"""
 
-只做装配与驱动：前缀缓存、队列标签、VD 仲裁、队内改写器全部 import 生产代码，
-不在本目录留第二份实现。入口见 ``sim/__main__.py``，里程碑见 ``sim/README.md``。
-"""
+from sim.core.bootstrap import load
+from sim.core.config import SimConfig
+from sim.drivers.engine import EngineConfig
+from sim.metrics import SimResult
+from sim.simulator import Simulator, run_synthetic
+from sim.workload.arrival import TaskSpec
+from sim.workload.service import ServiceModel
+from sim.workload.session_data import load_tasks
+from sim.workload.trace import Session, Turn
 
-from sim.bootstrap import load
-
-__all__ = ["load"]
+__all__ = [
+    "EngineConfig",
+    "ServiceModel",
+    "Session",
+    "SimConfig",
+    "SimResult",
+    "Simulator",
+    "TaskSpec",
+    "Turn",
+    "load",
+    "load_tasks",
+    "run_synthetic",
+]

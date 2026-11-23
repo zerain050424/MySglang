@@ -20,9 +20,10 @@ from array import array
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
+from sim.core.config import SimConfig
 from sim.metrics import SimResult
-from sim.runner import SimConfig, Simulator
-from sim.trace import Turn, max_total_len
+from sim.simulator import Simulator
+from sim.workload.trace import Turn, max_total_len
 
 
 # ---------------------------------------------------------------------------
@@ -193,10 +194,10 @@ def run_fidelity(
 
     def one_pass() -> Tuple[List[str], Simulator]:
         sim = Simulator(config)
-        sim.prepare(width)
+        sim.lifecycle.prepare(width)
         problems: List[str] = []
         for t, sid, turn in events:
-            sim.request(turn, sid)
+            sim.lifecycle.serve(turn, sid)
             problems.extend(check_tree(sim.cache, where=f"{sid}@{t:.0f}"))
             if problems:  # 首个问题就停：后面的树已经不可信
                 break

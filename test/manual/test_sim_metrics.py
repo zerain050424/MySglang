@@ -23,9 +23,10 @@ import pytest
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, ROOT)
 
+from sim.core.config import SimConfig  # noqa: E402
 from sim.cost import CostModel  # noqa: E402
-from sim.runner import SimConfig, Simulator  # noqa: E402
-from sim.trace import Session, Turn  # noqa: E402
+from sim.simulator import Simulator  # noqa: E402
+from sim.workload.trace import Session, Turn  # noqa: E402
 
 
 def _tok(base: int, n: int) -> array:
@@ -56,7 +57,7 @@ def test_uniform_cost_saving_equals_hit_rate(page_size):
     ]
     result = Simulator(
         SimConfig(capacity=4096, page_size=page_size, cost_model="uniform")
-    ).run(sessions)
+    ).run_replay(sessions)
 
     assert result.compute_saving_ratio == pytest.approx(result.hit_rate)
     assert result.summary["compute_saving_ratio"] == pytest.approx(result.hit_rate)
@@ -65,7 +66,7 @@ def test_uniform_cost_saving_equals_hit_rate(page_size):
 def test_position_cost_weights_deeper_hits():
     result = Simulator(
         SimConfig(capacity=4096, page_size=1, cost_model="position")
-    ).run(_two_turns())
+    ).run_replay(_two_turns())
 
     second = result.records[1]
     assert second.total_cost == sum(range(1, 33))
@@ -85,7 +86,7 @@ def test_page_size_weights_tokens_by_block_cost():
     ]
     result = Simulator(
         SimConfig(capacity=4096, page_size=8, cost_model="position")
-    ).run(sessions)
+    ).run_replay(sessions)
 
     second = result.records[1]
     assert second.hit == 8
@@ -124,7 +125,7 @@ def test_skipped_requests_do_not_enter_rates():
     ]
     result = Simulator(
         SimConfig(capacity=100, seed=1, page_size=1, oversize="skip")
-    ).run(sessions)
+    ).run_replay(sessions)
 
     assert [record.skipped for record in result.records] == [True, False]
     assert result.summary["requests"] == 1
@@ -137,7 +138,7 @@ def test_skipped_requests_do_not_enter_rates():
 
 
 def test_self_eviction_diagnostics_are_clean():
-    result = Simulator(SimConfig(capacity=4096, page_size=1)).run(_two_turns())
+    result = Simulator(SimConfig(capacity=4096, page_size=1)).run_replay(_two_turns())
     assert result.summary["self_evictions"] == 0
     assert result.summary["unexpected_evictions"] == 0
     assert result.summary["verify"] is True

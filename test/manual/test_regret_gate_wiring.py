@@ -21,15 +21,16 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 sys.path.insert(0, os.path.join(ROOT, "python"))
 
-sim = pytest.importorskip("sim.runner", reason="sim 需要完整 torch 导入链")
+sim = pytest.importorskip("sim.simulator", reason="sim 需要完整 torch 导入链")
 
 
 def test_regret_gate_stamps_and_joins_through_real_cache():
     import array
     import random
 
-    from sim.runner import SimConfig, Simulator
-    from sim.trace import Turn
+    from sim.core.config import SimConfig
+    from sim.simulator import Simulator
+    from sim.workload.trace import Turn
 
     cfg = SimConfig(
         capacity=4096,
@@ -40,16 +41,16 @@ def test_regret_gate_stamps_and_joins_through_real_cache():
         regret_gate={"enabled": True, "window_s": 120.0, "k": 1.0, "r_min": 0.5},
     )
     sim = Simulator(cfg)
-    sim.prepare(width=512)
+    sim.lifecycle.prepare(width=512)
 
     def mk(seed, n):
         rng = random.Random(seed)
         return array.array("q", [rng.randrange(1000, 60000) for _ in range(n)])
 
     def admit(rid, sid, seed, n, t):
-        matched = sim._match(Turn(t=t, prompt=mk(seed, n), out=8), sid, rid=rid)
-        pending = sim.begin_matched(matched)
-        sim.end(pending)
+        matched = sim.lifecycle.match(Turn(t=t, prompt=mk(seed, n), out=8), sid, rid=rid)
+        pending = sim.lifecycle.admit(matched)
+        sim.lifecycle.finish(pending)
 
     admit("a0", "s1", 1, 300, 0.0)
     for i in range(25):
@@ -62,11 +63,11 @@ def test_regret_gate_stamps_and_joins_through_real_cache():
     assert gate.joins == 0
 
     # 原会话回来：内容已被挤掉 → hit=0，断点页 join 回当初削它的队列
-    rematch = sim._match(Turn(t=50.0, prompt=mk(1, 300), out=8), "s1", rid="a1")
+    rematch = sim.lifecycle.match(Turn(t=50.0, prompt=mk(1, 300), out=8), "s1", rid="a1")
     assert rematch.hit == 0, f"挤占后应整链丢失，got hit={rematch.hit}"
     assert gate.joins == 1, f"断点页应 join 恰好一次，got {gate.joins}"
     attributed = {q for q in gate._rg if gate._rg_sum.get(q, 0) > 0}
     assert len(attributed) == 1, f"应归因到唯一队列，got {attributed}"
     # 再来一次同样的 miss：stamp 已摘除，不重复归因
-    sim._match(Turn(t=51.0, prompt=mk(1, 300), out=8), "s1", rid="a2")
+    sim.lifecycle.match(Turn(t=51.0, prompt=mk(1, 300), out=8), "s1", rid="a2")
     assert gate.joins == 1, "一个 stamp 只归因一次"

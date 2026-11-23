@@ -19,10 +19,11 @@ import pytest
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, ROOT)
 
+from sim.core.config import SimConfig  # noqa: E402
 from sim.metrics import RequestRecord, summarize  # noqa: E402
-from sim.runner import SimConfig, Simulator  # noqa: E402
-from sim.session_data import load_task, load_tasks  # noqa: E402
-from sim.trace import Session  # noqa: E402
+from sim.simulator import Simulator  # noqa: E402
+from sim.workload.session_data import load_task, load_tasks  # noqa: E402
+from sim.workload.trace import Session  # noqa: E402
 
 
 def _session(sid, num_turns, turns):
@@ -101,7 +102,7 @@ def test_dataset_response_is_reused_across_turns(trace_path):
     """Turn.response makes the next turn hit prev prompt + prev response."""
 
     sessions = load_task(trace_path, task_name="ShareGPT", shuffle=False)
-    result = Simulator(SimConfig(capacity=4096, seed=3)).run(sessions)
+    result = Simulator(SimConfig(capacity=4096, seed=3)).run_replay(sessions)
     chat = [r for r in result.records if r.session_id == "ShareGPT-0"]
     # turn 1 writes 64 prompt + 3 response; turn 2 matches all 67.
     assert chat[1].hit == 67
@@ -119,7 +120,7 @@ def test_sentinel_mode_misses_response_suffix(trace_path):
         )
         for session in sessions
     ]
-    result = Simulator(SimConfig(capacity=4096, seed=3)).run(stripped)
+    result = Simulator(SimConfig(capacity=4096, seed=3)).run_replay(stripped)
     chat = [r for r in result.records if r.session_id == "ShareGPT-0"]
     # turn 2 still stops at the 64-token prompt: sentinel != dataset response.
     assert chat[1].hit == 64
@@ -131,7 +132,7 @@ def test_per_task_metrics_grouped_separately(trace_path):
         base_dir=os.path.dirname(trace_path),
     )
     sim = Simulator(SimConfig(capacity=4096, seed=3))
-    result = sim.run(sessions)
+    result = sim.run_replay(sessions)
     summary = result.summary
 
     assert summary["per_task"], "per-task 指标没生成"

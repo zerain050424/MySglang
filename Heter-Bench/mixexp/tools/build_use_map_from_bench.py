@@ -133,7 +133,7 @@ def main() -> int:
     _add_paths()
 
     from sim.opt_map import build_use_map, write_use_map
-    from sim.session_data import load_tasks
+    from sim.workload.session_data import load_tasks
 
     csv_path = _resolve(args.csv or f"mixexp/result/exp3/{args.cell}/full_lru.csv")
     tasks_path = _resolve(args.tasks or f"TaskData/exp3/{args.cell}/tasks.yaml")

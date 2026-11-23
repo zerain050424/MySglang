@@ -19,9 +19,9 @@ import os
 import sys
 from array import array
 
-from sim import bootstrap
-from sim.allocator import OutOfTokens, TokenAllocator, tree_tokens
-from sim.clock import VirtualClock
+from sim.core import bootstrap
+from sim.core.allocator import OutOfTokens, TokenAllocator, tree_tokens
+from sim.core.clock import VirtualClock
 
 VALUE = {"horizon_s": 120.0, "floor_tokens": 0.0}
 
@@ -354,8 +354,9 @@ def _check_driver() -> list:
     """M3 验收：驱动跑通、同 seed 可复现、one-shot 由虚拟时钟推进触发。"""
 
     print("[4] 请求驱动（M3）")
-    from sim.runner import SimConfig, Simulator, run_synthetic
-    from sim.trace import Session, Turn
+    from sim.core.config import SimConfig
+    from sim.simulator import Simulator, run_synthetic
+    from sim.workload.trace import Session, Turn
 
     fails = []
     first = run_synthetic(SimConfig(capacity=4096, seed=7), seed=3, chat_turns=5)
@@ -394,7 +395,7 @@ def _check_driver() -> list:
             "apps_1", (Turn(t=200.0, prompt=array("q", range(5000, 5800)), out=0),)
         ),
     ]
-    result = sim.run(trace)
+    result = sim.run_replay(trace)
     sources = result.summary["victim_sources"]
     one_shot = sources.get("one_shot", 0.0)
     ok = one_shot >= 176
@@ -414,8 +415,8 @@ def _check_fidelity() -> list:
     """M4 验收：逐请求拓扑不变量 + 账本对拍 + 同 seed 复现。"""
 
     print("[5] 保真对拍（M4）")
+    from sim.core.config import SimConfig
     from sim.fidelity import run_fidelity
-    from sim.runner import SimConfig
 
     fails = []
     report = run_fidelity(SimConfig(capacity=2048, seed=11))
@@ -453,9 +454,11 @@ def _check_emitter() -> list:
     """R2 验收：闭环轮次（完成时刻 + lognormal）与服务时长模型。"""
 
     print("[6] 闭环发射（R2）")
-    from sim.runner import SimConfig, Simulator
-    from sim.schedule import ServiceModel, TaskSpec
-    from sim.trace import Session, Turn
+    from sim.core.config import SimConfig
+    from sim.simulator import Simulator
+    from sim.workload.arrival import TaskSpec
+    from sim.workload.service import ServiceModel
+    from sim.workload.trace import Session, Turn
 
     spec = TaskSpec(name="chat", lambda_rate=1.0, mu=1.0, sigma=0.0, seed=1)
     service = ServiceModel(
@@ -471,7 +474,7 @@ def _check_emitter() -> list:
             task_name="chat",
         )
     ]
-    result = Simulator(SimConfig(capacity=4096)).run_scheduled(
+    result = Simulator(SimConfig(capacity=4096)).run_closed_loop(
         sessions, [spec], service=service, arrival_scale=0.0
     )
     t1, t2 = result.records[0].t, result.records[1].t
@@ -502,10 +505,10 @@ def _check_emitter() -> list:
     spec0 = TaskSpec(
         name="chat", arrival_mode="fixed", arrival_offset_s=0.0, arrival_step_s=0.0
     )
-    par = Simulator(SimConfig(capacity=4096)).run_scheduled(
+    par = Simulator(SimConfig(capacity=4096)).run_closed_loop(
         racers, [spec0], service=service, max_inflight=0
     )
-    seq = Simulator(SimConfig(capacity=4096)).run_scheduled(
+    seq = Simulator(SimConfig(capacity=4096)).run_closed_loop(
         racers, [spec0], service=service, max_inflight=1
     )
     hits_par = [r.hit for r in par.records]
@@ -528,17 +531,18 @@ def _check_bounds() -> list:
     """R4 验收：无 response 时哨兵唯一 + 超大请求显式跳过。"""
 
     print("[7] 边界（R4）")
-    from sim.allocator import tree_tokens
-    from sim.req import OUTPUT_SENTINEL_BASE
-    from sim.runner import SimConfig, Simulator
-    from sim.trace import Session, Turn
+    from sim.core.allocator import tree_tokens
+    from sim.core.config import SimConfig
+    from sim.core.request import OUTPUT_SENTINEL_BASE
+    from sim.simulator import Simulator
+    from sim.workload.trace import Session, Turn
 
     fails = []
     sim = Simulator(SimConfig(capacity=4096, seed=1))
-    sim.prepare(width=80)
+    sim.lifecycle.prepare(width=80)
     prompt = list(range(64))
     for i in range(2):
-        sim.request(
+        sim.lifecycle.serve(
             Turn(t=0.0, prompt=array("q", prompt), out=16),
             f"apps_{i}",
             task_name="chat",
@@ -547,17 +551,17 @@ def _check_bounds() -> list:
     unique_ok = tree_tokens(sim.cache) == 64 + 16 + 16
     print(
         f"    response  : fallback 哨兵基址={OUTPUT_SENTINEL_BASE} "
-        f"dup={sim.duplicate_insert_tokens} tree={tree_tokens(sim.cache)} "
+        f"dup={sim.lifecycle.duplicate_insert_tokens} tree={tree_tokens(sim.cache)} "
         f"(want 96){'' if unique_ok else '  <-- decode 段被合并'}"
     )
-    if not unique_ok or sim.duplicate_insert_tokens != 0:
+    if not unique_ok or sim.lifecycle.duplicate_insert_tokens != 0:
         fails.append(
             f"response 段合并了：tree={tree_tokens(sim.cache)} "
-            f"dup={sim.duplicate_insert_tokens}"
+            f"dup={sim.lifecycle.duplicate_insert_tokens}"
         )
 
     skipped = Simulator(SimConfig(capacity=100, seed=1, oversize="skip"))
-    result = skipped.run(
+    result = skipped.run_replay(
         [
             Session("apps_0", (Turn(t=0.0, prompt=array("q", range(500))),), "chat"),
             Session("apps_1", (Turn(t=0.0, prompt=array("q", range(900, 1000))),), "chat"),

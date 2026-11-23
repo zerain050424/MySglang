@@ -19,10 +19,11 @@ import pytest
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, ROOT)
 
-from sim.allocator import OutOfTokens, tree_tokens  # noqa: E402
-from sim.req import OUTPUT_SENTINEL_BASE, SimReq  # noqa: E402
-from sim.runner import SimConfig, Simulator  # noqa: E402
-from sim.trace import Session, Turn  # noqa: E402
+from sim.core.allocator import OutOfTokens, tree_tokens  # noqa: E402
+from sim.core.config import SimConfig  # noqa: E402
+from sim.core.request import OUTPUT_SENTINEL_BASE, SimReq  # noqa: E402
+from sim.simulator import Simulator  # noqa: E402
+from sim.workload.trace import Session, Turn  # noqa: E402
 
 
 def _turn(prompt, out=0):
@@ -46,11 +47,11 @@ def test_identical_prompts_do_not_share_the_response_segment():
 
     prompt = list(range(64))
     sim = Simulator(SimConfig(capacity=4096, seed=1))
-    sim.prepare(width=80)
+    sim.lifecycle.prepare(width=80)
     for i in range(2):
-        sim.request(_turn(prompt, out=16), f"apps_{i}", task_name="chat")
+        sim.lifecycle.serve(_turn(prompt, out=16), f"apps_{i}", task_name="chat")
 
-    assert sim.duplicate_insert_tokens == 0, "response 段被合并了（fallback 哨兵没生效）"
+    assert sim.lifecycle.duplicate_insert_tokens == 0, "response 段被合并了（fallback 哨兵没生效）"
     # prompt 共享 64；两段 response 各写 16（共用一串 0 时树里只有 80）
     assert tree_tokens(sim.cache) == 64 + 16 + 16
     assert sim.alloc.used == tree_tokens(sim.cache)
@@ -60,7 +61,7 @@ def test_oversize_raises_by_default():
     session = Session("apps_0", (_turn(list(range(500))),), task_name="chat")
     sim = Simulator(SimConfig(capacity=100, seed=1))
     with pytest.raises(OutOfTokens, match="oversize"):
-        sim.run([session])
+        sim.run_replay([session])
 
 
 def test_oversize_skip_counts_and_keeps_the_cache_consistent():
@@ -70,7 +71,7 @@ def test_oversize_skip_counts_and_keeps_the_cache_consistent():
         Session("apps_1", (_turn(list(range(100))),), task_name="chat"),
     ]
     sim = Simulator(SimConfig(capacity=100, seed=1, oversize="skip"))
-    result = sim.run(sessions)
+    result = sim.run_replay(sessions)
 
     assert [r.skipped for r in result.records] == [True, False]
     assert result.summary["skipped_requests"] == 1
@@ -96,7 +97,7 @@ def test_skip_leaves_no_dangling_lock():
         Session("apps_2", (_turn(list(range(200, 290))),), task_name="chat"),
     ]
     sim = Simulator(SimConfig(capacity=100, seed=1, oversize="skip"))
-    result = sim.run(sessions)
+    result = sim.run_replay(sessions)
     assert [r.skipped for r in result.records] == [False, True, False]
     # 第三条要写 90 token，池里已有 80：必须能腾出来（说明锁没漏）
     assert result.records[2].evicted >= 70

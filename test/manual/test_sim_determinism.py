@@ -26,8 +26,9 @@ pytest.importorskip("torch", reason="需要 torch 才能建真缓存")
 
 from array import array  # noqa: E402
 
-from sim.runner import SimConfig, Simulator  # noqa: E402
-from sim.trace import Session, Turn  # noqa: E402
+from sim.core.config import SimConfig  # noqa: E402
+from sim.simulator import Simulator  # noqa: E402
+from sim.workload.trace import Session, Turn  # noqa: E402
 
 PREFIX = 256          # 每轮独有的 token 数（保证不被去重）
 SESSIONS = 20
@@ -57,7 +58,7 @@ def _run(policy):
         SimConfig(capacity=CAPACITY, page_size=8, eviction_policy=policy,
                   seed=42, oversize="skip")
     )
-    return sim, sim.run(_trace())
+    return sim, sim.run_replay(_trace())
 
 
 @pytest.mark.parametrize("policy", ["lru", "heter_cache"])

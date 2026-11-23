@@ -21,10 +21,12 @@ import pytest
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, ROOT)
 
-from sim.allocator import tree_tokens  # noqa: E402
-from sim.runner import SimConfig, Simulator  # noqa: E402
-from sim.schedule import ServiceModel, TaskSpec  # noqa: E402
-from sim.trace import Session, Turn  # noqa: E402
+from sim.core.allocator import tree_tokens  # noqa: E402
+from sim.core.config import SimConfig  # noqa: E402
+from sim.simulator import Simulator  # noqa: E402
+from sim.workload.arrival import TaskSpec  # noqa: E402
+from sim.workload.service import ServiceModel  # noqa: E402
+from sim.workload.trace import Session, Turn  # noqa: E402
 
 # 100 tok/s prefill + 10 tok/s decode：50 token 的请求恰好 0.5s
 SERVICE = ServiceModel(
@@ -52,7 +54,7 @@ def test_same_instant_requests_race():
         _one(f"apps_{i}", prefix + [900 + i] * 32) for i in range(3)
     ]
 
-    concurrent = Simulator(SimConfig(capacity=4096)).run_scheduled(
+    concurrent = Simulator(SimConfig(capacity=4096)).run_closed_loop(
         sessions, [_spec()], service=SERVICE, max_inflight=0
     )
     assert [r.hit for r in concurrent.records] == [0, 0, 0]
@@ -61,7 +63,7 @@ def test_same_instant_requests_race():
     assert concurrent.summary["emit"]["duplicate_insert_tokens"] == 2 * 64
     assert concurrent.summary["emit"]["mode"] == "closed_loop_concurrent"
 
-    sequential = Simulator(SimConfig(capacity=4096)).run_scheduled(
+    sequential = Simulator(SimConfig(capacity=4096)).run_closed_loop(
         sessions, [_spec()], service=SERVICE, max_inflight=1
     )
     assert [r.hit for r in sequential.records] == [0, 64, 64]
@@ -71,7 +73,7 @@ def test_same_instant_requests_race():
 
 def test_max_inflight_caps_dispatch():
     sessions = [_one(f"apps_{i}", [1000 + i] * 50) for i in range(5)]
-    result = Simulator(SimConfig(capacity=4096)).run_scheduled(
+    result = Simulator(SimConfig(capacity=4096)).run_closed_loop(
         sessions, [_spec()], service=SERVICE, max_inflight=2
     )
     # 0s 发两条 -> 0.5s 完成并补发两条 -> 1.0s 补最后一条
@@ -83,10 +85,10 @@ def test_max_inflight_caps_dispatch():
 def test_lock_window_spans_inflight():
     prefix = array("q", range(160))
     sim = Simulator(SimConfig(capacity=4096))
-    sim.prepare(width=176)
-    sim.request(Turn(t=0.0, prompt=prefix, out=0), "apps_x", task_name="chat")
+    sim.lifecycle.prepare(width=176)
+    sim.lifecycle.serve(Turn(t=0.0, prompt=prefix, out=0), "apps_x", task_name="chat")
 
-    pending = sim.begin(
+    pending = sim.lifecycle.start(
         Turn(t=1.0, prompt=prefix + array("q", [7] * 16), out=0),
         "apps_a",
         task_name="chat",
@@ -99,7 +101,7 @@ def test_lock_window_spans_inflight():
         assert sim.alloc.used == tree_tokens(sim.cache) + sim.inflight_tokens
         assert sim.inflight_tokens == 16
     finally:
-        sim.end(pending)
+        sim.lifecycle.finish(pending)
 
     assert pending.node.lock_ref == 0
     assert sim.inflight_tokens == 0
@@ -112,18 +114,18 @@ def test_concurrent_eviction_cannot_drop_locked_prefix():
     prefix = array("q", range(160))
     junk = array("q", range(5000, 5200))
     sim = Simulator(SimConfig(capacity=520, seed=1))
-    sim.prepare(width=400)
+    sim.lifecycle.prepare(width=400)
 
-    sim.request(Turn(t=0.0, prompt=prefix, out=0), "apps_x", task_name="chat")
-    sim.request(Turn(t=0.5, prompt=junk, out=0), "apps_y", task_name="chat")
+    sim.lifecycle.serve(Turn(t=0.0, prompt=prefix, out=0), "apps_x", task_name="chat")
+    sim.lifecycle.serve(Turn(t=0.5, prompt=junk, out=0), "apps_y", task_name="chat")
     assert tree_tokens(sim.cache) == 360
 
-    a = sim.begin(
+    a = sim.lifecycle.start(
         Turn(t=1.0, prompt=prefix + array("q", [7] * 16), out=0),
         "apps_a",
         task_name="chat",
     )
-    b = sim.begin(
+    b = sim.lifecycle.start(
         Turn(t=1.0, prompt=array("q", range(9000, 9200)), out=0),
         "apps_b",
         task_name="chat",
@@ -131,11 +133,11 @@ def test_concurrent_eviction_cannot_drop_locked_prefix():
     try:
         assert b.evicted >= 56, f"B 应当逼出淘汰，实际 {b.evicted}"
     finally:
-        sim.end(a)
-        sim.end(b)
+        sim.lifecycle.finish(a)
+        sim.lifecycle.finish(b)
 
     # P 仍在树上：再请求一次应命中 160
-    record = sim.request(Turn(t=2.0, prompt=prefix, out=0), "apps_c", task_name="chat")
+    record = sim.lifecycle.serve(Turn(t=2.0, prompt=prefix, out=0), "apps_c", task_name="chat")
     assert record.hit == 160
 
 
@@ -157,7 +159,7 @@ def test_concurrent_runs_are_deterministic():
         arrival_mode="poisson",
     )
     runs = [
-        Simulator(SimConfig(capacity=2048, seed=7)).run_scheduled(
+        Simulator(SimConfig(capacity=2048, seed=7)).run_closed_loop(
             sessions, [spec], service=SERVICE, max_inflight=0
         ).fingerprint()
         for _ in range(2)

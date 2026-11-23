@@ -23,10 +23,12 @@ import pytest
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, ROOT)
 
-from sim.engine import EngineConfig
-from sim.runner import SimConfig, Simulator
-from sim.schedule import ServiceModel, TaskSpec
-from sim.trace import Session, Turn
+from sim.core.config import SimConfig
+from sim.drivers.engine import EngineConfig
+from sim.simulator import Simulator
+from sim.workload.arrival import TaskSpec
+from sim.workload.service import ServiceModel
+from sim.workload.trace import Session, Turn
 
 # 100 tok/s prefill and 10 tok/s decode keep the expected wall times integral.
 SERVICE = ServiceModel(
@@ -193,8 +195,6 @@ def test_prefill_prefix_visible_while_request_is_decoding():
 
 def test_chunked_prefill_commits_intermediate_chunks_to_tree():
     """Chunked prefill 每完成一块即提交前缀到树并保持持锁，后续请求可直接命中已算块。"""
-    from sim.allocator import tree_tokens
-    from sim.engine import EngineSimulator
 
     sessions = [
         _session("apps_0", list(range(256)), out=0),
@@ -215,31 +215,38 @@ def test_chunked_prefill_commits_intermediate_chunks_to_tree():
     assert result.summary["emit"]["duplicate_insert_tokens"] == 0
 
     # 验证单步 chunked prefill 完成第 1 块后，树里已有 128 token 且被锁定保护
+    from sim.core.allocator import tree_tokens
+    from sim.drivers.engine import EngineScheduler
+
     sim = Simulator(SimConfig(capacity=4096, seed=1))
-    sim.prepare(width=256)
+    lc = sim.lifecycle
+    lc.prepare(width=256)
     single = [_session("apps_0", list(range(256)), out=0)]
-    eng = EngineSimulator(
-        sim,
+    eng = EngineScheduler(
+        lc,
         single,
         [_spec()],
         scheduler=EngineConfig(max_prefill_tokens=128, chunked_prefill_size=128),
         service=SERVICE,
     )
-    matched = sim._match(single[0].turns[0], "apps_0", rid="r0", task_name="chat")
-    sim.lock_matched(matched)
-    pending = sim._make_pending(matched, skipped=False, evicted=0)
-    sim.reserve_upto(pending, 128)
-    sim.commit_upto(pending, 128, chunked=True)
+    del eng
+    matched = lc.match(single[0].turns[0], "apps_0", rid="r0", task_name="chat")
+    lc.lock(matched)
+    pending = lc.new_pending(matched, skipped=False, evicted=0)
+    lc.reserve_upto(pending, 128)
+    lc.commit_upto(pending, 128, chunked=True)
     assert tree_tokens(sim.cache) == 128
     assert sim.cache.protected_size() == 128
     assert sim.inflight_tokens == 0
-    sim.end(pending)
+    lc.finish(pending)
     assert tree_tokens(sim.cache) == 256
     assert sim.cache.protected_size() == 0
 
 
 def test_lazy_decode_alloc_defers_output_allocation_and_eviction_to_decode_steps():
     """准入时仅占 prompt 槽位；output 槽位与触发的淘汰推迟到 decode 步进时刻发生。"""
+    from sim.drivers.engine import EngineScheduler
+
     sessions = [
         _session("apps_0", list(range(100)), out=0),
         _session("apps_1", list(range(500, 580)), out=40),
@@ -248,26 +255,8 @@ def test_lazy_decode_alloc_defers_output_allocation_and_eviction_to_decode_steps
 
     # 1) lazy_decode_alloc=True（默认）：s1 prefill 结束时仅用 100+80=180<=200，不淘汰 s0
     sim_lazy = Simulator(SimConfig(capacity=200, seed=1))
-    sim_lazy.prepare(width=200)
     evict_times_lazy = []
-    orig_evict = sim_lazy.cache.evict
-
-    def spy_evict(params):
-        evict_times_lazy.append(sim_lazy.clock())
-        return orig_evict(params)
-
-    # 通过 run_engine 验证，在 EngineSimulator 上挂钩观测
-    from sim.engine import EngineSimulator
-
-    eng_lazy = EngineSimulator(
-        sim_lazy,
-        sessions,
-        [spec],
-        scheduler=EngineConfig(max_prefill_tokens=4096, lazy_decode_alloc=True),
-        service=SERVICE,
-    )
-    # 跑 run_engine 并拦截 prepare 后的 cache.evict
-    orig_prepare = sim_lazy.prepare
+    orig_prepare = sim_lazy.lifecycle.prepare
 
     def hooked_prepare(width):
         orig_prepare(width)
@@ -279,19 +268,26 @@ def test_lazy_decode_alloc_defers_output_allocation_and_eviction_to_decode_steps
 
         sim_lazy.cache.evict = _spy
 
-    sim_lazy.prepare = hooked_prepare
-    res_lazy = eng_lazy.run(arrival_scale=1.0, wait_scale=1.0)
+    sim_lazy.lifecycle.prepare = hooked_prepare
+    res_lazy = EngineScheduler(
+        sim_lazy.lifecycle,
+        sessions,
+        [spec],
+        scheduler=EngineConfig(max_prefill_tokens=4096, lazy_decode_alloc=True),
+        service=SERVICE,
+    ).run(arrival_scale=1.0, wait_scale=1.0)
 
     assert res_lazy.records[1].session_id == "apps_1"
     assert res_lazy.records[1].evicted == 100
     assert res_lazy.records[1].used == 120
+    assert res_lazy.records[1].arrival_t == pytest.approx(1.0)
     # s1 在 t=1.0 开始 prefill，t=1.8 prefill 结束；21 个 decode token 后于 t=3.9 才越界淘汰
     assert evict_times_lazy and all(t > 1.8 for t in evict_times_lazy)
 
     # 2) 对照 lazy_decode_alloc=False：在 s1 准入瞬间 t=1.0 就立刻触发淘汰
     sim_eager = Simulator(SimConfig(capacity=200, seed=1))
     evict_times_eager = []
-    orig_prepare_e = sim_eager.prepare
+    orig_prepare_e = sim_eager.lifecycle.prepare
 
     def hooked_prepare_e(width):
         orig_prepare_e(width)
@@ -303,9 +299,9 @@ def test_lazy_decode_alloc_defers_output_allocation_and_eviction_to_decode_steps
 
         sim_eager.cache.evict = _spy
 
-    sim_eager.prepare = hooked_prepare_e
-    EngineSimulator(
-        sim_eager,
+    sim_eager.lifecycle.prepare = hooked_prepare_e
+    EngineScheduler(
+        sim_eager.lifecycle,
         sessions,
         [spec],
         scheduler=EngineConfig(max_prefill_tokens=4096, lazy_decode_alloc=False),

@@ -173,9 +173,10 @@ torch = pytest.importorskip("torch", reason="需要 torch 才能建真缓存")
 
 from array import array  # noqa: E402
 
+from sim.core.config import SimConfig  # noqa: E402
 from sim.opt_map import build_use_map, write_use_map  # noqa: E402
-from sim.runner import SimConfig, Simulator  # noqa: E402
-from sim.trace import Session, Turn  # noqa: E402
+from sim.simulator import Simulator  # noqa: E402
+from sim.workload.trace import Session, Turn  # noqa: E402
 
 
 def _tok(base, n):
@@ -233,7 +234,7 @@ def test_use_map_generation_matches_cache_hash(tmp_path):
             opt_use_map=str(path),
         )
     )
-    result = sim.run(sessions)
+    result = sim.run_replay(sessions)
     strategy = sim.cache.eviction_strategy
     assert type(strategy).__name__ == "OPTStrategy"
     # 关键：没有大面积 miss，说明 hash 与 TreeNode.hash_value 同源。
@@ -249,12 +250,12 @@ def test_opt_beats_lru_on_same_trace(tmp_path):
     write_use_map(str(path), build_use_map(sessions, page_size=8))
 
     lru = Simulator(SimConfig(capacity=96, page_size=8, eviction_policy="lru"))
-    lru_result = lru.run(sessions)
+    lru_result = lru.run_replay(sessions)
 
     opt = Simulator(
         SimConfig(capacity=96, page_size=8, eviction_policy="opt", opt_use_map=str(path))
     )
-    opt_result = opt.run(sessions)
+    opt_result = opt.run_replay(sessions)
 
     assert opt_result.hit_rate > lru_result.hit_rate, (
         f"OPT 应优于 LRU：opt={opt_result.hit_rate:.3f} lru={lru_result.hit_rate:.3f}"
@@ -287,7 +288,7 @@ def test_dataset_response_gets_finite_next_use(tmp_path):
             opt_use_map=str(path),
         )
     )
-    result = sim.run(sessions)
+    result = sim.run_replay(sessions)
     assert [record.hit for record in result.records] == [0, len(a) + len(r)]
     assert sim.cache.eviction_strategy._misses == 0
 
@@ -308,21 +309,22 @@ def test_dataset_response_gets_finite_next_use(tmp_path):
             eviction_policy="opt",
             opt_use_map=str(path),
         )
-    ).run(sentinel)
+    ).run_replay(sentinel)
     assert [record.hit for record in miss.records] == [0, len(a)]
 
 
 def test_opt_requires_use_map():
     with pytest.raises(ValueError, match="opt_use_map"):
-        Simulator(SimConfig(eviction_policy="opt", page_size=8)).run(_trace())
+        Simulator(SimConfig(eviction_policy="opt", page_size=8)).run_replay(_trace())
 
 
 # ---------------------------------------------------------------------------
 # 3. 闭环调度的 OPT 上界（冻结时间轴 + 覆盖 response 页）
 # ---------------------------------------------------------------------------
+from sim.core.request import MAX_SENTINEL_REQUESTS, OUTPUT_SENTINEL_BASE  # noqa: E402
 from sim.opt_map import use_map_from_run  # noqa: E402
-from sim.req import OUTPUT_SENTINEL_BASE, MAX_SENTINEL_REQUESTS  # noqa: E402
-from sim.schedule import ServiceModel, TaskSpec  # noqa: E402
+from sim.workload.arrival import TaskSpec  # noqa: E402
+from sim.workload.service import ServiceModel  # noqa: E402
 
 
 def test_sentinel_fits_hash_and_int32():
@@ -360,7 +362,7 @@ def test_closed_loop_freeze_and_opt_upper_bound(tmp_path):
     cfg = dict(capacity=96, page_size=8, seed=0, oversize="skip")
 
     lru = Simulator(SimConfig(eviction_policy="lru", **cfg))
-    run = lru.run_scheduled(sessions, specs, service=service, max_inflight=0)
+    run = lru.run_closed_loop(sessions, specs, service=service, max_inflight=0)
 
     assert sum(r.evicted for r in run.records) > 0, "这份 trace 必须有淘汰，否则测不到选择"
 
@@ -381,7 +383,7 @@ def test_closed_loop_freeze_and_opt_upper_bound(tmp_path):
     opt = Simulator(
         SimConfig(eviction_policy="opt", opt_use_map=str(path), **cfg)
     )
-    opt_result = opt.run(frozen)
+    opt_result = opt.run_replay(frozen)
     strategy = opt.cache.eviction_strategy
 
     assert strategy._misses == 0, (
@@ -412,7 +414,7 @@ def test_freeze_keeps_real_response_tokens(tmp_path):
 
     run = Simulator(
         SimConfig(capacity=4096, page_size=8, eviction_policy="lru")
-    ).run_scheduled(sessions, specs, service=service, max_inflight=0)
+    ).run_closed_loop(sessions, specs, service=service, max_inflight=0)
 
     frozen = run.freeze_sessions(sessions)
     assert list(frozen[0].turns[0].response) == list(r), "冻结丢了真实 response"
@@ -431,7 +433,7 @@ def test_use_map_from_run_requires_a_closed_loop_result(tmp_path):
     """开环 run 也能冻结（时刻就是 Turn.t），但缺 response 哨兵的表必须报错。"""
 
     sessions = _closed_loop_trace()
-    open_loop = Simulator(SimConfig(capacity=4096, page_size=8)).run(
+    open_loop = Simulator(SimConfig(capacity=4096, page_size=8)).run_replay(
         [
             Session(s.session_id, tuple(Turn(t=i + 1.0, prompt=tt.prompt, out=tt.out)
                                         for i, tt in enumerate(s.turns)), s.task_name)

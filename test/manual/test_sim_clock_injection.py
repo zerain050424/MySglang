@@ -98,7 +98,7 @@ def _clean_hooks():
 
 
 def _build(sym, *, now=None):
-    from sim.allocator import TokenAllocator
+    from sim.core.allocator import TokenAllocator
 
     return sym["HeterCacheRadixCache"].create_simulated(
         mock_allocator=TokenAllocator(4096),
@@ -165,7 +165,7 @@ def test_wrong_module_is_not_hooked():
 
 
 def test_real_heter_cache_follows_the_simulator_clock():
-    from sim import bootstrap
+    from sim.core import bootstrap
 
     sym = bootstrap.load()
     # 类已经 import 完了，匹配器不会回溯；直接对真实类执行同一段 hook
@@ -198,8 +198,8 @@ def test_real_heter_cache_follows_the_simulator_clock():
 
 
 def test_explicit_clock_is_not_overridden():
-    from sim import bootstrap
-    from sim.clock import VirtualClock
+    from sim.core import bootstrap
+    from sim.core.clock import VirtualClock
 
     sym = bootstrap.load()
     C_RadixCacheClockHook.hook(sym["RadixCache"])
@@ -214,7 +214,7 @@ def test_explicit_clock_is_not_overridden():
 
 
 def test_hook_is_idempotent():
-    from sim import bootstrap
+    from sim.core import bootstrap
 
     sym = bootstrap.load()
     C_RadixCacheClockHook.hook(sym["RadixCache"])

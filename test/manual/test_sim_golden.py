@@ -39,8 +39,9 @@ GOLDEN_PATH = HERE / "data" / "sim_golden.json"
 # 确定性测试负载（合成多类 + 手工带 response 多轮）
 # ---------------------------------------------------------------------------
 def _build_fixture():
-    from sim.schedule import ServiceModel, TaskSpec
-    from sim.trace import Session, Turn, synthetic_sessions
+    from sim.workload.arrival import TaskSpec
+    from sim.workload.service import ServiceModel
+    from sim.workload.trace import Session, Turn, synthetic_sessions
 
     raw_sessions = synthetic_sessions(
         seed=7,
@@ -213,9 +214,10 @@ def _canonical(obj: Any) -> Any:
 # 适配层：后续重构改 API 时，只改这里，不改场景清单与快照
 # ---------------------------------------------------------------------------
 def _run_scenario(case: Dict[str, Any]) -> Dict[str, Any]:
-    from sim.engine import EngineConfig
+    from sim.core.config import SimConfig
+    from sim.drivers.engine import EngineConfig
     from sim.opt_map import use_map_from_run, write_use_map
-    from sim.runner import SimConfig, Simulator
+    from sim.simulator import Simulator
 
     sessions, specs, service = _build_fixture()
     mode = case["mode"]
@@ -224,7 +226,7 @@ def _run_scenario(case: Dict[str, Any]) -> Dict[str, Any]:
         if not _native_hash_available():
             return {"skipped": "native_hash unavailable under CPU shim"}
         base_cfg = SimConfig(capacity=case["capacity"], page_size=case["page_size"], eviction_policy="lru", seed=7)
-        base_res = Simulator(base_cfg).run_scheduled(sessions, specs, service=service, max_inflight=0)
+        base_res = Simulator(base_cfg).run_closed_loop(sessions, specs, service=service, max_inflight=0)
         with tempfile.TemporaryDirectory() as tmp:
             umap_path = os.path.join(tmp, "use_map.json")
             write_use_map(umap_path, use_map_from_run(base_res, sessions, page_size=case["page_size"]))
@@ -235,7 +237,7 @@ def _run_scenario(case: Dict[str, Any]) -> Dict[str, Any]:
                 opt_use_map=umap_path,
                 seed=7,
             )
-            res = Simulator(opt_cfg).run(base_res.freeze_sessions(sessions))
+            res = Simulator(opt_cfg).run_replay(base_res.freeze_sessions(sessions))
         return _canonical({"fingerprint": res.fingerprint(), "summary": res.summary})
 
     cfg = SimConfig(
@@ -253,9 +255,9 @@ def _run_scenario(case: Dict[str, Any]) -> Dict[str, Any]:
     sim = Simulator(cfg)
 
     if mode == "replay":
-        res = sim.run(sessions)
+        res = sim.run_replay(sessions)
     elif mode == "closed":
-        res = sim.run_scheduled(
+        res = sim.run_closed_loop(
             sessions,
             specs,
             service=service,

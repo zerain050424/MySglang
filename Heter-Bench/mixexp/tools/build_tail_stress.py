@@ -46,27 +46,16 @@ REPO = pathlib.Path(os.environ.get("SIM_REPO", "/root/sg-unicache"))
 os.chdir(REPO)
 sys.path.insert(0, str(REPO))
 
-from sim.engine import EngineConfig  # noqa: E402
+from sim.core.config import SimConfig  # noqa: E402
+from sim.drivers.engine import EngineConfig  # noqa: E402
 from sim.opt_map import use_map_from_run, write_use_map  # noqa: E402
-from sim.runner import SimConfig, Simulator  # noqa: E402
-from sim.schedule import ServiceModel, TaskSpec  # noqa: E402
-from sim.trace import Session, Turn  # noqa: E402
-import sim.engine as ENG  # noqa: E402
+from sim.simulator import Simulator  # noqa: E402
+from sim.workload.arrival import TaskSpec  # noqa: E402
+from sim.workload.service import ServiceModel  # noqa: E402
+from sim.workload.trace import Session, Turn  # noqa: E402
 
 PAGE, RATE = 8, 8319.6
 T_END = 1200.0
-
-# 到达时刻靠 hook 抓：RequestRecord 只有派发时刻，排队时长得用 Queued.due 配对。
-ARRIVAL: dict = {}
-_orig_init = ENG._Queued.__init__
-
-
-def _init(self, turn, session_id, task_name, due, idx):
-    ARRIVAL[(session_id, idx)] = due
-    _orig_init(self, turn, session_id, task_name, due, idx)
-
-
-ENG._Queued.__init__ = _init
 
 
 def _tk(rng, n):
@@ -122,7 +111,6 @@ def pct(xs, p):
 
 def run_arm(sessions, specs, policy, cap, use_map=None, policy_config=None,
             chain_policy=None, regret_gate=None):
-    ARRIVAL.clear()
     sim = Simulator(SimConfig(capacity=cap, page_size=PAGE, eviction_policy=policy,
                               opt_use_map=use_map, policy_config=policy_config,
                               chain_policy=chain_policy, regret_gate=regret_gate,
@@ -138,7 +126,7 @@ def run_arm(sessions, specs, policy, cap, use_map=None, policy_config=None,
     for r in res.records:
         if r.skipped or r.turn < 0:
             continue
-        due = ARRIVAL.get((r.session_id, r.turn + 1))
+        due = r.arrival_t
         queue = max(0.0, r.t - due) if due is not None else 0.0
         miss = r.prompt_len - r.hit
         rows.append({"task": r.task_name, "plen": r.prompt_len, "hit": r.hit,

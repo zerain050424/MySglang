@@ -46,6 +46,8 @@ class RequestRecord:
     # 两者不再相等（命中比 miss 浅时 compute_saving < hit_rate）。
     total_cost: float = 0.0
     saved_cost: float = 0.0
+    # 到达调度时刻，不参与 line() 指纹计算，供排队延迟统计直接读取。
+    arrival_t: Optional[float] = None
 
     @property
     def hit_rate(self) -> float:
@@ -138,7 +140,7 @@ class SimResult:
         Raises:
             ValueError: 有轮次没有派发时刻（run 不是逐轮驱动的，或传错了 trace）。
         """
-        from sim.trace import Session, Turn
+        from sim.workload.trace import Session, Turn
 
         missing: List[Tuple[str, int]] = []
         frozen = []

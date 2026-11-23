@@ -15,11 +15,13 @@ REPO = pathlib.Path(os.environ.get("SIM_REPO", _HERE.parents[3]))  # 仓库根
 os.chdir(REPO)
 sys.path.insert(0, str(REPO)); sys.path.insert(0, str(REPO / "python"))
 
-from sim.runner import SimConfig, Simulator
-from sim.session_data import load_tasks
-from sim.schedule import ServiceModel, TaskSpec
-from sim.engine import EngineConfig
+from sim.core.config import SimConfig
+from sim.drivers.engine import EngineConfig
 from sim.opt_map import use_map_from_run, write_use_map
+from sim.simulator import Simulator
+from sim.workload.service import ServiceModel
+from sim.workload.arrival import TaskSpec
+from sim.workload.session_data import load_tasks
 
 PAGE = int(os.environ.get("PAGE", "8"))
 CAP = int(os.environ.get("CAP", "198000"))

@@ -34,6 +34,7 @@ class Matched(msgspec.Struct, frozen=True, kw_only=True):
     session_type: str
     task_name: str
     turn: int = -1
+    arrival_t: Optional[float] = None
 
 
 @dataclass
@@ -57,6 +58,7 @@ class Pending:
     response_token: int = 0
     allocated_len: int = 0
     committed_len: int = 0
+    arrival_t: Optional[float] = None
 
 
 class RequestLifecycle:
@@ -131,6 +133,7 @@ class RequestLifecycle:
         rid: Optional[str] = None,
         task_name: str = "",
         turn_idx: int = -1,
+        arrival_t: Optional[float] = None,
     ) -> Matched:
         """推进虚拟时钟并执行前缀匹配，不加锁、不触发淘汰或占槽。"""
         self._require_prepared()
@@ -177,6 +180,7 @@ class RequestLifecycle:
             session_type=session_type,
             task_name=task_name,
             turn=int(turn_idx),
+            arrival_t=arrival_t,
         )
 
     def new_pending(
@@ -203,6 +207,7 @@ class RequestLifecycle:
             ),
             allocated_len=matched.hit,
             committed_len=matched.hit,
+            arrival_t=matched.arrival_t,
         )
 
     def lock(self, matched: Matched) -> None:
@@ -332,10 +337,18 @@ class RequestLifecycle:
         rid: Optional[str] = None,
         task_name: str = "",
         turn_idx: int = -1,
+        arrival_t: Optional[float] = None,
     ) -> Pending:
         """执行匹配与全量预留；落树推迟到 finish()，保留在飞期间的竞态与锁保护窗口。"""
         return self.admit(
-            self.match(turn, session_id, rid, task_name, turn_idx=turn_idx)
+            self.match(
+                turn,
+                session_id,
+                rid,
+                task_name,
+                turn_idx=turn_idx,
+                arrival_t=arrival_t,
+            )
         )
 
     def finish(self, pending: Pending) -> RequestRecord:
@@ -392,6 +405,7 @@ class RequestLifecycle:
             response_token=pending.response_token,
             total_cost=total_cost,
             saved_cost=saved_cost,
+            arrival_t=pending.arrival_t,
         )
         self.records.append(record)
         return record
@@ -403,10 +417,18 @@ class RequestLifecycle:
         rid: Optional[str] = None,
         task_name: str = "",
         turn_idx: int = -1,
+        arrival_t: Optional[float] = None,
     ) -> RequestRecord:
         """立即执行并结束单轮请求，用于无并发开环回放。"""
         return self.finish(
-            self.start(turn, session_id, rid, task_name, turn_idx=turn_idx)
+            self.start(
+                turn,
+                session_id,
+                rid,
+                task_name,
+                turn_idx=turn_idx,
+                arrival_t=arrival_t,
+            )
         )
 
     def assert_balanced(self, where: str = "") -> None:
