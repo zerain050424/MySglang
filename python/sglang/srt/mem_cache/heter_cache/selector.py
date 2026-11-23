@@ -67,7 +67,14 @@ def pick_victim(*, strategy, leaves):
     order = strategy.queue_order()
     if gate is not None:
         passed = [queue for queue in order if not gate.abstain(queue, order)]
-        if not passed:
+        abstained_any = len(passed) < len(order)
+        early_priced = (
+            priced is not None
+            and getattr(gate.params, "early_priced", True)
+            and abstained_any
+            and len(passed) <= 1
+        )
+        if not passed or early_priced:
             return _pick_all_abstained(strategy, leaves, order, gate, priced)
     else:
         passed = order

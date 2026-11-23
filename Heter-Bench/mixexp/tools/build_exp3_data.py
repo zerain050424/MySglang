@@ -113,14 +113,27 @@ class TaskSpec:
         return None
 
 
+def _multi_turn_min_from_source() -> int:
+    """从 heter_cache/utils.py 源码读 MULTI_TURN_MIN（与 drop_short_sessions 同口径）。"""
+    import re
+    txt = (BENCH_DIR.parent / "python" / "sglang" / "srt" / "mem_cache" /
+           "heter_cache" / "utils.py").read_text(encoding="utf-8")
+    m = re.search(r"^\s*MULTI_TURN_MIN\s*=\s*(\d+)", txt, re.M)
+    return int(m.group(1)) if m else 5
+
+
+MULTI_TURN_MIN = _multi_turn_min_from_source()
+
+
 SPECS: Dict[str, TaskSpec] = {
     # chat：8 轮均值，其中 20% 取 10–15 轮。
-    # 源用 prepare_data.sh 产出的 mt5（已剔除轮数 < MULTI_TURN_MIN 的会话）——
+    # 源用 prepare_data.sh 产出的 mt<N>（N = heter_cache/utils.py 的 MULTI_TURN_MIN）——
     # 否则那些 1–4 轮会话终身判 TRANS，会挤占 one-shot 带、把 chat 的命中率压下去。
+    # 写死 mt5 是旧口径（上游 MULTI_TURN_MIN=5），W1 已改为 2。
     "chat": TaskSpec(
         name="chat",
         source="SharedGPT-multi-turn/Qwen2.5-7B-Instruct/"
-               "ShareGPT_cleaned_valid_deduplicated_session_data.nosys.mt5.jsonl",
+               f"ShareGPT_cleaned_valid_deduplicated_session_data.nosys.mt{MULTI_TURN_MIN}.jsonl",
         target=800,
         buckets=[(6, 8, 0.80), (10, 15, 0.20)],
     ),

@@ -53,7 +53,8 @@ class HeterCacheRadixCache(RadixCache):
         if regret is not None:
             self._stamp_eviction(victim, victim, len(victim.value), 1)
         rgate = getattr(self, "_rgate", None)
-        if rgate is not None:
+        # Stage 0 (one_shot) 清理不计入控制平面的后悔门，避免老化/豁免淘汰污染 R_q。
+        if rgate is not None and source != "one_shot":
             key = self._breakpoint_key(victim, rgate.params.context)
             rgate.on_evict(
                 key=key,

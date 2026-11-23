@@ -29,6 +29,18 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parents[2]      # Heter-Bench/
+
+
+def _multi_turn_min_from_source() -> int:
+    """从 heter_cache/utils.py 源码读 MULTI_TURN_MIN（与 drop_short_sessions 同口径）。"""
+    import re
+    txt = (HERE.parent / "python" / "sglang" / "srt" / "mem_cache" /
+           "heter_cache" / "utils.py").read_text(encoding="utf-8")
+    m = re.search(r"^\s*MULTI_TURN_MIN\s*=\s*(\d+)", txt, re.M)
+    return int(m.group(1)) if m else 5
+
+
+MULTI_TURN_MIN = _multi_turn_min_from_source()
 ROOT = HERE.parent                               # repo root
 
 # 时间轴（虚拟秒）：warmup 300 + 3×phase + cooldown 300。phase 长度由 --phase-s 给
@@ -83,8 +95,9 @@ CLASSES = {
     ),
     "agentic": dict(
         task="AgentBank_alfred",
+        # mt<N> 动态取值：W1 的 MULTI_TURN_MIN=2（旧上游是 5，写死会找不到文件）
         src="TaskData/AgentBankData/Qwen2.5-7B-Instruct/"
-            "AgentBank_alfred_scale_5000_session_data.nosys.mt5.jsonl",
+            f"AgentBank_alfred_scale_5000_session_data.nosys.mt{MULTI_TURN_MIN}.jsonl",
         mu=1.81, sigma=1.092, min_turns=20, max_turns=40,
     ),
 }

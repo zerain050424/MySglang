@@ -145,8 +145,13 @@ def main() -> int:
         print("dry-run：未写入")
         return 0
     if not turns_changed:
-        print("未写入：无变化", file=sys.stderr)
-        return 1
+        # 解析全部成功（sessions/turns 都读到了）但 0 轮含 system ⇒ 源本来就干净
+        # 或已被处理过（工具文案也是这么说的）。这不该算失败：否则 codeparrot 这类
+        # 本就没有 Qwen system 的源永远过不了，prepare_data.sh 也无法幂等重跑。
+        # 真正的解析静默失效（格式错、num_turns 读不到）在上面的 per-line 分支已经
+        # exit 1 拦住了。
+        print("未写入：源无 system 段（干净或已处理），视为成功", file=sys.stderr)
+        return 0
 
     dst.parent.mkdir(parents=True, exist_ok=True)
     dst.write_text("\n".join(records) + "\n", encoding="utf-8")

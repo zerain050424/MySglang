@@ -290,7 +290,7 @@ def main() -> None:
     p.add_argument("--floor", type=int, default=8192)
     p.add_argument("--weight", type=float, default=0.02)
     p.add_argument("--gate", default="multiturn")
-    p.add_argument("--rg-k", type=float, default=0.6)
+    p.add_argument("--rg-k", type=float, default=1.2)
     p.add_argument("--rg-rmin", type=float, default=0.3)
     p.add_argument("--pf-beta", type=float, default=1.0)
     p.add_argument("--records-dir", default=str(BENCH_DIR / "mixexp" / "result" / "sim_exp3_records"),

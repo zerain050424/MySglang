@@ -109,14 +109,14 @@ class RegretGate:
         return self._rg_sum.get(queue, 0) / evicted
 
     def abstain(self, queue: str, order: List[str]) -> bool:
-        """弃权判定：R_q >= max(r_min, k * 已采样队列中位数)；已采样队列 < 2 时不弃权。"""
+        """弃权判定：R_q >= r_min 且 R_q > k * 同侪中位数（排除自身）；无同侪采样时不弃权。"""
         r_q = self.r(queue)
         if r_q is None or r_q < self.params.r_min:
             return False
-        sampled = [self.r(q) for q in order if self.sampled(q)]
-        if len(sampled) < 2:
+        peers = [self.r(q) for q in order if q != queue and self.sampled(q)]
+        if not peers:
             return False
-        if r_q > self.params.k * median(sampled):
+        if r_q > self.params.k * median(peers):
             self.abstains[queue] = self.abstains.get(queue, 0) + 1
             return True
         return False

@@ -27,5 +27,5 @@ SIM_REPO="$REPO_ROOT" PYTHONPATH="$REPO_ROOT:$REPO_ROOT/python" \
     --cap "$CAP" \
     --arms "$ARMS" \
     --floor 8192 --weight 0.02 --gate multiturn \
-    --rg-k 0.6 --rg-rmin 0.3 --pf --pf-beta 1.0 \
+    --rg-k 1.2 --rg-rmin 0.3 --pf --pf-beta 1.0 \
     "$@"

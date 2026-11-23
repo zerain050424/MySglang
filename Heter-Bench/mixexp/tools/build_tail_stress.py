@@ -228,12 +228,17 @@ def main(argv=None):
         "priced_fallback": a.pf, "floor_tokens": a.pf_floor,
         "weight": a.pf_weight, "beta": a.pf_beta,
     }
+    base_lru = base_lru_rows = None
     for arm in [x for x in a.arms.split(",") if x]:
         if arm != "opt":
             cfg = chain_cfg if arm == "chain_lru" else None
-            cp = heter_chain_cfg if arm in ("heter_chain", "heter_full") else None
-            rgc = rgate_cfg if arm in ("heter_rgate", "heter_full") else None
-            real = "heter_cache" if arm in ("heter_chain", "heter_rgate", "heter_full") else arm
+            # heter_rgate_chain = 后悔门 + 队内 ChainEvict（与 exp3/drift3 同名臂对齐）
+            cp = heter_chain_cfg if arm in ("heter_chain", "heter_full",
+                                            "heter_rgate_chain") else None
+            rgc = rgate_cfg if arm in ("heter_rgate", "heter_full",
+                                       "heter_rgate_chain") else None
+            real = "heter_cache" if arm in ("heter_chain", "heter_rgate", "heter_full",
+                                            "heter_rgate_chain") else arm
             res, rows = run_arm(sessions, specs, real, a.cap, policy_config=cfg,
                                 chain_policy=cp, regret_gate=rgc)
             if a.records_dir:
@@ -244,6 +249,12 @@ def main(argv=None):
             if arm == "lru":
                 base_lru = res
             continue
+        if base_lru is None:
+            # opt 排在最前（没有 lru 臂建基线）时先补跑一次 lru 作为时间轴来源，
+            # 不进 out（不占臂位），但留着供末尾自检使用。
+            base_lru, base_lru_rows = run_arm(sessions, specs, "lru", a.cap)
+            print(f"  [baseline] 补跑 lru 作为 OPT 时间轴来源 "
+                  f"hit={base_lru.hit_rate:.4f}", flush=True)
         src, live = base_lru, [s for s in sessions
                                if (s.session_id, 0) in base_lru.dispatched]
         for it in range(1, 5):
@@ -263,10 +274,17 @@ def main(argv=None):
         out["opt"] = report("opt (Belady 上界)", res, rows)
         out["opt"]["time_axis_residual"] = ndiff
 
-    lru_p90 = out["lru"]["ttft_ms"]["p90"]
+    lru_rep = out.get("lru")
+    if lru_rep is None and base_lru is not None:
+        # 臂列表没显式跑 lru：用 OPT 懒基线补上自检口径（不写回 out）
+        lru_rep = report("lru (OPT 时间轴基线)", base_lru, base_lru_rows)
+    if lru_rep is None:
+        print("\n[自检] 跳过：本次没有任何 lru 运行可作为基线", flush=True)
+        return 0
+    lru_p90 = lru_rep["ttft_ms"]["p90"]
     opt_p90 = out.get("opt", {}).get("ttft_ms", {}).get("p90")
-    cold_p90 = out["lru"]["cold"]["p90_ms"]
-    warm_whole = out["lru"]["warm"]["whole_loss_pct"]
+    cold_p90 = lru_rep["cold"]["p90_ms"]
+    warm_whole = lru_rep["warm"]["whole_loss_pct"]
     print("\n[自检] cold p90 "
           f"{cold_p90:.0f}ms（≤300 ⇒ 无排队积压）｜warm 整链丢失 {warm_whole:.1f}%（≥50 ⇒ 缺陷触发）"
           + (f"｜LRU/OPT P90 = {lru_p90 / opt_p90:.1f}×（≥3 ⇒ 有可回收空间）" if opt_p90 else ""))

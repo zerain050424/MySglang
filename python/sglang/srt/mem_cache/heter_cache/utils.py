@@ -409,6 +409,7 @@ class RegretGateParams:
     max_stamps: int = 200_000
     context: int = 16
     priced_fallback: bool = False
+    early_priced: bool = True
     floor_tokens: int = 8192
     weight: float = 0.02
     beta: float = 1.0

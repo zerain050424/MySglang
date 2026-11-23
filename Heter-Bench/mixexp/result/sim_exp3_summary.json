@@ -1,0 +1,414 @@
+{
+  "scan": {
+    "opt": {
+      "hit_rate_pct": 38.5303,
+      "total_requests": 46712,
+      "prompt_tokens": 24818525,
+      "cached_tokens": 9562656,
+      "ttft_p50_ms": 46.75,
+      "ttft_p90_ms": 100.33,
+      "ttft_p99_ms": 193.66
+    },
+    "chain_lru": {
+      "hit_rate_pct": 37.0303,
+      "total_requests": 46712,
+      "prompt_tokens": 24818525,
+      "cached_tokens": 9190368,
+      "ttft_p50_ms": 47.3,
+      "ttft_p90_ms": 102.57,
+      "ttft_p99_ms": 211.5
+    },
+    "heter_rgate": {
+      "hit_rate_pct": 35.6688,
+      "total_requests": 46712,
+      "prompt_tokens": 24818525,
+      "cached_tokens": 8852464,
+      "ttft_p50_ms": 47.8,
+      "ttft_p90_ms": 104.83,
+      "ttft_p99_ms": 249.04,
+      "regret_gate_stats": {
+        "joins": 862,
+        "cheapest_pick": 0
+      },
+      "victim_overrides": {
+        "reuse:chat": {
+          "picks": 0,
+          "abstains": 0
+        },
+        "reuse:agentic": {
+          "picks": 0,
+          "abstains": 0
+        }
+      }
+    },
+    "heter_rgate_chain": {
+      "hit_rate_pct": 35.6688,
+      "total_requests": 46712,
+      "prompt_tokens": 24818525,
+      "cached_tokens": 8852464,
+      "ttft_p50_ms": 47.8,
+      "ttft_p90_ms": 104.83,
+      "ttft_p99_ms": 249.04,
+      "regret_gate_stats": {
+        "joins": 862,
+        "cheapest_pick": 0
+      },
+      "victim_overrides": {
+        "reuse:chat": {
+          "picks": 0,
+          "abstains": 0
+        },
+        "reuse:agentic": {
+          "picks": 0,
+          "abstains": 0
+        },
+        "chain:chat": {
+          "picks": 0,
+          "abstains": 0
+        },
+        "chain:agentic": {
+          "picks": 0,
+          "abstains": 0
+        }
+      }
+    },
+    "lfu": {
+      "hit_rate_pct": 27.7323,
+      "total_requests": 46712,
+      "prompt_tokens": 24818525,
+      "cached_tokens": 6882752,
+      "ttft_p50_ms": 51.85,
+      "ttft_p90_ms": 117.14,
+      "ttft_p99_ms": 239.59
+    },
+    "fifo": {
+      "hit_rate_pct": 32.5768,
+      "total_requests": 46712,
+      "prompt_tokens": 24818525,
+      "cached_tokens": 8085088,
+      "ttft_p50_ms": 49.07,
+      "ttft_p90_ms": 110.32,
+      "ttft_p99_ms": 256.94
+    },
+    "slru": {
+      "hit_rate_pct": 28.147,
+      "total_requests": 46712,
+      "prompt_tokens": 24818525,
+      "cached_tokens": 6985672,
+      "ttft_p50_ms": 51.5,
+      "ttft_p90_ms": 117.62,
+      "ttft_p99_ms": 240.54
+    }
+  },
+  "struct": {
+    "opt": {
+      "hit_rate_pct": 83.6581,
+      "total_requests": 21141,
+      "prompt_tokens": 24822515,
+      "cached_tokens": 20766056,
+      "ttft_p50_ms": 26.61,
+      "ttft_p90_ms": 74.04,
+      "ttft_p99_ms": 144.1
+    },
+    "chain_lru": {
+      "hit_rate_pct": 83.0697,
+      "total_requests": 21141,
+      "prompt_tokens": 24822515,
+      "cached_tokens": 20620000,
+      "ttft_p50_ms": 26.93,
+      "ttft_p90_ms": 75.99,
+      "ttft_p99_ms": 158.61
+    },
+    "heter_rgate": {
+      "hit_rate_pct": 82.8629,
+      "total_requests": 21141,
+      "prompt_tokens": 24822515,
+      "cached_tokens": 20568648,
+      "ttft_p50_ms": 27.03,
+      "ttft_p90_ms": 76.33,
+      "ttft_p99_ms": 161.52,
+      "regret_gate_stats": {
+        "joins": 420,
+        "cheapest_pick": 0
+      },
+      "victim_overrides": {
+        "reuse:chat": {
+          "picks": 0,
+          "abstains": 0
+        },
+        "reuse:agentic": {
+          "picks": 0,
+          "abstains": 0
+        }
+      }
+    },
+    "heter_rgate_chain": {
+      "hit_rate_pct": 82.8629,
+      "total_requests": 21141,
+      "prompt_tokens": 24822515,
+      "cached_tokens": 20568648,
+      "ttft_p50_ms": 27.03,
+      "ttft_p90_ms": 76.33,
+      "ttft_p99_ms": 161.52,
+      "regret_gate_stats": {
+        "joins": 420,
+        "cheapest_pick": 0
+      },
+      "victim_overrides": {
+        "reuse:chat": {
+          "picks": 0,
+          "abstains": 0
+        },
+        "reuse:agentic": {
+          "picks": 0,
+          "abstains": 0
+        },
+        "chain:chat": {
+          "picks": 0,
+          "abstains": 0
+        },
+        "chain:agentic": {
+          "picks": 0,
+          "abstains": 0
+        }
+      }
+    },
+    "lfu": {
+      "hit_rate_pct": 74.5261,
+      "total_requests": 21141,
+      "prompt_tokens": 24822515,
+      "cached_tokens": 18499240,
+      "ttft_p50_ms": 32.99,
+      "ttft_p90_ms": 106.67,
+      "ttft_p99_ms": 226.58
+    },
+    "fifo": {
+      "hit_rate_pct": 82.4543,
+      "total_requests": 21141,
+      "prompt_tokens": 24822515,
+      "cached_tokens": 20467224,
+      "ttft_p50_ms": 27.23,
+      "ttft_p90_ms": 78.14,
+      "ttft_p99_ms": 172.58
+    },
+    "slru": {
+      "hit_rate_pct": 74.9596,
+      "total_requests": 21141,
+      "prompt_tokens": 24822515,
+      "cached_tokens": 18606856,
+      "ttft_p50_ms": 31.88,
+      "ttft_p90_ms": 106.52,
+      "ttft_p99_ms": 228.0
+    }
+  },
+  "chat": {
+    "opt": {
+      "hit_rate_pct": 81.5381,
+      "total_requests": 29622,
+      "prompt_tokens": 24838490,
+      "cached_tokens": 20252840,
+      "ttft_p50_ms": 23.05,
+      "ttft_p90_ms": 67.37,
+      "ttft_p99_ms": 150.9
+    },
+    "chain_lru": {
+      "hit_rate_pct": 68.0716,
+      "total_requests": 29622,
+      "prompt_tokens": 24838490,
+      "cached_tokens": 16907968,
+      "ttft_p50_ms": 27.59,
+      "ttft_p90_ms": 108.67,
+      "ttft_p99_ms": 261.41
+    },
+    "heter_rgate": {
+      "hit_rate_pct": 64.1461,
+      "total_requests": 29622,
+      "prompt_tokens": 24838490,
+      "cached_tokens": 15932920,
+      "ttft_p50_ms": 29.94,
+      "ttft_p90_ms": 125.82,
+      "ttft_p99_ms": 261.74,
+      "regret_gate_stats": {
+        "joins": 5751,
+        "cheapest_pick": 0,
+        "abstain_struct": 8544,
+        "abstain_chat": 1092,
+        "abstain_agentic": 146
+      },
+      "victim_overrides": {
+        "reuse:chat": {
+          "picks": 24299,
+          "abstains": 0
+        },
+        "reuse:agentic": {
+          "picks": 350,
+          "abstains": 0
+        }
+      }
+    },
+    "heter_rgate_chain": {
+      "hit_rate_pct": 63.9412,
+      "total_requests": 29622,
+      "prompt_tokens": 24838490,
+      "cached_tokens": 15882024,
+      "ttft_p50_ms": 29.94,
+      "ttft_p90_ms": 126.61,
+      "ttft_p99_ms": 261.37,
+      "regret_gate_stats": {
+        "joins": 5855,
+        "cheapest_pick": 0,
+        "abstain_struct": 8501,
+        "abstain_chat": 986,
+        "abstain_agentic": 498
+      },
+      "victim_overrides": {
+        "reuse:chat": {
+          "picks": 0,
+          "abstains": 0
+        },
+        "reuse:agentic": {
+          "picks": 0,
+          "abstains": 0
+        },
+        "chain:chat": {
+          "picks": 22539,
+          "abstains": 0
+        },
+        "chain:agentic": {
+          "picks": 283,
+          "abstains": 0
+        }
+      }
+    },
+    "lfu": {
+      "hit_rate_pct": 31.4255,
+      "total_requests": 29622,
+      "prompt_tokens": 24838490,
+      "cached_tokens": 7805632,
+      "ttft_p50_ms": 68.48,
+      "ttft_p90_ms": 194.41,
+      "ttft_p99_ms": 278.02
+    },
+    "fifo": {
+      "hit_rate_pct": 62.4561,
+      "total_requests": 29622,
+      "prompt_tokens": 24838490,
+      "cached_tokens": 15513144,
+      "ttft_p50_ms": 28.97,
+      "ttft_p90_ms": 140.1,
+      "ttft_p99_ms": 261.71
+    },
+    "slru": {
+      "hit_rate_pct": 32.206,
+      "total_requests": 29622,
+      "prompt_tokens": 24838490,
+      "cached_tokens": 7999496,
+      "ttft_p50_ms": 67.71,
+      "ttft_p90_ms": 195.94,
+      "ttft_p99_ms": 283.25
+    }
+  },
+  "agentic": {
+    "opt": {
+      "hit_rate_pct": 84.5418,
+      "total_requests": 18828,
+      "prompt_tokens": 25388657,
+      "cached_tokens": 21464024,
+      "ttft_p50_ms": 28.02,
+      "ttft_p90_ms": 77.14,
+      "ttft_p99_ms": 147.96
+    },
+    "chain_lru": {
+      "hit_rate_pct": 83.8161,
+      "total_requests": 18828,
+      "prompt_tokens": 25388657,
+      "cached_tokens": 21279776,
+      "ttft_p50_ms": 28.57,
+      "ttft_p90_ms": 79.22,
+      "ttft_p99_ms": 167.04
+    },
+    "heter_rgate": {
+      "hit_rate_pct": 83.284,
+      "total_requests": 18828,
+      "prompt_tokens": 25388657,
+      "cached_tokens": 21144680,
+      "ttft_p50_ms": 28.79,
+      "ttft_p90_ms": 81.58,
+      "ttft_p99_ms": 186.37,
+      "regret_gate_stats": {
+        "joins": 524,
+        "cheapest_pick": 0,
+        "abstain_struct": 3
+      },
+      "victim_overrides": {
+        "reuse:chat": {
+          "picks": 10,
+          "abstains": 0
+        },
+        "reuse:agentic": {
+          "picks": 0,
+          "abstains": 0
+        }
+      }
+    },
+    "heter_rgate_chain": {
+      "hit_rate_pct": 83.284,
+      "total_requests": 18828,
+      "prompt_tokens": 25388657,
+      "cached_tokens": 21144680,
+      "ttft_p50_ms": 28.79,
+      "ttft_p90_ms": 81.58,
+      "ttft_p99_ms": 186.37,
+      "regret_gate_stats": {
+        "joins": 524,
+        "cheapest_pick": 0,
+        "abstain_struct": 5
+      },
+      "victim_overrides": {
+        "reuse:chat": {
+          "picks": 0,
+          "abstains": 0
+        },
+        "reuse:agentic": {
+          "picks": 0,
+          "abstains": 0
+        },
+        "chain:chat": {
+          "picks": 12,
+          "abstains": 0
+        },
+        "chain:agentic": {
+          "picks": 0,
+          "abstains": 0
+        }
+      }
+    },
+    "lfu": {
+      "hit_rate_pct": 66.5166,
+      "total_requests": 18828,
+      "prompt_tokens": 25388657,
+      "cached_tokens": 16887680,
+      "ttft_p50_ms": 45.22,
+      "ttft_p90_ms": 152.69,
+      "ttft_p99_ms": 549.21
+    },
+    "fifo": {
+      "hit_rate_pct": 82.84,
+      "total_requests": 18828,
+      "prompt_tokens": 25388657,
+      "cached_tokens": 21031960,
+      "ttft_p50_ms": 29.04,
+      "ttft_p90_ms": 83.99,
+      "ttft_p99_ms": 198.78
+    },
+    "slru": {
+      "hit_rate_pct": 73.2143,
+      "total_requests": 18828,
+      "prompt_tokens": 25388657,
+      "cached_tokens": 18588128,
+      "ttft_p50_ms": 41.82,
+      "ttft_p90_ms": 122.69,
+      "ttft_p99_ms": 234.67
+    }
+  }
+}

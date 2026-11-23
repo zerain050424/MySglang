@@ -77,7 +77,23 @@ def build_tasks(plan_path, *, seed=42, reverse=False, only_slices=None, fixed_la
 
 
 def service_model():
-    calib = json.loads((REPO / "Uni-Bench/result/tailshot/calib_lru.json").read_text())
+    """标定文件缺失时回退默认值（与 sim_exp3_cells._service_model 同口径）。
+
+    calib_lru.json 是 tailshot 基准的实测服务模型（prefill 吞吐 / decode 速率 /
+    TTFT 截距），仿真器用它把 miss token 换算成 TTFT；丢了不影响逻辑，只影响
+    换算常数与旧报告的可比性。
+    """
+    calib = None
+    for p in (REPO / "Uni-Bench/result/tailshot/calib_lru.json",
+              REPO / "Heter-Bench/result/tailshot/calib_lru.json"):
+        if p.is_file():
+            calib = json.loads(p.read_text())
+            break
+    if calib is None:
+        print("[drift3] ⚠ 未找到 calib_lru.json，回退默认：prefill=8319.6 tok/s, decode=40 tok/s",
+              flush=True)
+        return ServiceModel(prefill_base_s=0.0, prefill_tokens_per_s=8319.6,
+                            decode_tokens_per_s=40.0)
     return ServiceModel(
         prefill_base_s=max(0.0, float(calib.get("ttft_intercept_ms", 0.0)) / 1000.0),
         prefill_tokens_per_s=float(calib["prefill_rate_tok_per_s"]),
@@ -429,6 +445,15 @@ def matrix(a, engine, service):
                                             for k, v in arm_rows[arm]["phases"].items()), flush=True)
                 continue
             # OPT：时间轴取自 lru（时间轴对策略敏感 → 迭代到固定点）
+            if base_res is None:
+                # 臂列表里 opt 排在最前（没有非 opt 臂建基线）时，先补跑一次 lru
+                # 作为时间轴来源；lru 不进 arm_rows，不占臂位。
+                base_res, _lru_info = run_once(sessions, specs, "lru",
+                                               engine=engine, service=service)
+                live = [s for s in sessions
+                        if (s.session_id, 0) in base_res.dispatched]
+                print(f"  [baseline] 补跑 lru 作为 OPT 时间轴来源 "
+                      f"hit={_lru_info['hit_rate']:.4f}", flush=True)
             src = base_res
             for it in range(1, 4):
                 p = str(out_root / f"use_map_{bg:g}x_s{a.seed}_it{it}.json")
@@ -510,7 +535,7 @@ def main(argv=None):
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--stationary", action="store_true", help="跑稳态构成对照")
     ap.add_argument("--reverse", action="store_true", help="跑逆序路径依赖对照")
-    ap.add_argument("--rg-k", type=float, default=0.6)
+    ap.add_argument("--rg-k", type=float, default=1.2)
     ap.add_argument("--rg-rmin", type=float, default=0.3)
     ap.add_argument("--pf-beta", type=float, default=1.0)
     ap.add_argument("--records-dir", default=str(REPO / "Heter-Bench" / "mixexp" / "result" / "sim_drift3_records"),

@@ -421,6 +421,53 @@ def test_chain_leaf_key_shared_with_chain_evict():
     hu.SessionRegistry.reset_global()
 
 
+def test_peer_median_and_early_priced():
+    """同侪中位数（排除自身）+ early_priced=True/False 路由对比。"""
+    print("[10] peer median abstain & early_priced routing")
+    now = [1000.0]
+    g = _gate(now, window_s=1_000_000.0, retain_s=2_000_000.0,
+              min_evicted=100, r_min=0.3, k=1.2,
+              priced_fallback=True, early_priced=True)
+    # struct R=0.8, chat R=0.2 → struct > 1.2 * 0.2 (0.24) 弃权，chat < r_min 不弃权
+    for i in range(10):
+        g.on_evict(key=6000 + i, queue="struct", span=1000)
+        g.on_evict(key=7000 + i, queue="chat", span=1000)
+    for i in range(8):
+        g.on_request(key=6000 + i)
+    for i in range(2):
+        g.on_request(key=7000 + i)
+
+    check(g.abstain("struct", ["struct", "chat"]) is True, "struct > 1.2 * peer(0.2)")
+    check(g.abstain("chat", ["struct", "chat"]) is False, "chat < r_min")
+
+    fb = ov.PricedFallback(g.params, g)
+    st = _FakeStrategy(["struct", "chat"], {"struct": "V-ST", "chat": "V-CH"}, gate=g)
+    st.priced_fallback = fb
+    st.node_tag = lambda n: hu.HeterCacheNodeTag.coerce(getattr(n, "queue_tag", None))
+    st.session_registry = None
+    leaf = _LeafNode(_FakeId.next(), 1000, 5.0, 0, None, None,
+                     tag=hu.HeterCacheNodeTag.QCHAT)
+    v1, s1 = qs.pick_victim(strategy=st, leaves=[leaf])
+    check(s1.startswith("priced:"), f"单队承压时 early_priced=True 走 priced: {s1}")
+
+    g_off = _gate(now, window_s=1_000_000.0, retain_s=2_000_000.0,
+                  min_evicted=100, r_min=0.3, k=1.2,
+                  priced_fallback=True, early_priced=False)
+    for i in range(10):
+        g_off.on_evict(key=6100 + i, queue="struct", span=1000)
+        g_off.on_evict(key=7100 + i, queue="chat", span=1000)
+    for i in range(8):
+        g_off.on_request(key=6100 + i)
+    for i in range(2):
+        g_off.on_request(key=7100 + i)
+    st_off = _FakeStrategy(["struct", "chat"], {"struct": "V-ST", "chat": "V-CH"}, gate=g_off)
+    st_off.priced_fallback = ov.PricedFallback(g_off.params, g_off)
+    st_off.node_tag = st.node_tag
+    st_off.session_registry = None
+    v2, s2 = qs.pick_victim(strategy=st_off, leaves=[leaf])
+    check(s2 == "value:chat", f"early_priced=False 仍回退剩余单队 value:chat: {s2}")
+
+
 if __name__ == "__main__":
     test_r_and_window()
     test_abstain_rule()
@@ -431,6 +478,7 @@ if __name__ == "__main__":
     test_priced_fallback_beta_weighting()
     test_priced_fallback_routing()
     test_chain_leaf_key_shared_with_chain_evict()
+    test_peer_median_and_early_priced()
     if FAILS:
         print(f"\n{len(FAILS)} FAILED")
         sys.exit(1)
