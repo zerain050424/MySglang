@@ -1,4 +1,4 @@
-"""仿真器薄门面：组合 RequestLifecycle 与三类执行驱动。"""
+"""仿真器：组合 RequestLifecycle 与三类执行驱动。"""
 
 from __future__ import annotations
 

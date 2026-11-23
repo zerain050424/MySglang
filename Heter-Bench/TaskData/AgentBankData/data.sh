@@ -12,14 +12,16 @@
 # =============================================================================
 set -eu
 UB="$(cd "$(dirname "$0")/../.." && pwd)"
-TOKENIZER="/root/autodl-tmp/model/Qwen2.5-7B-Instruct"
-PY="/root/sl_old/bin/python"
-AB_DIR="/root/autodl-tmp/TaskData/AgentBankData/AgentBank"   # huggingface-cli 下载的 repo
+source "$UB/scripts/config.sh"                     # 提供 MODEL 默认（显式 env 优先）
+PY="${PY:-python3}"                                # 需带 transformers + pandas 的环境
+TOKENIZER="${TOKENIZER:-$MODEL}"
+RAW_DIR="${RAW_DIR:-$UB/TaskData/raw}"
+AB_DIR="$RAW_DIR/AgentBank"                        # snapshot_download 展开的 repo
 OUT_DIR="$UB/TaskData/AgentBankData/Qwen2.5-7B-Instruct"
 mkdir -p "$OUT_DIR"
 cd "$UB/TaskData/AgentBankData"
 
-[ -d "$AB_DIR" ] || { echo "❌ 未找到 $AB_DIR ，请先运行 download_datasets.sh"; exit 1; }
+[ -d "$AB_DIR" ] || { echo "❌ 未找到 $AB_DIR ，请先运行 bash TaskData/download_datasets.sh agentbank"; exit 1; }
 
 # 1) parquet → 各 task 对话 JSON（只导 benchmark 需要的 alfred/apps/mind2web）
 $PY prepare_agentbank_data.py --agentbank-dir "$AB_DIR" --out-dir . \

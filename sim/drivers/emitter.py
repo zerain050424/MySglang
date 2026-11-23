@@ -1,4 +1,4 @@
-"""闭环多轮发射器驱动（virtual time 复刻 bench_heap.py）。"""
+"""闭环多轮发射器驱动"""
 
 from __future__ import annotations
 

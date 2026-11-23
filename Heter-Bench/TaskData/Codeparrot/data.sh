@@ -8,15 +8,17 @@
 # =============================================================================
 set -eu
 UB="$(cd "$(dirname "$0")/../.." && pwd)"
-TOKENIZER="/root/autodl-tmp/model/Qwen2.5-7B-Instruct"
-PY="/root/sl_old/bin/python"
-RAW="/root/autodl-tmp/TaskData/Codeparrot/test.jsonl"
+source "$UB/scripts/config.sh"                     # 提供 MODEL 默认（显式 env 优先）
+PY="${PY:-python3}"                                # 需带 transformers 的环境
+TOKENIZER="${TOKENIZER:-$MODEL}"
+RAW_DIR="${RAW_DIR:-$UB/TaskData/raw}"
+RAW="$RAW_DIR/Codeparrot/test.jsonl"
 ID_PREFIX="${ID_PREFIX:-Code-}"          # 可覆盖: ID_PREFIX=apps_ bash data.sh
 OUT_DIR="$UB/TaskData/Codeparrot/Qwen2.5-7B-Instruct"
 mkdir -p "$OUT_DIR"
 cd "$UB/TaskData/Codeparrot"
 
-[ -f "$RAW" ] || { echo "❌ 未找到 $RAW ，请先下载"; exit 1; }
+[ -f "$RAW" ] || { echo "❌ 未找到 $RAW ，请先运行 bash TaskData/download_datasets.sh apps"; exit 1; }
 
 # 1) 原始 jsonl → 单轮对话 JSON（只取 introductory 难度）
 $PY prepare_data.py --input "$RAW" --output Code.json --id-prefix "$ID_PREFIX"

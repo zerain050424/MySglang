@@ -1,4 +1,4 @@
-"""到达流规范与闭环多轮调度计划（对齐 bench_heap.py）。"""
+"""到达流规范与闭环多轮调度计划。"""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from sim.workload.trace import Session
 
 
 def stable_seed_from_str(s: str, base_seed: int = 0) -> int:
-    """将 session_id 映射为跨进程稳定的 32-bit 种子（对齐 bench_heap.py）。"""
+    """将 session_id 映射为跨进程稳定的 32-bit 种子。"""
     h = hashlib.sha256(s.encode()).hexdigest()
     return (int(h, 16) + base_seed) % (2**32 - 1)
 

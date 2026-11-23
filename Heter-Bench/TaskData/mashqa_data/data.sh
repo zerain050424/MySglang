@@ -7,14 +7,15 @@
 # =============================================================================
 set -eu
 UB="$(cd "$(dirname "$0")/../.." && pwd)"
-TOKENIZER="/root/autodl-tmp/model/Qwen2.5-7B-Instruct"
-PY="/root/sl_old/bin/python"
-RAW_DIR="/root/autodl-tmp/TaskData/mashqa_data"
+source "$UB/scripts/config.sh"                     # 提供 MODEL 默认（显式 env 优先）
+PY="${PY:-python3}"                                # 需带 transformers 的环境
+TOKENIZER="${TOKENIZER:-$MODEL}"
+RAW_DIR="${RAW_DIR:-$UB/TaskData/raw}"/mashqa_data
 OUT_DIR="$UB/TaskData/mashqa_data/Qwen2.5-7B-Instruct"
 mkdir -p "$OUT_DIR"
 cd "$UB/TaskData/mashqa_data"
 
-[ -f "$RAW_DIR/train_webmd_squad_v2_full.json" ] || { echo "❌ 未找到 raw 数据"; exit 1; }
+[ -f "$RAW_DIR/train_webmd_squad_v2_full.json" ] || { echo "❌ 未找到 raw 数据，请先运行 bash TaskData/download_datasets.sh mashqa"; exit 1; }
 
 # 1) 原始 JSON → 单轮对话 JSON
 $PY prepare_data.py --input-dir "$RAW_DIR" --output mashqa.json

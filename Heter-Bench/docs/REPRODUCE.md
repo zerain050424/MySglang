@@ -16,29 +16,82 @@
 | 原始数据集 | `/root/autodl-tmp/TaskData/`（下载脚本见 `download_datasets.sh`） |
 | server 启动环境 | `scripts/env.sh`（venv python + ninja PATH + LD_LIBRARY_PATH） |
 
-## 一、数据准备（每个负载一次）
+## 一、数据准备（一键：下载 + 处理）
+
+### 0. 一键入口（新环境推荐）
+
+```bash
+# 下载侧依赖（无 torch/tokenizer）
+pip install -U huggingface_hub
+
+# 处理侧需要带 transformers 的 python（AgentBank 另需 pandas）。
+# 不设则默认 python3；TOKENIZER 默认取 scripts/config.sh 的 MODEL（可被环境变量覆盖）。
+bash TaskData/prepare_all.sh
+
+# 常用变体：
+SKIP_DOWNLOAD=1 bash TaskData/prepare_all.sh          # 原始数据已就绪，只跑处理
+DATASETS="sharegpt apps" bash TaskData/prepare_all.sh # 只下指定数据集
+RAW_DIR=/data/raw bash TaskData/prepare_all.sh        # 原始数据放别处
+PY=/root/sl_old/bin/python bash TaskData/prepare_all.sh # 指定处理侧 python
+```
+
+`prepare_all.sh` = `download_datasets.sh`（huggingface_hub，断点续传，
+默认 `HF_ENDPOINT=https://hf-mirror.com`）→ 依序跑四个 `data.sh`（sharegpt/
+apps/agentbank/mashqa），任一失败即停，重复跑幂等（已存在且大小合理的原始文件跳过下载）。
+
+原始数据落位（默认 `TaskData/raw/`）：
+
+| 数据集 | HF 来源 | 落位 | 处理产物 |
+|---|---|---|---|
+| ShareGPT | `anon8231489123/ShareGPT_Vicuna_unfiltered` 单文件 | `raw/SharedGPT-multi-turn/` | `ShareGPT_cleaned_valid_deduplicated_session_data.jsonl` |
+| Codeparrot(APPS) | `codeparrot/apps` 的 `test.jsonl` (~1.29GB) | `raw/Codeparrot/` | `Code_session_data.jsonl` |
+| AgentBank | `Solaris99/AgentBank` 整仓 parquet | `raw/AgentBank/` | `AgentBank_apps/alfred_scale_5000_session_data.jsonl` |
+| MASHQA | `VivekNaga/Medicaldata` 三个 `_full.json` | `raw/mashqa_data/` | `mashqa_session_data.jsonl` |
+
+### 0.1 单独跑某个环节
+
+```bash
+bash TaskData/download_datasets.sh sharegpt apps agentbank mashqa   # 只下载
+bash TaskData/SharedGPT-multi-turn/data.sh   # 只处理（路径已改为 env：PY/TOKENIZER/RAW_DIR）
+bash TaskData/Codeparrot/data.sh
+bash TaskData/AgentBankData/data.sh
+bash TaskData/mashqa_data/data.sh
+```
+
+### 环境注意
+
+- 处理侧 python 只需 `transformers`（tokenizer）+ `pandas`（AgentBank），不需要 torch/sglang；
+  本机 base conda 的 huggingface-hub 1.33 与 transformers `<1.0` 冲突时，自备一个干净 venv
+  并用 `PY=<venv>/bin/python` 指定。
+- `TOKENIZER` 必须与 sglang server 加载的模型一致（默认同取 `scripts/config.sh` 的 MODEL），
+  否则 input_ids 错位全 miss。
+- 国内网络靠 `HF_ENDPOINT=https://hf-mirror.com`（下载脚本已默认）；hf_hub_download 会先
+  落 hub 缓存再拷到 local_dir，两处都要有 ~4GB 余量。
 
 ### 1. ShareGPT（多轮 chat 数据；实际队列由缓存状态机动态判断）
 ```bash
-# 前提：/root/autodl-tmp/TaskData/SharedGPT-multi-turn/ShareGPT_V3_unfiltered_cleaned_split.json 已下载
 bash TaskData/SharedGPT-multi-turn/data.sh
 # 产物: TaskData/SharedGPT-multi-turn/Qwen2.5-7B-Instruct/ShareGPT_cleaned_valid_deduplicated_session_data.jsonl
 ```
 
 ### 2. Codeparrot（结构化单轮数据；实际队列由缓存状态机动态判断）
 ```bash
-# 前提：/root/autodl-tmp/TaskData/Codeparrot/test.jsonl 已下载（已就绪）
 bash TaskData/Codeparrot/data.sh
 # 产物: TaskData/Codeparrot/Qwen2.5-7B-Instruct/Code_session_data.jsonl
 ```
 
 ### 3. AgentBank（agentic 多轮 + 单轮 API）
 ```bash
-# 前提：AgentBank parquet 已下载（已就绪）
 bash TaskData/AgentBankData/data.sh
 # 产物: TaskData/AgentBankData/Qwen2.5-7B-Instruct/
 #   AgentBank_alfred_scale_5000_session_data.jsonl   (alfred_* → MULTI_TURN_AGENTIC)
 #   AgentBank_apps_session_data.jsonl                (apps_* 仅为数据集命名空间)
+```
+
+### 4. MASHQA（结构化单轮长共享前缀；hybrid 四负载之外备用）
+```bash
+bash TaskData/mashqa_data/data.sh
+# 产物: TaskData/mashqa_data/Qwen2.5-7B-Instruct/mashqa_session_data.jsonl
 ```
 
 ## 二、起 server（heter_cache 实验组）
