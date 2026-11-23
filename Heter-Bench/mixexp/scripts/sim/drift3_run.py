@@ -8,7 +8,7 @@
     # 正式矩阵（gate 通过后再跑）
     python mixexp/scripts/sim/drift3_run.py --plan TaskData/drift3/bg_10.json --arms lru,heter_cache,opt
 """
-import argparse, collections, json, os, pathlib, statistics, sys, time
+import argparse, collections, dataclasses, json, os, pathlib, statistics, sys, time
 
 _HERE = pathlib.Path(__file__).resolve()            # Heter-Bench/mixexp/scripts/sim/
 REPO = pathlib.Path(os.environ.get("SIM_REPO", _HERE.parents[4]))  # 仓库根
@@ -85,9 +85,11 @@ def service_model():
     )
 
 
-def run_once(sessions, specs, policy, use_map=None, engine=None, service=None):
+def run_once(sessions, specs, policy, use_map=None, engine=None, service=None,
+             regret_gate=None, chain_policy=None, records_path=None):
     sim = Simulator(SimConfig(capacity=CAP, page_size=PAGE, eviction_policy=policy,
-                              opt_use_map=use_map, seed=42, oversize="skip"))
+                              opt_use_map=use_map, seed=42, oversize="skip",
+                              regret_gate=regret_gate, chain_policy=chain_policy))
     t0 = time.time()
     res = sim.run_engine(sessions, specs, scheduler=engine, service=service,
                          arrival_scale=1.0, wait_scale=1.0)
@@ -99,7 +101,42 @@ def run_once(sessions, specs, policy, use_map=None, engine=None, service=None):
             "steps": emit.get("steps"), "prefill_steps": emit.get("prefill_steps"),
             "send_lag_p99_ms": emit.get("send_lag_p99_ms"),
             "wall_s": round(time.time() - t0, 1)}
+    if getattr(st, "regret_gate", None) is not None:
+        info["regret_gate_stats"] = st.regret_gate.stats()
+    if records_path:
+        _dump_records(res, pathlib.Path(records_path))
     return res, info
+
+
+def _dump_records(res, out_path: pathlib.Path) -> None:
+    """逐请求记录落盘（发送端统计组件的输入，零探针：只读引擎已有 metric）。"""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8") as f:
+        for r in res.records:
+            d = dataclasses.asdict(r)
+            d["dispatch_t"] = res.dispatched.get((r.session_id, r.turn))
+            f.write(json.dumps(d, ensure_ascii=False) + "\n")
+
+
+_HG_FLOOR = 8192   # 锚下限先验 / pf floor（与 tail-stress 运行器同口径）
+_HG_WEIGHT = 0.02  # 缺口罚斜率
+
+
+def _rg_cfg(a) -> dict:
+    """后悔门 + PricedFallback（best_configs.md 档 A/B 推荐口径）。"""
+    return {
+        "enabled": True, "k": a.rg_k, "r_min": a.rg_rmin, "window_s": 120.0,
+        "priced_fallback": True, "floor_tokens": _HG_FLOOR,
+        "weight": _HG_WEIGHT, "beta": a.pf_beta,
+    }
+
+
+def _heter_chain_cfg() -> dict:
+    """heter 内队内 ChainEvict（ChainParams 生产默认）。"""
+    return {
+        "enabled": True, "floor_tokens": _HG_FLOOR, "weight": _HG_WEIGHT,
+        "min_gaps": 1, "tail_first": True, "expire_anchors": True,
+    }
 
 
 def slice_of(plan, t):
@@ -368,7 +405,22 @@ def matrix(a, engine, service):
         live = None
         for arm in a.arms.split(","):
             if arm != "opt":
-                res, info = run_once(sessions, specs, arm, engine=engine, service=service)
+                # 臂 → (真实策略, regret_gate, chain_policy) 映射；未列出的臂
+                # （lru/lfu/fifo/slru/heter_cache）按原名直通，不带额外配置。
+                policy, rg, cp = arm, None, None
+                if arm == "heter_rgate":
+                    # 后悔门 + ReuseScoreEvict（reuse 默认开）
+                    policy, rg = "heter_cache", _rg_cfg(a)
+                elif arm == "heter_rgate_chain":
+                    # 后悔门 + 队内 ChainEvict
+                    policy, rg, cp = "heter_cache", _rg_cfg(a), _heter_chain_cfg()
+                rec_path = ""
+                if a.records_dir:
+                    rec_path = str(pathlib.Path(a.records_dir)
+                                   / f"bg_{bg:g}_s{a.seed}" / f"{arm}.records.jsonl")
+                res, info = run_once(sessions, specs, policy, engine=engine,
+                                     service=service, regret_gate=rg,
+                                     chain_policy=cp, records_path=rec_path)
                 if base_res is None:
                     base_res, live = res, [s for s in sessions if (s.session_id, 0) in res.dispatched]
                 arm_rows[arm] = {"info": info, "phases": summarize_phases(plan, res)}
@@ -389,6 +441,11 @@ def matrix(a, engine, service):
                 if ndiff == 0:
                     break
                 src = res
+            if a.records_dir:
+                _dump_records(
+                    res,
+                    pathlib.Path(a.records_dir) / f"bg_{bg:g}_s{a.seed}" / "opt.records.jsonl",
+                )
             arm_rows["opt"] = {"info": dict(info, time_axis_iter=it, residual=ndiff),
                                "phases": summarize_phases(plan, res)}
             print(f"  {'opt':12s} hit={info['hit_rate']:.4f} iter={it} 残差={ndiff} "
@@ -453,6 +510,11 @@ def main(argv=None):
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--stationary", action="store_true", help="跑稳态构成对照")
     ap.add_argument("--reverse", action="store_true", help="跑逆序路径依赖对照")
+    ap.add_argument("--rg-k", type=float, default=0.6)
+    ap.add_argument("--rg-rmin", type=float, default=0.3)
+    ap.add_argument("--pf-beta", type=float, default=1.0)
+    ap.add_argument("--records-dir", default=str(REPO / "Heter-Bench" / "mixexp" / "result" / "sim_drift3_records"),
+                    help="逐请求 records.jsonl 落盘目录（空字符串关闭）")
     a = ap.parse_args(argv)
 
     engine = EngineConfig(schedule_policy="fcfs")

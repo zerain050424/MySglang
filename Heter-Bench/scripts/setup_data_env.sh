@@ -3,8 +3,11 @@
 # Heter-Bench 轻量数据处理环境初始化脚本
 #
 # 作用：创建专用轻量 venv 并安装数据下载、模型下载与分词所需依赖：
-#       huggingface_hub, modelscope, transformers, pandas
+#       huggingface_hub, modelscope, transformers, pandas, pyarrow, jinja2
 #       （不需要 torch/cuda/sglang 依赖，启动快、体积小、无版本冲突）
+#       pyarrow: AgentBank parquet 读取（pandas 缺 parquet 引擎会直接报错）
+#       jinja2:  transformers apply_chat_template 硬依赖，缺失时数据处理脚本
+#                逐样本静默 [skip]，产物空文件但流程照常打"完毕"横幅
 #
 # 用法（在 Heter-Bench 根目录执行）:
 #   bash scripts/setup_data_env.sh
@@ -59,6 +62,8 @@ echo "📦 更新 pip 并安装数据处理依赖..."
     modelscope \
     transformers \
     pandas \
+    pyarrow \
+    jinja2 \
     -i "$PIP_INDEX_URL"
 
 # 4) 校验环境完整性
@@ -68,11 +73,14 @@ import huggingface_hub
 import modelscope
 import transformers
 import pandas
+import pyarrow
 print('✅ 依赖加载正常:')
 print('   huggingface_hub:', huggingface_hub.__version__)
 print('   modelscope     :', modelscope.__version__)
 print('   transformers   :', transformers.__version__)
 print('   pandas         :', pandas.__version__)
+print('   pyarrow        :', pyarrow.__version__)
+print('   jinja2         :', __import__('jinja2').__version__)
 "
 
 echo "=============================================================="

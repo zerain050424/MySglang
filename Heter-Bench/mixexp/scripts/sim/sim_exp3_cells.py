@@ -34,10 +34,13 @@ for _p in (str(REPO), str(REPO / "python")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import yaml  # noqa: E402
+
 from sim.analysis.opt_map import use_map_from_run, write_use_map  # noqa: E402
 from sim.core.config import SimConfig  # noqa: E402
 from sim.drivers.engine import EngineConfig  # noqa: E402
 from sim.simulator import Simulator  # noqa: E402
+from sim.workload.arrival import TaskSpec  # noqa: E402
 from sim.workload.service import ServiceModel  # noqa: E402
 from sim.workload.session_data import load_tasks  # noqa: E402
 
@@ -47,6 +50,53 @@ def _pct(xs: list[float], p: float) -> float:
         return 0.0
     s = sorted(xs)
     return s[min(len(s) - 1, max(0, int(round(p / 100.0 * (len(s) - 1)))))]
+
+
+def _rg_cfg(args) -> dict:
+    """后悔门 + PricedFallback 配置（口径与 best_configs.md 档 A/B 一致）。"""
+    return {
+        "enabled": True,
+        "k": args.rg_k,
+        "r_min": args.rg_rmin,
+        "window_s": 120.0,
+        "priced_fallback": True,
+        "floor_tokens": args.floor,
+        "weight": args.weight,
+        "beta": args.pf_beta,
+    }
+
+
+def _heter_chain_cfg(args) -> dict:
+    """heter 内队内 ChainEvict 配置（ChainParams 生产默认）。"""
+    return {
+        "enabled": True,
+        "floor_tokens": args.floor,
+        "weight": args.weight,
+        "min_gaps": 1,
+        "tail_first": True,
+        "expire_anchors": True,
+    }
+
+
+def _dump_records(res, out_path: pathlib.Path) -> None:
+    """逐请求记录落盘（发送端统计组件的输入，零探针：只读引擎已有 metric）。"""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8") as f:
+        for r in res.records:
+            f.write(json.dumps({
+                "t": r.t,
+                "session_id": r.session_id,
+                "task_name": r.task_name,
+                "session_type": r.session_type,
+                "prompt_len": r.prompt_len,
+                "hit": r.hit,
+                "need": r.need,
+                "turn": r.turn,
+                "arrival_t": r.arrival_t,
+                "dispatch_t": res.dispatched.get((r.session_id, r.turn)),
+                "out_len": r.out_len,
+                "skipped": r.skipped,
+            }, ensure_ascii=False) + "\n")
 
 
 def _service_model() -> ServiceModel:
@@ -87,28 +137,53 @@ def _run_once(
         oversize="skip",
     )
     sim = Simulator(cfg)
-    return sim.run_engine(
+    res = sim.run_engine(
         sessions,
         specs,
         scheduler=EngineConfig(schedule_policy="fcfs", max_prefill_tokens=16384),
         service=svc,
     )
+    st = sim.cache.eviction_strategy
+    if getattr(st, "regret_gate", None) is not None:
+        # 供验收：后悔门确实生效（弃权/定价次数非零）
+        res.summary["regret_gate_stats"] = st.regret_gate.stats()
+        res.summary["victim_overrides"] = {
+            f"{name}:{q}": pol.stats()
+            for name, pol_map in (
+                ("reuse", getattr(st, "reuse_evicts", {})),
+                ("chain", getattr(st, "chain_evicts", {})),
+            )
+            for q, pol in pol_map.items()
+        }
+    return res
 
 
-def _summarize(res) -> dict:
-    ttfts = [
-        (r.finish_t - r.decode_tokens / 40.0 - r.arrival_t) * 1000.0
-        for r in res.records
-        if r.arrival_t is not None and r.finish_t is not None
-    ]
+def _summarize(res, svc: ServiceModel | None = None) -> dict:
+    # TTFT 口径（与 tail-stress / 设计文档一致）：
+    #   TTFT = (派发时刻 − 到达时刻) + (prompt_len − hit) / prefill 吞吐
+    # 修复说明：旧版用 r.finish_t，但 RequestRecord 没有该字段（一跑就崩），
+    # 且 decode 时长会双算——TTFT 本就不含 decode。
+    rate = svc.prefill_tokens_per_s if svc is not None else 8319.6
+    ttfts = []
+    for r in res.records:
+        if r.skipped or r.arrival_t is None or (r.session_id, r.turn) not in res.dispatched:
+            continue
+        wait = res.dispatched[(r.session_id, r.turn)] - r.arrival_t
+        ttfts.append((wait + (r.prompt_len - r.hit) / rate) * 1000.0)
+    served = [r for r in res.records if not r.skipped]
+    extra = {
+        k: res.summary[k] for k in ("regret_gate_stats", "victim_overrides")
+        if k in (res.summary or {})
+    }
     return {
         "hit_rate_pct": round(res.hit_rate * 100.0, 4),
         "total_requests": len(res.records),
-        "prompt_tokens": res.total_prompt_tokens,
-        "cached_tokens": res.total_cached_tokens,
+        "prompt_tokens": sum(r.prompt_len for r in served),
+        "cached_tokens": sum(r.hit for r in served),
         "ttft_p50_ms": round(_pct(ttfts, 50), 2),
         "ttft_p90_ms": round(_pct(ttfts, 90), 2),
         "ttft_p99_ms": round(_pct(ttfts, 99), 2),
+        **extra,
     }
 
 
@@ -119,7 +194,10 @@ def run_cell(cell: str, arms: list[str], args) -> dict:
             f"未找到负载配置: {tasks_yaml}\n"
             f"请先运行: python Heter-Bench/mixexp/tools/build_exp3_data.py --mix all --total-tokens 25e6"
         )
-    sessions, specs = load_tasks(str(tasks_yaml))
+    # 修复：旧版 load_tasks(str(yaml)) 与当前 sim API 不符；对齐 drift3 的加载方式
+    plan_tasks = yaml.safe_load(tasks_yaml.read_text(encoding="utf-8"))["tasks"]
+    sessions = load_tasks(plan_tasks, base_dir=str(BENCH_DIR))
+    specs = [TaskSpec.from_config(t) for t in plan_tasks]
     svc = _service_model()
     cell_res: dict[str, dict] = {}
     lru_res = None
@@ -149,19 +227,23 @@ def run_cell(cell: str, arms: list[str], args) -> dict:
                 svc=svc, eviction_policy="chain_lru", policy_config=chain_cfg,
             )
         elif arm == "heter_rgate":
-            rg_cfg = {
-                "enabled": True,
-                "k": args.rg_k,
-                "r_min": args.rg_rmin,
-                "window_s": 120.0,
-                "priced_fallback": True,
-                "floor_tokens": args.floor,
-                "weight": args.weight,
-                "beta": args.pf_beta,
-            }
+            # 后悔门 + ReuseScoreEvict（reuse.enabled 默认 True）
             res = _run_once(
                 sessions, specs, cap=args.cap, page=args.page, seed=args.seed,
-                svc=svc, eviction_policy="heter_cache", regret_gate=rg_cfg,
+                svc=svc, eviction_policy="heter_cache", regret_gate=_rg_cfg(args),
+            )
+        elif arm == "heter_rgate_chain":
+            # 后悔门 + 队内 ChainEvict（chain.enabled=True，挤掉 reuse 排序）
+            res = _run_once(
+                sessions, specs, cap=args.cap, page=args.page, seed=args.seed,
+                svc=svc, eviction_policy="heter_cache",
+                regret_gate=_rg_cfg(args), chain_policy=_heter_chain_cfg(args),
+            )
+        elif arm in ("lfu", "fifo", "slru"):
+            # 经典策略直通：eviction_policy 工厂表已注册，无需额外配置
+            res = _run_once(
+                sessions, specs, cap=args.cap, page=args.page, seed=args.seed,
+                svc=svc, eviction_policy=arm,
             )
         elif arm == "opt":
             if lru_res is None:
@@ -173,8 +255,8 @@ def run_cell(cell: str, arms: list[str], args) -> dict:
                 map_path = str(pathlib.Path(tmpdir) / "use_map.json")
                 prev_res = lru_res
                 for _it in range(3):
-                    umap = use_map_from_run(prev_res.records, sessions, page_size=args.page)
-                    write_use_map(umap, map_path, page_size=args.page)
+                    umap = use_map_from_run(prev_res, sessions, page_size=args.page)
+                    write_use_map(map_path, umap)
                     prev_res = _run_once(
                         sessions, specs, cap=args.cap, page=args.page, seed=args.seed,
                         svc=svc, eviction_policy="opt", opt_use_map=map_path,
@@ -183,8 +265,13 @@ def run_cell(cell: str, arms: list[str], args) -> dict:
         else:
             raise ValueError(f"未知实验臂: {arm}")
 
-        stats = _summarize(res)
+        stats = _summarize(res, svc)
         cell_res[arm] = stats
+        if args.records_dir:
+            _dump_records(
+                res,
+                pathlib.Path(args.records_dir) / cell / f"{arm}.records.jsonl",
+            )
         print(
             f"  [{arm:12s}] hit={stats['hit_rate_pct']:6.2f}%  "
             f"ttft(p50/p90/p99)={stats['ttft_p50_ms']:6.1f}/{stats['ttft_p90_ms']:6.1f}/{stats['ttft_p99_ms']:7.1f} ms"
@@ -206,6 +293,8 @@ def main() -> None:
     p.add_argument("--rg-k", type=float, default=0.6)
     p.add_argument("--rg-rmin", type=float, default=0.3)
     p.add_argument("--pf-beta", type=float, default=1.0)
+    p.add_argument("--records-dir", default=str(BENCH_DIR / "mixexp" / "result" / "sim_exp3_records"),
+                   help="逐请求 records.jsonl 落盘目录（空字符串关闭）")
     p.add_argument("--out", default=None, help="可选结果 JSON 输出路径")
     args = p.parse_args()
 

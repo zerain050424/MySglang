@@ -47,6 +47,27 @@ bash "$UB/TaskData/Codeparrot/data.sh"
 bash "$UB/TaskData/AgentBankData/data.sh"
 bash "$UB/TaskData/mashqa_data/data.sh"
 
+# 3) 产物校验：data.sh 对单样本错误会静默 [skip]，极端情况（如缺 jinja2）会
+#    全部跳过、产物 0 字节，但流程仍打出"完毕"横幅。在此兑底：
+#    主产物必须存在且非空，否则以非零码退出，不让静默退化溜过去。
+echo ""
+echo ">>> 校验 session_data 产物..."
+for f in \
+    "TaskData/AgentBankData/Qwen2.5-7B-Instruct/AgentBank_apps_session_data.jsonl" \
+    "TaskData/Codeparrot/Qwen2.5-7B-Instruct/Code_session_data.jsonl" \
+    "TaskData/SharedGPT-multi-turn/Qwen2.5-7B-Instruct/ShareGPT_cleaned_valid_deduplicated_session_data.jsonl" \
+    "TaskData/AgentBankData/Qwen2.5-7B-Instruct/AgentBank_alfred_scale_5000_session_data.jsonl" \
+    "TaskData/mashqa_data/Qwen2.5-7B-Instruct/mashqa_session_data.jsonl"; do
+    if [ -s "$UB/$f" ]; then
+        echo "  ✅ $f ($(wc -l < "$UB/$f") lines)"
+    else
+        echo "  ❌ 产物缺失或为空: $f" >&2
+        echo "     常见原因：数据处理 venv 缺依赖（jinja2/pyarrow），"
+        echo "     请先 bash scripts/setup_data_env.sh 并查看各 data.sh 日志中的 [skip]/ImportError。" >&2
+        exit 1
+    fi
+done
+
 echo ""
 echo "全部完成。hybrid 负载产物（供 configs/hybrid_tasks_config.yaml）:"
 echo "  TaskData/AgentBankData/Qwen2.5-7B-Instruct/AgentBank_apps_session_data.jsonl"

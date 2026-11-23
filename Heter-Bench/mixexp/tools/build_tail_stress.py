@@ -109,6 +109,14 @@ def pct(xs, p):
     return xs[min(len(xs) - 1, max(0, int(round(p / 100 * (len(xs) - 1)))))]
 
 
+def _dump_rows(rows, out_path: pathlib.Path) -> None:
+    """逐请求记录落盘（发送端统计组件的输入，零探针：只读 run_arm 已有 rows）。"""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8") as f:
+        for x in rows:
+            f.write(json.dumps(x, ensure_ascii=False) + "\n")
+
+
 def run_arm(sessions, specs, policy, cap, use_map=None, policy_config=None,
             chain_policy=None, regret_gate=None):
     sim = Simulator(SimConfig(capacity=cap, page_size=PAGE, eviction_policy=policy,
@@ -191,6 +199,8 @@ def main(argv=None):
                     help="heter_rgate：档 B——全弃权兑底换全局叶子定价")
     ap.add_argument("--pf-floor", type=int, default=8192, help="档 B：锚下限先验")
     ap.add_argument("--pf-weight", type=float, default=0.02, help="档 B：罚斜率")
+    ap.add_argument("--records-dir", default=str(pathlib.Path(__file__).resolve().parents[1] / "result" / "sim_tail_stress_records"),
+                    help="逐请求 records.jsonl 落盘目录（空字符串关闭）")
     ap.add_argument("--pf-beta", type=float, default=1.0, help="档 B：R 归因加权系数")
     ap.add_argument("--gate", default="rerode",
                     choices=["none", "rerode", "multiturn"],
@@ -226,6 +236,8 @@ def main(argv=None):
             real = "heter_cache" if arm in ("heter_chain", "heter_rgate", "heter_full") else arm
             res, rows = run_arm(sessions, specs, real, a.cap, policy_config=cfg,
                                 chain_policy=cp, regret_gate=rgc)
+            if a.records_dir:
+                _dump_rows(rows, pathlib.Path(a.records_dir) / f"{arm}.records.jsonl")
             if arm == "heter_rgate" and run_arm.last_gate_stats:
                 print("  [rgate]", run_arm.last_gate_stats, flush=True)
             out[arm] = report(arm, res, rows)
@@ -239,6 +251,8 @@ def main(argv=None):
                           use_map_from_run(src, live, page_size=PAGE))
             res, rows = run_arm(sessions, specs, "opt", a.cap,
                                 use_map="/tmp/tail_stress_use_map.json")
+            if a.records_dir:
+                _dump_rows(rows, pathlib.Path(a.records_dir) / f"opt_it{it}.records.jsonl")
             common = set(src.dispatched) & set(res.dispatched)
             ndiff = sum(1 for k in common
                         if abs(src.dispatched[k] - res.dispatched[k]) > 1e-9)

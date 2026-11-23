@@ -47,7 +47,8 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 MASHQA_FILES = [
     "train_webmd_squad_v2_full.json",
-    "test_webmd_squad_v2_full.json",
+    # test_webmd_squad_v2_full.json 上游仓库不存在（hf 与镜像均 404），
+    # prepare_data.py 对缺失文件自动跳过，无需下载。
     "val_webmd_squad_v2_full.json",
 ]
 
