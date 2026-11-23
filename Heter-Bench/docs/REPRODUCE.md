@@ -7,32 +7,60 @@
 > 发射器一并删除，仅作历史记录；当前驱动为 `scripts/bench_heap.py`（只支持
 > `--tasks-config`，无单负载 / 相位 / burst-pause 模式）。
 
-## 环境
+## 环境与工具链
 
-| 组件 | 位置 |
-|---|---|
-| HeterCache 部署 venv | `/root/sl_old`（python 3.12.3，torch 2.13.0，与 9-26 基线 pin 一致） |
-| 模型（tokenizer 必须一致） | `/root/autodl-tmp/model/Qwen2.5-7B-Instruct` |
-| 原始数据集 | `/root/autodl-tmp/TaskData/`（下载脚本见 `download_datasets.sh`） |
-| server 启动环境 | `scripts/env.sh`（venv python + ninja PATH + LD_LIBRARY_PATH） |
+仓库采用**双环境解耦**设计，彻底消除对特定云平台（如 AutoDL `/root/autodl-tmp`）的硬编码依赖：
 
-## 一、数据准备（一键：下载 + 处理）
+| 组件 | 默认位置 / 说明 | 准备脚本 |
+|---|---|---|
+| 轻量数据处理 venv | `.venv_data`（仅需 `transformers`/`pandas`/`modelscope`，无 CUDA/Torch 依赖） | `bash scripts/setup_data_env.sh` |
+| 基准模型与 Tokenizer | `models/Qwen2.5-7B-Instruct`（默认 ModelScope 国内高速免翻墙下载，支持 HF 镜像） | `bash scripts/download_model.sh` |
+| 原始数据集 | `TaskData/raw/`（断点续传，国内默认走 `https://hf-mirror.com`） | `bash TaskData/download_datasets.sh` |
+| SGLang 生产/评测 venv | `.venv_sglang`（完整 PyTorch + CUDA + FlashInfer + SGLang editable install） | `bash scripts/setup_sglang_env.sh` |
+| Server 启动环境配置 | `scripts/env.sh`（指定运行环境 `PY`、ninja `PATH` 与 `LD_LIBRARY_PATH`） | 手动配置或 source 虚拟环境 |
 
-### 0. 一键入口（新环境推荐）
+---
+
+## 零、新服务器一键全流程（推荐）
+
+在全新服务器克隆本仓库后，只需在 `Heter-Bench/` 目录下执行一条命令，即可按序自动完成「轻量数据环境创建 → 模型下载 → 数据集下载 → 4 个负载 session_data 生成」：
 
 ```bash
-# 下载侧依赖（无 torch/tokenizer）
-pip install -U huggingface_hub
+cd Heter-Bench
+bash scripts/init_pipeline.sh
+```
 
-# 处理侧需要带 transformers 的 python（AgentBank 另需 pandas）。
-# 不设则默认 python3；TOKENIZER 默认取 scripts/config.sh 的 MODEL（可被环境变量覆盖）。
+> **常用控制开关（支持断点续跑）：**
+> - `SOURCE=huggingface bash scripts/init_pipeline.sh`：模型下载改走 Hugging Face 镜像。
+> - `SKIP_VENV=1 bash scripts/init_pipeline.sh`：跳过环境创建，直接复用当前环境。
+> - `SKIP_MODEL=1 bash scripts/init_pipeline.sh`：跳过模型下载步骤。
+> - `SKIP_DOWNLOAD=1 bash scripts/init_pipeline.sh`：跳过数据集下载，仅重新跑 session_data 处理。
+
+---
+
+## 一、分步数据准备
+
+### 0. 准备数据环境与模型（若未使用一键流水线）
+
+```bash
+# 1. 创建轻量数据处理环境（仅需几十秒）
+bash scripts/setup_data_env.sh
+
+# 2. 下载 Qwen2.5-7B-Instruct 模型与 Tokenizer
+bash scripts/download_model.sh
+```
+
+### 0.1 运行数据准备入口
+
+```bash
+# 默认使用 .venv_data/bin/python 与 models/Qwen2.5-7B-Instruct：
 bash TaskData/prepare_all.sh
 
 # 常用变体：
 SKIP_DOWNLOAD=1 bash TaskData/prepare_all.sh          # 原始数据已就绪，只跑处理
 DATASETS="sharegpt apps" bash TaskData/prepare_all.sh # 只下指定数据集
 RAW_DIR=/data/raw bash TaskData/prepare_all.sh        # 原始数据放别处
-PY=/root/sl_old/bin/python bash TaskData/prepare_all.sh # 指定处理侧 python
+PY=/root/sl_old/bin/python bash TaskData/prepare_all.sh # 指定自定义 python
 ```
 
 `prepare_all.sh` = `download_datasets.sh`（huggingface_hub，断点续传，
