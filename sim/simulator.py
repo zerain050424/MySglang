@@ -9,7 +9,7 @@ from sim.core.lifecycle import RequestLifecycle
 from sim.drivers.emitter import ClosedLoopEmitter
 from sim.drivers.engine import EngineConfig, EngineScheduler
 from sim.drivers.replay import ReplayDriver
-from sim.metrics import SimResult
+from sim.analysis.metrics import SimResult
 from sim.workload.trace import Session, synthetic_sessions
 
 

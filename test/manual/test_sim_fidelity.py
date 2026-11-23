@@ -32,6 +32,17 @@ def test_sim_selfcheck_passes():
     assert "OK" in proc.stdout.splitlines()[-1]
 
 
+def test_fidelity_stress_report():
+    """在 CPU 下直接校验树拓扑不变量、reconcile 后账本一致性与复现指纹。"""
+    from sim.analysis.fidelity import run_fidelity
+    from sim.core.config import SimConfig
+
+    report = run_fidelity(SimConfig(capacity=2048, seed=11))
+    assert not report.violations, report.violations
+    assert report.ledger["exact_after_reconcile"], report.ledger
+    assert report.matched, "两次保真压测指纹不一致"
+
+
 def test_sim_selfcheck_is_reproducible():
     """两次独立进程的完整输出必须逐字相同（含全部指纹）。"""
 

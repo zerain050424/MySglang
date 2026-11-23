@@ -10,7 +10,7 @@ from typing import List, Optional, Sequence, Tuple
 
 from sim.core.lifecycle import RequestLifecycle
 from sim.drivers.common import build_emit_stats
-from sim.metrics import SimResult
+from sim.analysis.metrics import SimResult
 from sim.workload.arrival import ArrivalPlan, TaskSpec
 from sim.workload.service import ServiceModel
 from sim.workload.trace import Session, max_total_len

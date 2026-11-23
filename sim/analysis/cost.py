@@ -1,21 +1,4 @@
-"""Per-block prefill cost models used by compute-saving metrics.
-
-The unit is one cache block, matching ``SimConfig.page_size``: block 0 is the
-first page of the prompt, block ``p`` is the page at position ``p``. PrefixSim
-uses the same models; ``position`` / ``linear:A,B`` capture the fact that
-attention over a longer context makes deeper blocks more expensive to
-recompute.
-
-Supported specs:
-
-* ``uniform`` -- every block costs 1; compute saving equals hit ratio.
-* ``position`` -- block ``p`` costs ``1 + p`` (prefix length to reconstruct it).
-* ``linear:A,B`` -- ``A + B * p``.
-* ``table:FILE`` -- one non-negative integer per line; comments and blank lines
-  are skipped. Positions past the last line reuse the last value.
-* ``qwen3coder30b_blksz_16`` -- ``linear:865,2``, the measured Qwen3-Coder-30B
-  per-block prefill cost at 16-token blocks.
-"""
+"""块级 Prefill 重算代价模型（独立于驱动层与核心层）。"""
 
 from __future__ import annotations
 
@@ -23,7 +6,7 @@ from typing import List, Optional
 
 
 class CostModel:
-    """A parsed per-block prefill cost model."""
+    """按缓存块位置定义的 Prefill 计算代价模型。"""
 
     __slots__ = ("_a", "_b", "_spec", "_table")
 
@@ -48,6 +31,7 @@ class CostModel:
 
     @classmethod
     def parse(cls, spec: str) -> "CostModel":
+        """从配置串解析代价模型，支持 uniform / position / linear:A,B / table:FILE。"""
         text = spec.strip()
         lowered = text.lower()
         if lowered == "uniform":
@@ -77,6 +61,7 @@ class CostModel:
         )
 
     def cost(self, block_index: int) -> int:
+        """返回第 block_index 个缓存块的相对重算代价。"""
         index = int(block_index)
         if index < 0:
             raise ValueError(f"block index must be non-negative, got {block_index}")

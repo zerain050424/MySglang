@@ -14,8 +14,8 @@ from sim.core.clock import VirtualClock
 from sim.core.config import SimConfig, build_policy_config
 from sim.core.pricing import PromptPricer
 from sim.core.request import OUTPUT_SENTINEL_BASE, FakeReqToTokenPool, SimReq
-from sim.cost import CostModel
-from sim.metrics import RequestRecord, SimResult, summarize
+from sim.analysis.cost import CostModel
+from sim.analysis.metrics import RequestRecord, SimResult, summarize
 from sim.workload.trace import Turn
 
 
@@ -321,7 +321,7 @@ class RequestLifecycle:
             if self.config.oversize != "skip":
                 raise OutOfTokens(
                     f"{exc}（rid={matched.rid} total={total} hit={matched.hit} "
-                    f"need={need}）——请调大 capacity 或设置 SimConfig(oversize=\"skip\")"
+                    f"need={need}）：请调大 capacity 或设置 SimConfig(oversize=\"skip\")"
                 ) from exc
             self.skipped_requests += 1
             self.assert_balanced(where=f"skip({matched.rid})")

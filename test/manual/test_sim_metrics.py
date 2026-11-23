@@ -23,8 +23,8 @@ import pytest
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, ROOT)
 
+from sim.analysis.cost import CostModel  # noqa: E402
 from sim.core.config import SimConfig  # noqa: E402
-from sim.cost import CostModel  # noqa: E402
 from sim.simulator import Simulator  # noqa: E402
 from sim.workload.trace import Session, Turn  # noqa: E402
 

@@ -214,9 +214,9 @@ def _canonical(obj: Any) -> Any:
 # 适配层：后续重构改 API 时，只改这里，不改场景清单与快照
 # ---------------------------------------------------------------------------
 def _run_scenario(case: Dict[str, Any]) -> Dict[str, Any]:
+    from sim.analysis.opt_map import use_map_from_run, write_use_map
     from sim.core.config import SimConfig
     from sim.drivers.engine import EngineConfig
-    from sim.opt_map import use_map_from_run, write_use_map
     from sim.simulator import Simulator
 
     sessions, specs, service = _build_fixture()

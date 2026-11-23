@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import List, Tuple
 
-from sim.cost import CostModel
+from sim.analysis.cost import CostModel
 
 
 class PromptPricer:

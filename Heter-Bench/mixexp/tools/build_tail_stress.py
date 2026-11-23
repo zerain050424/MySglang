@@ -48,7 +48,7 @@ sys.path.insert(0, str(REPO))
 
 from sim.core.config import SimConfig  # noqa: E402
 from sim.drivers.engine import EngineConfig  # noqa: E402
-from sim.opt_map import use_map_from_run, write_use_map  # noqa: E402
+from sim.analysis.opt_map import use_map_from_run, write_use_map  # noqa: E402
 from sim.simulator import Simulator  # noqa: E402
 from sim.workload.arrival import TaskSpec  # noqa: E402
 from sim.workload.service import ServiceModel  # noqa: E402

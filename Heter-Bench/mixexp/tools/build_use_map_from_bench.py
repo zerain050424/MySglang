@@ -4,8 +4,8 @@
 OPT 上界的唯一输入是 ``{block_hash: [使用时刻]}``（``sim/opt_map.py``）。本脚本
 只做「时刻回填」这一层：数据读取与 hash 规则全部复用现成模块——
 
-    CSV 行 ``(task, session_id, turn, ts)``  →  ``sim.session_data.load_tasks``
-    读出的 token 序列按轮回填时刻            →  ``sim.opt_map.build_use_map``
+    CSV 行 ``(task, session_id, turn, ts)``  →  ``sim.workload.session_data.load_tasks``
+    读出的 token 序列按轮回填时刻            →  ``sim.analysis.opt_map.build_use_map``
 
 两个时刻域的换算写在这里：CSV 的 ``ts`` 是 ``time.time()``（epoch 秒），server 的
 ``_now()`` 是 ``time.monotonic``（``radix_cache.py``，CLOCK_MONOTONIC，开机起算）。
@@ -132,7 +132,7 @@ def main() -> int:
     args = parse_args()
     _add_paths()
 
-    from sim.opt_map import build_use_map, write_use_map
+    from sim.analysis.opt_map import build_use_map, write_use_map
     from sim.workload.session_data import load_tasks
 
     csv_path = _resolve(args.csv or f"mixexp/result/exp3/{args.cell}/full_lru.csv")

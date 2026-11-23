@@ -102,3 +102,29 @@ def test_skip_leaves_no_dangling_lock():
     # 第三条要写 90 token，池里已有 80：必须能腾出来（说明锁没漏）
     assert result.records[2].evicted >= 70
     assert sim.alloc.used <= 100
+
+
+def test_allocator_capacity_and_double_free_guards():
+    """分配器必须拦截超容量分配与二次释放，归还后水位清零。"""
+    from sim.core.allocator import TokenAllocator
+
+    alloc = TokenAllocator(100)
+    alloc.alloc(60)
+    with pytest.raises(OutOfTokens):
+        alloc.alloc(41)
+    with pytest.raises(RuntimeError, match="二次释放"):
+        alloc.free_segment([0] * 70)
+    alloc.free_segment([0] * 60)
+    assert alloc.used == 0
+    assert alloc.available_size() == 100
+
+
+def test_virtual_clock_drives_one_shot_eviction():
+    """单轮请求闲置超过 ONE_SHOT_IDLE_S 后应走 one_shot 优先淘汰（证明注册表共用虚拟时钟）。"""
+    sim = Simulator(SimConfig(capacity=1024, seed=0))
+    trace = [
+        Session("apps_0", (Turn(t=0.0, prompt=array("q", range(400)), out=0),)),
+        Session("apps_1", (Turn(t=200.0, prompt=array("q", range(5000, 5800)), out=0),)),
+    ]
+    result = sim.run_replay(trace)
+    assert result.summary["victim_sources"].get("one_shot", 0.0) >= 176

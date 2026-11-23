@@ -26,7 +26,7 @@ from sim.drivers.policies import (
     ProgressiveCommit,
     ReservePolicy,
 )
-from sim.metrics import SimResult
+from sim.analysis.metrics import SimResult
 from sim.workload.arrival import ArrivalPlan, TaskSpec
 from sim.workload.service import ServiceModel
 from sim.workload.trace import Session, max_total_len

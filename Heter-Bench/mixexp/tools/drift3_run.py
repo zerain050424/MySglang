@@ -17,7 +17,7 @@ sys.path.insert(0, str(REPO)); sys.path.insert(0, str(REPO / "python"))
 
 from sim.core.config import SimConfig
 from sim.drivers.engine import EngineConfig
-from sim.opt_map import use_map_from_run, write_use_map
+from sim.analysis.opt_map import use_map_from_run, write_use_map
 from sim.simulator import Simulator
 from sim.workload.service import ServiceModel
 from sim.workload.arrival import TaskSpec

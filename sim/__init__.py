@@ -3,7 +3,7 @@
 from sim.core.bootstrap import load
 from sim.core.config import SimConfig
 from sim.drivers.engine import EngineConfig
-from sim.metrics import SimResult
+from sim.analysis.metrics import SimResult
 from sim.simulator import Simulator, run_synthetic
 from sim.workload.arrival import TaskSpec
 from sim.workload.service import ServiceModel

@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from typing import Iterable
 
+from sim.analysis.metrics import SimResult
 from sim.core.lifecycle import RequestLifecycle
-from sim.metrics import SimResult
 from sim.workload.trace import Session, max_total_len
 
 

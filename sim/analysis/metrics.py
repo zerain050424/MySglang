@@ -1,13 +1,4 @@
-"""指标：逐请求记录 + 汇总，全部取自生产对象（不另算一套口径）。
-
-两个来源：
-
-* **请求侧**：``match_prefix`` 返回的命中长度（= 生产 ``meta_info.cached_tokens``
-  的口径），以及驱动层算出的 shortfall / 淘汰量 / 水位；
-* **策略侧**：``eviction_strategy.profiler`` 的累计量——按队列的 hit / evicted 与
-  victim 来源（``one_shot`` / ``value:<queue>`` / ``value:fallback``）。
-  ``CacheTelemetry.on_hit`` 会按 rid 去重，所以记录里的 rid 必须唯一。
-"""
+"""逐请求记录、汇总指标、复现指纹与时间轴冻结（不反向依赖 core 或 drivers）。"""
 
 from __future__ import annotations
 
@@ -20,7 +11,7 @@ from typing import Dict, List, Optional, Tuple
 
 @dataclass(frozen=True)
 class RequestRecord:
-    """一轮请求的落盘视图。"""
+    """单轮请求完成后的观测记录。"""
 
     t: float
     session_id: str
@@ -34,16 +25,8 @@ class RequestRecord:
     session_type: str
     task_name: str = ""
     skipped: bool = False
-    # 轮次下标与 response 段用的唯一哨兵：OPT 的 use map 要用它们把「派发时刻」
-    # 与 response 页的 token 还原到树上（见 ``SimResult.freeze_sessions`` /
-    # ``response_tokens``）。``-1`` / ``0`` 表示未知（旧 jsonl 或非逐轮驱动）。
-    # 不参与 ``line()``（指纹）与任何口径计算。
     turn: int = -1
     response_token: int = 0
-    # 逐请求的计算代价（按 ``cost_model`` 折算的块成本）：``total_cost`` 是整条
-    # prompt 的价格，``saved_cost`` 是命中部分省下的价格。uniform 模型下二者之比
-    # 退化为命中率；``position`` / ``qwen3coder30b_blksz_16`` 下深块更贵，
-    # 两者不再相等（命中比 miss 浅时 compute_saving < hit_rate）。
     total_cost: float = 0.0
     saved_cost: float = 0.0
     # 到达调度时刻，不参与 line() 指纹计算，供排队延迟统计直接读取。
@@ -54,7 +37,7 @@ class RequestRecord:
         return self.hit / self.prompt_len if self.prompt_len else 0.0
 
     def line(self) -> str:
-        """指纹用的紧凑串（浮点定点，避免末位抖动）。"""
+        """返回用于跨运行复现性对比的定长文本行。"""
         return (
             f"{self.t:.3f}|{self.session_id}|{self.rid}|{self.prompt_len}|"
             f"{self.out_len}|{self.hit}|{self.evicted}|{self.used}|"
@@ -69,23 +52,18 @@ def _ratio(num: float, den: float) -> float:
 
 @dataclass
 class SimResult:
-    """一次 run 的全部产出。"""
+    """单次仿真运行的记录、摘要及真实派发时刻表。"""
 
     records: List[RequestRecord] = field(default_factory=list)
     summary: Dict = field(default_factory=dict)
-    # 本次 run 每个 ``(session_id, 轮次)`` 的**派发时刻**（虚拟秒）。
-    # 闭环调度只在运行中决定时刻、且不写回 ``Turn``（见 ``sim/schedule.py``），
-    # 所以 OPT 的 use map 必须从这里取时间轴。
     dispatched: Dict[Tuple[str, int], float] = field(default_factory=dict)
 
-    # ---- 常用聚合 ----
     @property
     def served(self) -> List[RequestRecord]:
         return [r for r in self.records if not r.skipped]
 
     @property
     def requests(self) -> int:
-        """Served requests; skipped requests are excluded from every ratio."""
         return len(self.served)
 
     @property
@@ -111,35 +89,15 @@ class SimResult:
         )
 
     def fingerprint(self) -> str:
-        """逐请求指纹：同 seed 两次 run 必须相同（M4 的复现基线）。"""
+        """对全部请求记录生成稳定 SHA1 前缀，用于同配置复现性校验。"""
         digest = hashlib.sha1()
         for record in self.records:
             digest.update(record.line().encode("utf-8"))
             digest.update(b"\n")
         return digest.hexdigest()[:16]
 
-    # ---- 冻结时间轴（OPT 的 use map 需要决策时刻） ----
     def freeze_sessions(self, sessions: List) -> List:
-        """把本次 run 的派发时刻回填进 ``Turn.t``，返回新的会话列表。
-
-        为什么需要：数据集加载出来的 ``Turn.t`` 是 0，闭环调度
-        （``run_scheduled`` / ``run_engine``）的时刻由发射器在运行中算出、
-        **不写回** —— 直接 ``build_use_map(sessions)`` 会得到全零时间轴，
-        ``OPTStrategy`` 于是把每个块都判成「不再使用」，静默退化成任意序。
-
-        为什么合法：同一份 ``tasks.yaml`` / seed / arrival-scale / wait-scale 下，
-        到达由 ``stable_seed`` 决定、服务时长只依赖 token 数，**与淘汰策略无关**，
-        所以这一次 run 采到的派发时刻就是重放时会发生的那条时间轴。
-
-        Args:
-            sessions: 本次 run 用的会话（顺序、数量必须与 run 一致）。
-
-        Returns:
-            ``Turn.t`` 已替换为新时刻的会话列表。
-
-        Raises:
-            ValueError: 有轮次没有派发时刻（run 不是逐轮驱动的，或传错了 trace）。
-        """
+        """将运行期记录的真实派发时刻回填至 Turn.t，供 OPT 生成非零未来使用表。"""
         from sim.workload.trace import Session, Turn
 
         missing: List[Tuple[str, int]] = []
@@ -158,8 +116,7 @@ class SimResult:
                             prompt=turn.prompt,
                             out=turn.out,
                             tool_call=turn.tool_call,
-                            # 真实 response 必须带过去：树里要写它，下一轮 prompt
-                            # 也靠它命中（丢掉就等于退回 fallback 哨兵）
+                            # 保留真实 response，否则下一轮 prompt 无法在 OPT 树内命中上轮回复段。
                             response=getattr(turn, "response", None),
                         )
                     )
@@ -174,20 +131,15 @@ class SimResult:
         return frozen
 
     def response_tokens(self) -> Dict[Tuple[str, int], int]:
-        """``(session_id, 轮次) -> response 段哨兵``。
-
-        use map 要覆盖树里真正的 token：``_adopt(prompt + output)`` 里那 ``out``
-        个 token 是每请求唯一的哨兵，不写进表就会让这批页永远查不到（未命中率
-        被虚高、且「粒度错配」告警失去判别力）。
-        """
+        """返回各请求分配的独占 response 哨兵映射，供 OPT use map 覆盖生成段页。"""
         return {
             (r.session_id, r.turn): r.response_token
             for r in self.records
             if r.turn >= 0 and r.response_token
         }
 
-    # ---- 输出 ----
     def to_jsonl(self, path) -> Path:
+        """将逐请求明细按行写入 JSONL 文件。"""
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
         with target.open("w", encoding="utf-8") as fp:
@@ -196,7 +148,7 @@ class SimResult:
         return target
 
     def render(self, limit: int = 12) -> str:
-        """人读摘要：整体命中率 + 按会话类型 + 淘汰来源。"""
+        """生成面向人工检查的汇总摘要文本。"""
         s = self.summary
         lines = [
             f"  requests={s['requests']}  skipped={s['skipped_requests']}  "
@@ -265,13 +217,7 @@ def summarize(
     occupancy,
     cost_model: str = "uniform",
 ) -> Dict:
-    """把逐请求记录与策略累计量折成一份 dict.
-
-    Skipped requests stay in ``records`` (they carry the raw hit/length for
-    debugging) but are excluded from every ratio; only served requests enter
-    ``prompt_tokens`` / ``hit_tokens`` / ``total_cost`` / ``per_type``.
-    """
-
+    """汇总请求侧命中与策略内部 profiler/occupancy 读数（跳过请求不计入分母）。"""
     served = [record for record in records if not record.skipped]
     skipped = [record for record in records if record.skipped]
 
@@ -317,7 +263,6 @@ def summarize(
         "skipped_requests": len(skipped),
         "skipped_prompt_tokens": sum(r.prompt_len for r in skipped),
         "sessions": sessions,
-        # 以下三项直接读生产对象，口径不复制
         "victim_sources": dict(getattr(profiler, "_victim_sources", {})),
         "queue_hit": dict(getattr(profiler, "_total_hit_tokens", {})),
         "queue_evicted": dict(getattr(profiler, "_total_evicted_tokens", {})),

@@ -19,8 +19,8 @@ import pytest
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, ROOT)
 
+from sim.analysis.metrics import RequestRecord, summarize  # noqa: E402
 from sim.core.config import SimConfig  # noqa: E402
-from sim.metrics import RequestRecord, summarize  # noqa: E402
 from sim.simulator import Simulator  # noqa: E402
 from sim.workload.session_data import load_task, load_tasks  # noqa: E402
 from sim.workload.trace import Session  # noqa: E402

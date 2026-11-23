@@ -1,4 +1,4 @@
-"""Acceptance for the SGLang-style engine-step driver (``sim.engine``).
+"""Acceptance for the SGLang-style engine-step driver (``sim.drivers.engine``).
 
 The tests pin the behaviour that distinguishes engine steps from the earlier
 event-by-event driver:

@@ -4,7 +4,7 @@
 1. **策略语义**（不需要 torch）：优先级 = `-下次使用时刻`，无未来 → `-inf`
    最先淘汰；真值来自 use map 的二分查询，策略必须**只读无状态**。
 2. **与缓存的接线**（需要 torch，base conda 下自动 skip）：use map 由
-   `sim.opt_map.build_use_map` 生成，hash 必须与 `TreeNode.hash_value` 对得上
+   `sim.analysis.opt_map.build_use_map` 生成，hash 必须与 `TreeNode.hash_value` 对得上
    （否则 OPT 静默退化成「全 +∞」），且同 trace 上 `opt.hit_rate > lru.hit_rate`。
 
     PYTHONPATH=$PWD/python python -m pytest -q test/manual/test_sim_opt.py
@@ -173,8 +173,8 @@ torch = pytest.importorskip("torch", reason="需要 torch 才能建真缓存")
 
 from array import array  # noqa: E402
 
+from sim.analysis.opt_map import build_use_map, write_use_map  # noqa: E402
 from sim.core.config import SimConfig  # noqa: E402
-from sim.opt_map import build_use_map, write_use_map  # noqa: E402
 from sim.simulator import Simulator  # noqa: E402
 from sim.workload.trace import Session, Turn  # noqa: E402
 
@@ -321,8 +321,8 @@ def test_opt_requires_use_map():
 # ---------------------------------------------------------------------------
 # 3. 闭环调度的 OPT 上界（冻结时间轴 + 覆盖 response 页）
 # ---------------------------------------------------------------------------
+from sim.analysis.opt_map import use_map_from_run  # noqa: E402
 from sim.core.request import MAX_SENTINEL_REQUESTS, OUTPUT_SENTINEL_BASE  # noqa: E402
-from sim.opt_map import use_map_from_run  # noqa: E402
 from sim.workload.arrival import TaskSpec  # noqa: E402
 from sim.workload.service import ServiceModel  # noqa: E402
 
@@ -402,7 +402,7 @@ def test_freeze_keeps_real_response_tokens(tmp_path):
     使用。这里用「表里必须出现 a+r 的每一页」来验证，不依赖淘汰是否发生。
     """
 
-    from sim.opt_map import _page_hashes
+    from sim.analysis.opt_map import _page_hashes
     from sglang.srt.mem_cache.radix_cache import RadixKey
     from sglang.srt.mem_cache.utils import get_storage_hash_str
 
