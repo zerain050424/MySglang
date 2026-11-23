@@ -1,6 +1,6 @@
 # Heter-Bench 堆发射器设计与使用指南 (`Bench-heap.md`)
 
-本文档详细剖析 Heter-Bench 的堆驱动真实墙钟 HTTP 压测发射器（[bench_heap.py](file:///home/rain/MySglang/Heter-Bench/scripts/bench_heap.py)），内容分为两部分：
+本文档是详细介绍 Heter-Bench 的堆驱动真实墙钟 HTTP 压测发射器,内容分为两部分：
 1. **主流程深度解析**：系统架构、数据读入机制与异步请求调度发射流水线。
 2. **使用指南与自动化脚本**：参数详解、结果指标解读以及开箱即用的自动化压测 Bash 脚本。
 
@@ -17,44 +17,7 @@
 - **真实墙钟唤醒**：主循环通过 `asyncio.wait_for` 睡眠至堆顶到期时刻。只有到点的请求才创建轻量协程发射；流式响应接收完成后，立即计算下一轮到达时刻并重新入堆。
 - **无客户端并发瓶颈**：连接层显式配置 `aiohttp.TCPConnector(limit=0)`，取消每主机 100 连接的默认限制，确保排队压力真实传导至服务端的 KV Cache 管理器与调度器。
 
-```
-                       tasks.yaml 配置
-                             │
-                             ▼
-              [ 数据读入: load_sessions ]
-                             │
-                             ▼
-        [ 混合到达流构建: build_hybrid_arrival_schedule ]
-          ├── Task A: Poisson(λ=2.0) ──┐
-          └── Task B: Poisson(λ=1.0) ──┴──► 按 (arrival_offset, counter) 升序
-                                                      │
-                                                      ▼
-                                           [ 最小堆: ArrivalHeap ]
-                                            (due_ts, seq, turn_1)
-                                                      │
-                                                      ▼
- ┌─────────────────────────────────────── HeapEmitter.run() 主循环 ───────────────────────────────────────┐
- │                                                                                                        │
- │   1. 槽位检查: _available_slots() 是否允许派发？若满或堆空 ──► 等待唤醒 (_wake.wait)                     │
- │   2. 时钟检查: wait_s = due_ts - now                                                                  │
- │      ├── wait_s > 0: 睡眠至到期时刻 (_sleep_until)，若期间有更早事件入堆可被提前唤醒                       │
- │      └── wait_s <= 0: 弹出当前到期轮次 pop_due(limit=slots)                                            │
- │   3. 并发发射: 派发协程 _fire() ──► 执行 _run_turn()                                                   │
- │                                                                                                        │
- └────────────────────────────────────────────────────┬───────────────────────────────────────────────────┘
-                                                      │
-                         ┌────────────────────────────┴────────────────────────────┐
-                         │                                                         │
-                         ▼                                                         ▼
-            [ 发送 HTTP: one_request ]                                [ 状态统计与流转: _run_turn ]
-       - payload: 完整历史 input_ids                                 - 解析流式 SSE chunk 计算 TTFT
-       - stream=True                                                 - 记录 Stats (按 warmup_s 切分)
-       - 提取服务端 meta_info                                         - 若未达末轮:
-         (cached_tokens, prompt_tokens,                                  wait_s = lognormvariate(μ, σ)
-          queue_time_ms, prefill_ms)                                     入堆 (finished_ts + wait_s, turn+1)
-                                                                         触发 _wake.set() 唤醒主循环
-```
-
+![alt text](image.png)
 ---
 
 ### 1.2 数据读入机制：如何载入与构造会话
@@ -75,15 +38,15 @@
 - 支持多任务异构混合（例如 Chat、Agentic、Struct 任务并行）：
   - 每个任务使用独立的随机种子 `seed + task_id`，保证各个任务内部打乱和到达时间的独立性与确定性。
   - **到达间隔**：支持两种模式：
-    - `poisson`（默认）：按指数分布 `Exp(lambda_rate)` 累加到达时刻，泊松到达率之比直接决定各任务流量占比。
+    - `poisson`（默认）：按指数分布 `Exp(lambda_rate)` 累加到达时刻，泊松到达率之比直接决定各任务流量占比。(泊松到达中的 $\lambda$（lambda） 表示单位时间内的平均到达率,若时间单位是秒，$\lambda = 2.0$ 表示平均每秒有 2.0 个新会话到达)
     - `fixed`：按确定性步长 `offset_s + step_s * i` 线性推进，用于严格复现固定间隔场景。
 - 各任务首轮事件打上全局唯一递增的 `counter` 标签，合并后按 `(arrival_offset, counter)` 全局升序排列，生成全局到达时间表。
 
 #### 4. Token 序列与模板历史一致性核验 (`_resolve_prompt_ids`)
 - 多轮请求中，模型每轮实际输入是前文所有轮次对话的拼接。数据集预处理时已通过对应的 Chat Template 将历史渲染并 Tokenize 到了本轮的 `turn_i.input_ids` 中。
 - `_resolve_prompt_ids` 在运行时提取该 ID 列表，并对比 `prev_input_ids + prev_response_ids` 是否为当前前缀：
-  - 若为字面前缀（如 Qwen 风格），记录拼接成功；
-  - 若模型在回复前插入了特殊角色头（如 Llama 风格），客户端简单拼接会与服务端模板不一致导致 Cache Miss。此时直接回退并采纳数据集原始预生成的完整 Token 序列，确保前缀命中不受客户端拼接差异干扰。
+  - 若为字面前缀，记录拼接成功；
+  - 若模型在回复前插入了特殊角色头，客户端简单拼接会与服务端模板不一致导致 Cache Miss。此时直接回退并采纳数据集原始预生成的完整 Token 序列，确保前缀命中不受客户端拼接差异干扰。
 
 ---
 
@@ -118,6 +81,17 @@
   - 从任务配置的 `(mu, sigma)` 中采样对数正态分布等待时间：`wait_s = rng.lognormvariate(mu, sigma) * wait_scale`；
   - 下一轮的到期时刻计算为 `finished_ts + wait_s`，组装 `turn_idx + 1` 压入堆中，并调用 `self._wake.set()`。
 
+
+- 若随机变量 $W > 0$ 服从 $\text{Lognormal}(\mu, \sigma)$，则有：
+
+   - $\ln(W) \sim \mathcal{N}(\mu, \sigma^2)$
+
+   - **$\mu$（对数空间的均值 / 位置参数）**：决定整体等待时间量级的中心位置。对数正态分布的中位数（P50）恰好为：
+  $\text{Median}(W) = e^{\mu}$
+
+   - 当 $\mu = 0$ 时，$e^0 = 1$（中位数为 1 秒）；$\mu$ 越大，整体思考/轮间空窗越长。
+   - **$\sigma$（对数空间的标准差 / 离散度或长尾程度）**：决定等待时间的波动范围与右偏长尾程度。$\sigma = 0$ 时分布退化为固定值 $e^{\mu}$（代码中 `mu == 0.0 and sigma == 0.0` 时直接返回 0.0）；$\sigma$ 越大，偶尔出现的极长轮间等待（长尾）越明显。
+
 #### 5. 统计窗与预热过滤 (`Stats`)
 - **预热窗过滤**：为了消除系统刚启动时缓存从冷到热、以及算法价值估计窗未收敛带来的偏差，支持设置 `--warmup-s`。
 - 请求完成时以当前墙钟时间判定：若完成时刻处于预热窗内，只计入 `warmup_*` 指标，不计入命中率和 TTFT 分位数统计；但明细数据仍完整写入 CSV（标记 `warmup=True`），便于对比冷启动过程。
@@ -128,7 +102,7 @@
 
 ### 2.1 环境准备
 
-`bench_heap.py` 已实现解耦与按需导入：纯逻辑与单元测试不需要 `aiohttp`；但若要向真实推理服务发起 HTTP 压测，需确保运行环境具备异步网络与 YAML 解析库：
+要向真实推理服务发起 HTTP 压测，需确保运行环境具备异步网络与 YAML 解析库：
 
 ```bash
 pip install aiohttp pyyaml
@@ -191,8 +165,7 @@ tasks:
 
 ### 2.4 自动化运行脚本 (`run_bench_heap.sh`)
 
-为了将“启动推理服务 -> 等待健康检查就绪 -> 启动堆发射器压测 -> 测试完成退出清理”全流程自动化，项目提供了自动化脚本 [Heter-Bench/scripts/run_bench_heap.sh](file:///home/rain/MySglang/Heter-Bench/scripts/run_bench_heap.sh)。
-
+为了将全流程自动化，项目提供了自动化脚本 [Heter-Bench/scripts/run_bench_heap.sh]
 #### 脚本功能特点：
 1. **自动生命周期管理**：若对应端口未运行服务，脚本会自动调用 `serve.sh` 在后台启动 SGLang；压测结束或按 `Ctrl+C` 中断时，`trap` 机制会安全回收后台进程，不残留僵尸服务。
 2. **服务就绪轮询**：每 2 秒检测一次 `/health` 端点，确认模型完全加载后再开始计时压测。
