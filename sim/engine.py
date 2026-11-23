@@ -29,7 +29,6 @@ second forward-time model and does not change prefix-cache admission.
 from __future__ import annotations
 
 import heapq
-import itertools
 from collections.abc import Iterable, Sequence
 from dataclasses import replace
 
@@ -38,8 +37,9 @@ import msgspec
 from sim.allocator import OutOfTokens
 from sim.metrics import SimResult
 from sim.runner import Matched, Simulator
-from sim.schedule import Emitter, ServiceModel, TaskSpec
-from sim.trace import Session, Turn, max_total_len
+from sim.workload.arrival import ArrivalPlan, TaskSpec
+from sim.workload.service import ServiceModel
+from sim.workload.trace import Session, Turn, max_total_len
 
 
 class EngineConfig(msgspec.Struct, frozen=True, kw_only=True):
@@ -188,10 +188,9 @@ class EngineSimulator:
         self.sim = sim
         self.scheduler = scheduler
         self.service = service or ServiceModel()
-        self.sessions = list(sessions)
-        self.emitter = Emitter(sim, self.sessions, list(specs), self.service)
+        self.plan = ArrivalPlan(list(sessions), list(specs))
+        self.sessions = self.plan.sessions
 
-        self._seq = itertools.count()
         self._wait_scale = 1.0
 
         # Step-level counters exposed through summary["emit"].
@@ -223,15 +222,7 @@ class EngineSimulator:
         sim.prepare(width)
         sim.tasks = {s.session_id: s.task_name for s in self.sessions}
 
-        heap: list[tuple[float, int, str, int]] = []
-        for spec in self.emitter.specs.values():
-            group = [s for s in self.sessions if s.task_name == spec.name]
-            offsets = self.emitter._arrival_offsets(spec, len(group))
-            for session, offset in zip(group, offsets):
-                heapq.heappush(
-                    heap,
-                    (offset * arrival_scale, next(self._seq), session.session_id, 1),
-                )
+        heap = self.plan.init_heap(arrival_scale=arrival_scale)
 
         waiting: list[_Queued] = []
         running: list[_State] = []
@@ -244,7 +235,7 @@ class EngineSimulator:
             # Scheduler._add_request_to_queue does before a step.
             while heap and heap[0][0] <= now + eps:
                 due, _seq, sid, idx = heapq.heappop(heap)
-                session = self.emitter._by_sid[sid]
+                session = self.plan.by_sid[sid]
                 waiting.append(
                     _Queued(
                         turn=session.turns[idx - 1],
@@ -570,14 +561,8 @@ class EngineSimulator:
         queued = state.queued
         if queued is None:
             return
-        session = self.emitter._by_sid[queued.session_id]
-        if queued.idx >= session.n_turns:
-            return
-        spec = self.emitter.specs[session.task_name]
-        wait = self.emitter._inter_turn_wait(spec, queued.session_id, self._wait_scale)
-        heapq.heappush(
-            heap,
-            (finish + wait, next(self._seq), queued.session_id, queued.idx + 1),
+        self.plan.push_next_turn(
+            heap, queued.session_id, queued.idx, finish, self._wait_scale
         )
 
     # ------------------------------------------------------------------ result
