@@ -1,5 +1,6 @@
 # drift3 · 构成漂移实验（设计 + seed=42 gate 结果）
 
+> 【漂移测试专题 · 负载设计】struct / 多轮 chat / agentic 轮换主导的构成漂移负载构造与门禁预检
 > 时间：2026-11-17 · 分支 `W1`
 > 载体：`sim/` 的 `EngineSimulator`（FCFS 成批 prefill），跑生产 `HeterCacheRadixCache`
 > 数据：`Heter-Bench/TaskData/drift3/`（由 `mixexp/tools/build_drift3_data.py` 生成）

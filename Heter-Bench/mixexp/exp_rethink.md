@@ -1,5 +1,6 @@
 # exp_rethink · exp3 离线复盘的改动与遗留问题
 
+> 【消融实验专题 · 离线复盘】exp3 核心瓶颈消融（one-shot 供给枯竭、MULTI_TURN_MIN 调整与 chat 队挤压）
 > 时间：2026-11-16 · 分支 `W1`（基线 `461517c`）
 > 载体：`sim/`（CPU 离线仿真，跑的是 `python/sglang/srt/mem_cache/` 的真实代码，非替身）
 > 数据：`Heter-Bench/TaskData/exp3/{scan,struct,chat,agentic}`，四 cell 各 ≈24.5M prompt token

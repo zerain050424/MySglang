@@ -1,5 +1,6 @@
 # drift3 结果：构成漂移下 LRU / heter_cache / OPT（engine FCFS · page=8 · seed=42）
 
+> 【漂移测试专题 · 评测分析报告】构成漂移下各策略表现、恢复时间 T90 与背景流量单调放大效应
 > 时间：2026-11-17 · 分支 `W1` · 单 seed（42），三段主导漂移
 > 载体：`sim/` 的 `EngineSimulator`（FCFS 成批 prefill），跑生产 `HeterCacheRadixCache`
 > 数据：`Heter-Bench/TaskData/drift3/`（15,309 会话 / 125 MB，`build_drift3_data.py` 生成）

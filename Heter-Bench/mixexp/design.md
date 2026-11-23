@@ -1,5 +1,6 @@
 # heter_cache 保护 TTFT 的淘汰设计
 
+> 【长尾优化专题 · 核心策略设计】淘汰目标转向防整链击穿与保护 TTFT p90（档 A 后悔门 + 档 B 全局定价）
 > 载体：`python/sglang/srt/mem_cache/heter_cache/` + `evict_policy.HeterCacheStrategy`
 > 状态：档 A（后悔弃权门 `RegretGate`）、档 B（全弃权全局定价 `PricedFallback`）
 > 均已实现，**默认关闭**；不带参数时其他策略行为逐位不变。

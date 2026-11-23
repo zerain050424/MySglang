@@ -1,5 +1,6 @@
 # 最优配置速查（TTFT 优先 / heter 保守改进）
 
+> 【长尾优化专题 · 现行最优推荐】汇总 TTFT 优先部署配置（chain_lru 全局版）与 heter 保守改进档位（档 A/B）
 > 时间：2026-11-18 · 分支 W1（`aba2b66`）· 全部数字实测于 tail-stress
 > （cap=198k、page=8、engine FCFS、1700 请求）与 exp3 四 cell（同
 > `exp3_cells_ttl300.md` 口径）。详细过程见 `chain_shape_report.md`。
