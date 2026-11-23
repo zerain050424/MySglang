@@ -115,7 +115,7 @@ exp3 scan 的 LRU 数字**逐位不变**（0.2965 / 7,268,856）。回归见
 ```bash
 cd <repo>
 python Heter-Bench/mixexp/tools/build_drift3_data.py --force      # 数据 + yaml + plan.json
-python Heter-Bench/mixexp/tools/drift3_run.py \
+python Heter-Bench/mixexp/scripts/sim/drift3_run.py \
   --plan Heter-Bench/TaskData/drift3/bg_10.json --gate            # G1~G6
 ```
 
@@ -124,7 +124,7 @@ python Heter-Bench/mixexp/tools/drift3_run.py \
 | `Heter-Bench/TaskData/drift3/{warmup,p1,p2,p3,cooldown}/{trans,struct,chat,agentic}.jsonl` | 15,309 条会话（125 MB，未提交） |
 | `Heter-Bench/TaskData/drift3/bg_{05,10,20}.{yaml,json}` | 人读 yaml + 驱动读 plan（含每 (类,相位) 的 λ / 会话数 / 目标份额） |
 | `Heter-Bench/mixexp/tools/build_drift3_data.py` | 切片 + λ 反算（λ = 目标份额 × 预算 / (秒数 × 实测 token/会话)） |
-| `Heter-Bench/mixexp/tools/drift3_run.py` | 驱动 + gate |
+| `Heter-Bench/mixexp/scripts/sim/drift3_run.py` | 驱动 + gate |
 
 ## 10. 成本（正式矩阵）
 

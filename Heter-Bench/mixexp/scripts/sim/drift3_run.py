@@ -3,15 +3,15 @@
 用法::
 
     # gate：只跑 seed=42 / bg=10，检查 G1~G6
-    python mixexp/tools/drift3_run.py --plan TaskData/drift3/bg_10.json --gate
+    python mixexp/scripts/sim/drift3_run.py --plan TaskData/drift3/bg_10.json --gate
 
     # 正式矩阵（gate 通过后再跑）
-    python mixexp/tools/drift3_run.py --plan TaskData/drift3/bg_10.json --arms lru,heter_cache,opt
+    python mixexp/scripts/sim/drift3_run.py --plan TaskData/drift3/bg_10.json --arms lru,heter_cache,opt
 """
 import argparse, collections, json, os, pathlib, statistics, sys, time
 
-_HERE = pathlib.Path(__file__).resolve()            # Heter-Bench/mixexp/tools/
-REPO = pathlib.Path(os.environ.get("SIM_REPO", _HERE.parents[3]))  # 仓库根
+_HERE = pathlib.Path(__file__).resolve()            # Heter-Bench/mixexp/scripts/sim/
+REPO = pathlib.Path(os.environ.get("SIM_REPO", _HERE.parents[4]))  # 仓库根
 os.chdir(REPO)
 sys.path.insert(0, str(REPO)); sys.path.insert(0, str(REPO / "python"))
 

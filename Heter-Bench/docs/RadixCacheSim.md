@@ -288,7 +288,7 @@ flowchart LR
    - 再带 `with_response=True` 与 `base_res.response_tokens()` 逐页调用生产同源哈希 `get_storage_hash_str`，将 prompt 与 response 页的全部未来使用时刻写入 JSON。
 3. **阶段 3（同轴重放或不动点收敛）**：
    - 若对比纯静态时间轴，可直接用 `Simulator(..., eviction_policy="opt", opt_use_map=...).run_replay(base_res.freeze_sessions(sessions))`；
-   - 若在 `EngineScheduler` 下希望连排队引起的微小时间偏移也完全对齐，可像 [`drift3_run.py`](file:///home/rain/MySglang/Heter-Bench/mixexp/tools/drift3_run.py) 那样迭代 1~3 轮直到连续两次 `dispatched` 时间差归零。
+   - 若在 `EngineScheduler` 下希望连排队引起的微小时间偏移也完全对齐，可像 [`drift3_run.py`](file:///home/rain/MySglang/Heter-Bench/mixexp/scripts/sim/drift3_run.py) 那样迭代 1~3 轮直到连续两次 `dispatched` 时间差归零。
 
 ---
 
@@ -589,7 +589,7 @@ ARMS="lru,chain_lru,heter_cache,heter_gate,opt" \
 bash Heter-Bench/scripts/run_radix_sim.sh
 
 # 示例 3：使用环境变量指定的 Conda Python 运行构成漂移专用脚本 (drift3_run.py)
-PYTHONPATH=.:python python3 Heter-Bench/mixexp/tools/drift3_run.py \
+PYTHONPATH=.:python python3 Heter-Bench/mixexp/scripts/sim/drift3_run.py \
     --plan Heter-Bench/mixexp/TaskData/drift3/bg_10.json \
     --arms lru,heter_cache,opt \
     --out /tmp/sim_drift3
@@ -600,9 +600,9 @@ PYTHONPATH=.:python python3 Heter-Bench/mixexp/tools/drift3_run.py \
 ### 3.4 仓库内现成高级实验脚本
 
 针对特定科研实验，`Heter-Bench/mixexp/tools/` 中已经内置了基于 `sim` 的专有驱动：
-- [`Heter-Bench/mixexp/tools/drift3_run.py`](file:///home/rain/MySglang/Heter-Bench/mixexp/tools/drift3_run.py)：负载构成漂移实验工具。内部自动构造 `segments` 到达流，支持 `--gate` 检查 G1~G6 约束、分相位 Steady/T90 恢复时间统计、`--stationary` 与 `--reverse` 路径依赖对照。
+- [`Heter-Bench/mixexp/scripts/sim/drift3_run.py`](file:///home/rain/MySglang/Heter-Bench/mixexp/scripts/sim/drift3_run.py)：负载构成漂移实验工具。内部自动构造 `segments` 到达流，支持 `--gate` 检查 G1~G6 约束、分相位 Steady/T90 恢复时间统计、`--stationary` 与 `--reverse` 路径依赖对照。
 - [`Heter-Bench/mixexp/tools/build_tail_stress.py`](file:///home/rain/MySglang/Heter-Bench/mixexp/tools/build_tail_stress.py)：尾部压力负载生成与长尾分析工具，直接导入 `sim.drivers.engine` 验证高并发排队积压场景，并直接通过 `RequestRecord.arrival_t` 计算排队延迟。
-- [`Heter-Bench/mixexp/tools/build_use_map_from_bench.py`](file:///home/rain/MySglang/Heter-Bench/mixexp/tools/build_use_map_from_bench.py)：离线构造基准 Trace 的 OPT `use_map.json`。
+- [`Heter-Bench/mixexp/scripts/real/build_use_map_from_bench.py`](file:///home/rain/MySglang/Heter-Bench/mixexp/scripts/real/build_use_map_from_bench.py)：离线构造基准 Trace 的 OPT `use_map.json`。
 
 ---
 

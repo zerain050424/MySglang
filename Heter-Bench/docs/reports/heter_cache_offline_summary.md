@@ -24,7 +24,7 @@
 ```bash
 cd /root/sg-unicache
 export PYTHONPATH=/root/sg-unicache:/root/sg-unicache/python PATH=/root/sl_old/bin:$PATH STRAT_LOG_LEVEL=quiet
-python Heter-Bench/mixexp/tools/drift3_run.py --plan Heter-Bench/TaskData/drift3/bg_05.json \
+python Heter-Bench/mixexp/scripts/sim/drift3_run.py --plan Heter-Bench/TaskData/drift3/bg_05.json \
        Heter-Bench/TaskData/drift3/bg_10.json Heter-Bench/TaskData/drift3/bg_20.json \
        --out /root/sim_runs/ttl300 --seed 42 --arms lru,heter_cache,opt
 ```
@@ -206,7 +206,7 @@ OPT 在 396k 就饱和（82.35%）⇒ chat 工作集约 35~40 万 token，是 19
 
 | 内容 | 位置（远程） |
 |---|---|
-| drift3 数据与驱动 | `Heter-Bench/TaskData/drift3/`、`Heter-Bench/mixexp/tools/drift3_run.py` |
+| drift3 数据与驱动 | `Heter-Bench/TaskData/drift3/`、`Heter-Bench/mixexp/scripts/sim/drift3_run.py` |
 | tail-stress 负载 | `Heter-Bench/mixexp/tools/build_tail_stress.py`、`mixexp/tail_stress_design.md` |
 | 四 cell 驱动 | `/root/sim_runs/sim_engine_cell.py` |
 | 本轮矩阵 | `/root/sim_runs/ttl300/all_s42.json`、`/root/sim_runs/engine_full{,_ttl180}/` |

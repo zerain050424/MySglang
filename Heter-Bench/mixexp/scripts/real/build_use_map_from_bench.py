@@ -15,10 +15,10 @@ Linux 上两者系统级同源、只差一个常数偏移；``--offset auto``（
 
 用法::
 
-    python mixexp/tools/build_use_map_from_bench.py --cell chat
+    python mixexp/scripts/real/build_use_map_from_bench.py --cell chat
 
     # 显式写全（默认值即由此展开；--csv/--tasks/--out 都相对 Heter-Bench 根解析）
-    python mixexp/tools/build_use_map_from_bench.py \\
+    python mixexp/scripts/real/build_use_map_from_bench.py \\
         --cell chat \\
         --csv mixexp/result/exp3/chat/full_lru.csv \\
         --tasks TaskData/exp3/chat/tasks.yaml \\
@@ -49,7 +49,7 @@ import time
 from dataclasses import replace
 from pathlib import Path
 
-BENCH_DIR = Path(__file__).resolve().parent.parent.parent   # mixexp/tools → Heter-Bench
+BENCH_DIR = Path(__file__).resolve().parents[3]   # mixexp/scripts/real → Heter-Bench
 REPO_ROOT = BENCH_DIR.parent                                # sim/ 与 python/ 在仓库根
 
 DEFAULT_CELL = "chat"

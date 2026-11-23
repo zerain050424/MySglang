@@ -17,7 +17,7 @@
 | 代码 | `/root/sg-unicache` @ `W1`（含 `arrival.mode=segments`、`evict` 平票确定化） |
 | 解释器 | `/root/sl_old/bin/python`（3.12 + torch） |
 | 服务时长 | `Uni-Bench/result/tailshot/calib_lru.json`：prefill 8,319.6 tok/s，decode 40 tok/s |
-| 驱动 | `Heter-Bench/mixexp/tools/drift3_run.py --plan bg_{05,10,20}.json --seed 42 --stationary --reverse` |
+| 驱动 | `Heter-Bench/mixexp/scripts/sim/drift3_run.py --plan bg_{05,10,20}.json --seed 42 --stationary --reverse` |
 
 ## 2. 参数设置
 

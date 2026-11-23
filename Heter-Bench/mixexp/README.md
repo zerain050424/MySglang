@@ -12,7 +12,8 @@
 - [二、漂移测试专题 (Drift3 Phase Shift)](#二漂移测试专题-drift3-phase-shift)
 - [三、消融实验专题 (Exp3 Ablations & Evolution)](#三消融实验专题-exp3-ablations--evolution)
 - [四、上限诊断专题 (Oracle & Upper Bound)](#四上限诊断专题-oracle--upper-bound)
-- [五、基础实验环境与度量口径（附录）](#五基础实验环境与度量口径附录)
+- [五、实验运行脚本导航 (scripts/sim & scripts/real)](#五实验运行脚本导航-scriptssim--scriptsreal)
+- [六、基础实验环境与度量口径（附录）](#六基础实验环境与度量口径附录)
 
 ---
 
@@ -62,9 +63,32 @@
 
 ---
 
-## 五、基础实验环境与度量口径（附录）
+## 五、实验运行脚本导航 (`scripts/sim` & `scripts/real`)
 
-### 5.1 实验负载与数据准备
+本目录将所有实验驱动划分为**模拟器（纯 CPU 离线仿真）**与**真机（实机 GPU SGLang 评测）**两套独立运行入口：
+
+### 5.1 模拟器实验脚本 (`scripts/sim/`)
+
+| 脚本 | 职责 | 一键命令 |
+|---|---|---|
+| [`scripts/sim/sim_exp3_cells.py`](scripts/sim/sim_exp3_cells.py) | exp3 四 cell（scan/struct/chat/agentic）策略对比引擎驱动 | `bash Heter-Bench/mixexp/scripts/sim/run_exp3.sh` |
+| [`scripts/sim/drift3_run.py`](scripts/sim/drift3_run.py) | drift3 构成漂移实验驱动（支持 `--gate`、稳态与逆序对照） | `bash Heter-Bench/mixexp/scripts/sim/run_drift3.sh` |
+| [`scripts/sim/run_tail_stress.sh`](scripts/sim/run_tail_stress.sh) | tail-stress 长尾 TTFT 压力测试（调用 `tools/build_tail_stress.py`） | `bash Heter-Bench/mixexp/scripts/sim/run_tail_stress.sh` |
+
+### 5.2 真机实验脚本 (`scripts/real/`)
+
+| 脚本 | 职责 | 一键命令 |
+|---|---|---|
+| [`scripts/real/run_exp3_real.sh`](scripts/real/run_exp3_real.sh) | exp3 真机全自动对比（启停服务 + `bench_heap.py` + `analyze.py` 汇总） | `CELL=chat bash Heter-Bench/mixexp/scripts/real/run_exp3_real.sh` |
+| [`scripts/real/run_opt_real.sh`](scripts/real/run_opt_real.sh) | OPT 上界真机全流程（Capture -> UseMap -> Replay） | `CELL=chat bash Heter-Bench/mixexp/scripts/real/run_opt_real.sh` |
+| [`scripts/real/build_use_map_from_bench.py`](scripts/real/build_use_map_from_bench.py) | 离线生成时间轴重锚定的 OPT `use_map` JSON | `python mixexp/scripts/real/build_use_map_from_bench.py --cell chat` |
+| [`scripts/real/analyze.py`](scripts/real/analyze.py) | 真机压测结果 JSON 聚合与公平/命中/TTFT 判定表生成 | `python mixexp/scripts/real/analyze.py --dir mixexp/result/exp3/chat --scale full` |
+
+---
+
+## 六、基础实验环境与度量口径（附录）
+
+### 6.1 实验负载与数据准备
 
 四个 cell，每个 cell 里四类负载同时在场，其中一类按 **prompt token** 占优（≥60%），用于检验不同压力源下多队列隔离的效果：
 
@@ -87,7 +111,7 @@ bash mixexp/prepare_data.sh
 python mixexp/tools/build_exp3_data.py --mix all --total-tokens 25e6
 ```
 
-### 5.2 OPT 离线最优上界测算
+### 6.2 OPT 离线最优上界测算
 
 OPT = Belady 离线最优：淘汰下次使用时刻最远的块（`evict_policy.OPTStrategy`）。它的输入是 use map（`{block_hash: [使用时刻]}`）。在真实 server 上跑 OPT 的流程为：**先采一次到达时刻，离线造 use map，再带 map 重放**。
 
@@ -97,7 +121,7 @@ OPT = Belady 离线最优：淘汰下次使用时刻最远的块（`evict_policy
    ```bash
    # 设定重放起点 R（epoch 秒，留出模型加载余量）
    R=$(( $(date +%s) + 600 ))
-   python mixexp/tools/build_use_map_from_bench.py --cell chat --replay-start $R
+   python mixexp/scripts/real/build_use_map_from_bench.py --cell chat --replay-start $R
    ```
 3. **带 map 起服务并重放**：
    ```bash
@@ -106,7 +130,7 @@ OPT = Belady 离线最优：淘汰下次使用时刻最远的块（`evict_policy
      bash scripts/serve.sh
    ```
 
-### 5.3 Regret Rate（淘汰后悔率）账本
+### 6.3 Regret Rate（淘汰后悔率）账本
 
 Regret 账本（`Heter-Bench/profile/regret_ledger.py`）衡量每次逐出决策造成的重算损失：
 - 一次 `_pick_victim` + 级联 = 一个 stamp，`span` 为腾出的 token 数。
