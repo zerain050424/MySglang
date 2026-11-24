@@ -64,6 +64,12 @@ def pick_victim(*, strategy, leaves):
 
     gate = getattr(strategy, "regret_gate", None)
     priced = getattr(strategy, "priced_fallback", None)
+    if priced is not None:
+        victim = priced.pick(leaves, getattr(strategy, "session_registry", None))
+        if victim is not None:
+            queue = strategy.node_tag(victim).queue_name
+            return victim, f"priced:{queue}"
+
     order = strategy.queue_order()
     if gate is not None:
         passed = [queue for queue in order if not gate.abstain(queue, order)]

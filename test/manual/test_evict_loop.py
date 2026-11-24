@@ -292,9 +292,9 @@ def test_no_one_shot_leaves_does_not_crash(ep, shc, base):
     check(len(cache.deleted) == 3, f"all leaves evicted, got {len(cache.deleted)}")
     check(result.num_tokens_evicted == 96,
           f"released tokens, got {result.num_tokens_evicted}")
-    srcs = {k: v for k, v in st.profiler._victim_sources.items() if k.startswith("value:")}
-    check(srcs.get("value:agentic", 0) + srcs.get("value:fallback", 0) == 96,
-          f"all 96 tokens must come from the VD path, got {st.profiler._victim_sources}")
+    srcs = {k: v for k, v in st.profiler._victim_sources.items() if k.startswith(("value:", "priced:"))}
+    check(srcs.get("priced:agentic", 0) + srcs.get("value:agentic", 0) + srcs.get("value:fallback", 0) == 96,
+          f"all 96 tokens must come from Stage 1, got {st.profiler._victim_sources}")
     check(not st.profiler._victim_sources.get("one_shot"),
           "no one-shot band should have been used")
 
@@ -372,8 +372,12 @@ def test_share_rewrites_struct_candidate(ep, shc, base):
     cache.evict(base.EvictParams(num_tokens=16))
 
     check(cache.deleted == [old], f"LRU-oldest must be picked, got {cache.deleted}")
-    check(st.profiler._victim_sources.get("value:struct") == 16,
-          f"source must be the struct queue, got {st.profiler._victim_sources}")
+    check(
+        st.profiler._victim_sources.get("priced:struct", 0)
+        + st.profiler._victim_sources.get("value:struct", 0)
+        == 16,
+        f"source must be the struct queue, got {st.profiler._victim_sources}",
+    )
     # struct 队的选点由 struct_tier 直接完成（share 分级 + 段内 LRU）；
     # 共享数账本只是账本 + 生命周期观测器，不参与选点。
 

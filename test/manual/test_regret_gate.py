@@ -266,15 +266,24 @@ def test_param_validation():
         {"context": 0},
         {"floor_tokens": -1},
         {"weight": -0.1},
+        {"alpha": -0.1},
         {"beta": -0.1},
+        {"scale_min": 0.0},
+        {"scale_min": 5.0, "scale_max": 4.0},
+        {"floor_by_queue": {"chat": -1}},
     ):
         try:
             hu.RegretGateParams(**kwargs)
         except ValueError:
             continue
         check(False, f"非法参数未拒绝：{kwargs}")
-    check(hu.RegretGateParams().enabled is False, "默认 enabled=False")
-    check(hu.RegretGateParams().priced_fallback is False, "默认 priced_fallback=False")
+    defaults = hu.RegretGateParams()
+    check(defaults.enabled is True, "W1-NEW 默认 enabled=True")
+    check(defaults.priced_fallback is True, "W1-NEW 默认 priced_fallback=True")
+    check(defaults.alpha == 0.5 and defaults.scale_min == 0.25 and defaults.scale_max == 4.0,
+          "W1-NEW 默认软加权参数")
+    check(defaults.floor_by_queue == {"struct": 0, "agentic": 4096, "chat": 8192},
+          f"W1-NEW 默认 floor_by_queue: {defaults.floor_by_queue}")
 
 
 class _LeafNode:
@@ -452,7 +461,7 @@ def test_peer_median_and_early_priced():
 
     g_off = _gate(now, window_s=1_000_000.0, retain_s=2_000_000.0,
                   min_evicted=100, r_min=0.3, k=1.2,
-                  priced_fallback=True, early_priced=False)
+                  priced_fallback=False, early_priced=False)
     for i in range(10):
         g_off.on_evict(key=6100 + i, queue="struct", span=1000)
         g_off.on_evict(key=7100 + i, queue="chat", span=1000)
@@ -461,11 +470,47 @@ def test_peer_median_and_early_priced():
     for i in range(2):
         g_off.on_request(key=7100 + i)
     st_off = _FakeStrategy(["struct", "chat"], {"struct": "V-ST", "chat": "V-CH"}, gate=g_off)
-    st_off.priced_fallback = ov.PricedFallback(g_off.params, g_off)
+    st_off.priced_fallback = None
     st_off.node_tag = st.node_tag
     st_off.session_registry = None
     v2, s2 = qs.pick_victim(strategy=st_off, leaves=[leaf])
-    check(s2 == "value:chat", f"early_priced=False 仍回退剩余单队 value:chat: {s2}")
+    check(s2 == "value:chat", f"关闭 priced_fallback 时回退剩余单队 value:chat: {s2}")
+
+    # 验证 W1-NEW 软加权乘数 scale_q(VD_q, R_q) 与 struct shared_depth / chat state.L 裁剪
+    occ_stub = type("Occ", (), {"occ": {"struct": 1000.0, "agentic": 1000.0, "chat": 1000.0}})()
+    real_stub = type("Real", (), {"densities": lambda self, occ: {"struct": 0.25, "agentic": 1.0, "chat": 4.0}})()
+    fb_soft = ov.PricedFallback(
+        g.params, g, realized=real_stub, occupancy=occ_stub,
+        share_of=lambda n: getattr(n, "_share", 0), share_min=2,
+    )
+    scales = fb_soft.queue_scales()
+    # med_vd = 1.0: agentic vd=1.0 -> 1.0; chat vd=4.0^0.5=2.0 * (1+0.2)=2.4; struct vd=0.25^0.5=0.5 * (1+0.8)=0.9
+    check(abs(scales["agentic"] - 1.0) < 1e-6, f"agentic scale={scales['agentic']}")
+    check(abs(scales["chat"] - 2.4) < 1e-6, f"chat scale={scales['chat']}")
+    check(abs(scales["struct"] - 0.9) < 1e-6, f"struct scale={scales['struct']}")
+
+    # struct 队列用 shared_depth 作证据门与锚深（无共享不护，有共享护到 shared_depth）
+    st_shared = _leaf_chain([(2000, 0, None)], 10.0, tag=hu.HeterCacheNodeTag.QSTRUCT)
+    st_shared._share = 3
+    st_unshared = _leaf_chain([(2000, 0, None)], 10.0, tag=hu.HeterCacheNodeTag.QSTRUCT)
+    st_unshared._share = 1
+    k_sh = ov.chain_leaf_key(st_shared, floor_tokens=0, weight=0.02, queue="struct",
+                             share_of=lambda n: getattr(n, "_share", 0), share_min=2)
+    k_un = ov.chain_leaf_key(st_unshared, floor_tokens=0, weight=0.02, queue="struct",
+                             share_of=lambda n: getattr(n, "_share", 0), share_min=2)
+    check(k_sh[0] > k_un[0] and abs(k_sh[0] - (st_shared.last_access_time + 0.02 * 2000)) < 1e-6,
+          f"struct 共享模板应护到 shared_depth=2000: shared={k_sh}, unshared={k_un}")
+
+    # agentic/chat 按 SessionState.L 裁剪 floor_q
+    reg = hu.SessionRegistry(now=lambda: now[0])
+    reg.touch("s_short", rid="r1", prompt_len=3000)
+    reg.touch("s_short", rid="r2", prompt_len=3000)  # len(gaps)=1
+    ag_leaf = _leaf_chain([(1000, 0, "s_short"), (1000, 0, "s_short")], 10.0, tag=hu.HeterCacheNodeTag.QAGENT)
+    k_cap = ov.chain_leaf_key(ag_leaf, floor_tokens=4096, weight=0.02, queue="agentic",
+                              registry=reg, min_gaps=1, cap_floor_by_session_L=True)
+    # _leaf_chain 2 节点中首节点为伪根 (parent=None)，故 remain=0，eff_floor=min(4096, 3000)=3000 -> penalty=60.0
+    check(abs(k_cap[0] - (ag_leaf.last_access_time + 0.02 * 3000)) < 1e-6,
+          f"state.L=3000 应裁剪 floor 4096→3000: got {k_cap}")
 
 
 if __name__ == "__main__":

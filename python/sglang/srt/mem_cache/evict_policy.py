@@ -328,8 +328,12 @@ class HeterCacheStrategy(EvictionStrategy):
                 self.regret_gate,
                 self.node_tag,
                 expired_of=self.session_expired,
+                realized=self.realized,
+                occupancy=self.occupancy,
+                share_of=self.node_share.share_of,
+                share_min=self.node_share.share_min,
             )
-            if (rg_params.enabled and rg_params.priced_fallback)
+            if rg_params.priced_fallback
             else None
         )
         self.chain_evicts = (
@@ -491,7 +495,11 @@ class HeterCacheStrategy(EvictionStrategy):
         return policy.pick(pool, self.session_registry)
 
     def fallback(self, leaves):
-        """所有队列均弃权或无候选时的均匀随机淘汰。"""
+        """兜底选点：优先走全局软定价器，未装配时均匀随机淘汰。"""
+        if self.priced_fallback is not None:
+            victim = self.priced_fallback.pick(leaves, self.session_registry)
+            if victim is not None:
+                return victim
         pool = sorted(leaves, key=lambda n: n.id)
         if not pool:
             return None

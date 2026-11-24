@@ -8,6 +8,8 @@ from sglang.srt.mem_cache.heter_cache.utils import (
     ChainParams,
     ReuseParams,
     HeterCacheNodeTag,
+    VALUE_QUEUES,
+    median,
     node_num_tokens,
     reuse_window_probability,
 )
@@ -132,29 +134,42 @@ class ReuseScoreEvict(VictimOverride):
         return f"<{type(self).__name__} name={self.name} queue={self.queue.queue_name}>"
 
 
-def _chain_walk(node) -> Tuple[list, int, int, int, set]:
-    """自叶向根遍历链条，返回 (nodes, remain, full, reread_depth, session_ids)。
+def _node_len(node) -> int:
+    key = getattr(node, "key", None)
+    if key is not None and hasattr(key, "__len__"):
+        return len(key)
+    return node_num_tokens(node)
+
+
+def _chain_walk(node, share_of=None, share_min: int = 2) -> Tuple[list, int, int, int, int, set]:
+    """自叶向根遍历链条，返回 (nodes, remain, full, reread_depth, shared_depth, session_ids)。
 
     remain: 淘汰该叶子后链上仍连续缓存的前缀 token 数（root->parent）。
     reread_depth: 链上最深重读节点的 root->node 深度（0 表示无重读）。
+    shared_depth: 链上最深跨会话共享节点的 root->node 深度（0 表示无共享）。
     """
-    leaf_len = len(node.key)
+    leaf_len = _node_len(node)
     nodes = [node]
     session_ids = {getattr(node, "session_id", None)}
-    cursor = node.parent
-    while cursor is not None and cursor.parent is not None:
+    cursor = getattr(node, "parent", None)
+    while cursor is not None and getattr(cursor, "parent", None) is not None:
         nodes.append(cursor)
         session_ids.add(getattr(cursor, "session_id", None))
-        cursor = cursor.parent
-    full = sum(len(n.key) for n in nodes)
+        cursor = getattr(cursor, "parent", None)
+    full = sum(_node_len(n) for n in nodes)
     remain = full - leaf_len
     reread_depth = 0
+    shared_depth = 0
     depth = 0
     for item in reversed(nodes):
-        depth += len(item.key)
+        depth += _node_len(item)
         if getattr(item, "reuse_count", 0) > 0:
             reread_depth = depth
-    return nodes, remain, full, reread_depth, session_ids
+        if getattr(item, "reuse_cross", 0) > 0 or (
+            share_of is not None and share_of(item) >= share_min
+        ):
+            shared_depth = depth
+    return nodes, remain, full, reread_depth, shared_depth, session_ids
 
 
 def _has_return_evidence(session_ids: set, registry, min_gaps: int) -> bool:
@@ -170,6 +185,20 @@ def _has_return_evidence(session_ids: set, registry, min_gaps: int) -> bool:
     return False
 
 
+def _max_session_L(session_ids: set, registry) -> int:
+    """链上已知会话最近一次 prompt 长度 L 的最大值（无有效记录时返回 0）。"""
+    if registry is None:
+        return 0
+    max_l = 0
+    for sid in session_ids:
+        if not sid:
+            continue
+        state = registry.get(sid)
+        if state is not None and state.L > max_l:
+            max_l = int(state.L)
+    return max_l
+
+
 def chain_leaf_key(
     node,
     *,
@@ -180,19 +209,39 @@ def chain_leaf_key(
     min_gaps: int = 1,
     expired_of=None,
     weight_scale: float = 1.0,
+    queue: Optional[str] = None,
+    share_of=None,
+    share_min: int = 2,
+    cap_floor_by_session_L: bool = False,
 ) -> Tuple[float, float, int]:
     """链形定价键 (lat + penalty, -remain, id)，min 即淘汰。
 
     ChainEvict 与 PricedFallback 共用同一套定价：
-    - 锚深 = max(floor_tokens, 最深重读深度)；
+    - struct 队列：以链上最深跨会话共享深度 shared_depth 作锚与证据门；
+    - chat / agentic：锚深 = max(有效 floor, 最深重读深度)，支持按 SessionState.L 裁剪；
     - 证据门 = 链上存在重读节点 或 会话有回访记录；无证据不保护；
     - 锚出口 = 路径上所有会话均已终结时释放罚项。
     """
     lat = float(node.last_access_time)
-    nodes, remain, _full, reread_depth, session_ids = _chain_walk(node)
-    anchor = max(floor_tokens, reread_depth)
+    nodes, remain, _full, reread_depth, shared_depth, session_ids = _chain_walk(
+        node, share_of=share_of, share_min=share_min
+    )
+    if queue == "struct":
+        anchor = max(floor_tokens, shared_depth)
+        has_evidence = shared_depth > 0
+    else:
+        eff_floor = floor_tokens
+        if cap_floor_by_session_L and eff_floor > 0:
+            sess_l = _max_session_L(session_ids, registry)
+            if sess_l > 0:
+                eff_floor = min(eff_floor, sess_l)
+        anchor = max(eff_floor, reread_depth)
+        has_evidence = bool(reread_depth) or _has_return_evidence(
+            session_ids, registry, min_gaps
+        )
+
     penalty = weight * weight_scale * max(0, anchor - remain)
-    if penalty > 0 and not reread_depth and not _has_return_evidence(session_ids, registry, min_gaps):
+    if penalty > 0 and not has_evidence:
         penalty = 0.0
     if penalty > 0 and expired_of is not None and all(expired_of(item) for item in nodes):
         penalty = 0.0
@@ -201,17 +250,32 @@ def chain_leaf_key(
 
 
 class PricedFallback(VictimOverride):
-    """全弃权时的全局链形定价兜底：用后悔归因加权的 chain_leaf_key 选全树最便宜叶子。"""
+    """多队列软加权全树链形定价器：融合 VD_q / R_q 宏观乘数与队列级锚深 anchor_q。"""
 
     name = "priced_fallback"
 
-    def __init__(self, params, gate, tag_of=None, expired_of=None) -> None:
-        self.params = params          # RegretGateParams（floor/weight/beta）
+    def __init__(
+        self,
+        params,
+        gate,
+        tag_of=None,
+        expired_of=None,
+        *,
+        realized=None,
+        occupancy=None,
+        share_of=None,
+        share_min: int = 2,
+    ) -> None:
+        self.params = params          # RegretGateParams（floor_by_queue/weight/alpha/beta/scale_min/max）
         self._gate = gate             # RegretGate，提供 r(queue)
         self._tag_of = tag_of or (
             lambda node: HeterCacheNodeTag.coerce(getattr(node, "queue_tag", None))
         )
         self._expired_of = expired_of
+        self._realized = realized     # QueueValueTracker，提供 densities(occ)
+        self._occupancy = occupancy   # QueueOccupancyTracker，提供 occ
+        self._share_of = share_of     # NodeShareLedger.share_of
+        self._share_min = int(share_min)
         self._registry = None
         # ---- 观测 ----
         self.picks = 0
@@ -220,32 +284,66 @@ class PricedFallback(VictimOverride):
         """接会话账本（与 ChainEvict.bind_registry 同约定）。"""
         self._registry = registry
 
+    def queue_scales(self) -> Dict[str, float]:
+        """计算各队列宏观保护乘数 scale_q = clip((VD_q / median_VD)^alpha * (1 + beta * R_q), s_min, s_max)。"""
+        alpha = getattr(self.params, "alpha", 0.5)
+        beta = self.params.beta
+        s_min = getattr(self.params, "scale_min", 0.25)
+        s_max = getattr(self.params, "scale_max", 4.0)
+
+        vd_map: Dict[str, float] = {}
+        med_vd = 0.0
+        if self._realized is not None and self._occupancy is not None and alpha > 0:
+            occ = self._occupancy.occ
+            vd_map = self._realized.densities(occ)
+            active_vds = [vd_map.get(q, 0.0) for q in VALUE_QUEUES if occ.get(q, 0.0) > 0.0]
+            if active_vds:
+                med_vd = median(active_vds)
+
+        scales: Dict[str, float] = {}
+        for q in VALUE_QUEUES:
+            if med_vd > 0.0 and alpha > 0:
+                vd_factor = (max(0.0, vd_map.get(q, 0.0)) / med_vd) ** alpha
+            else:
+                vd_factor = 1.0
+            rg_factor = 1.0
+            if beta > 0 and self._gate is not None:
+                r_q = self._gate.r(q)
+                if r_q is not None:
+                    rg_factor = 1.0 + beta * r_q
+            scales[q] = min(s_max, max(s_min, vd_factor * rg_factor))
+        return scales
+
     def pick(self, leaves, registry=None) -> Optional["TreeNode"]:
-        """全树叶子按后悔归因加权的链形定价取最便宜；空池弃权。"""
+        """全树叶子按队列软加权的链形定价取最便宜；空池弃权。"""
         if registry is not None:
             self._registry = registry
         pool = [node for node in (leaves or ())]
         if not pool:
             return None
         self.picks += 1
-        beta = self.params.beta
         weight = self.params.weight
+        scales = self.queue_scales()
+        floor_by_queue = getattr(self.params, "floor_by_queue", None) or {}
+        default_floor = self.params.floor_tokens
 
         def price(node):
-            scale = 1.0
-            if beta > 0 and self._gate is not None:
-                r_q = self._gate.r(self._tag_of(node).queue_name)
-                if r_q is not None:
-                    scale = 1.0 + beta * r_q
+            q = self._tag_of(node).queue_name
+            scale = scales.get(q, 1.0)
+            floor_q = floor_by_queue.get(q, default_floor)
             return chain_leaf_key(
                 node,
-                floor_tokens=self.params.floor_tokens,
+                floor_tokens=floor_q,
                 weight=weight,
                 tail_first=True,
                 registry=self._registry,
                 min_gaps=self.params.min_gaps,
                 expired_of=self._expired_of,
                 weight_scale=scale,
+                queue=q,
+                share_of=self._share_of,
+                share_min=self._share_min,
+                cap_floor_by_session_L=True,
             )
 
         return min(pool, key=price)

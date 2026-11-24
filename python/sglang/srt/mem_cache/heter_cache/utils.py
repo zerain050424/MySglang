@@ -400,19 +400,25 @@ class RegretGateParams:
             锚罚更重）。
     """
 
-    enabled: bool = False
+    enabled: bool = True
     window_s: float = 120.0
-    k: float = 1.0
-    r_min: float = 0.5
+    k: float = 1.2
+    r_min: float = 0.3
     min_evicted: int = 4096
     retain_s: float = 900.0
     max_stamps: int = 200_000
     context: int = 16
-    priced_fallback: bool = False
+    priced_fallback: bool = True
     early_priced: bool = True
     floor_tokens: int = 8192
+    floor_by_queue: Dict[str, int] = dataclasses.field(
+        default_factory=lambda: {"struct": 0, "agentic": 4096, "chat": 8192}
+    )
     weight: float = 0.02
+    alpha: float = 0.5
     beta: float = 1.0
+    scale_min: float = 0.25
+    scale_max: float = 4.0
     min_gaps: int = 1
 
     def __post_init__(self):
@@ -441,12 +447,25 @@ class RegretGateParams:
             )
         if self.weight < 0:
             raise ValueError(f"regret_gate.weight must be >= 0, got {self.weight}")
+        if self.alpha < 0:
+            raise ValueError(f"regret_gate.alpha must be >= 0, got {self.alpha}")
         if self.beta < 0:
             raise ValueError(f"regret_gate.beta must be >= 0, got {self.beta}")
+        if self.scale_min <= 0 or self.scale_min > self.scale_max:
+            raise ValueError(
+                f"regret_gate.scale_min ({self.scale_min}) must satisfy 0 < scale_min <= scale_max ({self.scale_max})"
+            )
         if self.min_gaps < 1:
             raise ValueError(
                 f"regret_gate.min_gaps must be >= 1, got {self.min_gaps}"
             )
+        merged_floors = {"struct": 0, "agentic": 4096, "chat": 8192}
+        if self.floor_by_queue:
+            for q, fl in self.floor_by_queue.items():
+                if fl < 0:
+                    raise ValueError(f"regret_gate.floor_by_queue[{q!r}] must be >= 0, got {fl}")
+                merged_floors[q] = int(fl)
+        self.floor_by_queue = merged_floors
 
     @classmethod
     def from_any(cls, value=None) -> "RegretGateParams":

@@ -137,6 +137,7 @@ TAG = {
 
 
 def _strategy(**kw):
+    kw.setdefault("regret_gate", {"enabled": False, "priced_fallback": False})
     return ep.HeterCacheStrategy(**kw)
 
 
@@ -289,7 +290,7 @@ def test_stage0_one_shot_preempts_arbitration():
 def test_stage1_labels_and_skip():
     """Stage 1：按 VD 排序点名队列，出候选时标 value:<queue>，无候选则跳队。"""
     print("[8] stage 1: VD-ordered queues, labels and skip-on-empty")
-    st = ep.HeterCacheStrategy()
+    st = _strategy()
     st.occupancy.reconcile({"struct": {"total": 900, "one_shot": 0},
                             "agentic": {"total": 600, "one_shot": 0},
                             "chat": {"total": 0, "one_shot": 0}}, capacity=1000)
@@ -318,7 +319,7 @@ def test_fallback_is_seeded_random():
     index = {id(n): i for i, n in enumerate(leaves)}
 
     def run(seed):
-        st = ep.HeterCacheStrategy(value={"seed": seed}, reuse={"enabled": False})
+        st = _strategy(value={"seed": seed}, reuse={"enabled": False})
         st.occupancy.reset()  # 全 0 -> 没有任何队列有压力 -> 直接兜底
         picks = []
         for _ in range(6):
