@@ -76,6 +76,7 @@ class HeterCacheRadixCache(RadixCache):
         if self._needs_capacity:
             available = self.token_to_kv_pool_allocator.available_size()
             capacity = float(self.token_to_kv_pool_allocator.size)
+            self.occupancy.update_pressure(available, capacity)
 
         self._observe_occupancy(available, capacity)
 
@@ -282,7 +283,7 @@ class HeterCacheRadixCache(RadixCache):
         if regret is not None:
             regret.on_request(key=breakpoint_key, recompute=recompute, prompt=prompt)
         if gate is not None:
-            gate.on_request(key=breakpoint_key)
+            gate.on_request(key=breakpoint_key, recompute=recompute)
 
     def match_prefix(self, params):
         """admission 匹配后将断点页交给 regret 账本与弃权门（回扫不参与）。"""

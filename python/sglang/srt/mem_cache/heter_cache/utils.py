@@ -189,15 +189,18 @@ def _coerce_params(cls, value, *, name: str):
 # 跨会话模板的共享会话数阈值。
 DEFAULT_SHARE_MIN = 2
 
-# 一次性带的时间豁免窗口（秒）：新写入的 TRANS/STRUCT 节点在归属会话活跃期内不进 one-shot 带。
+# 一次性带的时间豁免窗口（秒）：新写入的 TRANS 节点在豁免期内不进 one-shot 带；
+# 承压（available/capacity < 5%）时收缩至 ONE_SHOT_IDLE_PRESSURE_S 快速排空冲刷。
 ONE_SHOT_IDLE_S = 20.0
+ONE_SHOT_IDLE_PRESSURE_S = 3.0
 
 # 队内复用分的预测窗口 H（秒）：P(reuse in (a, a+H] | not reused by a)。
 DEFAULT_REUSE_WINDOW_S = 90.0
 
-# 按生效标签的老化阈值（秒）：节点超过该时长未被访问即降级到 one-shot 带（0 表示不老化）。
+# 按生效标签的老化阈值（秒）：0 表示不按固定墙钟 TTL 老化。
+# W1-NEW / HeterCache-TTFT：struct 默认 0（交由 Stage 1 按 shared_depth 平滑比价）。
 DEFAULT_AGEING_TTL_S = {
-    "struct": 120.0,
+    "struct": 0.0,
     "chat": 300.0,
     "agentic": 300.0,
     "random": 0.0,
@@ -206,29 +209,21 @@ DEFAULT_AGEING_TTL_S = {
 
 @dataclasses.dataclass
 class ShareParams:
-    """共享会话数阈值与按类型的节点老化 TTL。
-
-    Attributes:
-        share_min: 受保护的共享会话数阈值，必须 >= 2。
-        ageing_ttl_s: 按队列名的老化 TTL（秒），0 表示该类型不老化。只写想
-            覆盖的键即可，其余类型沿用 DEFAULT_AGEING_TTL_S。
-    """
+    """共享会话数阈值与 Purified Stage 0 老化/豁免参数。"""
 
     share_min: int = DEFAULT_SHARE_MIN
     ageing_ttl_s: Dict[str, float] = dataclasses.field(
         default_factory=lambda: dict(DEFAULT_AGEING_TTL_S)
     )
-    # 老化判据的两种口径：
-    #   "queue_ttl"    —— 按队列 TTL（历史口径，节点"M 秒没被访问"就老化）
-    #   "session_life" —— 按会话寿命（方案 A）：只看该会话自己的轮间隔分布，
-    #                     超过 k×p90 才算终结；终结后的**私有**内容才可回收。
-    # 前者分不清"会话还活着只是这轮间隔长"，后者把"会话终结"当成唯一判据。
-    # struct 始终走 TTL：它是模板族，没有会话级证据（单轮、gaps 为空）。
-    ageing_mode: str = "queue_ttl"
-    session_ttl_k: float = 3.0
-    session_ttl_min_s: float = 60.0
+    # 老化判据：W1-NEW 默认 "session_life"（仅终结后的私有残链进 Stage 0，
+    # 保守参数 k=4.0, min_s=180s, min_gaps=3 防误杀长间隔活跃 chat）。
+    ageing_mode: str = "session_life"
+    session_ttl_k: float = 4.0
+    session_ttl_min_s: float = 180.0
     session_ttl_max_s: float = 1800.0
-    session_ttl_min_gaps: int = 2
+    session_ttl_min_gaps: int = 3
+    one_shot_idle_s: float = ONE_SHOT_IDLE_S
+    one_shot_idle_pressure_s: float = ONE_SHOT_IDLE_PRESSURE_S
 
     def __post_init__(self):
         if self.share_min < 2:
@@ -257,6 +252,12 @@ class ShareParams:
         if self.session_ttl_min_gaps < 1:
             raise ValueError(
                 f"share.session_ttl_min_gaps must be >= 1, got {self.session_ttl_min_gaps}"
+            )
+        if self.one_shot_idle_s < 0:
+            raise ValueError(f"share.one_shot_idle_s must be >= 0, got {self.one_shot_idle_s}")
+        if self.one_shot_idle_pressure_s < 0:
+            raise ValueError(
+                f"share.one_shot_idle_pressure_s must be >= 0, got {self.one_shot_idle_pressure_s}"
             )
         merged = {**DEFAULT_AGEING_TTL_S, **self.ageing_ttl_s}
         for queue, ttl in merged.items():
@@ -412,13 +413,19 @@ class RegretGateParams:
     early_priced: bool = True
     floor_tokens: int = 8192
     floor_by_queue: Dict[str, int] = dataclasses.field(
-        default_factory=lambda: {"struct": 0, "agentic": 4096, "chat": 8192}
+        default_factory=lambda: {"struct": 0, "agentic": 8192, "chat": 8192}
     )
     weight: float = 0.02
-    alpha: float = 0.5
+    alpha: float = 0.0
     beta: float = 1.0
-    scale_min: float = 0.25
+    scale_min: float = 1.0
     scale_max: float = 4.0
+    tail_recompute_min: int = 2048
+    time_scale_align: bool = True
+    tau_ref_s: float = 120.0
+    tau_by_queue: Dict[str, float] = dataclasses.field(
+        default_factory=lambda: {"chat": 120.0, "agentic": 15.0, "struct": 120.0}
+    )
     min_gaps: int = 1
 
     def __post_init__(self):
@@ -455,17 +462,30 @@ class RegretGateParams:
             raise ValueError(
                 f"regret_gate.scale_min ({self.scale_min}) must satisfy 0 < scale_min <= scale_max ({self.scale_max})"
             )
+        if self.tail_recompute_min < 0:
+            raise ValueError(
+                f"regret_gate.tail_recompute_min must be >= 0, got {self.tail_recompute_min}"
+            )
+        if self.tau_ref_s <= 0:
+            raise ValueError(f"regret_gate.tau_ref_s must be > 0, got {self.tau_ref_s}")
         if self.min_gaps < 1:
             raise ValueError(
                 f"regret_gate.min_gaps must be >= 1, got {self.min_gaps}"
             )
-        merged_floors = {"struct": 0, "agentic": 4096, "chat": 8192}
+        merged_floors = {"struct": 0, "agentic": 8192, "chat": 8192}
         if self.floor_by_queue:
             for q, fl in self.floor_by_queue.items():
                 if fl < 0:
                     raise ValueError(f"regret_gate.floor_by_queue[{q!r}] must be >= 0, got {fl}")
                 merged_floors[q] = int(fl)
         self.floor_by_queue = merged_floors
+        merged_tau = {"chat": 120.0, "agentic": 15.0, "struct": 120.0}
+        if self.tau_by_queue:
+            for q, tv in self.tau_by_queue.items():
+                if tv <= 0:
+                    raise ValueError(f"regret_gate.tau_by_queue[{q!r}] must be > 0, got {tv}")
+                merged_tau[q] = float(tv)
+        self.tau_by_queue = merged_tau
 
     @classmethod
     def from_any(cls, value=None) -> "RegretGateParams":

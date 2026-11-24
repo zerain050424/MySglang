@@ -365,6 +365,7 @@ class HeterCacheStrategy(EvictionStrategy):
         if self.regret_gate is not None:
             self.regret_gate.use_clock(now)
         if self.priced_fallback is not None:
+            self.priced_fallback.use_clock(now)
             self.priced_fallback.bind_registry(self.session_registry)
 
     def node_tag(self, node) -> HeterCacheNodeTag:
@@ -408,7 +409,10 @@ class HeterCacheStrategy(EvictionStrategy):
 
     def session_expired(self, node) -> bool:
         """归属会话是否已终结（跨会话共享节点不受单会话终结影响）。"""
-        if self.node_share.share_of(node) >= self.node_share.share_min:
+        if (
+            self.node_share.share_of(node) >= self.node_share.share_min
+            or getattr(node, "reuse_cross", 0) > 0
+        ):
             return False
         state = self.session_registry.get(getattr(node, "session_id", None))
         if state is None:
@@ -417,18 +421,23 @@ class HeterCacheStrategy(EvictionStrategy):
         return life is not None and (self._now() - state.last_active > life)
 
     def is_one_shot(self, node) -> bool:
-        """判定节点是否进入 One-shot 优先清理带。"""
+        """Purified Stage 0：仅收已确认终结的私有死链与超豁免期的未复用 TRANS 瞬态流。"""
         if self.is_aged(node):
             return True
         st = self.session_registry.get(getattr(node, "session_id", None))
         if st is None or getattr(node, "reuse_count", 0) > 0:
             return False
+        idle_s = (
+            self.share.one_shot_idle_pressure_s
+            if self.occupancy.under_pressure
+            else self.share.one_shot_idle_s
+        )
         anchor = max(st.last_active, getattr(node, "last_access_time", 0.0))
-        if self._now() - anchor < ONE_SHOT_IDLE_S:
+        if self._now() - anchor < idle_s:
             return False
         if self.node_share.share_of(node) >= self.node_share.share_min:
             return False
-        return st.session_type in (SessionType.TRANS, SessionType.STRUCT)
+        return st.session_type is SessionType.TRANS
 
     def one_shot_key(self, node) -> tuple:
         """One-shot 带内淘汰排序：老化节点最优先，其余按访问时间升序。"""

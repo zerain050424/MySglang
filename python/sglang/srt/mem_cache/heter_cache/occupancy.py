@@ -16,7 +16,7 @@ PRESSURE_WINDOW_S = 3.0
 class QueueOccupancyTracker:
     """三队列占用账本计数,只计可调度内容——one-shot 节点在写入方就已被排除"""
 
-    __slots__ = ("_occ", "_capacity", "_last_reconcile", "_now")
+    __slots__ = ("_occ", "_capacity", "_last_reconcile", "_now", "_under_pressure")
 
     def __init__(self, now: Optional[Callable[[], float]] = None) -> None:
         self._occ: Dict[str, float] = {q: 0.0 for q in VALUE_QUEUES}
@@ -25,6 +25,7 @@ class QueueOccupancyTracker:
         # -inf 而不是 0：首次淘汰必须校准（真时钟下 now-0 本来就巨大，
         # 而虚拟时钟从 0 起算时 now-0=0 会让第一次淘汰漏掉校准）。
         self._last_reconcile = float("-inf")
+        self._under_pressure = False
 
     def use_clock(self, now: Callable[[], float]) -> None:
         """接管时间源（默认墙钟下等价于无操作）；不重置上一行校准时刻。"""
@@ -39,6 +40,18 @@ class QueueOccupancyTracker:
     def capacity(self) -> float:
         """最近一次校准得到的池容量（Token）。"""
         return self._capacity
+
+    @property
+    def under_pressure(self) -> bool:
+        """当前池是否处于承压态（available / capacity < PRESSURE_AVAILABLE_RATIO）。"""
+        return self._under_pressure
+
+    def update_pressure(self, available: float, capacity: float) -> bool:
+        """根据最新 allocator 水位刷新承压状态。"""
+        self._under_pressure = capacity > 0 and (
+            available / capacity < PRESSURE_AVAILABLE_RATIO
+        )
+        return self._under_pressure
 
     def snapshot(self) -> Dict[str, float]:
         """副本，供渲染或跨线程使用。"""
@@ -104,3 +117,4 @@ class QueueOccupancyTracker:
         for q in VALUE_QUEUES:
             self._occ[q] = 0.0
         self._last_reconcile = float("-inf")
+        self._under_pressure = False

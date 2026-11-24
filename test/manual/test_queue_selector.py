@@ -506,15 +506,15 @@ def test_reuse_window_probability():
 
 
 def test_per_type_ageing_ttl():
-    """按类型老化：struct < chat <= agentic，random 不老化；带内最优先。"""
-    print("[14] per-type ageing TTL: struct < chat <= agentic, random off")
-    ttl = hu.DEFAULT_AGEING_TTL_S
-    check(ttl["struct"] < ttl["chat"],
-          f"TTL must grow with re-prefill cost: {ttl}")
+    """按类型老化（显式 queue_ttl 消融口径）：struct <= chat <= agentic，random 不老化。"""
+    print("[14] per-type ageing TTL: struct <= chat <= agentic, random off")
+    ttl = {**hu.DEFAULT_AGEING_TTL_S, "struct": 120.0}
+    check(hu.DEFAULT_AGEING_TTL_S["struct"] == 0.0,
+          f"HeterCache-TTFT default disables struct fixed TTL, got {hu.DEFAULT_AGEING_TTL_S}")
     check(ttl["chat"] >= 300.0,
           f"chat TTL is set by the drift3 sweep peak (>=300s), got {ttl['chat']}")
     check(ttl["random"] == 0, "random nodes are one-shot already; no ageing")
-    st = _strategy()
+    st = _strategy(share={"ageing_mode": "queue_ttl", "ageing_ttl_s": {"struct": 120.0}})
     now = time.monotonic()
 
     def node(tag, age_s, share=0, tokens=100):
@@ -561,7 +561,7 @@ def test_per_type_ageing_ttl():
         else:
             check(False, f"invalid ageing_ttl_s must be rejected: {bad}")
 
-    fa = _strategy(force_agentic=True)
+    fa = _strategy(force_agentic=True, share={"ageing_mode": "queue_ttl"})
     check(fa.is_aged(node(TAG["struct"], ttl["agentic"] + 1)),
           "force_agentic must score every node with the agentic TTL")
 

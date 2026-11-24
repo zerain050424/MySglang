@@ -70,11 +70,19 @@ class RegretGate:
             self._stamps.pop(old, None)
         self._push(self._ev, self._ev_sum, queue, now, span)
 
-    def on_request(self, *, key: Optional[int], ts: Optional[float] = None) -> None:
-        """断点页 join：命中 stamp 则按其队列归属记一次后悔（span 全额，一次）。
+    def on_request(
+        self,
+        *,
+        key: Optional[int],
+        recompute: Optional[int] = None,
+        ts: Optional[float] = None,
+    ) -> None:
+        """断点页 join：命中 stamp 时按尾重算代价（recompute >= tail_recompute_min）记后悔。
 
         Args:
             key: 断点页内容键；``None``（全命中）不 join。
+            recompute: 本次请求实际重算 token 数（prompt - matched）；
+                省略时退回单节点 ``span``（兼容旧单测）。
         """
         if key is None:
             return
@@ -88,7 +96,13 @@ class RegretGate:
         _, queue, span = stamp
         # 摘除后再记后悔：一个 stamp 只归因一次（账本用 hit_age 达成同一语义）
         self.joins += 1
-        self._push(self._rg, self._rg_sum, queue, now, span)
+        if recompute is None:
+            regret_tokens = span
+        else:
+            rec = int(recompute)
+            regret_tokens = rec if rec >= self.params.tail_recompute_min else 0
+        if regret_tokens > 0:
+            self._push(self._rg, self._rg_sum, queue, now, regret_tokens)
 
     def note_skip(self, reason: str) -> None:
         """无法测量的请求/节点（bigram 视图等），不让它静默消失。"""

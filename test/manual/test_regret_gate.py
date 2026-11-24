@@ -271,6 +271,9 @@ def test_param_validation():
         {"scale_min": 0.0},
         {"scale_min": 5.0, "scale_max": 4.0},
         {"floor_by_queue": {"chat": -1}},
+        {"tail_recompute_min": -1},
+        {"tau_ref_s": 0.0},
+        {"tau_by_queue": {"agentic": 0.0}},
     ):
         try:
             hu.RegretGateParams(**kwargs)
@@ -280,10 +283,12 @@ def test_param_validation():
     defaults = hu.RegretGateParams()
     check(defaults.enabled is True, "W1-NEW 默认 enabled=True")
     check(defaults.priced_fallback is True, "W1-NEW 默认 priced_fallback=True")
-    check(defaults.alpha == 0.5 and defaults.scale_min == 0.25 and defaults.scale_max == 4.0,
-          "W1-NEW 默认软加权参数")
-    check(defaults.floor_by_queue == {"struct": 0, "agentic": 4096, "chat": 8192},
-          f"W1-NEW 默认 floor_by_queue: {defaults.floor_by_queue}")
+    check(defaults.alpha == 0.0 and defaults.scale_min == 1.0 and defaults.scale_max == 4.0,
+          "HeterCache-TTFT 默认单向 Tail-Regret 参数 (alpha=0.0, scale_min=1.0)")
+    check(defaults.tail_recompute_min == 2048 and defaults.time_scale_align is True,
+          "HeterCache-TTFT 默认 tail_recompute_min=2048, time_scale_align=True")
+    check(defaults.floor_by_queue == {"struct": 0, "agentic": 8192, "chat": 8192},
+          f"HeterCache-TTFT 默认 floor_by_queue: {defaults.floor_by_queue}")
 
 
 class _LeafNode:
@@ -476,7 +481,7 @@ def test_peer_median_and_early_priced():
     v2, s2 = qs.pick_victim(strategy=st_off, leaves=[leaf])
     check(s2 == "value:chat", f"关闭 priced_fallback 时回退剩余单队 value:chat: {s2}")
 
-    # 验证 W1-NEW 软加权乘数 scale_q(VD_q, R_q) 与 struct shared_depth / chat state.L 裁剪
+    # 验证 HeterCache-TTFT 默认单向 Tail-Regret 乘数 (alpha=0.0, scale_min=1.0 → 永不打折)
     occ_stub = type("Occ", (), {"occ": {"struct": 1000.0, "agentic": 1000.0, "chat": 1000.0}})()
     real_stub = type("Real", (), {"densities": lambda self, occ: {"struct": 0.25, "agentic": 1.0, "chat": 4.0}})()
     fb_soft = ov.PricedFallback(
@@ -484,10 +489,10 @@ def test_peer_median_and_early_priced():
         share_of=lambda n: getattr(n, "_share", 0), share_min=2,
     )
     scales = fb_soft.queue_scales()
-    # med_vd = 1.0: agentic vd=1.0 -> 1.0; chat vd=4.0^0.5=2.0 * (1+0.2)=2.4; struct vd=0.25^0.5=0.5 * (1+0.8)=0.9
+    # alpha=0 -> vd_factor=1.0; agentic R=None -> 1.0; chat R=0.2 -> 1.2; struct R=0.8 -> 1.8
     check(abs(scales["agentic"] - 1.0) < 1e-6, f"agentic scale={scales['agentic']}")
-    check(abs(scales["chat"] - 2.4) < 1e-6, f"chat scale={scales['chat']}")
-    check(abs(scales["struct"] - 0.9) < 1e-6, f"struct scale={scales['struct']}")
+    check(abs(scales["chat"] - 1.2) < 1e-6, f"chat scale={scales['chat']}")
+    check(abs(scales["struct"] - 1.8) < 1e-6, f"struct scale={scales['struct']}")
 
     # struct 队列用 shared_depth 作证据门与锚深（无共享不护，有共享护到 shared_depth）
     st_shared = _leaf_chain([(2000, 0, None)], 10.0, tag=hu.HeterCacheNodeTag.QSTRUCT)
@@ -540,6 +545,51 @@ def test_chain_lru_clock_sync():
     hu.SessionRegistry.reset_global()
 
 
+def test_tail_regret_timescale_and_purified_stage0():
+    """HeterCache-TTFT 三项核心：Tail-Regret 过滤、分队列近期性归一化、Purified Stage 0。"""
+    print("[12] Tail-Regret + time_scale_align + Purified Stage 0")
+    hu.SessionRegistry.reset_global()
+    now = [1000.0]
+
+    # 1) Tail-Regret: recompute < 2048 不记后悔；recompute >= 2048 按 recompute 记后悔
+    g = _gate(now, window_s=120.0, retain_s=900.0, min_evicted=100, tail_recompute_min=2048)
+    g.on_evict(key=9001, queue="chat", span=512)
+    g.on_evict(key=9002, queue="chat", span=512)
+    g.on_request(key=9001, recompute=512)    # 轻度尾截断 -> 记 0
+    check(g.r("chat") == 0.0, f"recompute < 2048 不应记入后悔: r={g.r('chat')}")
+    g.on_request(key=9002, recompute=8192)   # 大重算 -> 记 8192 / 1024 = 8.0
+    check(abs(g.r("chat") - 8.0) < 1e-6, f"recompute=8192 应记 8.0, got {g.r('chat')}")
+
+    # 2) time_scale_align: chat 闲置 45s vs agentic (tau=15s) 闲置 15s -> agentic 等效 120s 更旧
+    params = hu.RegretGateParams(enabled=True, priced_fallback=True, time_scale_align=True)
+    fb = ov.PricedFallback(params, g)
+    fb.use_clock(lambda: now[0])
+    c_node = _leaf_chain([(1000, 1, "sc")], now[0] - 45.0, tag=hu.HeterCacheNodeTag.QCHAT)
+    a_node = _leaf_chain([(1000, 1, "sa")], now[0] - 15.0, tag=hu.HeterCacheNodeTag.QAGENT)
+    check(fb._effective_lat(a_node, "agentic", now[0]) < fb._effective_lat(c_node, "chat", now[0]),
+          "agentic 闲置 15s (1x tau) 应比 chat 闲置 45s (0.375x tau) 等效更旧")
+
+    # 3) Purified Stage 0: TRANS 正常 20s 豁免、承压 3s 豁免；单轮 STRUCT 不进 one_shot
+    st = ep.HeterCacheStrategy(now=lambda: now[0])
+    st.use_clock(lambda: now[0])
+    reg = st.session_registry
+    reg.observe_request("s_tr", rid="r1", prompt_len=500)
+    reg.touch("s_tr", rid="r1", prompt_len=500)
+    reg.observe_request("s_st", rid="r2", prompt_len=500)
+    reg.record_cross_session_hit("s_st", "other_sid")
+    reg.touch("s_st", rid="r2", prompt_len=500)
+
+    n_tr = _leaf_chain([(500, 0, "s_tr")], now[0], tag=hu.HeterCacheNodeTag.QTRANS)
+    n_st = _leaf_chain([(500, 0, "s_st")], now[0], tag=hu.HeterCacheNodeTag.QSTRUCT)
+    now[0] += 5.0  # 闲置 5s：常态不进 one_shot，承压态 TRANS 进、STRUCT 不进
+    st.occupancy.update_pressure(available=800, capacity=1000)
+    check(st.is_one_shot(n_tr) is False, "常态 5s < 20s 不进 one_shot")
+    st.occupancy.update_pressure(available=10, capacity=1000)  # < 5% 承压
+    check(st.is_one_shot(n_tr) is True, "承压态 5s >= 3s TRANS 应立即进 one_shot")
+    check(st.is_one_shot(n_st) is False, "Purified Stage 0 不应把单轮 STRUCT 打入 one_shot")
+    hu.SessionRegistry.reset_global()
+
+
 if __name__ == "__main__":
     test_r_and_window()
     test_abstain_rule()
@@ -552,6 +602,7 @@ if __name__ == "__main__":
     test_chain_leaf_key_shared_with_chain_evict()
     test_peer_median_and_early_priced()
     test_chain_lru_clock_sync()
+    test_tail_regret_timescale_and_purified_stage0()
     if FAILS:
         print(f"\n{len(FAILS)} FAILED")
         sys.exit(1)

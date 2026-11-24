@@ -213,16 +213,17 @@ def chain_leaf_key(
     share_of=None,
     share_min: int = 2,
     cap_floor_by_session_L: bool = False,
+    effective_lat: Optional[float] = None,
 ) -> Tuple[float, float, int]:
-    """链形定价键 (lat + penalty, -remain, id)，min 即淘汰。
+    """链形定价键 (eff_lat + penalty, -remain, id)，min 即淘汰。
 
     ChainEvict 与 PricedFallback 共用同一套定价：
     - struct 队列：以链上最深跨会话共享深度 shared_depth 作锚与证据门；
-    - chat / agentic：锚深 = max(有效 floor, 最深重读深度)，支持按 SessionState.L 裁剪；
+    - chat / agentic：锚深 = max(有效 floor, 最深重读深度)；
     - 证据门 = 链上存在重读节点 或 会话有回访记录；无证据不保护；
     - 锚出口 = 路径上所有会话均已终结时释放罚项。
     """
-    lat = float(node.last_access_time)
+    lat = float(node.last_access_time) if effective_lat is None else float(effective_lat)
     nodes, remain, _full, reread_depth, shared_depth, session_ids = _chain_walk(
         node, share_of=share_of, share_min=share_min
     )
@@ -276,19 +277,24 @@ class PricedFallback(VictimOverride):
         self._occupancy = occupancy   # QueueOccupancyTracker，提供 occ
         self._share_of = share_of     # NodeShareLedger.share_of
         self._share_min = int(share_min)
+        self._now = time.monotonic
         self._registry = None
         # ---- 观测 ----
         self.picks = 0
+
+    def use_clock(self, now) -> None:
+        """接管时间源（用于时间尺度归一化计算 elapsed = now - last_access_time）。"""
+        self._now = now
 
     def bind_registry(self, registry) -> None:
         """接会话账本（与 ChainEvict.bind_registry 同约定）。"""
         self._registry = registry
 
     def queue_scales(self) -> Dict[str, float]:
-        """计算各队列宏观保护乘数 scale_q = clip((VD_q / median_VD)^alpha * (1 + beta * R_q), s_min, s_max)。"""
-        alpha = getattr(self.params, "alpha", 0.5)
+        """计算各队列保护乘数：默认 alpha=0, scale_min=1.0，仅按 Tail-Regret 单向放大。"""
+        alpha = getattr(self.params, "alpha", 0.0)
         beta = self.params.beta
-        s_min = getattr(self.params, "scale_min", 0.25)
+        s_min = getattr(self.params, "scale_min", 1.0)
         s_max = getattr(self.params, "scale_max", 4.0)
 
         vd_map: Dict[str, float] = {}
@@ -314,8 +320,26 @@ class PricedFallback(VictimOverride):
             scales[q] = min(s_max, max(s_min, vd_factor * rg_factor))
         return scales
 
+    def _effective_lat(self, node, queue: str, now: float) -> float:
+        """分队列近期性：将闲置时长按队列/会话特征周期归一化到基准尺度 tau_ref。"""
+        raw_lat = float(node.last_access_time)
+        if not getattr(self.params, "time_scale_align", True):
+            return raw_lat
+        tau_ref = float(getattr(self.params, "tau_ref_s", 120.0))
+        tau_by_queue = getattr(self.params, "tau_by_queue", None) or {}
+        tau_q = float(tau_by_queue.get(queue, tau_ref))
+        tau_n = tau_q
+        if queue != "struct" and self._registry is not None:
+            sid = getattr(node, "session_id", None)
+            if sid:
+                st = self._registry.get(sid)
+                if st is not None and len(st.gaps) >= 2:
+                    tau_n = min(3.0 * tau_q, max(0.5 * tau_q, median(st.gaps)))
+        elapsed = max(0.0, now - raw_lat)
+        return now - (tau_ref / tau_n) * elapsed
+
     def pick(self, leaves, registry=None) -> Optional["TreeNode"]:
-        """全树叶子按队列软加权的链形定价取最便宜；空池弃权。"""
+        """全树叶子按时间尺度近期性 + 尾延迟后悔放大链形定价取最便宜；空池弃权。"""
         if registry is not None:
             self._registry = registry
         pool = [node for node in (leaves or ())]
@@ -326,11 +350,13 @@ class PricedFallback(VictimOverride):
         scales = self.queue_scales()
         floor_by_queue = getattr(self.params, "floor_by_queue", None) or {}
         default_floor = self.params.floor_tokens
+        now = self._now()
 
         def price(node):
             q = self._tag_of(node).queue_name
             scale = scales.get(q, 1.0)
             floor_q = floor_by_queue.get(q, default_floor)
+            eff_lat = self._effective_lat(node, q, now)
             return chain_leaf_key(
                 node,
                 floor_tokens=floor_q,
@@ -343,7 +369,8 @@ class PricedFallback(VictimOverride):
                 queue=q,
                 share_of=self._share_of,
                 share_min=self._share_min,
-                cap_floor_by_session_L=True,
+                cap_floor_by_session_L=False,
+                effective_lat=eff_lat,
             )
 
         return min(pool, key=price)
