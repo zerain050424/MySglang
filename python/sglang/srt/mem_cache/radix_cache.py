@@ -410,6 +410,9 @@ class RadixCache(BasePrefixCache):
 
         self.evictable_leaves = set()
         self.session_registry = SessionRegistry.global_instance()
+        # 所有策略都共享 session_registry（touch/charge），统一与缓存时钟对齐，
+        # 避免非 HeterCache 策略（如 chain_lru）下虚拟钟与墙钟错源。
+        self.session_registry.use_clock(self._now)
         self.reset()
         self.node_labels = start_node_label_logger(self)
 

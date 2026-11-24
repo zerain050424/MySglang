@@ -203,8 +203,9 @@ class ChainLRUStrategy(EvictionStrategy):
         self._now = time.monotonic
 
     def use_clock(self, now: Callable[[], float]) -> None:
-        """接管时间源（与 HeterCacheStrategy.use_clock 同一约定）。"""
+        """接管时间源并同步到 SessionRegistry（与 HeterCacheStrategy.use_clock 同一约定）。"""
         self._now = now
+        SessionRegistry.global_instance().use_clock(now)
 
     def _session_returned(self, session_id) -> bool:
         """归属会话是否已观测到 ≥ min_gaps 个轮间隔（= 至少回来过一次）。"""

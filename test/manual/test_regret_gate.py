@@ -513,6 +513,33 @@ def test_peer_median_and_early_priced():
           f"state.L=3000 应裁剪 floor 4096→3000: got {k_cap}")
 
 
+def test_chain_lru_clock_sync():
+    """ChainLRUStrategy.use_clock 必须同步 SessionRegistry，避免虚拟钟与墙钟错源。"""
+    print("[11] ChainLRUStrategy.use_clock syncs SessionRegistry")
+    hu.SessionRegistry.reset_global()
+    now = [100.0]
+    st = ep.ChainLRUStrategy(
+        floor_tokens=8192, weight=0.02, gate="multiturn",
+        session_ttl_k=3.0, session_ttl_min_s=60.0, session_ttl_max_s=1800.0,
+    )
+    st.use_clock(lambda: now[0])
+    reg = hu.SessionRegistry.global_instance()
+    # 模拟 3 轮：t=100, 110, 120 → gaps=[10, 10]，life = max(3*10, 60) = 60s
+    reg.touch("s_clk", rid="r1", prompt_len=2000)
+    now[0] = 110.0
+    reg.touch("s_clk", rid="r2", prompt_len=3000)
+    now[0] = 120.0
+    reg.touch("s_clk", rid="r3", prompt_len=4000)
+    state = reg.get("s_clk")
+    check(state is not None and abs(state.last_active - 120.0) < 1e-6,
+          f"SessionRegistry.last_active 应为虚拟钟 120.0，实得 {getattr(state, 'last_active', None)}")
+    now[0] = 150.0  # 距上次 30s < 60s → 未终结
+    check(st._session_expired("s_clk") is False, "30s < 60s 不应终结")
+    now[0] = 200.0  # 距上次 80s > 60s → 应终结
+    check(st._session_expired("s_clk") is True, "80s > 60s 应判定终结（若时钟错源会恒为 False）")
+    hu.SessionRegistry.reset_global()
+
+
 if __name__ == "__main__":
     test_r_and_window()
     test_abstain_rule()
@@ -524,6 +551,7 @@ if __name__ == "__main__":
     test_priced_fallback_routing()
     test_chain_leaf_key_shared_with_chain_evict()
     test_peer_median_and_early_priced()
+    test_chain_lru_clock_sync()
     if FAILS:
         print(f"\n{len(FAILS)} FAILED")
         sys.exit(1)
